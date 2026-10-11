@@ -4246,7 +4246,7 @@ mod tests {
         fs, io,
         os::unix::process::ExitStatusExt,
         path::Path,
-        process::{Command, ExitStatus, Output},
+        process::{Command, ExitStatus, Output, Stdio},
         sync::{
             atomic::{AtomicBool, Ordering},
             mpsc, Arc, Barrier, Mutex,
@@ -5155,14 +5155,18 @@ line.txt";
     /// one cannot be asked about, and neither can the group it led be named afterwards.
     #[test]
     fn a_finished_git_is_watched_and_not_collected() {
+        // The shell holds its exit until the reading end is closed, so "has not finished" is a
+        // fact here rather than a race with a shell that is free to exit before the first ask.
         let mut child = Command::new("sh")
-            .args(["-c", "exit 0"])
+            .args(["-c", "read line; exit 0"])
+            .stdin(Stdio::piped())
             .spawn()
             .expect("a shell to watch");
         assert!(
             !exited_unreaped(&child).expect("a running Git can be watched"),
             "a Git that has not finished is not an exit"
         );
+        drop(child.stdin.take());
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !exited_unreaped(&child).expect("a running Git can be watched") {
