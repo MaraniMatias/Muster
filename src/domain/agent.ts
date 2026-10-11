@@ -235,12 +235,11 @@ export function isPiLifecycleEvent(rawType: string): boolean {
  * function would mean the title path could return the identity path's certainty, which is exactly
  * the confusion the panel's own documentation refuses to make.
  *
- * Only Pi is asked, because only Pi answers. A terminal's foreground program cannot be the gate
- * either: Pi is a Node program, so the OS reports `node` for it and for every other Node process on
- * the machine, and a row that waited to be told the process was `pi` would draw nothing for most
- * real terminals. The bridge already said which terminal each session is in, so that is what is
- * asked, and a session from another provider is not a candidate here even in the day it grows a
- * route of its own.
+ * Only Pi is asked, because only Pi answers. A terminal's foreground program is not the gate:
+ * process names depend on the runtime and platform, and even when one says `pi`, that is weaker
+ * evidence than the bridge's direct terminal identity. The bridge already said which terminal each
+ * session is in, so that is what is asked, and a session from another provider is not a candidate
+ * here even in the day it grows a route of its own.
  */
 export type AgentTerminalMatch<Session> = { kind: "one"; session: Session } | { kind: "none" };
 

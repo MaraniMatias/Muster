@@ -265,10 +265,9 @@ describe("provider identity", () => {
   });
 
   it("answers identity for Pi whatever the OS calls the process running it", () => {
-    // The runtime cannot be the gate here. Pi is a Node program, so the OS reports `node` for it
-    // and for every other Node process on the machine; a row that waited for a foreground answer
-    // would draw nothing for most real Pi terminals. What makes it a Pi terminal is that the bridge
-    // minted a credential for that terminal and a session came back over it.
+    // The process name cannot be the gate here: it varies with runtime and platform, and even a
+    // reported `pi` is weaker than the bridge's direct terminal identity. What makes this a Pi
+    // terminal is that the bridge minted a credential for it and a session came back over it.
     const inTerminal = session({ id: "ses_pi", provider: "pi", terminalId: "terminal:one", title: "Review" });
     expect(matchAgentSessionTerminal([inTerminal], "terminal:one").kind).toBe("one");
     // The other direction is the one that would actually be wrong: an OpenCode session must never be

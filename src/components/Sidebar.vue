@@ -1182,11 +1182,10 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
        *
        * - **Pi is matched by identity.** The bridge reports the terminal a session is running in, so
        *   this is an equality check against a value Muster itself minted (`matchAgentSessionTerminal`).
-       *   Nothing about the runtime gates it, because nothing about the runtime would work: Pi is a
-       *   Node program, so the OS reports `node` for it and for every other Node process here, and a
-       *   row that waited to be told the process was `pi` would draw nothing for a real Pi terminal.
-       *   The cost is that the answer depends on the bridge having said so, so it draws no state at
-       *   all until then rather than reaching for the nearest session.
+       *   The process name is not the gate: it depends on the runtime and platform, and even `pi`
+       *   is weaker evidence than the bridge's direct terminal identity. The cost is that the answer
+       *   depends on the bridge having said so, so it draws no state at all until then rather than
+       *   reaching for the nearest session.
        * - **OpenCode is matched by inference.** It has no route from a TUI process to a session, so
        *   the only thing that can name one is the title that terminal's own TUI wrote
        *   (`agentSessionTitle`, which the runtime must confirm, then `matchAgentSessionTitle`). The

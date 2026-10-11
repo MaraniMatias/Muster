@@ -860,9 +860,9 @@ describe("Sidebar workdir rows", () => {
     /**
      * One Pi terminal in one worktree, drawn from whatever the runtime and the bridge say.
      *
-     * The runtime deliberately reports `node`: Pi is a Node program, so that is what the OS calls it
-     * and what this fixture uses. Nothing in the row may depend on that name being `pi`, because for
-     * a real terminal it never is.
+     * This fixture reports `node` to prove the row's identity does not depend on a process name.
+     * That name varies with the runtime and platform; the bridge's terminal id is the authoritative
+     * link between a Pi session and its terminal.
      */
     function mountPi(
       row: TerminalAgentSession | null,
@@ -897,9 +897,9 @@ describe("Sidebar workdir rows", () => {
     }
 
     it("names the session the bridge reported, not the process the OS calls", () => {
-      // Pi writes no `OC | …` title and its executable is reported as `node`, so neither the title
-      // chain nor the program name can name this row. What names it is the terminal the bridge said
-      // the session is running in, which is a value Muster minted for that terminal itself.
+      // Pi writes no `OC | …` title, and this fixture reports `node`; neither the title nor the
+      // process name identifies the session. What names it is the terminal the bridge said the
+      // session is running in, which is a value Muster minted for that terminal itself.
       const wrapper = mountPi(
         rowSession({
           id: "ses_pi",
