@@ -242,6 +242,7 @@ describe("Sidebar workdir rows", () => {
     expect(wrapper.findAll(".workdir-row.selected")).toHaveLength(1);
     expect(wrapper.get('[data-session-id="session:read"]').classes()).toContain("selected");
     expect(wrapper.findAll(".workdir-row.dimmed")).toHaveLength(0);
+    expect(wrapper.get('[data-session-id="session:read"] > .workdir-select').attributes("aria-current")).toBe("page");
 
     // A file open in the main panel takes the selection with it, and the file wears it on its own
     // row in the inspector beside this one. Nothing here claims it: a row that says "this is what
@@ -253,6 +254,7 @@ describe("Sidebar workdir rows", () => {
     const row = wrapper.get('[data-session-id="session:read"]');
     expect(row.classes()).toContain("dimmed");
     expect(row.classes()).toContain("active");
+    expect(row.get(".workdir-select").attributes("aria-current")).toBeUndefined();
     // Its sibling is not the row that was moved off, so it gets neither class.
     expect(wrapper.get('[data-session-id="session:other"]').classes()).not.toContain("dimmed");
     // A branch that holds the dimmed terminal does not take the selection up: the selection did
@@ -266,6 +268,7 @@ describe("Sidebar workdir rows", () => {
     await wrapper.setProps({ mainViewKind: "diff" });
     expect(wrapper.findAll(".workdir-row.selected")).toHaveLength(0);
     expect(wrapper.get('[data-session-id="session:read"]').classes()).toContain("dimmed");
+    expect(wrapper.get('[data-session-id="session:read"] .workdir-select').attributes("aria-current")).toBeUndefined();
 
     // Back to the terminal and the edge comes back with it. The session was never re-selected in
     // between, which is the point: the rule reads the panel, not the session.
@@ -273,6 +276,7 @@ describe("Sidebar workdir rows", () => {
     expect(wrapper.findAll(".workdir-row.selected")).toHaveLength(1);
     expect(wrapper.get('[data-session-id="session:read"]').classes()).toContain("selected");
     expect(wrapper.findAll(".workdir-row.dimmed")).toHaveLength(0);
+    expect(wrapper.get('[data-session-id="session:read"] .workdir-select').attributes("aria-current")).toBe("page");
     wrapper.unmount();
   });
 

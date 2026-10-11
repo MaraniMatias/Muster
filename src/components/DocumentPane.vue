@@ -386,11 +386,10 @@ async function copyFilePath() {
   const checkoutId = props.checkout?.id;
   const path = props.path;
   if (path === null || (props.origin === "checkout" && !checkoutPath)) return;
-  // A review file lives outside the checkout, and where it lives is a preference: the folder is
-  // asked of the backend rather than assembled here, so the path copied is the one it was read from.
-  if (props.origin === "review" && !checkoutId) return;
+  if (props.origin !== "checkout" && !checkoutId) return;
   try {
-    const reviewRoot = props.origin === "review" ? (await getReviewFolder(checkoutId!)).path : undefined;
+    const storage = props.origin === "review-workdir" ? "workdir" : "default";
+    const reviewRoot = props.origin === "checkout" ? undefined : (await getReviewFolder(checkoutId!, storage)).path;
     await writeText(absoluteFilePath(checkoutPath ?? "", path, props.origin, reviewRoot));
     pushToast("File path copied.", "info");
   } catch (error) {

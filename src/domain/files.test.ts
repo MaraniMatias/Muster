@@ -15,9 +15,9 @@ describe("absoluteFilePath", () => {
     expect(absoluteFilePath("/", "notes.txt")).toBe("/notes.txt");
   });
 
-  it("uses the review root for exported files", () => {
-    expect(absoluteFilePath("/repo", "notes.md", "review", "/Users/dev/.muster/tmp/reviews/")).toBe(
-      "/Users/dev/.muster/tmp/reviews/notes.md",
+  it.each(["review-default", "review-workdir"] as const)("uses the pinned %s root for exported files", (origin) => {
+    expect(absoluteFilePath("/repo", "notes.md", origin, "/Users/dev/.muster/reviews/")).toBe(
+      "/Users/dev/.muster/reviews/notes.md",
     );
   });
 });

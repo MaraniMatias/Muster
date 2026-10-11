@@ -193,7 +193,7 @@ describe("useMarkdownPreview", () => {
   /** What is on screen decides whether anything is asked, not the other way round. */
   it("asks for nothing on a page outside the checkout, and repaints nothing either", async () => {
     const page = host();
-    page.origin.value = "review";
+    page.origin.value = "review-workdir";
     await page.preview.load("checkout:one", "docs/readme.md", DOC);
     expect(page.reads()).toHaveLength(0);
 

@@ -7,6 +7,7 @@ import type {
   FileProbe,
   FileTree,
   PrettierConfig,
+  ReviewExport,
   ReviewFolder,
   ReviewFolderCleared,
 } from "../domain/files";
@@ -117,18 +118,15 @@ export function readPrettierConfig(
 }
 
 /**
- * Writes one exported review round and answers the file it wrote.
- *
- * The folder is the one the preference names for this checkout, so it is a decision made once
- * rather than a question asked per round — which is why the checkout travels with it.
+ * Writes one exported review round and returns the relative path with the storage origin the backend used.
  */
 export function exportReviewMarkdown(
   checkoutId: string,
   date: string,
   timestamp: string,
   markdown: string,
-): Promise<string> {
-  return invoke<string>("review_export_markdown", { checkoutId, date, timestamp, markdown });
+): Promise<ReviewExport> {
+  return invoke<ReviewExport>("review_export_markdown", { checkoutId, date, timestamp, markdown });
 }
 
 /**
@@ -147,8 +145,8 @@ export function getReviewFolder(checkoutId: string, storage?: ReviewStorageMode)
  * Refused for a working directory: those notes belong to the repository, and the button that asks
  * for this is not drawn there either.
  */
-export function clearReviewFolder(checkoutId: string): Promise<ReviewFolderCleared> {
-  return invoke<ReviewFolderCleared>("review_folder_clear", { checkoutId });
+export function clearReviewFolder(checkoutId: string, confirmedPath: string): Promise<ReviewFolderCleared> {
+  return invoke<ReviewFolderCleared>("review_folder_clear", { checkoutId, storage: "default", confirmedPath });
 }
 
 export function loadReviewTarget(checkoutId: string): Promise<ReviewTarget> {

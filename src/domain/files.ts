@@ -1,3 +1,4 @@
+import type { DocumentOrigin } from "./main-document";
 import type { ReviewStorageMode } from "./settings";
 
 /**
@@ -12,6 +13,12 @@ export interface ReviewFolder {
   storage: ReviewStorageMode;
   files: number;
   bytes: number;
+}
+
+/** The exported file path and the storage origin the backend actually wrote to. */
+export interface ReviewExport {
+  path: string;
+  origin: Exclude<DocumentOrigin, "checkout">;
 }
 
 /** What a clear removed. Reported rather than assumed: the app's own folder may hold other things. */
@@ -93,10 +100,10 @@ export interface CheckoutImage {
 export function absoluteFilePath(
   canonicalPath: string,
   path: string,
-  origin: "checkout" | "review" = "checkout",
+  origin: DocumentOrigin = "checkout",
   reviewRoot?: string,
 ): string {
-  const root = origin === "review" ? reviewRoot : canonicalPath;
+  const root = origin === "checkout" ? canonicalPath : reviewRoot;
   if (!root) throw new Error("review file path requires its root");
   return `${root.replace(/[\\/]+$/, "")}/${path}`;
 }

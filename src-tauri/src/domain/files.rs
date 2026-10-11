@@ -52,6 +52,21 @@ pub struct FileProbe {
     pub path: String,
 }
 
+/// The path and pinned storage origin the backend used for a review export.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewExport {
+    pub path: String,
+    pub origin: ReviewDocumentOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewDocumentOrigin {
+    ReviewDefault,
+    ReviewWorkdir,
+}
+
 /// The folder exported reviews are kept in, as the settings dialog describes it: where it is, which
 /// of the two answers put it there, and what it currently holds.
 #[derive(Debug, Clone, Serialize)]

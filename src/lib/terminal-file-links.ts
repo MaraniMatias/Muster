@@ -72,19 +72,13 @@ export interface FileLinkOptions {
    * worktree, not of the moment it was opened.
    */
   readonly checkoutId: string;
-  /**
-   * Where this terminal's shell is, which is what a bare name on a line is relative to.
-   *
-   * An `ls` prints names with no directory on them, so `README.md` and `LICENSE` name the files
-   * where the shell is sitting rather than the ones at the root of the checkout. Without this the
-   * probe reads every relative name from the root, which is right for a terminal that never moved
-   * and wrong for every one that did — and a listing is nothing but bare names.
-   *
-   * Read through a getter because it changes under a terminal that keeps its process: a shell
-   * that `cd`s is the same terminal pointing somewhere else, and an answer resolved against where
-   * it used to be would underline a name that is no longer the one on screen.
-   */
+  /** Cached shell directory used only when no fresh directory reader is provided. */
   readonly workingDirectory?: string;
+  /**
+   * Reads the authoritative shell directory for a path batch and again on activation. Returning
+   * `null` means status failed or the OS could not report a directory, so the provider fails closed.
+   */
+  refreshWorkingDirectory?: (checkoutId: string) => Promise<string | null>;
   /** Opens a confirmed file in the preview. */
   open: (path: string) => void;
   /**
@@ -149,19 +143,20 @@ export function registerFilePathLinks(terminal: Terminal, options: FileLinkOptio
   const cache = new Map<string, CachedProbe>();
   // One probe per path however many lines are waiting on it: the same path is usually the same
   // path, and asking twice for one answer is one IPC too many on the line the mouse crosses most.
-  // Keyed by the directory as well as the name, because the same name in two directories is two
-  // different files and the second one must not be answered with the first one's.
+  // Keyed by checkout and directory as well as name, because the same name can resolve differently
+  // in either tree.
   const inFlight = new Map<string, Promise<string | null>>();
   let disposed = false;
+  let latestLookup = 0;
 
-  const probe = (raw: string): Promise<string | null> => {
-    const key = `${options.workingDirectory ?? ""}\0${raw}`;
+  const probe = (checkoutId: string, raw: string, workingDirectory?: string): Promise<string | null> => {
+    const key = `${checkoutId}\0${workingDirectory ?? ""}\0${raw}`;
     const cached = cache.get(key);
     if (cached && Date.now() - cached.at < PROBE_TTL_MS) return Promise.resolve(cached.path);
     const pending = inFlight.get(key);
     if (pending) return pending;
 
-    const request = probeCheckoutFile(options.checkoutId, raw, options.workingDirectory)
+    const request = probeCheckoutFile(checkoutId, raw, workingDirectory)
       .then((probed) => probed?.path ?? null)
       .catch(() => {
         // A failed probe is a path this cannot open, which is the same answer a missing file gets
@@ -186,6 +181,7 @@ export function registerFilePathLinks(terminal: Terminal, options: FileLinkOptio
 
   const provider: ILinkProvider = {
     provideLinks(bufferLineNumber, callback) {
+      const lookup = ++latestLookup;
       const buffer = terminal.buffer.active;
       // xterm's rows are 1-based and `getLine` is 0-based, so the row it hands over is not the row
       // it can be read from. Reading it as given underlines the line below the one under the mouse.
@@ -200,25 +196,58 @@ export function registerFilePathLinks(terminal: Terminal, options: FileLinkOptio
         callback(urlLinks.length > 0 ? urlLinks : undefined);
         return;
       }
-      // Every candidate is asked about at once and the slowest answer decides, so a line with
-      // three paths underlines in one step instead of three.
-      void Promise.all(candidates.map((candidate) => probe(candidate.path))).then((probed) => {
-        // A panel that closed mid-probe has nothing left to underline, and answering anyway would
-        // draw into a terminal that is being disposed.
-        if (disposed) return;
+
+      // Relative candidates share one authoritative directory read; absolute paths need no CWD.
+      void (async () => {
+        const checkoutId = options.checkoutId;
+        const refreshWorkingDirectory = options.refreshWorkingDirectory;
+        const hasRelativeCandidates = candidates.some(({ path }) => !path.startsWith("/"));
+        let workingDirectory = options.workingDirectory;
+        if (refreshWorkingDirectory && hasRelativeCandidates) {
+          try {
+            workingDirectory = (await refreshWorkingDirectory(checkoutId)) ?? undefined;
+          } catch {
+            // A failed fresh read cannot safely fall back to the last polled directory.
+            workingDirectory = undefined;
+          }
+        }
+        const current = () => !disposed && lookup === latestLookup && options.checkoutId === checkoutId;
+        if (!current()) return;
+        // Absolute paths do not depend on the shell directory; relative paths fail closed when a
+        // fresh status could not report one. All candidates still share this one status read.
+        const probed = await Promise.all(
+          candidates.map((candidate) => {
+            const absolute = candidate.path.startsWith("/");
+            if (refreshWorkingDirectory && !absolute && workingDirectory === undefined) return null;
+            return probe(checkoutId, candidate.path, absolute ? undefined : workingDirectory);
+          }),
+        );
+        if (!current()) return;
         const links: ILink[] = [...urlLinks];
         for (const [index, candidate] of candidates.entries()) {
           const opened = probed[index];
           // No answer means no link: the path did not survive the check that it is a file this
           // checkout holds, and xterm is not told about it at all, so it cannot underline it.
           if (!opened) continue;
-          // The path the probe confirmed rather than the one the line printed: the confirmed
-          // spelling is the checkout-relative one the preview is asked to open.
-          const link = linkOver(line, candidate, opened, options.open);
+          const openIfCurrent = (path: string) => {
+            if (!current()) return;
+            if (!refreshWorkingDirectory || candidate.path.startsWith("/")) {
+              options.open(path);
+              return;
+            }
+            // The shell may `cd` between hover and click. Do not open a path resolved against the
+            // old directory; failed status reads also fail closed.
+            void refreshWorkingDirectory(checkoutId)
+              .then((directory) => {
+                if (current() && directory === workingDirectory) options.open(path);
+              })
+              .catch(() => undefined);
+          };
+          const link = linkOver(line, candidate, opened, openIfCurrent);
           if (link) links.push(link);
         }
         callback(links.length > 0 ? links : undefined);
-      });
+      })();
     },
   };
 

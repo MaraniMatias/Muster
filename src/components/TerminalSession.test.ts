@@ -251,7 +251,11 @@ vi.mock("@tauri-apps/api/event", () => ({ emit: appEvents.emit }));
  */
 const fileLinks = vi.hoisted(() => ({
   registrations: [] as Array<{
-    options: { checkoutId: string; workingDirectory?: string };
+    options: {
+      checkoutId: string;
+      workingDirectory?: string;
+      refreshWorkingDirectory?: (checkoutId: string) => Promise<string | null>;
+    };
     dispose: ReturnType<typeof vi.fn>;
   }>,
 }));
@@ -485,6 +489,14 @@ describe("TerminalSession UI", () => {
     const first = fileLinks.registrations.at(-1)!;
     expect(first.options.workingDirectory).toBe("/work/feature/src/lib");
     expect(first.options.checkoutId).toBe("checkout:repo");
+    vi.mocked(getTerminalStatus).mockResolvedValueOnce({
+      state: "running",
+      workingDirectory: "/work/feature/child",
+    });
+    await expect(first.options.refreshWorkingDirectory?.("checkout:repo")).resolves.toBe("/work/feature/child");
+    expect(getTerminalStatus).toHaveBeenLastCalledWith("checkout:repo", "session:new");
+    vi.mocked(getTerminalStatus).mockResolvedValueOnce({ state: "exited" });
+    await expect(first.options.refreshWorkingDirectory?.("checkout:repo")).resolves.toBeNull();
 
     vi.mocked(getTerminalStatus).mockResolvedValue({
       state: "running",

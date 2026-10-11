@@ -178,15 +178,19 @@ function cursorMoves(
   // will be after the next character rather than where it is now: neither is a position the cursor
   // is at, and moving it there would answer a click with a jump nobody asked for.
   if (compare(clicked, { row: inputRow, col: inputColumn }) < 0) return null;
-  // Nothing is below the last row on screen, so that is as far as the line can be walked: a
-  // command longer than the window cannot be clicked on where it is not drawn.
-  if (compare(clicked, endOfLine(buffer, terminal.cols, cursor, buffer.baseY + terminal.rows - 1)) > 0) {
-    return null;
-  }
+  // Only a click ahead of the cursor needs the line end. Empty tab-fill cells do not end a line
+  // when later text follows; cellsBetween rejects any movement across those ambiguous columns.
+  const lineEnd =
+    compare(clicked, cursor) > 0 ? endOfLine(buffer, terminal.cols, cursor, buffer.baseY + terminal.rows - 1) : null;
+  if (lineEnd && compare(clicked, lineEnd) > 0) return null;
 
+  const target = buffer.getLine(clicked.row)?.getCell(clicked.col);
+  if (!target) return null;
+  // A blank cell is a valid caret at the exact line end, but not in the middle of a tab-fill span.
+  if (target.getWidth() !== 0 && !target.getChars() && (!lineEnd || compare(clicked, lineEnd) !== 0)) return null;
   // Walked from the cursor towards the click, because that is the direction the keys go in.
   const steps = cellsBetween(buffer, terminal.cols, cursor, clicked);
-  if (steps === 0) return null;
+  if (steps === null || steps === 0) return null;
   return steps < 0 ? LEFT.repeat(-steps) : RIGHT.repeat(steps);
 }
 
@@ -214,7 +218,20 @@ function endOfLine(buffer: IBuffer, cols: number, cursor: Cell, lastRow: number)
       const cell = line?.getCell(col);
       // The second half of a wide glyph holds nothing of its own and is not the end of anything.
       if (cell?.getWidth() === 0) continue;
-      if (!cell?.getChars()) return { row, col };
+      if (!cell?.getChars()) {
+        // xterm leaves tab-fill cells empty; if text follows on this row, keep scanning for the end.
+        let nextCol = col + 1;
+        while (nextCol < cols) {
+          const next = line?.getCell(nextCol);
+          if (next?.getWidth() !== 0 && next?.getChars()) break;
+          nextCol += 1;
+        }
+        if (nextCol < cols) {
+          col = nextCol - 1;
+          continue;
+        }
+        return { row, col };
+      }
     }
   }
   return { row: lastRow, col: cols };
@@ -233,28 +250,24 @@ function cellUnder(terminal: Terminal, event: MouseEvent): Cell | null {
   if (!screen || terminal.cols < 1 || terminal.rows < 1) return null;
   const rect = screen.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return null;
-  const col = clamp(Math.floor(((event.clientX - rect.left) / rect.width) * terminal.cols), 0, terminal.cols - 1);
-  const row = clamp(Math.floor(((event.clientY - rect.top) / rect.height) * terminal.rows), 0, terminal.rows - 1);
-  // The first visible row is `baseY` scrolled back by however much the viewport is, which is what
-  // the row under the pointer is counted from: the same click names a different cell once the
-  // scrollback is showing.
-  return { row: terminal.buffer.active.baseY - terminal.buffer.active.viewportY + row, col };
-}
-
-function clamp(value: number, low: number, high: number): number {
-  return Math.min(high, Math.max(low, value));
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  if (x < 0 || x >= rect.width || y < 0 || y >= rect.height) return null;
+  const col = Math.floor((x / rect.width) * terminal.cols);
+  const row = Math.floor((y / rect.height) * terminal.rows);
+  // Visible row zero is the viewport's absolute buffer row, independent of where the buffer's
+  // bottom (baseY) is; this stays correct both at the bottom and while scrolled into history.
+  return { row: terminal.buffer.active.viewportY + row, col };
 }
 
 /**
  * How many keys it takes to walk from one cell to another, negative when the answer is to the left.
  *
  * Cells, not columns: the trailing half of a wide glyph is not a character the line editor holds,
- * and counting it puts the cursor one place past where it was clicked. A tab is the other way round
- * — one cell for a character that may have advanced several — and is the one thing here a click
- * cannot place exactly. It lands within the tab's own width of the truth, which is the same tab the
- * shell's own cursor skips over.
+ * and counting it puts the cursor one place past where it was clicked. xterm leaves tab-fill cells
+ * empty and does not expose their origin, so an empty cell in the span makes the mapping ambiguous.
  */
-function cellsBetween(buffer: IBuffer, cols: number, from: Cell, to: Cell): number {
+function cellsBetween(buffer: IBuffer, cols: number, from: Cell, to: Cell): number | null {
   // Walked from whichever cell comes first in the buffer, because the cells between two cells are
   // the same however they are approached, and a click above the cursor — on a line that wrapped —
   // is the ordinary case here rather than the one that could be refused.
@@ -270,7 +283,10 @@ function cellsBetween(buffer: IBuffer, cols: number, from: Cell, to: Cell): numb
     for (let col = start; col < end; col += 1) {
       const cell = line.getCell(col);
       // A width of 0 is the cell a wide glyph's second half leaves behind; it holds no character.
-      if (cell && cell.getWidth() !== 0) steps += 1;
+      if (!cell) return null;
+      if (cell.getWidth() === 0) continue;
+      if (!cell.getChars()) return null;
+      steps += 1;
     }
   }
   return forward ? steps : -steps;

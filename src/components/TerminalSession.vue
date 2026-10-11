@@ -700,25 +700,31 @@ async function answerClose(confirmed: boolean) {
   await stopSession();
 }
 
-/**
- * Puts the file links and the web links on the tree this terminal currently belongs to.
- *
- * Read fresh on every registration rather than captured once, because a terminal moved to another
- * worktree keeps its process, its scrollback and this component: the only thing that changed is
- * which checkout a path may be looked up in, and a provider still holding the old one would
- * underline paths that are not files here and refuse the ones that are.
- */
+/** Resolve the shell's current directory without waiting for the slower status poll. */
+async function refreshFileLinkWorkingDirectory(checkoutId: string): Promise<string | null> {
+  const id = sessionId;
+  if (disposed || closing.value || !id || props.checkoutId !== checkoutId) return null;
+  try {
+    const status = await getTerminalStatus(checkoutId, id);
+    if (disposed || closing.value || sessionId !== id || props.checkoutId !== checkoutId) return null;
+    return status.state === "running" ? (status.workingDirectory ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Register links against the checkout and directory this live terminal currently belongs to. */
 function registerFileLinks() {
   fileLinks?.dispose();
   fileLinks = registerFilePathLinks(terminal, {
     get checkoutId() {
       return props.checkoutId;
     },
-    // The shell's own directory, which is what a bare name off an `ls` is relative to. A terminal
-    // that has not reported one yet answers from the root, which is where it starts.
+    // Retain the polled value as fallback; path lookups use the authoritative reader below.
     get workingDirectory() {
       return state.value.workingDirectory;
     },
+    refreshWorkingDirectory: refreshFileLinkWorkingDirectory,
     open: (path) => emit("openFile", path),
     // A page is the browser's to open, which is where `curl`'s own output goes: the webview is
     // not a browser, so the address travels back over the bridge like the preview's links do.

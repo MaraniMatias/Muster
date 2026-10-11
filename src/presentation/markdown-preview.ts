@@ -147,7 +147,7 @@ export function useMarkdownPreview(getCheckoutId: () => string | null, getOrigin
     const preview = await renderMarkdownPreview(source, path);
     const paths = preview.images.map((image) => image.path);
     const loadedImages = new Map<string, LoadedImage>();
-    if (getOrigin() === "review") {
+    if (getOrigin() !== "checkout") {
       markdownHtml.value = attachMarkdownImages(preview.html, paths, loadedImages);
       markdownPreviewState.value = "ready";
       return;
@@ -265,7 +265,7 @@ export function useMarkdownPreview(getCheckoutId: () => string | null, getOrigin
     if (disposed || !current) return false;
     if (current.checkoutId !== getCheckoutId()) return false;
     // A review document is outside the checkout, so no batch inside it moves one of its images.
-    if (getOrigin() === "review") return false;
+    if (getOrigin() !== "checkout") return false;
     const { attachMarkdownImages } = await import("../lib/markdown-preview");
     const requestGeneration = generation;
     const images = new Map(current.images);

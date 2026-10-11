@@ -1,5 +1,5 @@
 export type DocumentMode = "code" | "view";
-export type DocumentOrigin = "checkout" | "review";
+export type DocumentOrigin = "checkout" | "review-default" | "review-workdir";
 
 /** The copy of the whole-change-set view, shared by the breadcrumb and the diff header. */
 export const ALL_CHANGES_LABEL = "All changes";

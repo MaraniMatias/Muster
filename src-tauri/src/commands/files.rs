@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use tauri::State;
 
 use crate::{
-    config::{ConfigFile, REVIEW_STORAGE_WORKDIR},
+    config::{ConfigFile, REVIEW_STORAGE_DEFAULT, REVIEW_STORAGE_WORKDIR},
     domain::{
         files::{
-            CheckoutImage, FileContent, FileProbe, FileTree, PrettierConfig, ReviewFolder,
-            ReviewFolderCleared,
+            CheckoutImage, FileContent, FileProbe, FileTree, PrettierConfig, ReviewExport,
+            ReviewFolder, ReviewFolderCleared,
         },
         ipc::IpcError,
     },
@@ -54,8 +54,8 @@ pub async fn file_read(
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let places = services::files::ReviewPlaces::load(&config_file)?;
-        services::files::read(&database, &checkout_id, &origin, &path, &places)
+        let places = services::files::ReviewPlaces::load_for_origin(&config_file, &origin)?;
+        services::files::read(&database, &checkout_id, &origin, &path, places.as_ref())
     })
     .await
     .map_err(operation_error)?
@@ -75,8 +75,14 @@ pub async fn file_read_prettier_config(
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let places = services::files::ReviewPlaces::load(&config_file)?;
-        services::files::read_prettier_config(&database, &checkout_id, &origin, &path, &places)
+        let places = services::files::ReviewPlaces::load_for_origin(&config_file, &origin)?;
+        services::files::read_prettier_config(
+            &database,
+            &checkout_id,
+            &origin,
+            &path,
+            places.as_ref(),
+        )
     })
     .await
     .map_err(operation_error)?
@@ -137,7 +143,7 @@ pub async fn file_write(
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let places = services::files::ReviewPlaces::load(&config_file)?;
+        let places = services::files::ReviewPlaces::load_for_origin(&config_file, &origin)?;
         services::files::write(
             &database,
             &checkout_id,
@@ -145,17 +151,14 @@ pub async fn file_write(
             &path,
             &content,
             &expected_content,
-            &places,
+            places.as_ref(),
         )
     })
     .await
     .map_err(operation_error)?
 }
 
-/// Writes one exported review round and answers the file it wrote.
-///
-/// The folder is the one the preference names for this checkout, so an export is a decision made
-/// once rather than a question asked per round.
+/// Writes one exported review round and returns its relative path and effective storage origin.
 #[tauri::command]
 pub async fn review_export_markdown(
     checkout_id: String,
@@ -164,13 +167,19 @@ pub async fn review_export_markdown(
     markdown: String,
     database: State<'_, Database>,
     config_file: State<'_, ConfigFile>,
-) -> Result<String, IpcError> {
+) -> Result<ReviewExport, IpcError> {
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let places = services::files::ReviewPlaces::load(&config_file)?;
-        let root = services::files::review_root_for(&database, &checkout_id, &places)?;
-        services::files::export_review_markdown(&root, &date, &timestamp, &markdown)
+        services::files::export_review_for_checkout(
+            &database,
+            &checkout_id,
+            &places,
+            &date,
+            &timestamp,
+            &markdown,
+        )
     })
     .await
     .map_err(operation_error)?
@@ -178,9 +187,8 @@ pub async fn review_export_markdown(
 
 /// Where exported reviews are kept and what is in there, for the settings dialog.
 ///
-/// `storage` is the mode the row is showing rather than the one on file, so a person changing the
-/// selector sees the folder they are choosing before they Apply. It is read as a mode and not as a
-/// path: an answer that is neither of the two is the saved one.
+/// `storage` is the mode the row is showing rather than the one on file. Known modes are explicit;
+/// an absent or unknown mode uses the saved preference.
 #[tauri::command]
 pub async fn review_folder(
     checkout_id: String,
@@ -191,28 +199,60 @@ pub async fn review_folder(
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut places = services::files::ReviewPlaces::load(&config_file)?;
-        if storage.as_deref() == Some(REVIEW_STORAGE_WORKDIR) {
-            places.set_storage(REVIEW_STORAGE_WORKDIR);
-        }
+        let places = match storage.as_deref() {
+            Some(REVIEW_STORAGE_DEFAULT) => {
+                services::files::ReviewPlaces::load_for_origin(&config_file, "review-default")?
+            }
+            Some(REVIEW_STORAGE_WORKDIR) => {
+                services::files::ReviewPlaces::load_for_origin(&config_file, "review-workdir")?
+            }
+            _ => Some(services::files::ReviewPlaces::load(&config_file)?),
+        };
+        let places = places.ok_or_else(|| {
+            IpcError::new(
+                crate::domain::ipc::IpcErrorCode::InvalidPath,
+                "review folder requires a storage mode",
+            )
+        })?;
         services::files::review_folder(&database, &checkout_id, &places)
     })
     .await
     .map_err(operation_error)?
 }
 
-/// Deletes the exported reviews in the app's own folder. Refused for a working directory: those
-/// notes belong to the repository, and the button that asks for this is not drawn there.
+/// Deletes only the confirmed app folder. A workdir target is refused even if sent over IPC.
 #[tauri::command]
 pub async fn review_folder_clear(
     checkout_id: String,
+    storage: String,
+    confirmed_path: String,
     database: State<'_, Database>,
     config_file: State<'_, ConfigFile>,
 ) -> Result<ReviewFolderCleared, IpcError> {
     let database = database.inner().clone();
     let config_file = config_file.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let places = services::files::ReviewPlaces::load(&config_file)?;
+        if storage != REVIEW_STORAGE_DEFAULT {
+            return Err(IpcError::new(
+                crate::domain::ipc::IpcErrorCode::InvalidPath,
+                "only the confirmed default review folder can be cleared",
+            ));
+        }
+        let places =
+            services::files::ReviewPlaces::load_for_origin(&config_file, "review-default")?
+                .ok_or_else(|| {
+                    IpcError::new(
+                        crate::domain::ipc::IpcErrorCode::InvalidPath,
+                        "review folder requires an explicit origin",
+                    )
+                })?;
+        let folder = services::files::review_folder(&database, &checkout_id, &places)?;
+        if folder.path != confirmed_path {
+            return Err(IpcError::new(
+                crate::domain::ipc::IpcErrorCode::InvalidPath,
+                "review folder changed after confirmation",
+            ));
+        }
         services::files::clear_review_folder(&database, &checkout_id, &places)
     })
     .await

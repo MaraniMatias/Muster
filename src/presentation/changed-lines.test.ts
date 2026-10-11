@@ -170,8 +170,8 @@ describe("useChangedLines", () => {
     expect(mocks.asked).toHaveLength(1);
 
     panel.path.value = "review/notes.md";
-    panel.origin.value = "review";
-    panel.fileIdentity.value = "checkout:a\0review\0review/notes.md";
+    panel.origin.value = "review-workdir";
+    panel.fileIdentity.value = "checkout:a\0review-workdir\0review/notes.md";
     await nextTick();
     await flushPromises();
 

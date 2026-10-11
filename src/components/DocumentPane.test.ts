@@ -800,43 +800,98 @@ describe("DocumentPane", () => {
   it("copying the path of an exported file yields the path that exists", async () => {
     mocks.readCheckoutFile.mockResolvedValue({ path: "notes.md", content: "# Review" });
     const wrapper = mount(DocumentPane, {
-      props: { ...documentPaneProps("notes.md", "view"), origin: "review" },
+      props: { ...documentPaneProps("notes.md", "view"), origin: "review-default" },
     });
     await flushPromises();
 
     await wrapper.get('[aria-label="Copy file path"]').trigger("click");
 
-    expect(mocks.getReviewFolder).toHaveBeenCalledOnce();
+    expect(mocks.getReviewFolder).toHaveBeenCalledWith("checkout:one", "default");
     expect(writeText).toHaveBeenCalledWith("/Users/dev/.muster/tmp/reviews/notes.md");
     wrapper.unmount();
   });
 
-  it("an exported file and a checkout file with the same name keep separate drafts", async () => {
+  it("same-name review files from different pinned roots keep separate drafts", async () => {
     mocks.readCheckoutFile.mockImplementation(async (_checkoutId: string, path: string, origin: string) => ({
       path,
-      content: origin === "review" ? "review baseline" : "checkout baseline",
+      content:
+        origin === "review-default"
+          ? "default baseline"
+          : origin === "review-workdir"
+            ? "workdir baseline"
+            : "checkout baseline",
     }));
     const wrapper = mount(DocumentPane, { props: documentPaneProps("notes.md") });
     await vi.waitFor(() => expect(wrapper.find(".cm-content").exists()).toBe(true));
+    const edit = async (text: string) => {
+      const editor = wrapper.get(".cm-content").element as HTMLElement;
+      editor.textContent = text;
+      editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "t" }));
+      await flushPromises();
+    };
 
-    const editor = wrapper.get(".cm-content").element as HTMLElement;
-    editor.textContent = "checkout draft";
-    editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "t" }));
-    await flushPromises();
-
-    await wrapper.setProps({ origin: "review" });
-    await vi.waitFor(() => expect(wrapper.get(".cm-content").text()).toContain("review baseline"));
+    await edit("checkout draft");
+    await wrapper.setProps({ origin: "review-default" });
+    await vi.waitFor(() => expect(wrapper.get(".cm-content").text()).toContain("default baseline"));
+    await edit("default draft");
+    await wrapper.setProps({ origin: "review-workdir" });
+    await vi.waitFor(() => expect(wrapper.get(".cm-content").text()).toContain("workdir baseline"));
+    await edit("workdir draft");
+    await wrapper.setProps({ origin: "review-default" });
+    await vi.waitFor(() => expect(wrapper.get(".cm-content").text()).toContain("default draft"));
     await wrapper.setProps({ origin: "checkout" });
     await vi.waitFor(() => expect(wrapper.get(".cm-content").text()).toContain("checkout draft"));
 
-    expect(mocks.readCheckoutFile).toHaveBeenCalledWith("checkout:one", "notes.md", "review");
+    expect(mocks.readCheckoutFile).toHaveBeenCalledWith("checkout:one", "notes.md", "review-default");
+    expect(mocks.readCheckoutFile).toHaveBeenCalledWith("checkout:one", "notes.md", "review-workdir");
+    wrapper.unmount();
+  });
+
+  it("keeps read, format, save and copy on the pinned workdir origin", async () => {
+    const source = "This   is   a review";
+    mocks.readCheckoutFile.mockResolvedValue({ path: "notes.md", content: source });
+    mocks.readPrettierConfig.mockResolvedValue(null);
+    mocks.writeCheckoutFile.mockResolvedValue(undefined);
+    mocks.getReviewFolder.mockImplementation(async (_checkoutId: string, storage: string) => ({
+      path: storage === "workdir" ? "/checkout:one/.muster/reviews" : "/Users/dev/.muster/tmp/reviews",
+      storage,
+      files: 0,
+      bytes: 0,
+    }));
+    const wrapper = mount(DocumentPane, {
+      props: { ...documentPaneProps("notes.md"), origin: "review-workdir" },
+    });
+    await vi.waitFor(() => expect(wrapper.find(".cm-content").exists()).toBe(true));
+    expect(mocks.readCheckoutFile).toHaveBeenCalledWith("checkout:one", "notes.md", "review-workdir");
+
+    await wrapper.get('[data-testid="format-file"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.find('[aria-label="Unsaved changes"]').exists()).toBe(true));
+    expect(mocks.readPrettierConfig).toHaveBeenCalledWith("checkout:one", "notes.md", "review-workdir");
+
+    const editor = wrapper.get(".cm-content").element as HTMLElement;
+    editor.textContent = "# Saved review";
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "d" }));
+    await flushPromises();
+    await wrapper.get('button[aria-label="Save"]').trigger("click");
+    await flushPromises();
+    expect(mocks.writeCheckoutFile).toHaveBeenCalledWith(
+      "checkout:one",
+      "notes.md",
+      "# Saved review",
+      expect.any(String),
+      "review-workdir",
+    );
+
+    await wrapper.get('[aria-label="Copy file path"]').trigger("click");
+    expect(mocks.getReviewFolder).toHaveBeenCalledWith("checkout:one", "workdir");
+    expect(writeText).toHaveBeenCalledWith("/checkout:one/.muster/reviews/notes.md");
     wrapper.unmount();
   });
 
   it("an exported Markdown preview does not request images from the checkout", async () => {
     mocks.readCheckoutFile.mockResolvedValue({ path: "notes.md", content: "![image](image.png)" });
     const wrapper = mount(DocumentPane, {
-      props: { ...documentPaneProps("notes.md", "view"), origin: "review" },
+      props: { ...documentPaneProps("notes.md", "view"), origin: "review-default" },
     });
     await vi.waitFor(() => expect(wrapper.find('[aria-label="File contents"] article').exists()).toBe(true));
 

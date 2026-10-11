@@ -27,6 +27,8 @@ let open: ReturnType<typeof vi.fn<(path: string) => void>>;
 let openUrl: ReturnType<typeof vi.fn<(url: string) => void>>;
 /** The directory the fake terminal is sitting in, which is what a bare name is read against. */
 let shellDirectory: string | undefined;
+let refreshWorkingDirectory: ((checkoutId: string) => Promise<string | null>) | undefined;
+let activeCheckoutId = "checkout:one";
 
 async function write(text: string) {
   await new Promise<void>((resolve) => terminal.write(text, resolve));
@@ -54,11 +56,12 @@ function mount() {
   };
   return registerFilePathLinks(terminal as never, {
     get checkoutId() {
-      return "checkout:one";
+      return activeCheckoutId;
     },
     get workingDirectory() {
       return shellDirectory;
     },
+    ...(refreshWorkingDirectory && { refreshWorkingDirectory }),
     open,
     openUrl,
   });
@@ -77,6 +80,8 @@ beforeEach(async () => {
   probe.mockReset();
   probe.mockResolvedValue(null);
   shellDirectory = undefined;
+  refreshWorkingDirectory = undefined;
+  activeCheckoutId = "checkout:one";
   document.documentElement.style.setProperty("--muster-accent", "#74ade8");
   // An empty write is still a write: it is what flushes xterm's parser, so the rows a test writes
   // after it start at row 1 rather than after whatever the last one left on the screen.
@@ -188,6 +193,142 @@ describe("registerFilePathLinks behaviour", () => {
     expect(probe).toHaveBeenCalledWith("checkout:one", "LICENSE", "/work/plain/src/lib");
     link.activate({ ctrlKey: true } as MouseEvent, link.text);
     expect(open).toHaveBeenCalledWith("LICENSE");
+  });
+
+  it("resolves against a fresh directory while the polled directory is stale", async () => {
+    await write("LICENSE   README.md\r\n");
+    shellDirectory = "/work/feature";
+    let finishStatus!: (directory: string | null) => void;
+    const refreshStatus = vi
+      .fn<(checkoutId: string) => Promise<string | null>>()
+      .mockImplementationOnce(() => new Promise((resolve) => (finishStatus = resolve)))
+      .mockResolvedValue("/work/feature/child");
+    refreshWorkingDirectory = refreshStatus;
+    probe.mockImplementation(async (_checkoutId, path, directory) => ({
+      path: directory === "/work/feature/child" ? `child/${path}` : path,
+    }));
+    mount();
+
+    const pending = linksOn(1);
+    await Promise.resolve();
+    expect(refreshStatus).toHaveBeenCalledOnce();
+    expect(probe).not.toHaveBeenCalled();
+
+    // `cd child; ls` happened, but the 750ms poll still says `/work/feature`. Both directories
+    // contain the same names; only the backend's current directory identifies the right files.
+    finishStatus("/work/feature/child");
+    const links = await pending;
+    expect(links?.map((link) => link.text)).toEqual(["child/LICENSE", "child/README.md"]);
+    expect(refreshStatus).toHaveBeenCalledOnce();
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledWith("checkout:one", "LICENSE", "/work/feature/child");
+    expect(probe).toHaveBeenCalledWith("checkout:one", "README.md", "/work/feature/child");
+
+    // A second `cd` before activation invalidates the hover's path rather than opening the old twin.
+    refreshStatus.mockResolvedValueOnce("/work/feature/elsewhere");
+    links![0]!.activate({ ctrlKey: true } as MouseEvent, links![0]!.text);
+    await Promise.resolve();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("resolves absolute links when fresh status has no directory or fails", async () => {
+    await write("src/relative.ts /work/absolute-missing.ts\r\nsrc/relative.ts /work/absolute-error.ts\r\n");
+    shellDirectory = "/work/stale";
+    const refreshStatus = vi
+      .fn<(checkoutId: string) => Promise<string | null>>()
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("status unavailable"));
+    refreshWorkingDirectory = refreshStatus;
+    probe.mockImplementation(async (_checkoutId, path) => ({ path: path.split("/").at(-1)! }));
+    mount();
+
+    const missingLinks = await linksOn(1);
+    expect(missingLinks?.map((link) => link.text)).toEqual(["absolute-missing.ts"]);
+    missingLinks![0]!.activate({ ctrlKey: true } as MouseEvent, missingLinks![0]!.text);
+
+    const errorLinks = await linksOn(2);
+    expect(errorLinks?.map((link) => link.text)).toEqual(["absolute-error.ts"]);
+    errorLinks![0]!.activate({ ctrlKey: true } as MouseEvent, errorLinks![0]!.text);
+    expect(refreshStatus).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledWith("checkout:one", "/work/absolute-missing.ts", undefined);
+    expect(probe).toHaveBeenCalledWith("checkout:one", "/work/absolute-error.ts", undefined);
+    expect(open).toHaveBeenCalledTimes(2);
+    // Absolute activation does not depend on the unavailable CWD, so it needs no second status call.
+    expect(refreshStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips status for absolute-only lookups and rejects stale absolute activations", async () => {
+    await write("/work/absolute.ts\r\n");
+    const refreshStatus = vi.fn().mockResolvedValue(null);
+    refreshWorkingDirectory = refreshStatus;
+    probe.mockResolvedValue({ path: "absolute.ts" });
+    const links = mount();
+    const [link] = (await linksOn(1))!;
+
+    expect(refreshStatus).not.toHaveBeenCalled();
+    activeCheckoutId = "checkout:two";
+    link.activate({ ctrlKey: true } as MouseEvent, link.text);
+    activeCheckoutId = "checkout:one";
+    links.dispose();
+    link.activate({ ctrlKey: true } as MouseEvent, link.text);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse cached paths when fresh status fails", async () => {
+    await write("LICENSE\r\n");
+    const refreshStatus = vi.fn().mockResolvedValue("/work/feature/child");
+    refreshWorkingDirectory = refreshStatus;
+    probe.mockResolvedValue({ path: "child/LICENSE" });
+    mount();
+
+    expect((await linksOn(1))?.[0]?.text).toBe("child/LICENSE");
+    refreshStatus.mockRejectedValueOnce(new Error("status unavailable"));
+    expect(await linksOn(1)).toBeUndefined();
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("ignores an older status lookup after a newer line has resolved", async () => {
+    await write("LICENSE\r\nREADME   LICENSE\r\n");
+    let finishOldStatus!: (directory: string | null) => void;
+    const refreshStatus = vi
+      .fn<(checkoutId: string) => Promise<string | null>>()
+      .mockImplementationOnce(() => new Promise((resolve) => (finishOldStatus = resolve)))
+      .mockResolvedValue("/work/feature/new");
+    refreshWorkingDirectory = refreshStatus;
+    probe.mockImplementation(async (_checkoutId, path, directory) => ({ path: `${directory}/${path}` }));
+    mount();
+
+    let oldCallback = false;
+    const oldLookup = linksOn(1).then(() => (oldCallback = true));
+    const currentLinks = await linksOn(2);
+    finishOldStatus("/work/feature/old");
+    await Promise.resolve();
+
+    expect(currentLinks?.[0]?.text).toBe("/work/feature/new/README");
+    expect(oldCallback).toBe(false);
+    expect(probe).toHaveBeenCalledTimes(2);
+    void oldLookup;
+  });
+
+  it("ignores a fresh directory that arrives after the provider is disposed", async () => {
+    await write("LICENSE\r\n");
+    let finishStatus!: (directory: string | null) => void;
+    refreshWorkingDirectory = vi.fn<() => Promise<string | null>>(
+      () => new Promise((resolve) => (finishStatus = resolve)),
+    );
+    const links = mount();
+
+    let settled = false;
+    const pending = linksOn(1).then(() => (settled = true));
+    await Promise.resolve();
+    links.dispose();
+    finishStatus("/work/feature/child");
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(probe).not.toHaveBeenCalled();
+    void pending;
   });
 
   it("asks again once the shell has moved, rather than answering from where it was", async () => {

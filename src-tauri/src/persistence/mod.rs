@@ -15,7 +15,7 @@ use crate::domain::workspace::{
     WorkspaceState,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const REVIEW_NOTE_COLUMNS: &str = "id, checkout_id, path, side, line_start, line_end, content, code, status, code_hash, outdated, round_id, created_at, updated_at";
 const ACTIVE_CHECKOUT: &str = "active_checkout_id";
 const ACTIVE_SESSION: &str = "active_session_id";
@@ -2341,16 +2341,19 @@ fn validate_checkout_ui_state(checkout_id: &str, state: &CheckoutUiState) -> boo
         && matches!(state.inspector_tab.as_str(), "files" | "changes")
         && state.document.as_ref().is_none_or(|document| {
             document.checkout_id == checkout_id
-                && matches!(document.origin.as_str(), "checkout" | "review")
-                && if document.origin == "review" {
-                    safe_review_relative_path(&document.path)
-                } else {
+                && matches!(
+                    document.origin.as_str(),
+                    "checkout" | "review-default" | "review-workdir"
+                )
+                && if document.origin == "checkout" {
                     safe_checkout_relative_path(&document.path)
+                } else {
+                    safe_review_relative_path(&document.path)
                 }
                 && matches!(document.source.as_str(), "file" | "change")
                 && matches!(document.mode.as_str(), "diff" | "view" | "code")
                 && (document.source != "file" || document.mode != "diff")
-                && (document.origin != "review"
+                && (document.origin == "checkout"
                     || (document.source == "file" && document.mode != "diff"))
         })
         && (state.main_view != "document" || state.document.is_some())
@@ -3087,11 +3090,11 @@ mod tests {
     /// A file with no stamp gets the whole schema, a file already stamped with this build's
     /// version is left alone, and a file from any other version is refused by name.
     #[test]
-    fn a_fresh_file_gets_schema_14_and_a_foreign_one_is_refused() {
+    fn a_fresh_file_gets_schema_15_and_a_foreign_one_is_refused() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("workspace.sqlite3");
         let database = Database::open(&path).expect("fresh database");
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
         let checkout_path = temp.path().join("checkout");
         fs::create_dir(&checkout_path).unwrap();
         let repo = plain_repo(&checkout_path, "now");
@@ -3134,17 +3137,38 @@ mod tests {
         }
 
         let foreign_path = temp.path().join("foreign.sqlite3");
-        Connection::open(&foreign_path)
-            .unwrap()
-            .pragma_update(None, "user_version", 13)
-            .unwrap();
+        {
+            let connection = Connection::open(&foreign_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE preserved (value TEXT NOT NULL);
+                     INSERT INTO preserved VALUES ('keep');
+                     PRAGMA user_version = 14;",
+                )
+                .unwrap();
+        }
         let error = Database::open(&foreign_path)
             .err()
             .expect("a file from another schema version is refused");
-        assert!(error.contains("schema version 13"), "{error}");
-        assert!(error.contains("this build speaks version 14"), "{error}");
+        assert!(error.contains("schema version 14"), "{error}");
+        assert!(error.contains("this build speaks version 15"), "{error}");
         assert!(error.contains("deleting"), "{error}");
         assert!(error.contains("empty workspace"), "{error}");
+
+        let connection = Connection::open(&foreign_path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM preserved", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
     }
 
     /// A session outlives nothing: its PTY died with the process, so reopening drops the rows
@@ -3383,7 +3407,7 @@ mod tests {
                         document: Some(PersistedDocument {
                             checkout_id: checkout_id.clone(),
                             path: "2026-03-14-1532.md".into(),
-                            origin: "review".into(),
+                            origin: "review-workdir".into(),
                             source: "file".into(),
                             mode: "view".into(),
                         }),
@@ -3402,7 +3426,7 @@ mod tests {
                 .document
                 .unwrap()
                 .origin,
-            "review"
+            "review-workdir"
         );
     }
 

@@ -714,7 +714,8 @@ describe("App UI integration", () => {
     mocks.getTerminalStatus.mockResolvedValue({ state: "running", foregroundProcess: false });
     mocks.loadReviewTarget.mockResolvedValue("markdown");
     mocks.saveReviewTarget.mockResolvedValue(undefined);
-    mocks.exportReviewMarkdown.mockResolvedValue("2026-03-14-1532.md");
+    mocks.exportReviewMarkdown.mockResolvedValue({ path: "2026-03-14-1532.md", origin: "review-default" });
+    mocks.clearReviewFolder.mockResolvedValue({ files: 0, bytes: 0 });
     mocks.getVersion.mockResolvedValue("9.9.9");
     mocks.toggleMaximize.mockResolvedValue(undefined);
     mocks.minimize.mockResolvedValue(undefined);
@@ -3471,37 +3472,46 @@ describe("App UI integration", () => {
     });
   });
 
-  it("exports a review by default without dispatching a round or changing note status", async () => {
-    mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
-    mocks.reviewNotes = [reviewNoteFixture()];
-    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+  it.each([
+    ["default", "review-workdir"],
+    ["workdir", "review-default"],
+  ] as const)(
+    "pins the backend-reported origin when frontend storage is %s",
+    async (frontendStorage, effectiveOrigin) => {
+      mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
+      mocks.reviewNotes = [reviewNoteFixture()];
+      mocks.exportReviewMarkdown.mockResolvedValue({ path: "2026-03-14-1532.md", origin: effectiveOrigin });
+      const settings = cloneSettings(DEFAULT_SETTINGS);
+      settings.reviews.storage = frontendStorage;
+      const wrapper = await mountApp(workspaceWith(checkout("checkout:one")), { ...DEFAULT_APP_LAYOUT }, { settings });
 
-    await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
-    await flushPromises();
-    await wrapper.get('[data-testid="send-review"]').trigger("click");
-    await flushPromises();
+      await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+      await flushPromises();
+      await wrapper.get('[data-testid="send-review"]').trigger("click");
+      await flushPromises();
 
-    expect(mocks.exportReviewMarkdown).toHaveBeenCalledOnce();
-    // The checkout travels with it: the folder an export lands in is per checkout, not one
-    // answer for the whole app.
-    const [checkoutId, date, timestamp, markdown] = mocks.exportReviewMarkdown.mock.calls[0];
-    expect(checkoutId).toBe("checkout:one");
-    expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-    expect(timestamp).toMatch(new RegExp(`^${date}-\\d{4}$`));
-    expect(markdown).toContain(`# Code Review ${date}`);
-    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
-    expect(mocks.createAgentSession).not.toHaveBeenCalled();
-    expect(mocks.reviewNotes[0]?.status).toBe("draft");
-    expect(wrapper.get('[data-testid="document-pane"]').text()).toBe("2026-03-14-1532.md");
+      expect(mocks.exportReviewMarkdown).toHaveBeenCalledOnce();
+      // The checkout travels with it: the folder an export lands in is per checkout, not one
+      // answer for the whole app.
+      const [checkoutId, date, timestamp, markdown] = mocks.exportReviewMarkdown.mock.calls[0];
+      expect(checkoutId).toBe("checkout:one");
+      expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(timestamp).toMatch(new RegExp(`^${date}-\\d{4}$`));
+      expect(markdown).toContain(`# Code Review ${date}`);
+      expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+      expect(mocks.createAgentSession).not.toHaveBeenCalled();
+      expect(mocks.reviewNotes[0]?.status).toBe("draft");
+      expect(wrapper.get('[data-testid="document-pane"]').text()).toBe("2026-03-14-1532.md");
 
-    await vi.advanceTimersByTimeAsync(300);
-    await flushPromises();
-    expect(mocks.saveCheckoutUiState).toHaveBeenLastCalledWith(
-      "checkout:one",
-      expect.objectContaining({ document: expect.objectContaining({ origin: "review" }) }),
-    );
-    wrapper.unmount();
-  });
+      await vi.advanceTimersByTimeAsync(300);
+      await flushPromises();
+      expect(mocks.saveCheckoutUiState).toHaveBeenLastCalledWith(
+        "checkout:one",
+        expect.objectContaining({ document: expect.objectContaining({ origin: effectiveOrigin }) }),
+      );
+      wrapper.unmount();
+    },
+  );
 
   it("dispatches the review to the chosen agent session as one round", async () => {
     mocks.loadReviewTarget.mockResolvedValue("opencode");
@@ -4250,7 +4260,7 @@ describe("App UI integration", () => {
         .find((button) => button.text() === "Delete")!
         .trigger("click");
       await flushPromises();
-      expect(mocks.clearReviewFolder).toHaveBeenCalledWith("checkout:one");
+      expect(mocks.clearReviewFolder).toHaveBeenCalledWith("checkout:one", "/Users/dev/.muster/tmp/reviews");
 
       // Moving the selector asks for the other folder without waiting for Apply: the row names
       // the folder the chosen mode writes to, and that folder is not in the settings file.
@@ -4267,6 +4277,103 @@ describe("App UI integration", () => {
       wrapper.unmount();
     });
 
+    it("ignores review-folder replies superseded by a draft change", async () => {
+      type Folder = { path: string; storage: "default" | "workdir"; files: number; bytes: number };
+      const pending: Array<{ resolve: (folder: Folder) => void; reject: (error: unknown) => void }> = [];
+      mocks.getReviewFolder.mockImplementation(
+        () => new Promise<Folder>((resolve, reject) => pending.push({ resolve, reject })),
+      );
+      const wrapper = await openSettings();
+      const folder = () => wrapper.get('[data-testid="review-folder"]');
+      const select = wrapper
+        .findAllComponents(SelectControl)
+        .find((control) => control.props("label") === "Exported notes")!;
+      const choose = async (storage: "default" | "workdir") => {
+        await select.get('button[data-value="' + storage + '"]').trigger("click");
+        await flushPromises();
+      };
+      const answer = (path: string, storage: Folder["storage"]): Folder => ({ path, storage, files: 1, bytes: 100 });
+
+      expect(pending).toHaveLength(1);
+      await choose("workdir");
+      pending[1]!.resolve(answer("/workdir-review", "workdir"));
+      await flushPromises();
+      expect(folder().text()).toContain("/workdir-review");
+      expect(wrapper.findAll("button").some((button) => button.text() === "Delete notes")).toBe(false);
+
+      await choose("default");
+      expect(folder().text()).toBe("");
+      pending[0]!.resolve(answer("/stale-default", "default"));
+      await flushPromises();
+      expect(folder().text()).toBe("");
+      pending[2]!.resolve(answer("/latest-default", "default"));
+      await flushPromises();
+      expect(folder().text()).toContain("/latest-default");
+
+      await choose("workdir");
+      await choose("default");
+      pending[4]!.resolve(answer("/current-default", "default"));
+      await flushPromises();
+      pending[3]!.reject(new Error("stale request"));
+      await flushPromises();
+      expect(folder().text()).toContain("/current-default");
+      wrapper.unmount();
+    });
+
+    it("uses the confirmed default folder even when the saved mode is workdir", async () => {
+      mocks.getReviewFolder.mockImplementation(async (_checkoutId: string, storage: "default" | "workdir") => ({
+        path: storage === "default" ? "/Users/dev/.muster/tmp/reviews" : "/Users/dev/work/app/.muster/reviews",
+        storage,
+        files: 1,
+        bytes: 128,
+      }));
+      mocks.clearReviewFolder.mockResolvedValue({ files: 1, bytes: 128 });
+      const savedSettings = cloneSettings(DEFAULT_SETTINGS);
+      savedSettings.reviews.storage = "workdir";
+      const wrapper = await openSettings(savedSettings);
+      await flushPromises();
+      const select = wrapper
+        .findAllComponents(SelectControl)
+        .find((control) => control.props("label") === "Exported notes")!;
+      await select.get('button[data-value="default"]').trigger("click");
+      await flushPromises();
+
+      expect(wrapper.get('[data-testid="review-folder"]').text()).toContain("/Users/dev/.muster/tmp/reviews");
+      await wrapper
+        .findAll("button")
+        .find((button) => button.text() === "Delete notes")!
+        .trigger("click");
+      await flushPromises();
+      expect(wrapper.findAll('[role="dialog"]').at(-1)!.text()).toContain("/Users/dev/.muster/tmp/reviews");
+      await wrapper
+        .findAll('[role="dialog"]')
+        .at(-1)!
+        .findAll("button")
+        .find((button) => button.text() === "Delete")!
+        .trigger("click");
+      await flushPromises();
+      expect(mocks.clearReviewFolder).toHaveBeenCalledWith("checkout:one", "/Users/dev/.muster/tmp/reviews");
+      wrapper.unmount();
+    });
+
+    it("does not show a folder response after its checkout disappears", async () => {
+      type Folder = { path: string; storage: "default"; files: number; bytes: number };
+      let resolveFolder!: (folder: Folder) => void;
+      mocks.getReviewFolder.mockReturnValue(
+        new Promise<Folder>((resolve) => {
+          resolveFolder = resolve;
+        }),
+      );
+      const wrapper = await openSettings();
+      mocks.workspaceRef!.value = { ...mocks.workspaceRef!.value, activeCheckoutId: null };
+      await flushPromises();
+      resolveFolder({ path: "/stale", storage: "default", files: 1, bytes: 1 });
+      await flushPromises();
+
+      expect(wrapper.get('[data-testid="review-folder"]').text()).toBe("");
+      wrapper.unmount();
+    });
+
     it("offers no delete for a folder the working directory owns", async () => {
       mocks.getReviewFolder.mockResolvedValue({
         path: "/Users/dev/work/app/.muster/reviews",
@@ -4274,7 +4381,9 @@ describe("App UI integration", () => {
         files: 1,
         bytes: 512,
       });
-      const wrapper = await openSettings();
+      const savedSettings = cloneSettings(DEFAULT_SETTINGS);
+      savedSettings.reviews.storage = "workdir";
+      const wrapper = await openSettings(savedSettings);
       await flushPromises();
 
       expect(wrapper.get('[data-testid="review-folder"]').text()).toContain("/Users/dev/work/app/.muster/reviews");

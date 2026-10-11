@@ -11,12 +11,12 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::{
-    config::{AppSettings, ConfigFile, REVIEW_STORAGE_WORKDIR},
+    config::{AppSettings, ConfigFile, REVIEW_STORAGE_DEFAULT, REVIEW_STORAGE_WORKDIR},
     domain::review::MAX_ROUND_PROMPT_BYTES,
     domain::{
         files::{
             CheckoutImage, FileContent, FileEntry, FileEntryKind, FileProbe, FileTree,
-            PrettierConfig, ReviewFolder, ReviewFolderCleared,
+            PrettierConfig, ReviewDocumentOrigin, ReviewExport, ReviewFolder, ReviewFolderCleared,
         },
         ipc::{IpcError, IpcErrorCode},
         workspace::{Checkout, Repo, RepoKind},
@@ -35,12 +35,9 @@ const MAX_DIRECTORY_ENTRIES: usize = 2000;
 /// repository, which would otherwise put it in the list the moment ignores became visible.
 const GIT_DIRECTORY: &str = ".git";
 
-/// What a `review` origin resolves against: the settings file, and what it says.
+/// What a pinned review origin resolves against: the settings file location and its named storage mode.
 ///
-/// One value rather than two on every function that has to know where reviews go. The pair always
-/// travels together, and the home is not carried beside them at all — it is the folder the settings
-/// file lives in, so `~/.muster/tmp/reviews` is found without a second copy of "where this
-/// person's home is" in six signatures that could disagree about it.
+/// The mode is captured per document; only the file location is used to find the app's home folder.
 #[derive(Clone)]
 pub struct ReviewPlaces {
     config_file: PathBuf,
@@ -63,6 +60,19 @@ impl ReviewPlaces {
         ))
     }
 
+    /// Checkout origins use no review settings; pinned review origins resolve their named place directly.
+    pub fn load_for_origin(config_file: &Path, origin: &str) -> Result<Option<Self>, IpcError> {
+        let storage = match origin {
+            "checkout" => return Ok(None),
+            "review-default" => REVIEW_STORAGE_DEFAULT,
+            "review-workdir" => REVIEW_STORAGE_WORKDIR,
+            _ => return Err(invalid_origin()),
+        };
+        let mut places = Self::new(config_file.to_path_buf(), AppSettings::default());
+        places.set_storage(storage);
+        Ok(Some(places))
+    }
+
     /// Answers for a mode the settings file does not hold yet, for a row that is showing the
     /// folder a preference would write to before it is saved.
     pub fn set_storage(&mut self, storage: &str) {
@@ -77,30 +87,48 @@ const REVIEW_ROOT_FROM_HOME: &str = ".muster/tmp/reviews";
 /// that is not the project's to name. The name is not a preference, because the only question a
 /// person asks about it is which of the two places reviews go to.
 const REVIEW_DIR_IN_CHECKOUT: &str = ".muster/reviews";
+const EXPORTED_REVIEW_MARKER: &str = "<!-- muster-review-export -->\n";
 
-/// The folder exported reviews are written to.
-///
-/// `default` answers without touching the checkout, so it also works for one that has gone missing:
-/// a review that cannot be written because the repository is gone is a review nobody gets back.
-/// `workdir` is the checkout's own canonical directory, the same path the containment checks
-/// compare against, joined with the folder above.
+fn checkout_root_for_review(database: &Database, checkout_id: &str) -> Result<PathBuf, IpcError> {
+    let (repo, checkout) = registered_checkout(database, checkout_id)?;
+    ensure_checkout_available(checkout.is_missing, &checkout.canonical_path)?;
+    crate::services::checkout::resolve_checkout_path(&repo, checkout_id, Path::new("."))
+}
+
+fn workdir_review_paths(
+    database: &Database,
+    checkout_id: &str,
+) -> Result<(PathBuf, PathBuf), IpcError> {
+    let checkout_root = checkout_root_for_review(database, checkout_id)?;
+    let review_root =
+        contained_path_allow_missing(&checkout_root.join(REVIEW_DIR_IN_CHECKOUT), &checkout_root)?;
+    Ok((checkout_root, review_root))
+}
+
+/// The folder exported reviews are written to. A workdir root may not exist yet, but every
+/// existing ancestor must resolve inside the available checkout.
 pub fn review_root_for(
     database: &Database,
     checkout_id: &str,
     places: &ReviewPlaces,
 ) -> Result<PathBuf, IpcError> {
-    if places.settings.reviews.storage != REVIEW_STORAGE_WORKDIR {
-        let config_file = ConfigFile(places.config_file.clone());
-        let home = crate::config::home_of(&config_file).ok_or_else(|| {
-            IpcError::new(
-                IpcErrorCode::InvalidPath,
-                "the settings path has no home directory above it",
-            )
-        })?;
-        return Ok(home.join(REVIEW_ROOT_FROM_HOME));
+    let config_file = ConfigFile(places.config_file.clone());
+    match places.settings.reviews.storage.as_str() {
+        REVIEW_STORAGE_WORKDIR => workdir_review_paths(database, checkout_id).map(|(_, root)| root),
+        REVIEW_STORAGE_DEFAULT => {
+            let home = crate::config::home_of(&config_file).ok_or_else(|| {
+                IpcError::new(
+                    IpcErrorCode::InvalidPath,
+                    "the settings path has no home directory above it",
+                )
+            })?;
+            Ok(home.join(REVIEW_ROOT_FROM_HOME))
+        }
+        _ => Err(IpcError::new(
+            IpcErrorCode::InvalidPath,
+            "unknown review storage mode",
+        )),
     }
-    let (_repo, checkout) = registered_checkout(database, checkout_id)?;
-    Ok(Path::new(&checkout.canonical_path).join(REVIEW_DIR_IN_CHECKOUT))
 }
 
 /// The review folder, and what it holds, for the settings dialog.
@@ -123,9 +151,8 @@ pub fn review_folder(
     })
 }
 
-/// How much the folder holds, in one pass over its entries and no recursion: exports are written
-/// flat, so a subdirectory here is not something this wrote. A folder that is not there holds
-/// nothing, which is the state it starts in rather than a failure.
+/// How much this app's exports hold, using the same ownership test as clear. Exports are flat; a
+/// missing folder holds nothing, which is the state it starts in rather than a failure.
 fn review_folder_usage(root: &Path) -> Result<(usize, u64), IpcError> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -139,34 +166,23 @@ fn review_folder_usage(root: &Path) -> Result<(usize, u64), IpcError> {
     };
     let mut files = 0;
     let mut bytes = 0;
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        // An entry this cannot stat is not counted, and a link is not a note: the metadata is the
-        // entry's own, so a link into a repository reads as a link rather than as what it points at.
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
+    for entry in entries.flatten() {
+        if let Some(metadata) = owned_review_export(&entry) {
+            files += 1;
+            bytes += metadata.len();
         }
-        files += 1;
-        bytes += metadata.len();
     }
     Ok((files, bytes))
 }
 
-/// Deletes the exported reviews, and nothing else.
-///
-/// The name pattern is the point: this is a folder in the user's home that they may have put
-/// something in, and only the names `export_review_markdown` writes are removed. `workdir` is
-/// refused here rather than merely hidden in the dialog: those notes are the project's, not a cache
-/// of this app's, and what a button is drawn next to is not what decides what a command does.
+/// Deletes files bearing this app's export marker, and nothing else. `workdir` is refused here
+/// rather than merely hidden in the dialog: those notes are the project's, not a cache of this app's.
 pub fn clear_review_folder(
     database: &Database,
     checkout_id: &str,
     places: &ReviewPlaces,
 ) -> Result<ReviewFolderCleared, IpcError> {
-    if places.settings.reviews.storage == REVIEW_STORAGE_WORKDIR {
+    if places.settings.reviews.storage != REVIEW_STORAGE_DEFAULT {
         return Err(IpcError::new(
             IpcErrorCode::InvalidPath,
             "review notes inside a working directory are kept there, not cleared from here",
@@ -186,18 +202,9 @@ pub fn clear_review_folder(
     };
     for entry in entries {
         let Ok(entry) = entry else { continue };
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        let Some(metadata) = owned_review_export(&entry) else {
             continue;
         };
-        if !is_exported_review(&name) {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
         fs::remove_file(entry.path())
             .map_err(|error| filesystem_error("could not delete review export", error))?;
         cleared.files += 1;
@@ -206,8 +213,25 @@ pub fn clear_review_folder(
     Ok(cleared)
 }
 
-/// Whether a name in the review folder is one `export_review_markdown` wrote: the export timestamp,
-/// and the `-2` a second export in the same minute gets.
+/// Whether a directory entry is one of this app's exports. A timestamp-shaped name alone is not
+/// ownership; the marker is written by the exporter and checked without following symlinks.
+fn owned_review_export(entry: &fs::DirEntry) -> Option<fs::Metadata> {
+    let name = entry.file_name();
+    if !is_exported_review(name.to_str()?) {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(entry.path()).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut file = File::open(entry.path()).ok()?;
+    let mut marker = [0; EXPORTED_REVIEW_MARKER.len()];
+    file.read_exact(&mut marker).ok()?;
+    (marker.as_slice() == EXPORTED_REVIEW_MARKER.as_bytes()).then_some(metadata)
+}
+
+/// Whether a name is one `export_review_markdown` writes: the export timestamp, and the `-2` a
+/// second export in the same minute gets.
 fn is_exported_review(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".md") else {
         return false;
@@ -358,7 +382,7 @@ pub fn read(
     checkout_id: &str,
     origin: &str,
     relative_path: &Path,
-    places: &ReviewPlaces,
+    places: Option<&ReviewPlaces>,
 ) -> Result<FileContent, IpcError> {
     let (repo, checkout) = registered_checkout(database, checkout_id)?;
     let relative_path = relative_path
@@ -375,8 +399,9 @@ pub fn read(
             )?;
             (relative_path, path)
         }
-        "review" => {
+        "review-default" | "review-workdir" => {
             let relative_path = parse_review_relative_path(relative_path)?;
+            let places = places.ok_or_else(missing_review_places)?;
             let root = review_root_for(database, checkout_id, places)?;
             let path = resolve_review_path(&root, &relative_path)?;
             (relative_path, path)
@@ -433,16 +458,11 @@ pub fn probe(
     } else {
         base.join(&requested)
     };
-    // Asked of the disk before the database, on purpose. A hover asks about every name on a line
-    // and most of a build log is prose, and the checkout is a query under the connection every
-    // other read in the app queues behind: a name that is not a file here must never take it. What
-    // decides what a path may name is untouched by the order, and still runs before an answer.
+    // Canonicalization cheaply rejects absent names before the database lookup. Do not inspect file
+    // contents until the registered checkout boundary has been established below.
     let Ok(target) = fs::canonicalize(&target) else {
         return Ok(None);
     };
-    if !preview_can_draw(&target, &requested) {
-        return Ok(None);
-    }
     let (_, checkout) = registered_checkout(database, checkout_id)?;
     if checkout.is_missing {
         return Ok(None);
@@ -456,6 +476,9 @@ pub fn probe(
         Ok(relative_path) => relative_path,
         Err(_) => return Ok(None),
     };
+    if !preview_can_draw(&target, &requested) {
+        return Ok(None);
+    }
     Ok(Some(FileProbe {
         path: relative_path
             .to_string_lossy()
@@ -567,7 +590,7 @@ pub fn write(
     relative_path: &Path,
     content: &str,
     expected_content: &str,
-    places: &ReviewPlaces,
+    places: Option<&ReviewPlaces>,
 ) -> Result<(), IpcError> {
     let (repo, checkout) = registered_checkout(database, checkout_id)?;
     if content.len() as u64 > MAX_FILE_BYTES {
@@ -585,8 +608,9 @@ pub fn write(
             let relative_path = parse_relative_path(relative_path)?;
             crate::services::checkout::resolve_checkout_path(&repo, checkout_id, &relative_path)?
         }
-        "review" => {
+        "review-default" | "review-workdir" => {
             let relative_path = parse_review_relative_path(relative_path)?;
+            let places = places.ok_or_else(missing_review_places)?;
             let root = review_root_for(database, checkout_id, places)?;
             resolve_review_path(&root, &relative_path)?
         }
@@ -652,7 +676,7 @@ pub fn read_prettier_config(
     checkout_id: &str,
     origin: &str,
     relative_path: &str,
-    places: &ReviewPlaces,
+    places: Option<&ReviewPlaces>,
 ) -> Result<Option<PrettierConfig>, IpcError> {
     let (_repo, checkout) = registered_checkout(database, checkout_id)?;
     let (root, relative) = match origin {
@@ -663,10 +687,13 @@ pub fn read_prettier_config(
                 parse_relative_path(relative_path)?,
             )
         }
-        "review" => (
-            canonical_root(&review_root_for(database, checkout_id, places)?)?,
-            parse_review_relative_path(relative_path)?,
-        ),
+        "review-default" | "review-workdir" => {
+            let places = places.ok_or_else(missing_review_places)?;
+            (
+                canonical_root(&review_root_for(database, checkout_id, places)?)?,
+                parse_review_relative_path(relative_path)?,
+            )
+        }
         _ => return Err(invalid_origin()),
     };
     // The file's own directory first and the root last, so a config next to the file wins over the
@@ -745,6 +772,51 @@ fn canonical_root(root: &Path) -> Result<PathBuf, IpcError> {
     fs::canonicalize(root).map_err(|error| {
         filesystem_error("could not resolve the root of the folder being read", error)
     })
+}
+
+/// Canonicalizes the nearest existing ancestor and appends missing components. Every existing
+/// ancestor must remain inside the checkout; the final review directory may not exist yet.
+fn contained_path_allow_missing(candidate: &Path, boundary: &Path) -> Result<PathBuf, IpcError> {
+    let mut ancestor = candidate;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => {
+                if !resolved.starts_with(boundary) {
+                    return Err(IpcError::new(
+                        IpcErrorCode::PathOutsideCheckout,
+                        "review folder resolves outside the checkout",
+                    ));
+                }
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(resolved, |path, component| path.join(component)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(filesystem_error(
+                        "could not resolve review export folder",
+                        error,
+                    ));
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = ancestor.parent() else {
+                    return Err(filesystem_error(
+                        "could not resolve review export folder",
+                        error,
+                    ));
+                };
+                ancestor = parent;
+            }
+            Err(error) => {
+                return Err(filesystem_error(
+                    "could not resolve review export folder",
+                    error,
+                ));
+            }
+        }
+    }
 }
 
 /// The options in one directory, or `None` when it holds no config that counts.
@@ -872,6 +944,45 @@ pub fn export_review_markdown(
     timestamp: &str,
     markdown: &str,
 ) -> Result<String, IpcError> {
+    export_review_markdown_inner(review_root, date, timestamp, markdown, None)
+}
+
+pub fn export_review_for_checkout(
+    database: &Database,
+    checkout_id: &str,
+    places: &ReviewPlaces,
+    date: &str,
+    timestamp: &str,
+    markdown: &str,
+) -> Result<ReviewExport, IpcError> {
+    let (boundary, root, origin) = match places.settings.reviews.storage.as_str() {
+        REVIEW_STORAGE_WORKDIR => {
+            let (boundary, root) = workdir_review_paths(database, checkout_id)?;
+            (Some(boundary), root, ReviewDocumentOrigin::ReviewWorkdir)
+        }
+        REVIEW_STORAGE_DEFAULT => (
+            None,
+            review_root_for(database, checkout_id, places)?,
+            ReviewDocumentOrigin::ReviewDefault,
+        ),
+        _ => {
+            return Err(IpcError::new(
+                IpcErrorCode::InvalidPath,
+                "unknown review storage mode",
+            ))
+        }
+    };
+    let path = export_review_markdown_inner(&root, date, timestamp, markdown, boundary.as_deref())?;
+    Ok(ReviewExport { path, origin })
+}
+
+fn export_review_markdown_inner(
+    review_root: &Path,
+    date: &str,
+    timestamp: &str,
+    markdown: &str,
+    boundary: Option<&Path>,
+) -> Result<String, IpcError> {
     validate_review_timestamp(date, timestamp)?;
     if markdown.len() > MAX_ROUND_PROMPT_BYTES {
         return Err(too_large());
@@ -880,10 +991,20 @@ pub fn export_review_markdown(
         return Err(binary_file());
     }
 
-    fs::create_dir_all(review_root)
+    let review_root = match boundary {
+        Some(boundary) => contained_path_allow_missing(review_root, boundary)?,
+        None => review_root.to_path_buf(),
+    };
+    fs::create_dir_all(&review_root)
         .map_err(|error| filesystem_error("could not create review export folder", error))?;
-    let root = fs::canonicalize(review_root)
+    let root = fs::canonicalize(&review_root)
         .map_err(|error| filesystem_error("could not resolve review export folder", error))?;
+    if boundary.is_some_and(|boundary| !root.starts_with(boundary)) {
+        return Err(IpcError::new(
+            IpcErrorCode::PathOutsideCheckout,
+            "review folder resolves outside the checkout",
+        ));
+    }
     let stem = timestamp.to_string();
     for suffix in 1usize.. {
         let filename = if suffix == 1 {
@@ -894,7 +1015,10 @@ pub fn export_review_markdown(
         let path = root.join(&filename);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                if let Err(error) = file.write_all(markdown.as_bytes()) {
+                let result = file
+                    .write_all(EXPORTED_REVIEW_MARKER.as_bytes())
+                    .and_then(|()| file.write_all(markdown.as_bytes()));
+                if let Err(error) = result {
                     let _ = fs::remove_file(&path);
                     return Err(filesystem_error("could not write review export", error));
                 }
@@ -1512,6 +1636,13 @@ fn invalid_origin() -> IpcError {
     IpcError::new(IpcErrorCode::InvalidPath, "file origin is not supported")
 }
 
+fn missing_review_places() -> IpcError {
+    IpcError::new(
+        IpcErrorCode::OperationFailed,
+        "review settings were not loaded for this operation",
+    )
+}
+
 fn ignored_paths(root: &Path, entries: &[FileEntry]) -> Result<HashSet<String>, IpcError> {
     if entries.is_empty() {
         return Ok(HashSet::new());
@@ -1629,9 +1760,10 @@ mod tests {
     };
 
     use super::{
-        clear_review_folder, export_review_markdown, list, open_externally, probe, read,
-        read_markdown_image, read_prettier_config, review_folder, review_root_for, write,
-        FileContent, IpcError, ReviewPlaces, MAX_ROUND_PROMPT_BYTES, REVIEW_DIR_IN_CHECKOUT,
+        clear_review_folder, export_review_for_checkout, export_review_markdown, list,
+        open_externally, probe, read, read_markdown_image, read_prettier_config, review_folder,
+        review_root_for, write, FileContent, IpcError, ReviewDocumentOrigin, ReviewPlaces,
+        EXPORTED_REVIEW_MARKER, MAX_ROUND_PROMPT_BYTES, REVIEW_DIR_IN_CHECKOUT,
     };
 
     fn git(cwd: &Path, args: &[&str]) {
@@ -1651,9 +1783,7 @@ mod tests {
         Database::open(temp.join("workspace.sqlite3")).unwrap()
     }
 
-    /// Where a review origin would look, for a test that never asks: the settings file in a temporary
-    /// home, holding the defaults. Only `origin: "review"` reads any of it, and the tests that do
-    /// build their own naming a folder that exists.
+    /// A place for direct service tests, with the settings file in a temporary home.
     fn places_in(home: &Path, storage: &str) -> ReviewPlaces {
         ReviewPlaces::new(
             home.join(".muster").join("config.yml"),
@@ -1666,9 +1796,6 @@ mod tests {
         )
     }
 
-    static CHECKOUT_ORIGIN: std::sync::LazyLock<ReviewPlaces> =
-        std::sync::LazyLock::new(|| places_in(Path::new("/"), REVIEW_STORAGE_DEFAULT));
-
     /// The pair that puts reviews inside the checkout, which is what the `review` origin tests
     /// read through.
     fn reviews_in_the_checkout() -> ReviewPlaces {
@@ -1680,13 +1807,7 @@ mod tests {
         checkout_id: &str,
         path: &str,
     ) -> Result<FileContent, IpcError> {
-        read(
-            database,
-            checkout_id,
-            "checkout",
-            Path::new(path),
-            &CHECKOUT_ORIGIN,
-        )
+        read(database, checkout_id, "checkout", Path::new(path), None)
     }
 
     fn write_checkout(
@@ -1703,8 +1824,177 @@ mod tests {
             Path::new(path),
             content,
             expected_content,
-            &CHECKOUT_ORIGIN,
+            None,
         )
+    }
+
+    #[test]
+    fn checkout_and_pinned_review_origins_ignore_invalid_review_settings() {
+        let temp = tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let config_file = temp.path().join(".muster/config.yml");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(&config_file, "reviews: [\n").unwrap();
+        fs::write(checkout.join("notes.txt"), "before").unwrap();
+        let database = db(temp.path());
+        let state = workspace::register_folder(&database, &checkout).unwrap();
+        let checkout_id = &state.repos[0].checkouts[0].id;
+        let places = ReviewPlaces::load_for_origin(&config_file, "checkout").unwrap();
+
+        assert!(places.is_none());
+        assert_eq!(
+            read(
+                &database,
+                checkout_id,
+                "checkout",
+                Path::new("notes.txt"),
+                places.as_ref(),
+            )
+            .unwrap()
+            .content,
+            "before"
+        );
+        assert!(read_prettier_config(
+            &database,
+            checkout_id,
+            "checkout",
+            "notes.txt",
+            places.as_ref(),
+        )
+        .unwrap()
+        .is_none());
+        write(
+            &database,
+            checkout_id,
+            "checkout",
+            Path::new("notes.txt"),
+            "after",
+            "before",
+            places.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("notes.txt")).unwrap(),
+            "after"
+        );
+
+        assert!(
+            ReviewPlaces::load_for_origin(&config_file, "review-default")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ReviewPlaces::load_for_origin(&config_file, "review-workdir")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pinned_review_origins_read_write_format_and_clear_their_own_roots() {
+        let temp = tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let config_file = temp.path().join(".muster/config.yml");
+        let default_root = temp.path().join(".muster/tmp/reviews");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&default_root).unwrap();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(&config_file, "reviews:\n  storage: workdir\n").unwrap();
+        let database = db(temp.path());
+        let state = workspace::register_folder(&database, &checkout).unwrap();
+        let checkout_id = &state.repos[0].checkouts[0].id;
+        let default_places = ReviewPlaces::load_for_origin(&config_file, "review-default")
+            .unwrap()
+            .unwrap();
+        let workdir_places = ReviewPlaces::load_for_origin(&config_file, "review-workdir")
+            .unwrap()
+            .unwrap();
+        let workdir_root = checkout.join(REVIEW_DIR_IN_CHECKOUT);
+        fs::create_dir_all(&workdir_root).unwrap();
+        fs::write(default_root.join("same.md"), "default").unwrap();
+        fs::write(workdir_root.join("same.md"), "workdir").unwrap();
+        fs::write(default_root.join(".prettierrc"), r#"{"tabWidth": 4}"#).unwrap();
+        fs::write(workdir_root.join(".prettierrc"), r#"{"tabWidth": 7}"#).unwrap();
+
+        assert_eq!(
+            read(
+                &database,
+                checkout_id,
+                "review-default",
+                Path::new("same.md"),
+                Some(&default_places)
+            )
+            .unwrap()
+            .content,
+            "default"
+        );
+        assert_eq!(
+            read(
+                &database,
+                checkout_id,
+                "review-workdir",
+                Path::new("same.md"),
+                Some(&workdir_places)
+            )
+            .unwrap()
+            .content,
+            "workdir"
+        );
+        for (origin, places, tab_width) in [
+            ("review-default", &default_places, 4),
+            ("review-workdir", &workdir_places, 7),
+        ] {
+            let config =
+                read_prettier_config(&database, checkout_id, origin, "same.md", Some(places))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(config.options["tabWidth"], tab_width);
+        }
+        write(
+            &database,
+            checkout_id,
+            "review-workdir",
+            Path::new("same.md"),
+            "saved workdir",
+            "workdir",
+            Some(&workdir_places),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(default_root.join("same.md")).unwrap(),
+            "default"
+        );
+        assert_eq!(
+            fs::read_to_string(workdir_root.join("same.md")).unwrap(),
+            "saved workdir"
+        );
+
+        let default_export = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &default_places,
+            "2026-03-14",
+            "2026-03-14-1532",
+            "default export",
+        )
+        .unwrap();
+        let workdir_export = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &workdir_places,
+            "2026-03-14",
+            "2026-03-14-1532",
+            "workdir export",
+        )
+        .unwrap();
+        assert_eq!(default_export.origin, ReviewDocumentOrigin::ReviewDefault);
+        assert_eq!(workdir_export.origin, ReviewDocumentOrigin::ReviewWorkdir);
+        assert_eq!(default_export.path, workdir_export.path);
+        let cleared = clear_review_folder(&database, checkout_id, &default_places).unwrap();
+        assert_eq!(cleared.files, 1);
+        assert!(!default_root.join(&default_export.path).exists());
+        assert!(workdir_root.join(&workdir_export.path).exists());
     }
 
     #[test]
@@ -1979,7 +2269,7 @@ mod tests {
         checkout_id: &str,
         origin: &str,
         path: &str,
-        places: &ReviewPlaces,
+        places: Option<&ReviewPlaces>,
     ) -> Result<Option<serde_json::Value>, IpcError> {
         read_prettier_config(database, checkout_id, origin, path, places)
             .map(|config| config.map(|config| config.options))
@@ -2008,21 +2298,15 @@ mod tests {
             checkout_id,
             "checkout",
             "src/nested/app.ts",
-            &CHECKOUT_ORIGIN,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(nested, serde_json::json!({ "semi": false }));
 
-        let at_root = prettier_config(
-            &database,
-            checkout_id,
-            "checkout",
-            "README.md",
-            &CHECKOUT_ORIGIN,
-        )
-        .unwrap()
-        .unwrap();
+        let at_root = prettier_config(&database, checkout_id, "checkout", "README.md", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(at_root, serde_json::json!({ "printWidth": 120 }));
     }
 
@@ -2042,15 +2326,9 @@ mod tests {
         let checkout_id = &state.repos[0].checkouts[0].id;
 
         assert_eq!(
-            prettier_config(
-                &database,
-                checkout_id,
-                "checkout",
-                "src/app.ts",
-                &CHECKOUT_ORIGIN,
-            )
-            .unwrap()
-            .unwrap(),
+            prettier_config(&database, checkout_id, "checkout", "src/app.ts", None,)
+                .unwrap()
+                .unwrap(),
             serde_json::json!({ "printWidth": 120, "singleQuote": true })
         );
     }
@@ -2071,7 +2349,7 @@ mod tests {
             &state.repos[0].checkouts[0].id,
             "checkout",
             "src/école.ts",
-            &CHECKOUT_ORIGIN,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2104,7 +2382,7 @@ mod tests {
                 checkout_id,
                 "checkout",
                 "packages/app/src/a.ts",
-                &CHECKOUT_ORIGIN,
+                None,
             )
             .unwrap()
             .unwrap(),
@@ -2115,7 +2393,7 @@ mod tests {
             checkout_id,
             "checkout",
             "packages/app/src/a.ts",
-            &CHECKOUT_ORIGIN,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2127,7 +2405,7 @@ mod tests {
                 checkout_id,
                 "checkout",
                 "packages/other/src/a.ts",
-                &CHECKOUT_ORIGIN,
+                None,
             )
             .unwrap(),
             None
@@ -2151,13 +2429,7 @@ mod tests {
         // A config nobody may read is not a checkout that configures nothing: answering `None`
         // would format the file with defaults and tell the reader nothing about why.
         fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
-        let outcome = prettier_config(
-            &database,
-            checkout_id,
-            "checkout",
-            "src/app.ts",
-            &CHECKOUT_ORIGIN,
-        );
+        let outcome = prettier_config(&database, checkout_id, "checkout", "src/app.ts", None);
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(
@@ -2195,7 +2467,7 @@ mod tests {
                 checkout_id,
                 "checkout",
                 "src/linked/app.ts",
-                &CHECKOUT_ORIGIN,
+                None,
             )
             .unwrap_err();
             assert!(matches!(
@@ -2203,14 +2475,8 @@ mod tests {
                 IpcErrorCode::PathOutsideCheckout
             ));
 
-            let config_is_a_link = prettier_config(
-                &database,
-                checkout_id,
-                "checkout",
-                "README.md",
-                &CHECKOUT_ORIGIN,
-            )
-            .unwrap_err();
+            let config_is_a_link =
+                prettier_config(&database, checkout_id, "checkout", "README.md", None).unwrap_err();
             assert!(matches!(
                 config_is_a_link.code,
                 IpcErrorCode::PathOutsideCheckout
@@ -2231,29 +2497,20 @@ mod tests {
         let state = workspace::register_folder(&database, &root).unwrap();
         let checkout_id = &state.repos[0].checkouts[0].id;
 
-        assert!(prettier_config(
-            &database,
-            checkout_id,
-            "checkout",
-            "src/app.ts",
-            &CHECKOUT_ORIGIN,
-        )
-        .unwrap()
-        .is_none());
-        assert!(prettier_config(
-            &database,
-            checkout_id,
-            "review",
-            "review.md",
-            &CHECKOUT_ORIGIN,
-        )
-        .is_err());
+        assert!(
+            prettier_config(&database, checkout_id, "checkout", "src/app.ts", None,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prettier_config(&database, checkout_id, "review-default", "review.md", None,).is_err()
+        );
         assert!(prettier_config(
             &database,
             "checkout:unregistered",
             "checkout",
             "src/app.ts",
-            &CHECKOUT_ORIGIN,
+            None,
         )
         .is_err());
     }
@@ -2273,15 +2530,9 @@ mod tests {
         let checkout_id = &state.repos[0].checkouts[0].id;
 
         assert_eq!(
-            prettier_config(
-                &database,
-                checkout_id,
-                "checkout",
-                "src/app.ts",
-                &CHECKOUT_ORIGIN,
-            )
-            .unwrap()
-            .unwrap(),
+            prettier_config(&database, checkout_id, "checkout", "src/app.ts", None,)
+                .unwrap()
+                .unwrap(),
             serde_json::json!({ "useTabs": true })
         );
 
@@ -2294,7 +2545,7 @@ mod tests {
             checkout_id,
             "checkout",
             "src/broken/other.ts",
-            &CHECKOUT_ORIGIN,
+            None,
         )
         .unwrap_err();
         assert!(matches!(broken.code, IpcErrorCode::OperationFailed));
@@ -2341,8 +2592,16 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(checkout.join("checkout-only.md"), "checkout").unwrap();
         fs::write(outside.join("secret.md"), "secret").unwrap();
+        fs::write(review_root.join("inside.md"), "inside").unwrap();
         #[cfg(unix)]
-        symlink(outside.join("secret.md"), review_root.join("escape.md")).unwrap();
+        {
+            symlink(outside.join("secret.md"), review_root.join("escape.md")).unwrap();
+            symlink(
+                review_root.join("inside.md"),
+                review_root.join("inside-link.md"),
+            )
+            .unwrap();
+        }
         let database = db(temp.path());
         let state = workspace::register_folder(&database, &checkout).unwrap();
         let checkout_id = &state.repos[0].checkouts[0].id;
@@ -2351,18 +2610,18 @@ mod tests {
         let checkout_file = read(
             &database,
             checkout_id,
-            "review",
+            "review-workdir",
             Path::new("checkout-only.md"),
-            &places,
+            Some(&places),
         )
         .unwrap_err();
         assert!(matches!(checkout_file.code, IpcErrorCode::FolderMissing));
         let traversal = read(
             &database,
             checkout_id,
-            "review",
+            "review-workdir",
             Path::new("../checkout/checkout-only.md"),
-            &places,
+            Some(&places),
         )
         .unwrap_err();
         assert!(matches!(traversal.code, IpcErrorCode::PathOutsideCheckout));
@@ -2371,12 +2630,24 @@ mod tests {
             let escape = read(
                 &database,
                 checkout_id,
-                "review",
+                "review-workdir",
                 Path::new("escape.md"),
-                &places,
+                Some(&places),
             )
             .unwrap_err();
             assert!(matches!(escape.code, IpcErrorCode::PathOutsideCheckout));
+            assert_eq!(
+                read(
+                    &database,
+                    checkout_id,
+                    "review-workdir",
+                    Path::new("inside-link.md"),
+                    Some(&places),
+                )
+                .unwrap()
+                .content,
+                "inside"
+            );
         }
     }
 
@@ -2395,11 +2666,11 @@ mod tests {
             let error = write(
                 &database,
                 checkout_id,
-                "review",
+                "review-workdir",
                 Path::new(path),
                 "changed",
                 "before",
-                &places,
+                Some(&places),
             )
             .unwrap_err();
             assert!(matches!(error.code, IpcErrorCode::InvalidPath));
@@ -2458,6 +2729,96 @@ mod tests {
             review_root_for(&database, checkout_id, &reviews_in_the_checkout()).unwrap(),
             Path::new(&state.repos[0].checkouts[0].canonical_path).join(REVIEW_DIR_IN_CHECKOUT),
         );
+        let folder = review_folder(&database, checkout_id, &reviews_in_the_checkout()).unwrap();
+        assert_eq!((folder.files, folder.bytes), (0, 0));
+    }
+
+    #[test]
+    fn workdir_export_does_not_recreate_a_missing_checkout() {
+        let temp = tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let database = db(temp.path());
+        let state = workspace::register_folder(&database, &checkout).unwrap();
+        let checkout_id = &state.repos[0].checkouts[0].id;
+        fs::remove_dir_all(&checkout).unwrap();
+
+        let error = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &reviews_in_the_checkout(),
+            "2026-03-14",
+            "2026-03-14-1532",
+            "review",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, IpcErrorCode::FolderMissing);
+        assert!(!checkout.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workdir_export_rejects_escaping_ancestor_symlinks_and_allows_internal_ones() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let outside = temp.path().join("outside");
+        let internal = checkout.join("internal");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&internal).unwrap();
+        let database = db(temp.path());
+        let state = workspace::register_folder(&database, &checkout).unwrap();
+        let checkout_id = &state.repos[0].checkouts[0].id;
+        let places = reviews_in_the_checkout();
+
+        symlink(&outside, checkout.join(".muster")).unwrap();
+        let error = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &places,
+            "2026-03-14",
+            "2026-03-14-1532",
+            "review",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::PathOutsideCheckout);
+        assert!(!outside.join("reviews").exists());
+
+        fs::remove_file(checkout.join(".muster")).unwrap();
+        fs::create_dir(checkout.join(".muster")).unwrap();
+        symlink(&outside, checkout.join(".muster/reviews")).unwrap();
+        let error = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &places,
+            "2026-03-14",
+            "2026-03-14-1532",
+            "review",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::PathOutsideCheckout);
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        fs::remove_file(checkout.join(".muster/reviews")).unwrap();
+        fs::remove_dir(checkout.join(".muster")).unwrap();
+        symlink(&internal, checkout.join(".muster")).unwrap();
+        let filename = export_review_for_checkout(
+            &database,
+            checkout_id,
+            &places,
+            "2026-03-14",
+            "2026-03-14-1532",
+            "review",
+        )
+        .unwrap();
+        assert_eq!(filename.origin, ReviewDocumentOrigin::ReviewWorkdir);
+        assert_eq!(
+            fs::read_to_string(internal.join("reviews").join(filename.path)).unwrap(),
+            format!("{EXPORTED_REVIEW_MARKER}review")
+        );
     }
 
     /// What the dialog reports about a folder is the folder before anything is in it: it asks
@@ -2482,44 +2843,76 @@ mod tests {
         assert!(folder.path.ends_with(".muster/tmp/reviews"));
     }
 
-    /// Clearing removes what this app wrote and nothing else: the folder is in the user's home, so
-    /// a file they put there, or one whose name only looks like an export, is left alone.
+    /// Clearing removes only marked app exports: an ordinary note or a timestamp-shaped file is
+    /// not evidence of ownership. Count and delete use the same selector.
     #[test]
     fn clearing_a_review_folder_removes_the_exports_and_leaves_the_rest() {
         let temp = tempdir().unwrap();
         let checkout = temp.path().join("checkout");
+        let outside = temp.path().join("outside");
         fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
         let database = db(temp.path());
         let state = workspace::register_folder(&database, &checkout).unwrap();
         let places = places_in(temp.path(), REVIEW_STORAGE_DEFAULT);
         let checkout_id = &state.repos[0].checkouts[0].id;
         let root = review_root_for(&database, checkout_id, &places).unwrap();
 
-        export_review_markdown(&root, "2026-03-14", "2026-03-14-1532", "first").unwrap();
+        let first =
+            export_review_markdown(&root, "2026-03-14", "2026-03-14-1532", "first").unwrap();
         export_review_markdown(&root, "2026-03-14", "2026-03-14-1532", "second").unwrap();
-        // The same minute gets a suffix, so both shapes are on disk at once.
+        let original = format!("{EXPORTED_REVIEW_MARKER}first");
+        let edited = format!("{EXPORTED_REVIEW_MARKER}edited");
+        write(
+            &database,
+            checkout_id,
+            "review-default",
+            Path::new(&first),
+            &edited,
+            &original,
+            Some(&places),
+        )
+        .unwrap();
+        // Valid export-like names, a directory and a symlink are not owned without the marker.
         fs::write(root.join("2026-03-14-9999.md"), "not an hour").unwrap();
+        fs::write(root.join("2026-03-14-1540-4.md"), "manual").unwrap();
         fs::write(root.join("notes.txt"), "mine").unwrap();
         fs::create_dir_all(root.join("2026-03-14-1600.md")).unwrap();
+        fs::write(
+            outside.join("export.md"),
+            format!("{EXPORTED_REVIEW_MARKER}linked"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("export.md"), root.join("2026-03-14-1601.md"))
+            .unwrap();
 
+        let counted = review_folder(&database, checkout_id, &places).unwrap();
+        assert_eq!(counted.files, 2);
+        assert_eq!(
+            counted.bytes,
+            edited.len() as u64 + (EXPORTED_REVIEW_MARKER.len() + "second".len()) as u64
+        );
         let cleared = clear_review_folder(&database, checkout_id, &places).unwrap();
         assert_eq!(cleared.files, 2);
-        assert_eq!(cleared.bytes, "first".len() as u64 + "second".len() as u64);
+        assert_eq!(cleared.bytes, counted.bytes);
 
         let left: Vec<String> = fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left.len(), 3, "the folder kept what this app did not write");
-        for name in ["notes.txt", "2026-03-14-9999.md", "2026-03-14-1600.md"] {
+        for name in [
+            "notes.txt",
+            "2026-03-14-9999.md",
+            "2026-03-14-1540-4.md",
+            "2026-03-14-1600.md",
+        ] {
             assert!(left.iter().any(|left| left == name), "{name} is gone");
         }
-        assert_eq!(
-            review_folder(&database, checkout_id, &places)
-                .unwrap()
-                .files,
-            2
-        );
+        #[cfg(unix)]
+        assert!(left.iter().any(|left| left == "2026-03-14-1601.md"));
+        let empty = review_folder(&database, checkout_id, &places).unwrap();
+        assert_eq!((empty.files, empty.bytes), (0, 0));
     }
 
     /// Notes inside a working directory are the project's, not a cache of this app's, so the
@@ -2552,8 +2945,15 @@ mod tests {
 
         assert_eq!(first, "2026-03-14-1532.md");
         assert_eq!(second, "2026-03-14-1532-2.md");
+        assert_eq!(
+            fs::read(root.join(&first)).unwrap(),
+            [EXPORTED_REVIEW_MARKER.as_bytes(), b"first"].concat()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(second)).unwrap(),
+            format!("{EXPORTED_REVIEW_MARKER}second")
+        );
         assert_eq!(fs::read(root.join(first)).unwrap(), first_bytes);
-        assert_eq!(fs::read_to_string(root.join(second)).unwrap(), "second");
     }
 
     #[test]
@@ -2663,6 +3063,27 @@ mod tests {
     }
 
     #[test]
+    fn probe_validates_checkout_before_reading_external_preview_content() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("plain");
+        let external = temp.path().join("outside.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&external, [0, 1, 2]).unwrap();
+        let database = db(temp.path());
+        workspace::register_folder(&database, &root).unwrap();
+
+        let error = probe(
+            &database,
+            "unknown-checkout",
+            external.to_str().unwrap(),
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, IpcErrorCode::InvalidCheckout);
+    }
+
+    #[test]
     fn probe_confirms_only_text_files_this_checkout_holds() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("plain");
@@ -2672,6 +3093,7 @@ mod tests {
         fs::write(root.join("nested/deep.rs"), "fn main() {}").unwrap();
         fs::write(root.join("binary.bin"), [0, 1, 2]).unwrap();
         fs::write(root.join("large.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        git(&root, &["init", "--quiet"]);
         let database = db(temp.path());
         let state = workspace::register_folder(&database, &root).unwrap();
         let checkout_id = &state.repos[0].checkouts[0].id;

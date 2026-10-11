@@ -1619,7 +1619,7 @@ function rowLabel(item: WorkdirItem): string {
                   v-else
                   type="button"
                   class="workdir-select"
-                  :aria-current="item.active ? 'page' : undefined"
+                  :aria-current="item.active && showingTerminal ? 'page' : undefined"
                   :aria-label="`Terminal session: ${rowLabel(item)}`"
                   :aria-haspopup="item.canMove ? 'menu' : undefined"
                   :aria-expanded="item.canMove ? moveMenuFor === item.session.id : undefined"

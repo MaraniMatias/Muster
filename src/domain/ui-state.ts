@@ -130,12 +130,14 @@ export function normalizeCheckoutUiState(value: unknown): CheckoutUiState {
   const document =
     isRecord(rawDocument) &&
     typeof rawDocument.path === "string" &&
-    (rawDocument.origin === "review" || rawDocument.origin === "checkout") &&
-    (rawDocument.origin === "review" ? safeReviewPath(rawDocument.path) : safePath(rawDocument.path)) &&
+    (rawDocument.origin === "review-default" ||
+      rawDocument.origin === "review-workdir" ||
+      rawDocument.origin === "checkout") &&
+    (rawDocument.origin === "checkout" ? safePath(rawDocument.path) : safeReviewPath(rawDocument.path)) &&
     typeof rawDocument.checkoutId === "string" &&
     (rawDocument.source === "file" || rawDocument.source === "change") &&
     (rawDocument.mode === "diff" || rawDocument.mode === "view" || rawDocument.mode === "code") &&
-    (rawDocument.origin !== "review" || (rawDocument.source === "file" && rawDocument.mode !== "diff"))
+    (rawDocument.origin === "checkout" || (rawDocument.source === "file" && rawDocument.mode !== "diff"))
       ? ({
           checkoutId: rawDocument.checkoutId,
           path: rawDocument.path,

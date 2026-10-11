@@ -61,7 +61,7 @@ const emit = defineEmits<{
    * naming two options.
    */
   reviewStorageChanged: [storage: ReviewStorageMode];
-  clearReviewFolder: [];
+  clearReviewFolder: [storage: ReviewStorageMode];
 }>();
 
 const draft = ref<AppSettings>(props.settings);
@@ -288,7 +288,7 @@ function onDialogKeydown(event: KeyboardEvent) {
           <div v-if="section.id === 'reviews'" class="mt-3" data-testid="review-folder">
             <!-- Nothing at all while the answer is not in: an empty row is the honest state for a
                  folder this window could not read, and a number it guessed would not be. -->
-            <template v-if="reviewFolder">
+            <template v-if="reviewFolder && reviewFolder.storage === draft.reviews.storage">
               <p class="text-xs text-(--muster-text-secondary)">{{ reviewFolder.path }}</p>
               <p class="mt-1 text-[0.6875rem] text-(--muster-text-faint)">
                 <template v-if="reviewFolder.storage === 'default'">
@@ -300,13 +300,13 @@ function onDialogKeydown(event: KeyboardEvent) {
               <!-- Only the app's own folder: notes inside a working directory belong to the
                    repository, so there is nothing here a delete could be honest about. -->
               <Button
-                v-if="reviewFolder.storage === 'default'"
+                v-if="draft.reviews.storage === 'default' && reviewFolder.storage === 'default'"
                 variant="ghost"
                 size="sm"
                 class="mt-2"
                 :disabled="saving"
                 :aria-label="`Delete ${reviewFolder.files === 1 ? 'the exported review note' : 'the exported review notes'} in ${reviewFolder.path}`"
-                @click="emit('clearReviewFolder')"
+                @click="emit('clearReviewFolder', draft.reviews.storage)"
               >
                 Delete notes
               </Button>

@@ -933,21 +933,45 @@ function closeSettings() {
  * row that could be wrong.
  */
 const reviewFolder = ref<ReviewFolder | null>(null);
+let reviewFolderRequest = 0;
+const reviewFolderStorage = ref<ReviewStorageMode>("default");
 
 async function loadReviewFolder(storage: ReviewStorageMode) {
+  const request = ++reviewFolderRequest;
+  reviewFolderStorage.value = storage;
   const checkoutId = activeCheckout.value?.id;
-  if (!checkoutId) {
-    reviewFolder.value = null;
-    return;
-  }
+  reviewFolder.value = null;
+  if (!checkoutId) return;
   try {
-    reviewFolder.value = await getReviewFolder(checkoutId, storage);
+    const folder = await getReviewFolder(checkoutId, storage);
+    if (request === reviewFolderRequest && settingsOpen.value && activeCheckout.value?.id === checkoutId) {
+      reviewFolder.value = folder;
+    }
   } catch {
-    // A folder that cannot be read is not a reason to refuse the dialog. The row then shows
-    // nothing rather than a number, and the preference beside it stays editable either way.
-    reviewFolder.value = null;
+    // A folder that cannot be read is not a reason to refuse the dialog. Ignore stale failures too.
+    if (request === reviewFolderRequest) reviewFolder.value = null;
   }
 }
+
+watch(
+  settingsOpen,
+  (open) => {
+    if (open) return;
+    reviewFolderRequest += 1;
+    reviewFolder.value = null;
+  },
+  { flush: "sync" },
+);
+
+watch(
+  () => activeCheckout.value?.id,
+  () => {
+    reviewFolderRequest += 1;
+    reviewFolder.value = null;
+    if (settingsOpen.value) void loadReviewFolder(reviewFolderStorage.value);
+  },
+  { flush: "sync" },
+);
 
 function openSettings() {
   settingsOpen.value = true;
@@ -960,23 +984,22 @@ function openSettings() {
  * It is asked about rather than done: the folder is in the person's home and a clear cannot be
  * taken back, so the question names the folder and says what it leaves alone.
  */
-function requestClearReviewFolder() {
+function requestClearReviewFolder(storage: ReviewStorageMode) {
   const folder = reviewFolder.value;
-  if (!folder || folder.storage !== "default") return;
+  const checkoutId = activeCheckout.value?.id;
+  if (storage !== "default" || folder?.storage !== storage || !checkoutId) return;
   askConfirm({
     title: "Delete exported review notes",
     message: `${folder.files} exported ${folder.files === 1 ? "note" : "notes"} (${formatBytes(folder.bytes)}) in ${folder.path} are deleted. Anything else in that folder is left alone.`,
     confirmLabel: "Delete",
     destructive: true,
     run: async () => {
-      const checkoutId = activeCheckout.value?.id;
-      if (!checkoutId) return;
-      const cleared = await clearReviewFolder(checkoutId);
+      const cleared = await clearReviewFolder(checkoutId, folder.path);
       pushToast(
         `Deleted ${cleared.files} exported ${cleared.files === 1 ? "note" : "notes"} (${formatBytes(cleared.bytes)}).`,
         "info",
       );
-      await loadReviewFolder("default");
+      await loadReviewFolder(reviewFolderStorage.value);
     },
   });
 }
@@ -1731,8 +1754,13 @@ async function sendReviewToAgent(ids: string[], queue = false) {
   sendingReview.value = true;
   try {
     if (destination === "markdown") {
-      const path = await exportReviewMarkdown(checkout.id, localTime.date, localTime.timestamp, markdown);
-      showView(checkout.id, { kind: "document", path, mode: "view", origin: "review" });
+      const exported = await exportReviewMarkdown(checkout.id, localTime.date, localTime.timestamp, markdown);
+      showView(checkout.id, {
+        kind: "document",
+        path: exported.path,
+        mode: "view",
+        origin: exported.origin,
+      });
       return;
     }
     const target = await resolveAgentTarget();

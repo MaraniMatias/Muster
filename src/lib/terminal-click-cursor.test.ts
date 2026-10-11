@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from "vitest";
-import type { Terminal } from "@xterm/xterm";
+import type { IBuffer, Terminal } from "@xterm/xterm";
+import { Terminal as Headless } from "@xterm/headless";
 import { enableClickToMoveCursor } from "./terminal-click-cursor";
 
 /**
@@ -58,15 +59,16 @@ function fakeTerminal(
   // A marker is a row that moves with the buffer, so it is registered the way xterm.js registers
   // one: on the row the cursor is on at that moment.
   const marker = { line: undefined as number | undefined, dispose: vi.fn() };
+  const buffer = { active };
   const terminal = {
     element,
     cols,
     rows: gridRows,
     modes: { mouseTrackingMode: "none" as string },
     cleared: 0,
-    buffer: { active },
+    buffer,
     registerMarker() {
-      marker.line = active.baseY + active.cursorY;
+      marker.line = buffer.active.baseY + buffer.active.cursorY;
       return marker;
     },
     clearSelection() {
@@ -103,6 +105,22 @@ describe("enableClickToMoveCursor", () => {
     click(element, 1, 4);
 
     expect(send).toHaveBeenCalledWith(LEFT.repeat(2));
+    registration.dispose();
+  });
+
+  it("moves to the exact blank cell after an unambiguous command end", () => {
+    const { terminal, element } = fakeTerminal({
+      rows: ["> abc"],
+      cursor: { row: 0, col: 2 },
+      gridRows: 1,
+    });
+    const send = vi.fn();
+    const registration = enableClickToMoveCursor(terminal, send);
+
+    registration.inputStarted();
+    click(element, 0, 5);
+
+    expect(send).toHaveBeenCalledWith(RIGHT.repeat(3));
     registration.dispose();
   });
 
@@ -180,28 +198,52 @@ describe("enableClickToMoveCursor", () => {
     registration.dispose();
   });
 
-  it("measures the click against the scrolled viewport rather than the bottom of the scrollback", () => {
+  it("maps clicks to absolute rows at the bottom of nonempty scrollback", () => {
     const { terminal, raw, element } = fakeTerminal({
-      rows: ["> abc", "", "", "", "", "", "defg", "", "zzzz", ""],
-      cursor: { row: 0, col: 2 },
+      rows: ["", "", "", "", "", "", "output", "history", "> abcdef", ""],
+      cursor: { row: 2, col: 2 },
+      baseY: 6,
+      viewportY: 6,
     });
     const send = vi.fn();
     const registration = enableClickToMoveCursor(terminal, send);
 
     registration.inputStarted();
-    // The line has been typed out to the bottom of the buffer and the scrollback has been scrolled
-    // back, so the cursor sits on the last row on screen and the command is four rows above it.
+    raw.buffer.active.cursorX = 6;
+    click(element, 2, 4);
+    expect(send).toHaveBeenCalledWith(LEFT.repeat(2));
+
+    send.mockClear();
+    click(element, 0, 1);
+    expect(send).not.toHaveBeenCalled();
+    registration.dispose();
+  });
+
+  it("maps scrolled-up clicks to viewport rows and leaves visible output alone", () => {
+    const { terminal, raw, element } = fakeTerminal({
+      cols: 4,
+      rows: ["", "", "", "log", "old", "stuff", "> ab", "cdef", "ghij", "klmn"],
+      cursor: { row: 0, col: 2 },
+      baseY: 6,
+      viewportY: 6,
+    });
+    const send = vi.fn();
+    const registration = enableClickToMoveCursor(terminal, send);
+
+    registration.inputStarted();
     const buffer = raw.buffer.active;
-    buffer.baseY = 5;
-    buffer.viewportY = 2;
+    buffer.baseY = 8;
+    buffer.viewportY = 3;
     buffer.cursorY = 1;
-    buffer.cursorX = 4;
+    buffer.cursorX = 2;
 
-    // The fourth visible row is buffer row 6, where the cursor is. Counting from the bottom of the
-    // scrollback instead would name row 8, which is past the end of the command and is not clicked.
-    click(element, 3, 0);
+    // Screen row 3 is absolute buffer row 6 (input); baseY is not part of this conversion.
+    click(element, 3, 3);
+    expect(send).toHaveBeenCalledWith(LEFT.repeat(11));
 
-    expect(send).toHaveBeenCalledWith(LEFT.repeat(4));
+    send.mockClear();
+    click(element, 0, 0);
+    expect(send).not.toHaveBeenCalled();
     registration.dispose();
   });
 
@@ -343,5 +385,97 @@ describe("enableClickToMoveCursor", () => {
 
     click(element, 1, 0);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("refuses ambiguous tab cells from a real xterm headless buffer", async () => {
+    const headless = new Headless({ cols: 16, rows: 3, allowProposedApi: true });
+    await new Promise<void>((resolve) => headless.write("> ", resolve));
+    const { terminal, element } = fakeTerminal({ cols: 16, gridRows: 3 });
+    (terminal.buffer as unknown as { active: IBuffer }).active = headless.buffer.active;
+    const send = vi.fn();
+    const registration = enableClickToMoveCursor(terminal, send);
+
+    registration.inputStarted();
+    await new Promise<void>((resolve) => headless.write("ab\tcd", resolve));
+    const line = headless.buffer.active.getLine(0);
+    expect(Array.from({ length: 10 }, (_, col) => line?.getCell(col)?.getChars())).toEqual([
+      ">",
+      " ",
+      "a",
+      "b",
+      "",
+      "",
+      "",
+      "",
+      "c",
+      "d",
+    ]);
+    expect(line?.getCell(4)?.getWidth()).toBe(1);
+
+    // The public buffer exposes tab fill as empty cells with no way to identify their source.
+    click(element, 0, 3);
+    click(element, 0, 5);
+    expect(send).not.toHaveBeenCalled();
+
+    // Positions before and after the tab still work when the move does not cross its blank span.
+    await new Promise<void>((resolve) => headless.write("\u001b[6D", resolve));
+    expect(headless.buffer.active.cursorX).toBe(4);
+    click(element, 0, 3);
+    expect(send).toHaveBeenCalledWith(LEFT);
+
+    // A move across the tab is ambiguous even though text follows its fill cells.
+    send.mockClear();
+    click(element, 0, 8);
+    expect(send).not.toHaveBeenCalled();
+
+    await new Promise<void>((resolve) => headless.write("\u001b[4C", resolve));
+    expect(headless.buffer.active.cursorX).toBe(8);
+    click(element, 0, 9);
+    expect(send).toHaveBeenCalledWith(RIGHT);
+
+    // The blank after the visible text is an endpoint, but reaching it crosses the tab's fill span.
+    send.mockClear();
+    await new Promise<void>((resolve) => headless.write("\u001b[6D", resolve));
+    expect(headless.buffer.active.cursorX).toBe(2);
+    click(element, 0, 10);
+    expect(send).not.toHaveBeenCalled();
+
+    registration.dispose();
+    headless.dispose();
+  });
+
+  it("counts real typed spaces as shell cursor positions", async () => {
+    const headless = new Headless({ cols: 16, rows: 3, allowProposedApi: true });
+    await new Promise<void>((resolve) => headless.write("> ", resolve));
+    const { terminal, element } = fakeTerminal({ cols: 16, gridRows: 3 });
+    (terminal.buffer as unknown as { active: IBuffer }).active = headless.buffer.active;
+    const send = vi.fn();
+    const registration = enableClickToMoveCursor(terminal, send);
+
+    registration.inputStarted();
+    await new Promise<void>((resolve) => headless.write("a b", resolve));
+    expect(headless.buffer.active.getLine(0)?.getCell(3)?.getChars()).toBe(" ");
+    click(element, 0, 2);
+
+    expect(send).toHaveBeenCalledWith(LEFT.repeat(3));
+    registration.dispose();
+    headless.dispose();
+  });
+
+  it("rejects mouseup coordinates outside the terminal grid instead of clamping them to an edge cell", () => {
+    const { terminal, raw, element } = fakeTerminal({
+      rows: ["", "> abcdefgh"],
+      cursor: { row: 1, col: 0 },
+    });
+    const send = vi.fn();
+    const registration = enableClickToMoveCursor(terminal, send);
+
+    registration.inputStarted();
+    raw.buffer.active.cursorX = 4;
+    element.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientX: 96, clientY: 15 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { button: 0, clientX: 100, clientY: 15 }));
+
+    expect(send).not.toHaveBeenCalled();
+    registration.dispose();
   });
 });

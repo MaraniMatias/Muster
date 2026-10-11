@@ -71,6 +71,28 @@ describe("terminalPathsIn", () => {
     expect(terminalPathsIn("writing ./src/App.vue")).toEqual([{ path: "./src/App.vue", start: 8, end: 21 }]);
   });
 
+  it("reads only the name field from basic long `ls` rows", () => {
+    const file = "-rw-r--r--  1 user  staff  123 Oct 11 12:34 LICENSE";
+    expect(terminalPathsIn(file)).toEqual([{ path: "LICENSE", ...at(file, "LICENSE") }]);
+
+    // A long-listing name may contain spaces; the whole basename and its original columns survive.
+    const spaced = "-rw-r--r--  1 user  staff  123 Oct 11 2026 release notes";
+    expect(terminalPathsIn(spaced)).toEqual([{ path: "release notes", ...at(spaced, "release notes") }]);
+
+    const directory = "drwxr-xr-x  5 user  staff  160 Oct 11 12:34 src";
+    expect(terminalPathsIn(directory)).toEqual([{ path: "src", ...at(directory, "src") }]);
+
+    const symlink = "lrwxr-xr-x  1 user  staff  9 Oct 11 12:34 alias with spaces -> docs/dest file";
+    expect(terminalPathsIn(symlink)).toEqual([{ path: "alias with spaces", ...at(symlink, "alias with spaces") }]);
+
+    // The arrow is only a target separator for symlink rows; a regular basename may contain it.
+    const regular = "-rw-r--r--  1 user  staff  123 Oct 11 12:34 file -> archive";
+    expect(terminalPathsIn(regular)).toEqual([{ path: "file -> archive", ...at(regular, "file -> archive") }]);
+
+    // A leading-dash name is still rejected by the path candidate guard.
+    expect(terminalPathsIn("-rw-r--r--  1 user staff  123 Oct 11 12:34 --verbose")).toEqual([]);
+  });
+
   it("offers the bare names on a listing and not the words on a sentence", () => {
     // What `ls` prints in columns: the extension-less names are the ones that used to be
     // unopenable, and the probe says which of them are files.

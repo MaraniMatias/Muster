@@ -161,12 +161,37 @@ describe("persisted UI state", () => {
         document: {
           checkoutId: "checkout:/repo",
           path: "2026-03-14-1532.md",
+          origin: "review-default",
+          source: "file",
+          mode: "view",
+        },
+      }),
+    ).toMatchObject({ document: { origin: "review-default", path: "2026-03-14-1532.md" } });
+    expect(
+      normalizeCheckoutUiState({
+        mainView: "document",
+        document: {
+          checkoutId: "checkout:/repo",
+          path: "2026-03-14-1532.md",
+          origin: "review-workdir",
+          source: "file",
+          mode: "view",
+        },
+      }),
+    ).toMatchObject({ document: { origin: "review-workdir" } });
+    // The old settings-relative origin cannot be safely restored as either pinned location.
+    expect(
+      normalizeCheckoutUiState({
+        mainView: "document",
+        document: {
+          checkoutId: "checkout:/repo",
+          path: "2026-03-14-1532.md",
           origin: "review",
           source: "file",
           mode: "view",
         },
       }),
-    ).toMatchObject({ document: { origin: "review", path: "2026-03-14-1532.md" } });
+    ).toMatchObject({ document: null });
     // An unreadable mainView or flag falls to the terminal rather than failing the load.
     expect(normalizeCheckoutUiState({ mainView: "diff", diffAllFiles: "yes" })).toMatchObject({
       mainView: "terminal",

@@ -34,6 +34,10 @@ const QUOTED_TOKEN = /"([^"]+)"|'([^']+)'/g;
 /** `foo.rs:42:10` and `foo.rs:42` are a location, and the file is `foo.rs`. */
 const LINE_AND_COLUMN = /:\d+(?::\d+)?$/;
 
+/** Basic Unix `ls -l` columns, ending in the name field (which may contain spaces). */
+const LONG_LISTING =
+  /^\s*([bcdlps-][rwxStTs-]{9}[+@.]?)\s+\d+\s+\S+\s+\S+\s+\d+\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+(?:\d{2}:\d{2}|\d{4})\s+(\S(?:.*\S)?)\s*$/;
+
 /**
  * A page, and the only thing the browser is asked to open.
  *
@@ -213,6 +217,27 @@ export function terminalPathIn(token: string): string | null {
 }
 
 /**
+ * The name field in basic `ls -l` output, or `null` when the line is not that format.
+ *
+ * The owner, group, size and date columns are metadata, not file names; checking this format first
+ * keeps homonymous checkout files from turning those fields into links.
+ */
+function longListingPaths(line: string): TerminalPath[] | null {
+  const match = LONG_LISTING.exec(line);
+  if (!match) return null;
+  const fieldName = match[2]!;
+  const targetSeparator = match[1]![0] === "l" ? fieldName.indexOf(" -> ") : -1;
+  const rawName = targetSeparator < 0 ? fieldName : fieldName.slice(0, targetSeparator);
+  const quoted = /^(["'])(.*)\1$/.exec(rawName);
+  const path = quoted?.[2] ?? rawName;
+  // Keep the ordinary flag guard even though this is a listing: file paths beginning with `-`
+  // are still refused unless the user prints them with an explicit `./` prefix.
+  if (!couldNameFile(path, line)) return [];
+  const start = line.length - fieldName.length + (quoted ? 1 : 0);
+  return [{ path, start, end: start + path.length }];
+}
+
+/**
  * Every name a line offers, in the order the line prints them, with the characters each covers.
  *
  * A name here is a candidate and not a verdict: the probe is what tells a file from a word, and
@@ -220,6 +245,8 @@ export function terminalPathIn(token: string): string | null {
  * of these, and `terminalUrlsIn` is where it goes instead.
  */
 export function terminalPathsIn(line: string): TerminalPath[] {
+  const longListing = longListingPaths(line);
+  if (longListing !== null) return longListing;
   const found: TerminalPath[] = [];
   for (const span of tokenSpans(line)) {
     const parsed = terminalPathInToken(span.token, line);

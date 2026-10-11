@@ -253,11 +253,10 @@ if [[ -z ${{__muster_integrated-}} ]]; then
     (( __muster_pending )) || __muster_status=0
     __muster_pending=0
     printf '{OSC_EXIT_BASH}' "$__muster_status"
-    # The prompt is printed after this hook and never before it, so the marker goes on the end of
-    # the prompt rather than being printed here. Guarded because this runs once per prompt, and a
-    # second copy would start the input one cell short of where it really begins. The literal
-    # string around it says the bytes take up no columns, which is the difference between a prompt
-    # that looks right and one whose line editor believes it is eight columns wider than it is.
+    # This runs after user prompt hooks, so it marks their final PS1 rather than a value they replace.
+    # Guarded because this runs once per prompt, and a second copy would start the input one cell short
+    # of where it really begins. The literal string says the bytes take up no columns, which keeps the
+    # line editor's idea of the prompt width right.
     #
     # It is left unterminated on purpose. With the closing sequence written out, this shell prints a
     # brace after the marker instead of consuming it, at the end of every prompt.
@@ -266,7 +265,7 @@ if [[ -z ${{__muster_integrated-}} ]]; then
     [[ $PS1 == *"$__muster_input"* ]] || PS1="$PS1%{{$__muster_input"
   }}
   muster_px() {{ __muster_pending=1; print -Pn "{OSC_STARTED}"; }}
-  precmd_functions=(muster_pc ${{precmd_functions:#muster_pc}})
+  precmd_functions=(${{precmd_functions:#muster_pc}} muster_pc)
   preexec_functions+=(muster_px)
 fi
 "#
@@ -279,7 +278,7 @@ fi
 if [[ -z ${{__muster_integrated-}} ]]; then
   __muster_integrated=1
   __muster_first_prompt=1
-  __muster_prompt_command() {{
+  __muster_prompt_begin() {{
     local __muster_status=$?
     if [[ $__muster_first_prompt == 1 ]]; then
       if [[ ${{__muster_restore_posix-}} == off ]]; then set +o posix; fi
@@ -287,17 +286,20 @@ if [[ -z ${{__muster_integrated-}} ]]; then
       __muster_status=0
       __muster_first_prompt=0
     fi
-    printf '{OSC_EXIT_BASH}' "$__muster_status"
-    # The same marker the zsh script appends, appended the same way and for the same reason: PS1 is
-    # printed after every prompt command, and nothing after this one runs until a line is typed.
-    local __muster_input=$'{OSC_INPUT_STARTED_BASH}'
-    [[ $PS1 == *"$__muster_input"* ]] || PS1="${{PS1-}}$__muster_input"
+    __muster_command_status=$__muster_status
     return "$__muster_status"
   }}
+  __muster_prompt_end() {{
+    printf '{OSC_EXIT_BASH}' "$__muster_command_status"
+    # User prompt hooks may replace PS1, so append the marker after they have all run.
+    local __muster_input=$'{OSC_INPUT_STARTED_BASH}'
+    [[ ${{PS1-}} == *"$__muster_input"* ]] || PS1="${{PS1-}}$__muster_input"
+  }}
   if [[ ${{BASH_VERSINFO[0]}} -gt 5 || ${{BASH_VERSINFO[0]}} -eq 5 && ${{BASH_VERSINFO[1]}} -ge 1 ]] && [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
-    PROMPT_COMMAND=(__muster_prompt_command "${{PROMPT_COMMAND[@]}}")
+    PROMPT_COMMAND=(__muster_prompt_begin "${{PROMPT_COMMAND[@]}}" __muster_prompt_end)
   else
-    PROMPT_COMMAND="__muster_prompt_command${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}"
+    PROMPT_COMMAND="__muster_prompt_begin${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}
+__muster_prompt_end"
   fi
   printf -v PS0 '%s' '{OSC_STARTED_BASH}'"${{PS0-}}"
 fi
@@ -1034,14 +1036,13 @@ user_prompt_three() { printf '[THREE:%s]' \"$?\"; }
                     "{bash}: PROMPT_COMMAND lost {entry}:\n{stream}"
                 );
             }
-            // Ours goes in as its own element rather than folded into element 0, which is the shape
-            // that only matters where every element runs. On a bash that runs element 0 alone the
-            // string form below is what keeps the user's commands, and asserting this there would be
-            // asserting the wrong thing.
+            // The begin/end hooks are separate elements around the user's entries on shells that run
+            // every array element. On older bash only element 0 runs, so the string case below covers it.
             if arrays_honoured {
                 assert!(
-                    stream.contains("[0]=\"__muster_prompt_command\""),
-                    "{bash}: our function was folded into element 0 rather than prepended to the array:\n{stream}"
+                    stream.contains("[0]=\"__muster_prompt_begin\"")
+                        && stream.contains("[4]=\"__muster_prompt_end\""),
+                    "{bash}: the integration hooks do not bracket the user's entries:\n{stream}"
                 );
             }
 
@@ -1066,6 +1067,96 @@ user_prompt_three() { printf '[THREE:%s]' \"$?\"; }
                 stream.contains("[ONE:1]"),
                 "{bash}: the first prompt command after ours saw $? = 0 rather than the command's status:\n{stream}"
             );
+        }
+    }
+
+    #[test]
+    fn prompt_end_markers_follow_dynamic_user_prompts_and_keep_exit_status() {
+        const INPUT_STARTED: &str = "\x1b]133;B\x07";
+        let check = |shell: &str, hook: &str, prompt: &str, stream: &str| {
+            let hook_at = stream.rfind(hook).unwrap_or_else(|| {
+                panic!("{shell}: user prompt hook did not report status:\n{stream}")
+            });
+            let finished_at = stream.rfind("\x1b]133;D;1\x07").unwrap_or_else(|| {
+                panic!("{shell}: failed command exit marker is missing:\n{stream}")
+            });
+            let prompt_at = stream
+                .rfind(prompt)
+                .unwrap_or_else(|| panic!("{shell}: dynamic PS1 was not printed:\n{stream}"));
+            assert!(
+                hook_at < finished_at && finished_at < prompt_at,
+                "{shell}: exit status was not reported after hooks and before the final prompt:\n{stream}"
+            );
+            let final_prompt = &stream[prompt_at..];
+            assert!(
+                final_prompt.starts_with(&format!("{prompt}{INPUT_STARTED}")),
+                "{shell}: the marker is missing from the dynamic prompt:\n{stream}"
+            );
+            assert_eq!(
+                final_prompt.matches(INPUT_STARTED).count(),
+                1,
+                "{shell}: dynamic prompt has duplicate input markers:\n{stream}"
+            );
+            let (prompts, reports) = (
+                stream.matches(INPUT_STARTED).count(),
+                stream.matches("\x1b]133;D;").count(),
+            );
+            assert!(
+                prompts == reports || prompts == reports + 1,
+                "{shell}: {prompts} input markers for {reports} prompt reports:\n{stream}"
+            );
+            assert_no_prompt_leftovers(stream, INPUT_STARTED);
+        };
+
+        for bash in bashes() {
+            let home = tempdir().unwrap();
+            let prompt_command = if bash_honours_prompt_command_arrays(&bash) {
+                "PROMPT_COMMAND=(user_prompt)"
+            } else {
+                "PROMPT_COMMAND=user_prompt"
+            };
+            fs::write(
+                home.path().join(".bash_profile"),
+                format!(
+                    "user_prompt() {{ printf '[BASH_HOOK:%s]' \"$?\"; PS1='MUSTER_DYNAMIC_BASH> '; }}\n{prompt_command}\n"
+                ),
+            )
+            .unwrap();
+            let scripts = home.path().join("scripts");
+            let stream = native_session(
+                &bash,
+                home.path(),
+                &scripts,
+                false,
+                &[b"false\n"],
+                b"\x1b]133;D;1\x07",
+                &[],
+            );
+            check(&bash, "[BASH_HOOK:1]", "MUSTER_DYNAMIC_BASH> ", &stream);
+        }
+
+        if Command::new("/bin/zsh")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            let home = tempdir().unwrap();
+            fs::write(
+                home.path().join(".zshrc"),
+                "user_prompt() { printf '[ZSH_HOOK:%s]' \"$?\"; PS1='MUSTER_DYNAMIC_ZSH> '; }\nprecmd_functions=(user_prompt)\n",
+            )
+            .unwrap();
+            let scripts = home.path().join("scripts");
+            let stream = native_session(
+                "/bin/zsh",
+                home.path(),
+                &scripts,
+                false,
+                &[b"false\n"],
+                b"\x1b]133;D;1\x07",
+                &[],
+            );
+            check("/bin/zsh", "[ZSH_HOOK:1]", "MUSTER_DYNAMIC_ZSH> ", &stream);
         }
     }
 
