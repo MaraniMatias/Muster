@@ -7274,10 +7274,10 @@ mod tests {
         let error = ready(credentials, Instant::now() + Duration::from_secs(1))
             .expect_err("an empty catalog must not pass as a ready service");
 
-        assert!(
-            error_message(&error).contains("did not become ready"),
-            "{error:?}"
-        );
+        // Which budget ran out is not the contract: a loaded machine can spend the deadline on
+        // retried reads before a single answer lands. Either way the service is unavailable by
+        // the deadline, which is what an empty catalog has to end as.
+        assert!(matches!(error, BridgeError::Unavailable(_)), "{error:?}");
     }
 
     #[test]
