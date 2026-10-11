@@ -1,6 +1,6 @@
 [package]
 name = "muster"
-version = "0.20.1"
+version = "0.21.0"
 description = "A focused workspace for repositories and checkouts"
 authors = ["Marani Matias Ezequiel"]
 license = "MIT"
