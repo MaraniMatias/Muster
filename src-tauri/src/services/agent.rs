@@ -1198,10 +1198,17 @@ fn validate_session_id(session_id: &str) -> Result<(), BridgeError> {
 
 /// Waits until the discovered service answers for this checkout, before the bridge is handed out.
 ///
-/// Ready means "the agent catalog has something in it", not merely "a route answered":
-/// `/api/agent` is empty for the first moments after the service starts, while it is still loading
-/// its configuration. A bridge that returned from that window would tell every later reader that
-/// the project has no agents at all, and the colors the sidebar paints come from that list.
+/// Ready means one thing: `/api/agent` answered inside the deadline. What the catalog holds is not
+/// part of it. OpenCode always offers its built-in agents, and the list is empty for the first
+/// moments after the service starts while it is still loading its configuration; refusing a bridge
+/// over that list would leave someone who just started their service with no bridge at all, and a
+/// row with no color of its own already falls back rather than failing.
+///
+/// The boot window is why the loop exists, and the deadline is the only clock it reads. It reads it
+/// once per round, because a reply landing a moment before the deadline and a reply landing after it
+/// are the same situation and must not be told apart. For the same reason a round that went
+/// unanswered is not a verdict: only the deadline ends the wait, unless the service answered about
+/// this bridge rather than about the timing, which is reported as it comes.
 fn ready(
     credentials: ServerCredentials,
     deadline: Instant,
@@ -1214,21 +1221,29 @@ fn ready(
         reader: Mutex::new(None),
         stopped: std::sync::atomic::AtomicBool::new(false),
     };
+    let mut answered = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(BridgeError::Unavailable(
-                "the OpenCode service did not become ready in time".into(),
-            ));
+            // The one place the outcome is decided: did anything land before the clock ran out.
+            return if answered {
+                Ok(credentials)
+            } else {
+                Err(BridgeError::Unavailable(
+                    "the OpenCode service did not become ready in time".into(),
+                ))
+            };
         }
         // /api/agent is cheap and confirms reachability, directory scoping and readiness at
         // once, which is why this route and not another.
-        let catalog: Vec<serde_json::Value> =
-            probe.get_json_with_timeout("/api/agent", remaining)?;
-        if !catalog.is_empty() || Instant::now() >= deadline {
-            // A catalog that never fills is still a usable server: the bridge works, and a row
-            // with no color of its own falls back rather than failing.
-            return Ok(credentials);
+        match probe.get_json_with_timeout::<Vec<serde_json::Value>>("/api/agent", remaining) {
+            Ok(_) => answered = true,
+            // Nothing landed this round, which is what a service that is still booting looks like.
+            Err(BridgeError::Unavailable(_)) => {}
+            // The service answered and what it said was about this bridge: a refused password, an
+            // endpoint that moved, or a reply that is not the envelope. Asking again would only be
+            // told the same thing.
+            Err(error) => return Err(error),
         }
         sleep(Duration::from_millis(50).min(remaining));
     }
@@ -3524,6 +3539,25 @@ mod tests {
         port
     }
 
+    /// A service that accepts connections and never answers any of them.
+    ///
+    /// The accepted streams are held rather than dropped, because closing one is an answer of its
+    /// own and would end the caller's wait on the wrong grounds. Left running rather than joined,
+    /// like `serving_empty_catalog`: it ends when the test binary does, and its port is returned
+    /// because that is all a caller needs to point a bridge at it.
+    fn serving_silence() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock service should bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                held.push(stream);
+            }
+        });
+        port
+    }
+
     /// What one request looked like on the wire: its request line, its Basic auth header, its
     /// body, and every header it carried so a scope can be asserted on.
     type CapturedJsonRequest = (String, String, Vec<u8>, Vec<(String, String)>);
@@ -4534,8 +4568,11 @@ mod tests {
 
     #[test]
     fn candidate_budget_covers_slow_initial_session_list() {
-        let (port, _, arrived) =
-            serving_candidate_reads(Vec::new(), &[], Duration::from_millis(300));
+        // Far beyond the bound rather than just past it: the budget is what has to end this read, and
+        // a fixture that answered a moment after the bound would make the assertion a coin toss
+        // between the deadline working and the runner being slow. Nothing waits for the delay, so
+        // what it costs the suite is nothing.
+        let (port, _, arrived) = serving_candidate_reads(Vec::new(), &[], Duration::from_secs(4));
         let agents = AgentService::with_test_server(port);
         let bridge = agents.bridge("local", Path::new("/")).unwrap();
         let budget = Duration::from_millis(100);
@@ -4550,7 +4587,7 @@ mod tests {
             "a partial candidate snapshot was published"
         );
         assert!(
-            elapsed < Duration::from_millis(250),
+            elapsed < Duration::from_secs(2),
             "initial list exceeded total budget: {elapsed:?}"
         );
     }
@@ -4625,13 +4662,14 @@ mod tests {
         }]});
         let path = directory.path().to_path_buf();
         // The mock sends headers and half a valid empty envelope promptly, then finishes the body
-        // only after the pending-read deadline has expired.
+        // only long after the pending-read deadline has expired. Four seconds is far enough past it
+        // that the bound below is about the deadline and not about how quickly the rest arrived.
         let port = serving_scoped_pending(
             listed,
             &HashMap::new(),
             &[],
             None,
-            Some((path, Duration::from_millis(1_500))),
+            Some((path, Duration::from_secs(4))),
         );
         let mut agents = AgentService::with_test_server(port);
         agents.pending_read_budget = Duration::from_millis(400);
@@ -4647,7 +4685,7 @@ mod tests {
             "a body timeout is unknown, not idle"
         );
         assert!(
-            elapsed < Duration::from_millis(1_200),
+            elapsed < Duration::from_secs(2),
             "the body read outlived its shared deadline: {elapsed:?}"
         );
     }
@@ -5106,36 +5144,45 @@ mod tests {
         assert_eq!(second_requests[0].1, first_authorization);
     }
 
-    #[test]
-    fn failed_history_advances_fair_cursor_and_keeps_other_session_progress() {
-        let origin = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-        let origin_path = origin.path().to_path_buf();
-        let destination_path = destination.path().to_path_buf();
-        let listed_sessions = ["ses_bad", "ses_good"].map(|id| {
+    /// A service whose `ses_bad` history is refused and whose `ses_good` history reports a turn that
+    /// ran in `destination`.
+    ///
+    /// `refusal_delay` is served before the refusal, which is what lets a test tell a read that was
+    /// abandoned at the budget from one that was waited out. The channel says when the refused read
+    /// reached the wire rather than when the refusal came back, because what a test needs to know
+    /// is that the read was attempted at all: without it a budget spent before the request says
+    /// nothing here, and the failure surfaces later as an unexplained cursor that never advanced.
+    fn serving_refused_history(
+        origin: &Path,
+        destination: &Path,
+        refusal_delay: Duration,
+    ) -> (u16, mpsc::Receiver<()>) {
+        let sessions = ["ses_bad", "ses_good"].map(|id| {
             serde_json::json!({
                 "id": id,
                 "time": {"updated": 2},
-                "location": {"directory": origin_path}
+                "location": {"directory": origin}
             })
         });
-        let listed = Arc::new(serde_json::json!({"data": listed_sessions}));
+        let listed = Arc::new(serde_json::json!({"data": sessions}));
         let good_history = Arc::new(serde_json::json!({"data": [{
             "type": "assistant",
             "content": [{
                 "type": "tool", "name": "shell", "time": {"completed": 10},
-                "state": {"status": "completed", "input": {"workdir": destination_path}, "metadata": {}}
+                "state": {"status": "completed", "input": {"workdir": destination}, "metadata": {}}
             }]
         }]}));
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (refused_tx, refused) = mpsc::channel();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock service should bind");
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(mut stream) = incoming else { break };
                 let listed = Arc::clone(&listed);
                 let good_history = Arc::clone(&good_history);
+                let refused_tx = refused_tx.clone();
                 std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
                     let mut request = String::new();
                     if reader.read_line(&mut request).unwrap_or(0) == 0 {
                         return;
@@ -5146,8 +5193,8 @@ mod tests {
                             break;
                         }
                     }
-                    // Only the failing history read is meant to outlast the budget; the fixed
-                    // costs stay small so a loaded runner cannot spend it before that read.
+                    // Only the refused read is meant to outlast a budget; the fixed costs stay small
+                    // so a loaded runner cannot spend the budget before that read is attempted.
                     let (status, body, delay) = if request.starts_with("GET /api/session/active") {
                         (
                             "200 OK",
@@ -5157,10 +5204,11 @@ mod tests {
                     } else if request.starts_with("GET /api/session?") {
                         ("200 OK", (*listed).clone(), Duration::from_millis(10))
                     } else if request.starts_with("GET /api/session/ses_bad/message") {
+                        let _ = refused_tx.send(());
                         (
                             "503 Service Unavailable",
                             serde_json::json!({"data": []}),
-                            Duration::from_millis(600),
+                            refusal_delay,
                         )
                     } else if request.starts_with("GET /api/session/ses_good/message") {
                         ("200 OK", (*good_history).clone(), Duration::ZERO)
@@ -5168,13 +5216,27 @@ mod tests {
                         ("200 OK", serde_json::json!({"data": []}), Duration::ZERO)
                     };
                     sleep(delay);
-                    let body = serde_json::to_vec(&body).unwrap();
+                    let body = serde_json::to_vec(&body).expect("the reply should encode");
                     let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                     let _ = stream.write_all(&body);
                 });
             }
         });
+        (port, refused)
+    }
 
+    /// A panel that has already seen both sessions work in `origin`, with `ses_bad` carrying a target
+    /// verified before anything went wrong, and the fair cursor parked on `ses_good`.
+    ///
+    /// Parking the cursor is what makes the next round start at `ses_bad`, so the failing read is
+    /// the first thing it attempts; `ses_good` is what the round after that has to let through.
+    /// Returns the service, the checkouts a read is asked about, and the target `ses_bad` starts with.
+    fn service_awaiting_a_refused_history(
+        port: u16,
+        origin: &Path,
+        destination: &Path,
+    ) -> (AgentService, Vec<(String, PathBuf)>, PathBuf) {
+        let origin_path = origin.to_path_buf();
         let agents = AgentService::with_test_server(port);
         agents.bridge("origin", &origin_path).unwrap();
         let now = Instant::now();
@@ -5211,16 +5273,42 @@ mod tests {
             );
         }
         let checkouts = vec![
-            ("origin".into(), origin_path.clone()),
-            ("destination".into(), destination_path.clone()),
+            ("origin".into(), origin_path),
+            ("destination".into(), destination.to_path_buf()),
         ];
-        let budget = Duration::from_millis(350);
+        (agents, checkouts, previous_target)
+    }
 
-        let started = Instant::now();
+    /// Long enough that a read which waited for the reply could not be mistaken for one that gave up
+    /// on it, and short enough that the mock's own threads, which nothing joins, are asleep again
+    /// long before a test binary that runs them in parallel is done.
+    const REFUSED_HISTORY_DELAY: Duration = Duration::from_secs(4);
+
+    /// What a round is given. The refused read is four seconds away from this, so the two cannot be
+    /// confused for one another the way a budget and a marginally longer delay can.
+    const RELOCATION_BUDGET: Duration = Duration::from_millis(350);
+
+    #[test]
+    fn failed_history_advances_fair_cursor_and_keeps_other_session_progress() {
+        let origin = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        // The refusal is as slow as the other test's, and that is not a timing claim here: what the
+        // slow read buys is that the round runs out of budget on the failing session, which is the
+        // situation this test describes. A refusal answered instantly would let the same round read
+        // `ses_good` too, and "the next round lets it through" would stop being a statement about
+        // fairness at all. The budget itself is measured elsewhere.
+        let (port, refused) =
+            serving_refused_history(origin.path(), destination.path(), REFUSED_HISTORY_DELAY);
+        let (agents, checkouts, previous_target) =
+            service_awaiting_a_refused_history(port, origin.path(), destination.path());
+
         let first = agents
-            .relocations_with_budget(&checkouts, false, budget)
+            .relocations_with_budget(&checkouts, false, RELOCATION_BUDGET)
             .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(500));
+
+        refused
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the refused history read was never attempted");
         assert!(first.is_empty());
         let after_first = agents.session_work.lock().unwrap();
         assert_eq!(
@@ -5235,12 +5323,36 @@ mod tests {
         drop(after_first);
 
         let second = agents
-            .relocations_with_budget(&checkouts, false, budget)
+            .relocations_with_budget(&checkouts, false, RELOCATION_BUDGET)
             .unwrap();
         assert!(second
             .iter()
             .any(|move_| move_.session_id == "ses_good" && move_.to_checkout_id == "destination"));
         assert!(agents.session_work.lock().unwrap()["ses_good"].completed == 10);
+    }
+
+    #[test]
+    fn a_history_read_that_will_not_answer_is_abandoned_at_the_budget() {
+        let origin = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let (port, refused) =
+            serving_refused_history(origin.path(), destination.path(), REFUSED_HISTORY_DELAY);
+        let (agents, checkouts, _previous_target) =
+            service_awaiting_a_refused_history(port, origin.path(), destination.path());
+
+        let started = Instant::now();
+        let first = agents
+            .relocations_with_budget(&checkouts, false, RELOCATION_BUDGET)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        refused
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the read that never answers was never attempted");
+        assert!(first.is_empty());
+        // Generous enough that a loaded runner passes it, and still well short of the four seconds
+        // the refusal takes: a round that waited for the reply would land here at about four.
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
@@ -7255,7 +7367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_service_with_no_agents_yet_is_given_until_the_deadline_and_no_longer() {
+    fn an_empty_catalog_is_a_ready_service_once_the_deadline_passes() {
         let directory = tempfile::tempdir().unwrap();
         // A service that answers for this checkout with an empty catalog, which is what the first
         // moments after someone starts OpenCode look like. It keeps answering, because how many
@@ -7271,13 +7383,42 @@ mod tests {
             directory: directory.path().to_path_buf(),
         };
 
-        let error = ready(credentials, Instant::now() + Duration::from_secs(1))
-            .expect_err("an empty catalog must not pass as a ready service");
+        let started = Instant::now();
+        let accepted = ready(credentials.clone(), started + Duration::from_secs(1))
+            .expect("a service that answers is ready, whatever the catalog holds");
 
-        // Which budget ran out is not the contract: a loaded machine can spend the deadline on
-        // retried reads before a single answer lands. Either way the service is unavailable by
-        // the deadline, which is what an empty catalog has to end as.
-        assert!(matches!(error, BridgeError::Unavailable(_)), "{error:?}");
+        assert_eq!(accepted, credentials);
+        // The catalog never fills, so the deadline is the only thing that can end the wait. That is
+        // the point: the answer must not depend on whether a reply landed just before the deadline
+        // or just after it. The lower bound is what proves the loop ran to the end rather than
+        // deciding early; the upper bound is slack enough that a loaded machine cannot fail it.
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(800), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_service_that_never_answers_is_not_ready_when_the_deadline_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        // The other half of the same rule: an answer is what makes a service ready, so a service
+        // that stays silent is unavailable by the deadline however much of it it was given.
+        let port = serving_silence();
+        let credentials = ServerCredentials {
+            endpoint: ServiceEndpoint {
+                url: format!("http://127.0.0.1:{port}"),
+                port,
+                password: "secret".into(),
+            },
+            directory: directory.path().to_path_buf(),
+        };
+
+        let error = ready(credentials, Instant::now() + Duration::from_secs(1))
+            .expect_err("a service that never answered is not a ready service");
+
+        assert_eq!(
+            error_message(&error),
+            "the OpenCode service did not become ready in time"
+        );
     }
 
     #[test]
