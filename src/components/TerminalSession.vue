@@ -10,7 +10,16 @@ import { isIpcError } from "../domain/ipc";
 import { terminalHasProcess } from "../domain/workspace";
 import type { TerminalSessionStatus } from "../domain/workspace";
 import type { TerminalCursorStyle, TerminalScrollbarMode } from "../domain/settings";
-import { closeTerminal, createTerminal, getTerminalStatus, resizeTerminal, writeTerminal } from "../lib/ipc";
+import {
+  closeTerminal,
+  createTerminal,
+  getTerminalStatus,
+  launchPiReviewTerminal,
+  resizeTerminal,
+  writeTerminal,
+} from "../lib/ipc";
+import type { ReviewLaunch } from "../lib/ipc";
+import type { ReviewRound } from "../domain/review";
 import {
   attachTerminalRenderer,
   createMusterTerminal,
@@ -55,6 +64,13 @@ const props = withDefaults(
     cursorBlink?: boolean;
     cursorStyle?: TerminalCursorStyle;
     zoom?: number;
+    /**
+     * Set when this terminal is a Pi started to receive a review rather than a shell.
+     *
+     * Read once, when the session starts: it says what the terminal was opened to become, and a
+     * terminal that is already running is not the same one re-decided.
+     */
+    launch?: ReviewLaunch;
   }>(),
   {
     visible: true,
@@ -67,10 +83,18 @@ const props = withDefaults(
     cursorBlink: true,
     cursorStyle: "block",
     zoom: 1,
+    launch: undefined,
   },
 );
 const emit = defineEmits<{
   created: [result: Awaited<ReturnType<typeof createTerminal>>];
+  /**
+   * The round a launched Pi's terminal is holding.
+   *
+   * A separate answer from `created` because it means something different: the terminal existing
+   * is not the round arriving, which is why the round travels with it and stays pending.
+   */
+  reviewLaunched: [round: ReviewRound];
   closed: [workspace: Awaited<ReturnType<typeof closeTerminal>>];
   statusChanged: [status: TerminalSessionStatus];
   failed: [message: string];
@@ -779,7 +803,7 @@ watch(
 defineExpose({ requestClose, changeDirectory, focus: () => terminal.focus() });
 
 async function startSession() {
-  if (started || disposed || !terminalReady || !props.active || !terminalElement.value) return;
+  if (started || disposed || !terminalReady || (!props.active && !props.launch) || !terminalElement.value) return;
   started = true;
   fitActiveView();
   // One writer for the whole session, before the first byte can arrive: chunks are joined and
@@ -800,13 +824,35 @@ async function startSession() {
     outputWriter?.push(buffer);
   };
   const initialSize = { cols: terminal.cols || 80, rows: terminal.rows || 24 };
+  const launch = props.launch;
   try {
-    const created = await createTerminal(props.checkoutId, initialSize.cols, initialSize.rows, channel);
+    // The same session, the same output channel and the same PTY either way: what differs is only
+    // what runs in it. A review Pi is handed its notes through this call and is never written to
+    // afterwards, so nothing here is a place input could be injected.
+    let created: Awaited<ReturnType<typeof createTerminal>>;
+    // The round the backend recorded for a Pi it just started. Carried alongside rather than read
+    // off the answer because a terminal existing says a Pi was started, not that it read anything:
+    // the round arrives pending, and its own state is what says so.
+    let launchedRound: ReviewRound | null = null;
+    if (launch) {
+      const launched = await launchPiReviewTerminal(
+        launch,
+        props.checkoutId,
+        initialSize.cols,
+        initialSize.rows,
+        channel,
+      );
+      created = launched;
+      launchedRound = launched.round;
+    } else {
+      created = await createTerminal(props.checkoutId, initialSize.cols, initialSize.rows, channel);
+    }
     if (disposed) {
       await closeTerminal(props.checkoutId, created.session.id);
       return;
     }
     sessionId = created.session.id;
+    if (launchedRound) emit("reviewLaunched", launchedRound);
     // The writer may already have counted output the backend sent before the session had a name
     // to be answered under, and the first report is what lets the reader's gate be opened by an
     // answer rather than by its own timeout.
@@ -973,7 +1019,7 @@ watch(
     // here rather than left at the pace the session started at.
     syncStatusPolling();
     if (active && visible && sessionUnavailable.value && (!wasActive || !wasVisible)) void pollStatus();
-    if (!active) return;
+    if (!active && !props.launch) return;
     await nextTick();
     fitActiveView();
     if (visible && focused) terminal.focus();

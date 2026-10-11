@@ -59,8 +59,14 @@ const mocks = vi.hoisted(() => ({
   isMaximized: vi.fn(),
   onWindowResized: null as (() => void) | null,
   followAgentRelocation: null as ((relocation: unknown) => void) | null,
-  /** The sessions each worktree's OpenCode lists, as `useTerminalAgentRows` would report them. */
-  agentSessionsByCheckout: {} as Record<string, { id: string; title: string }[]>,
+  /**
+   * The sessions each worktree's OpenCode lists, as `useTerminalAgentRows` would report them.
+   *
+   * `provider` is OpenCode for all of them, which is the whole of what these tests need: the panel
+   * matches an OpenCode terminal by the title its TUI wrote, and it matches only OpenCode sessions,
+   * so a stub without the field would be read as belonging to no provider and named by nobody.
+   */
+  agentSessionsByCheckout: {} as Record<string, { id: string; title: string; provider: string }[]>,
   moveSession: vi.fn(),
   focusActiveTerminal: vi.fn(),
   onCloseRequested: null as ((event: { preventDefault(): void }) => Promise<void>) | null,
@@ -74,6 +80,8 @@ const mocks = vi.hoisted(() => ({
   agentSessions: [] as Array<{
     id: string;
     checkoutId: string;
+    provider: "opencode" | "pi";
+    terminalId?: string | null;
     title: string;
     busy: boolean;
     awaitingReply: boolean;
@@ -83,11 +91,17 @@ const mocks = vi.hoisted(() => ({
   agentTargetId: null as string | null,
   createAgentSession: vi.fn(),
   dispatchReviewRound: vi.fn(),
+  recordReviewRound: vi.fn(),
+  refreshReviewNotes: vi.fn(async () => undefined),
   reconcileRounds: vi.fn(),
   flushQueuedRounds: vi.fn(),
   ackFinishedTurn: vi.fn(),
+  settlePiRound: vi.fn(async () => []),
   // Turn completions are observed, so the watcher needs a real reactive source.
   turns: null as { value: number } | null,
+  completedSessionIds: [] as string[],
+  // Live agent events are observed too, and a Pi settlement is asked about from one.
+  agentEvents: null as { report(event: unknown): void; reset(): void } | null,
 }));
 
 vi.mock("reka-ui", async () => {
@@ -375,15 +389,27 @@ vi.mock("./presentation/review-notes", () => ({
     clearOutdated: vi.fn(),
     resolveNote: vi.fn(),
     dispatchRound: mocks.dispatchReviewRound,
+    recordRound: mocks.recordReviewRound,
+    refreshNotes: mocks.refreshReviewNotes,
     reconcileRounds: mocks.reconcileRounds,
     flushQueuedRounds: mocks.flushQueuedRounds,
     ackFinishedTurn: mocks.ackFinishedTurn,
+    settlePiRound: mocks.settlePiRound,
   }),
 }));
 vi.mock("./presentation/agent-sessions", async () => {
   const { reactive } = await import("vue");
   const turns = reactive({ value: 0 });
   mocks.turns = turns;
+  // The event stream is real reactive state, because the shell watches it for the two Pi reports
+  // that can settle a review round.
+  const events = reactive<{ events: unknown[] }>({ events: [] });
+  mocks.agentEvents = {
+    // Reassigned rather than pushed into, which is how the real store reports one: the shell
+    // watches the list itself, so replacing it is what a watcher here tracks.
+    report: (event: unknown) => (events.events = [...events.events, event]),
+    reset: () => (events.events = []),
+  };
   return {
     AGENT_EVENT: "muster://agent-event",
     useAgentSessions: () => ({
@@ -392,7 +418,9 @@ vi.mock("./presentation/agent-sessions", async () => {
       targetId: mocks.agentTargetId,
       state: "ready",
       error: "",
-      events: [],
+      get events() {
+        return events.events;
+      },
       reload: vi.fn(),
       createSession: mocks.createAgentSession,
       selectTarget: vi.fn(),
@@ -400,6 +428,9 @@ vi.mock("./presentation/agent-sessions", async () => {
       // A getter, so the watcher that observes turn completions tracks this source.
       get turnsCompleted() {
         return turns.value;
+      },
+      get completedSessionIds() {
+        return mocks.completedSessionIds;
       },
     }),
     // The sidebar rows read this, keyed by checkout. Empty here: these tests are about the rest
@@ -470,7 +501,14 @@ const SidebarStub = defineComponent({
 const SessionPaneStub = defineComponent({
   name: "SessionPane",
   props: { activeSessionId: String },
-  emits: ["sessionStatusChanged", "workspaceUpdated", "shellCreated", "sessionOrder"],
+  emits: [
+    "sessionStatusChanged",
+    "workspaceUpdated",
+    "shellCreated",
+    "sessionOrder",
+    "reviewRoundLaunched",
+    "reviewLaunchFailed",
+  ],
   setup(props, { expose }) {
     onMounted(() => (mocks.sessionPaneMounts += 1));
     expose({ focusActiveTerminal: mocks.focusActiveTerminal, moveSession: mocks.moveSession });
@@ -564,6 +602,9 @@ const FileDiffStub = defineComponent({
               false,
             ),
         }),
+        // The shell's own Pi feedback, so a test can read what the panel the send came from
+        // would draw. The real component draws it from this same sender.
+        sender?.piFeedback ? h("span", { "data-testid": "pi-feedback" }, JSON.stringify(sender.piFeedback)) : null,
       ]);
   },
 });
@@ -685,6 +726,7 @@ describe("App UI integration", () => {
     mocks.reviewNotes = [];
     mocks.agentSessions = [];
     mocks.agentTargetId = null;
+    mocks.completedSessionIds = [];
     mocks.followAgentRelocation = null;
     mocks.agentSessionsByCheckout = {};
     mocks.createAgentSession.mockReset();
@@ -692,9 +734,12 @@ describe("App UI integration", () => {
     mocks.moveSession.mockReset();
     mocks.moveSession.mockResolvedValue({ moved: true, directoryChange: "not-requested" });
     mocks.dispatchReviewRound.mockReset();
+    mocks.recordReviewRound.mockReset();
     mocks.reconcileRounds.mockReset();
     mocks.flushQueuedRounds.mockReset();
     mocks.ackFinishedTurn.mockReset();
+    mocks.settlePiRound.mockClear();
+    mocks.agentEvents?.reset();
     if (mocks.turns) mocks.turns.value = 0;
     mocks.loadAppLayout.mockResolvedValue({ ...DEFAULT_APP_LAYOUT });
     mocks.loadSettings.mockResolvedValue(cloneSettings(DEFAULT_SETTINGS));
@@ -769,6 +814,7 @@ describe("App UI integration", () => {
     return {
       id,
       checkoutId: "checkout:one",
+      provider: "opencode" as const,
       title: "review",
       busy: false,
       idleAt: 1,
@@ -1464,8 +1510,14 @@ describe("App UI integration", () => {
   });
 
   describe("an OpenCode session that moved to another worktree", () => {
-    /** The session a terminal is showing: the id a move names, and the title its TUI wrote. */
-    const agentSession = (title: string) => ({ id: `ses_${title}`, title });
+    /**
+     * The session a terminal is showing: the id a move names, the title its TUI wrote, and the
+     * program it belongs to.
+     *
+     * The provider is what scopes the title inference to OpenCode, so a stub without it names no
+     * session at all and every move in this block would be refused for the wrong reason.
+     */
+    const agentSession = (title: string) => ({ id: `ses_${title}`, title, provider: "opencode" });
     const move = (
       sessionId: string,
       fromCheckoutId = "checkout:one",
@@ -1882,7 +1934,7 @@ describe("App UI integration", () => {
       );
       mocks.agentSessionsByCheckout["checkout:one"] = [
         agentSession("ship it"),
-        { id: "ses_duplicate", title: "ship it" },
+        { id: "ses_duplicate", title: "ship it", provider: "opencode" },
       ];
 
       move("ses_ship it");
@@ -3513,12 +3565,15 @@ describe("App UI integration", () => {
     },
   );
 
-  it("dispatches the review to the chosen agent session as one round", async () => {
+  it("dispatches the review only to an OpenCode session when Pi is newer and selected", async () => {
     mocks.loadReviewTarget.mockResolvedValue("opencode");
     mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
     mocks.reviewNotes = [reviewNoteFixture()];
-    mocks.agentSessions = [agentSessionFixture("ses_one", 10)];
-    mocks.agentTargetId = "ses_one";
+    mocks.agentSessions = [
+      agentSessionFixture("ses_one", 10),
+      { ...agentSessionFixture("ses_pi", 99), provider: "pi", terminalId: "terminal:pi" },
+    ];
+    mocks.agentTargetId = "ses_pi";
     mocks.dispatchReviewRound.mockResolvedValue({
       id: "round:1",
       checkoutId: "checkout:one",
@@ -3553,16 +3608,187 @@ describe("App UI integration", () => {
     const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
     expect(mocks.flushQueuedRounds).not.toHaveBeenCalled();
 
+    mocks.completedSessionIds = ["ses_one"];
     mocks.turns!.value = 1;
     await flushPromises();
 
     // The flush runs before the round is acknowledged: a queued review goes out while the
     // agent is free, and the turn completion is what says it is.
     expect(mocks.flushQueuedRounds).toHaveBeenCalledTimes(1);
-    expect(mocks.ackFinishedTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.ackFinishedTurn).toHaveBeenCalledExactlyOnceWith("ses_one");
     expect(mocks.flushQueuedRounds.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.ackFinishedTurn.mock.invocationCallOrder[0],
     );
+    wrapper.unmount();
+  });
+
+  /**
+   * A Pi send opens a terminal instead of naming a session, and it opens it in the checkout the
+   * reader was looking at.
+   *
+   * Nothing about a session takes part — no dispatch, no target to resolve, and no session created
+   * to have one to send to — because there is no session until this terminal has started one.
+   */
+  it("opens a terminal in the same checkout for Pi, with no session and no queue", async () => {
+    mocks.loadReviewTarget.mockResolvedValue("pi");
+    mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
+    mocks.reviewNotes = [reviewNoteFixture()];
+    mocks.agentSessions = [agentSessionFixture("ses_one", 10)];
+    mocks.agentTargetId = "ses_one";
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one"), checkout("checkout:two")));
+
+    await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+    await flushPromises();
+    await wrapper.get('[data-testid="send-review"]').trigger("click");
+    await flushPromises();
+
+    const main = wrapper.getComponent({ name: "MainPane" });
+    const request = main.props("shellRequest") as {
+      checkoutId: string;
+      token: number;
+      reviewLaunch?: { ids: string[]; markdown: string };
+    };
+    expect(request.checkoutId).toBe("checkout:one");
+    expect(request.reviewLaunch?.ids).toEqual(["note:1"]);
+    expect(request.reviewLaunch?.markdown).toContain("# Code Review ");
+    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+    expect(mocks.createAgentSession).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  /**
+   * A round whose Pi has been started is not a round that has landed.
+   *
+   * The terminal opening and the Pi reporting itself in say a Pi was launched and where; neither
+   * says the review was read. So the round joins the list still pending, its notes are re-read from
+   * the backend rather than assumed delivered, and nothing acks it.
+   */
+  it("keeps a launched Pi round pending until something confirms it", async () => {
+    mocks.loadReviewTarget.mockResolvedValue("pi");
+    mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
+    mocks.reviewNotes = [reviewNoteFixture()];
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    const pane = wrapper.getComponent({ name: "SessionPane" });
+
+    const round = {
+      id: "round:pi:1",
+      checkoutId: "checkout:one",
+      provider: "pi",
+      sessionId: null,
+      terminalId: "session:terminal:pi",
+      status: "dispatching",
+      marker: "muster-review:round:pi:1",
+      noteIds: ["note:1"],
+      createdAt: "1",
+      updatedAt: "1",
+    } as const;
+    pane.vm.$emit("reviewRoundLaunched", round);
+    await flushPromises();
+
+    expect(mocks.recordReviewRound).toHaveBeenCalledWith(round);
+    expect(mocks.refreshReviewNotes).toHaveBeenCalled();
+    // Recorded and re-read, never dispatched, reconciled or acked: the terminal opening and the Pi
+    // reporting itself in say a Pi was launched, not that the review was read.
+    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+    expect(mocks.ackFinishedTurn).not.toHaveBeenCalled();
+    expect(mocks.reconcileRounds).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  /**
+   * What a Pi round needs is asked of the Pi, from the two reports it makes.
+   *
+   * The session appearing is when its receipts are readable, and a turn settling is the only
+   * completion a Pi announces — `turn_end` and `agent_end` are boundaries it can keep working
+   * past, so neither is one. Everything else on the stream is about a row, not about a round, so
+   * it is not asked about, and a report that has already been acted on is not asked about twice.
+   */
+  it("asks what a Pi reported about its round, and only from the two reports that mean something", async () => {
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    expect(mocks.settlePiRound).not.toHaveBeenCalled();
+
+    const report = async (rawType: string, sessionId: string | null) => {
+      mocks.agentEvents!.report({
+        checkoutId: "checkout:one",
+        sessionId,
+        kind: "turnFinished",
+        rawType,
+        data: null,
+      });
+      await flushPromises();
+    };
+
+    await report("pi.session_started", "ses_pi");
+    expect(mocks.settlePiRound).toHaveBeenCalledWith("ses_pi", "checkout:one");
+
+    // A later runtime report for the same session is re-checked: the first may have arrived
+    // before the launched round was bound, and backend settlement is idempotent.
+    await report("pi.session_started", "ses_pi");
+    expect(mocks.settlePiRound).toHaveBeenCalledTimes(2);
+
+    await report("pi.agent_settled", "ses_pi");
+    expect(mocks.settlePiRound).toHaveBeenCalledTimes(3);
+
+    // A prompt the person has to answer says nothing about a round, and neither does an event
+    // with no session to settle: there is nothing to ask about.
+    await report("pi.ui_prompt_start", "ses_pi");
+    await report("pi.ui_prompt_end", "ses_pi");
+    await report("turnFinished", "ses_opencode");
+    await report("pi.agent_settled", null);
+    expect(mocks.settlePiRound).toHaveBeenCalledTimes(3);
+
+    // And asking settles rounds; it is never a route that sends one.
+    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+    expect(mocks.flushQueuedRounds).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  /**
+   * A Pi send that never started one leaves nothing to hang a failure on.
+   *
+   * It fails before anything is recorded — the backend undoes the round and its notes — so the
+   * only lasting trace is the reason, and it is drawn on the panel the send came from rather than
+   * in a toast nobody is looking at any more. A launch that works is what takes it away.
+   */
+  it("keeps why a Pi send did not start, until one does", async () => {
+    mocks.loadReviewTarget.mockResolvedValue("pi");
+    mocks.reviewNotes = [reviewNoteFixture()];
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    const pane = wrapper.getComponent({ name: "SessionPane" });
+    // The panel the send came from, which is where the reason is drawn.
+    await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+    await flushPromises();
+    const feedback = () =>
+      wrapper.find('[data-testid="pi-feedback"]').exists()
+        ? JSON.parse(wrapper.get('[data-testid="pi-feedback"]').text())
+        : null;
+
+    pane.vm.$emit("reviewLaunchFailed", "Pi is not installed, or not on this app's PATH");
+    await flushPromises();
+    expect(feedback()).toEqual({
+      pending: 0,
+      delivered: 0,
+      settled: 0,
+      error: "Pi is not installed, or not on this app's PATH",
+    });
+
+    pane.vm.$emit("reviewRoundLaunched", {
+      id: "round:pi:2",
+      checkoutId: "checkout:one",
+      provider: "pi",
+      sessionId: null,
+      terminalId: "session:terminal:pi",
+      status: "dispatching",
+      marker: "muster-review:round:1762000000:4242:7",
+      noteIds: ["note:1"],
+      createdAt: "1",
+      updatedAt: "1",
+    } as const);
+    await flushPromises();
+    // A launch that worked takes the failure away. With the round the store holds still the one it
+    // always was, there is nothing left to draw at all — which is the honest reading: the reason
+    // is gone and no delivery has been claimed.
+    expect(feedback()?.error ?? "").toBe("");
     wrapper.unmount();
   });
 
@@ -3570,8 +3796,8 @@ describe("App UI integration", () => {
     mocks.loadReviewTarget.mockResolvedValue("opencode");
     mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
     mocks.reviewNotes = [reviewNoteFixture()];
-    mocks.agentSessions = [];
-    mocks.agentTargetId = null;
+    mocks.agentSessions = [{ ...agentSessionFixture("ses_pi", 99), provider: "pi", terminalId: "terminal:pi" }];
+    mocks.agentTargetId = "ses_pi";
     mocks.createAgentSession.mockResolvedValue(agentSessionFixture("ses_new", 10));
     mocks.dispatchReviewRound.mockResolvedValue({
       id: "round:1",

@@ -36,6 +36,10 @@ portable-pty = "0.9"
 ureq = { version = "3", default-features = false, features = ["json"] }
 notify = "8"
 libc = "0.2"
+# The credential a terminal hands its Pi, so a connection can be checked against what this app
+# minted. Already in the tree as a transitive dependency; named directly because a credential that
+# could not be unpredictable would still be a credential, and that failure has to be visible.
+getrandom = "0.3"
 # Local MCP automation bridge. Optional and only compiled with the `dev-bridge`
 # feature, so release builds never include it.
 tauri-plugin-mcp-bridge = { version = "0.13", optional = true }

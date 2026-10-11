@@ -16,6 +16,7 @@ import {
   X as XIcon,
 } from "@lucide/vue";
 import type { Checkout, Repo } from "./domain/workspace";
+import type { AgentEvent } from "./domain/agent";
 import type { CheckoutFileActivity } from "./domain/git";
 import type { ReviewTarget } from "./domain/review";
 import {
@@ -69,10 +70,11 @@ import { useTerminalMovement } from "./presentation/terminal-movement-controller
 import { WORKDIR_ICONS } from "./presentation/workdir-icons";
 import { theme } from "./presentation/theme";
 import type { Theme } from "./presentation/theme";
-import { AGENT_APP, defaultAgentSession, matchAgentSessionTitle } from "./domain/agent";
+import { AGENT_APP, defaultOpenCodeSession, matchAgentSessionTitle } from "./domain/agent";
 import { DEFAULT_ZOOM, zoomKeyFor, zoomLabel, zoomStep } from "./domain/zoom";
 import type { Zoom, ZoomModifier } from "./domain/zoom";
 import { buildReviewMarkdown, localReviewTimestamp } from "./domain/review";
+import type { ReviewRound } from "./domain/review";
 import { useLayoutPersistence } from "./presentation/layout-persistence";
 import { isMarkdownPath } from "./presentation/markdown-preview";
 import { mediaKind } from "./domain/media";
@@ -92,6 +94,7 @@ import type { AppSettings, ReviewStorageMode } from "./domain/settings";
 import type { ReviewFolder } from "./domain/files";
 import { formatBytes } from "./domain/files";
 import { loadAppLayout, loadCheckoutUiState, loadSettings, prepareAppExit, saveSettings } from "./lib/ipc";
+import type { ReviewLaunch } from "./lib/ipc";
 import { reportFrontendDiagnostic } from "./lib/diagnostics";
 import type { DiagnosticCategory } from "./lib/diagnostics";
 
@@ -204,6 +207,14 @@ const terminalMovement = useTerminalMovement({
     workspace.value.activeCheckoutId === fromCheckoutId &&
     workspace.value.activeSessionId === sessionId &&
     terminalIsOnScreen(sessionId),
+  isPiTerminal: (terminalId) =>
+    workspace.value.repos.some((repo) =>
+      repo.checkouts.some((checkout) =>
+        terminalAgents
+          .row(checkout.id)
+          .sessions.some((session) => session.provider === "pi" && session.terminalId === terminalId),
+      ),
+    ),
   moveSession: async (sessionId, checkoutId, index, changeDirectory, selectTarget) =>
     await mainPane.value?.moveSession(sessionId, checkoutId, index, changeDirectory, selectTarget),
   followMovedTerminal: async (sessionId, checkoutId, isCurrent) => {
@@ -235,7 +246,9 @@ watch(
     if (!checkoutId) return;
     try {
       const target = await loadReviewTarget(checkoutId);
-      if (request === reviewTargetLoadGeneration) reviewTarget.value = target === "opencode" ? target : "markdown";
+      // A saved target this build does not name is not a destination, and "Markdown" is what a
+      // checkout with no saved choice gets. `pi` is a real destination and is read back as itself.
+      if (request === reviewTargetLoadGeneration && target !== "markdown") reviewTarget.value = target;
     } catch (cause) {
       if (request === reviewTargetLoadGeneration) reportCause(cause);
     }
@@ -259,19 +272,52 @@ watch(
   },
 );
 
-// v2.0.18 has no turn-completed event, so a finished turn is observed rather than announced.
-// When one is seen the round closes, which is what clears the "rounds not finished" count.
-// What the turn did to each line is judged separately, by the diff.
+// v2.0.18 has no turn-completed event, so OpenCode completions are observed by session.
+// A Pi settlement is handled only by its receipt/agent_settled path below.
+let observedCompletedTurns = 0;
 watch(
   () => agent.turnsCompleted,
-  async () => {
-    // A queued round waited for exactly this: the agent is free now, so the reviews held
-    // back while it was busy go out, oldest first.
+  async (completed) => {
+    const sessionIds = agent.completedSessionIds.slice(observedCompletedTurns, completed);
+    observedCompletedTurns = completed;
+    if (!sessionIds.length) return;
     await review.flushQueuedRounds();
-    await review.ackFinishedTurn();
+    for (const sessionId of sessionIds) await review.ackFinishedTurn(sessionId);
   },
 );
-const shellRequest = ref<{ checkoutId: string; token: number } | null>(null);
+
+/**
+ * The two Pi reports that can move a round, and nothing else.
+ *
+ * A session appearing is when its receipts are first readable, and a turn settling is the only
+ * completion a Pi announces. `ui_prompt_start` and the rest say nothing about a round, so they
+ * are not asked about.
+ */
+const PI_SETTLING_REPORTS = ["pi.session_started", "pi.agent_settled"];
+/** Event objects already acted on; a new report for the same session must be checked again. */
+const askedPiReports = new WeakSet<AgentEvent>();
+
+/**
+ * Asks the backend what a Pi session's own reports prove about its rounds.
+ *
+ * Driven from the event stream rather than from a read, because both facts live where they are
+ * observed: a receipt exists only while Pi is connected, and a settlement only ever arrives as
+ * an announcement. Asking is not sending — the command behind it cannot start a Pi — so a round
+ * that has not been confirmed stays unconfirmed instead of being sent again by something that
+ * noticed it.
+ */
+watch(
+  () => agent.events,
+  (events) => {
+    for (const event of events) {
+      if (!event.sessionId || !PI_SETTLING_REPORTS.includes(event.rawType)) continue;
+      if (askedPiReports.has(event)) continue;
+      askedPiReports.add(event);
+      void review.settlePiRound(event.sessionId, event.checkoutId);
+    }
+  },
+);
+const shellRequest = ref<{ checkoutId: string; token: number; reviewLaunch?: ReviewLaunch } | null>(null);
 let shellRequestToken = 0;
 let pendingShellNavigation: { checkoutId: string; token: number; revision: number } | null = null;
 watch(launchCheckoutId, (checkoutId) => {
@@ -1709,18 +1755,31 @@ function restoreArchivedWorktrees(repoId: string) {
   });
 }
 
-async function requestShell(checkoutId: string) {
+async function requestShell(checkoutId: string, reviewLaunch?: ReviewLaunch) {
   const selection = { activeCheckoutId: checkoutId, activeSessionId: null };
   noteTerminalNavigation(selection);
   showView(checkoutId, { kind: "terminal", sessionId: null }, { navigation: false });
   const token = ++shellRequestToken;
   const revision = terminalMovement.navigationRevision;
   pendingShellNavigation = { checkoutId, token, revision };
+  if (reviewLaunch) {
+    // Launch ownership is the requested checkout, not whichever navigation finishes last. The
+    // terminal request must survive a later navigation, while its stale selection must not.
+    shellRequest.value = { checkoutId, token, reviewLaunch };
+    void persistCheckoutSelection(checkoutId)
+      .then(() => {
+        if (token === shellRequestToken && revision === terminalMovement.navigationRevision) {
+          workspace.value = { ...workspace.value, ...selection };
+        }
+      })
+      .catch(reportCause);
+    return;
+  }
   try {
     await persistCheckoutSelection(checkoutId);
     if (token !== shellRequestToken || revision !== terminalMovement.navigationRevision) return;
     workspace.value = { ...workspace.value, ...selection };
-    shellRequest.value = { checkoutId, token };
+    shellRequest.value = { checkoutId, token, reviewLaunch };
   } catch (cause) {
     if (token === shellRequestToken) {
       if (pendingShellNavigation?.token === token) pendingShellNavigation = null;
@@ -1729,12 +1788,23 @@ async function requestShell(checkoutId: string) {
   }
 }
 
+/** Why the last Pi send did not start, when it did not. Empty while nothing has failed. */
+const piLaunchError = ref("");
+
 /**
- * Ships the notes the caller chose to one agent session as a single message.
+ * Ships the notes the caller chose to one agent as a single message.
  *
- * The round is recorded before the agent is called, so an interrupted send is recognizable
- * afterwards instead of being repeated. The target comes from the bridge, so a review can
- * never land in a session belonging to another checkout.
+ * The three destinations are three different journeys, and which one is taken is decided before
+ * anything is built: Markdown is written out, OpenCode is sent to a session that already exists,
+ * and Pi has no session to name — a send to Pi opens a terminal running one. That last one is
+ * why this asks the shell for a terminal rather than dispatching a round itself: the Pi's output
+ * belongs to the terminal that runs it, so the terminal has to exist before there is anything to
+ * read or to focus.
+ *
+ * The round is recorded by the backend before the message can reach the agent, as it is for the
+ * OpenCode path. What differs is what the round can then be: a Pi round is confirmed from the
+ * marker that Pi reports having read, and closed from the settlement Pi announces, so it says
+ * "delivered" and "finished" on its own schedule rather than when a turn is next observed.
  */
 async function sendReviewToAgent(ids: string[], queue = false) {
   const checkout = activeCheckout.value;
@@ -1763,6 +1833,14 @@ async function sendReviewToAgent(ids: string[], queue = false) {
       });
       return;
     }
+    // No queue and no target to resolve: every Pi send opens its own terminal in this checkout.
+    if (destination === "pi") {
+      await requestShell(checkout.id, {
+        ids: notes.map((note) => note.id),
+        markdown,
+      });
+      return;
+    }
     const target = await resolveAgentTarget();
     if (!target) return;
     // `queue` records the round and leaves the agent alone: the message it was accepted
@@ -1775,7 +1853,11 @@ async function sendReviewToAgent(ids: string[], queue = false) {
       queue,
     );
   } catch (cause) {
-    reportCause(cause);
+    // Kept on the destination rather than in a toast alone: a Pi send fails before it can
+    // record anything, so there is no round to draw the failure on and an expiring toast is all
+    // there would otherwise be. Only a launch that works clears it.
+    const message = reportCause(cause);
+    if (destination === "pi") piLaunchError.value = message;
   } finally {
     sendingReview.value = false;
   }
@@ -1795,7 +1877,10 @@ async function selectReviewTarget(target: ReviewTarget) {
 
 /** The session a review goes to: the selected one, otherwise the newest live session. */
 async function resolveAgentTarget(): Promise<string | null> {
-  const target = agent.targetId ?? defaultAgentSession(agent.sessions)?.id ?? null;
+  const target =
+    agent.sessions.find((session) => session.provider === "opencode" && session.id === agent.targetId)?.id ??
+    defaultOpenCodeSession(agent.sessions)?.id ??
+    null;
   if (target) return target;
   // No session yet: start one so the review is not silently dropped.
   const created = await agent.createSession(`Review ${new Date().toISOString().slice(0, 10)}`);
@@ -1820,7 +1905,21 @@ const reviewSender: ReviewSender = {
     return agent.targetId;
   },
   get unfinishedRounds() {
-    return review.rounds.filter((round) => round.status !== "acked" && round.status !== "relocated").length;
+    return review.rounds.filter(
+      (round) => round.provider === "opencode" && round.status !== "acked" && round.status !== "relocated",
+    ).length;
+  },
+  get piFeedback() {
+    const rounds = review.rounds.filter((round) => round.provider === "pi");
+    const count = (statuses: ReviewRound["status"][]) =>
+      rounds.filter((round) => statuses.includes(round.status)).length;
+    // Nothing to say until something has been sent or has failed: a checkout whose Pi rounds are
+    // all settled has no business drawing a line about it.
+    const pending = count(["dispatching", "queued"]);
+    const delivered = count(["dispatched"]);
+    const settled = count(["acked"]);
+    if (!pending && !delivered && !settled && !piLaunchError.value) return null;
+    return { pending, delivered, settled, error: piLaunchError.value };
   },
   selectTarget: (sessionId) => agent.selectTarget(sessionId),
   selectReviewTarget,
@@ -1873,9 +1972,12 @@ function noteTerminalNavigation(
  * several, and the id, because the same title can be on that list more than once.
  */
 function terminalShowsSession(checkoutId: string, terminalId: string, sessionId: string): boolean {
+  const sessions = terminalAgents.row(checkoutId).sessions;
+  const pi = sessions.find((session) => session.provider === "pi" && session.terminalId === terminalId);
+  if (pi) return pi.id === sessionId;
   const status = sessionRuntimeStatuses.value[terminalId];
   if (status?.foregroundApp !== AGENT_APP) return false;
-  const match = matchAgentSessionTitle(terminalAgents.row(checkoutId).sessions, agentSessionTitle(status));
+  const match = matchAgentSessionTitle(sessions, agentSessionTitle(status));
   return match.kind === "one" && match.session.id === sessionId;
 }
 
@@ -1898,6 +2000,31 @@ async function renameTerminalSession(sessionId: string, name: string) {
 
 function applyWorkspace(next: WorkspaceState) {
   updateWorkspace(next);
+}
+
+/**
+ * The round a Pi launched for a review is holding.
+ *
+ * Put in the list and nothing more. A round is not delivered because a terminal was created: it
+ * names the terminal it was sent to, and stays pending until the Pi reports having read the
+ * marker, which is what `settlePiRound` asks about.
+ */
+function onReviewRoundLaunched(round: ReviewRound) {
+  review.recordRound(round);
+  // The launch worked, so the last failure is no longer what the destination is doing.
+  piLaunchError.value = "";
+  void review.refreshNotes();
+}
+
+/**
+ * A Pi send that never started one.
+ *
+ * It fails before anything is recorded, so there is no round for the panel to draw it on and no
+ * notes left marked sent — the backend undoes both. What is left is the reason, and a toast is the
+ * only place it would otherwise live, which is not where somebody looks after it expires.
+ */
+function onReviewLaunchFailed(message: string) {
+  piLaunchError.value = message;
 }
 
 function onShellCreated(token: number, checkoutId: string, sessionId: string) {
@@ -2201,6 +2328,8 @@ function reportWarning(message: string) {
           @open-folder="chooseFolder"
           @workspace-updated="updatePaneWorkspace"
           @shell-created="onShellCreated"
+          @review-round-launched="onReviewRoundLaunched"
+          @review-launch-failed="onReviewLaunchFailed"
           @session-status-changed="updateSessionStatus"
           @session-order="updateSessionOrder"
           @update-document-mode="setDocumentMode"

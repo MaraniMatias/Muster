@@ -271,6 +271,48 @@ export function dispatchReviewRound(request: {
   return invoke<ReviewRound>("review_round_dispatch", { request });
 }
 
+/**
+ * What a terminal has to be opened with when it is a Pi receiving a review.
+ *
+ * Travels with the terminal view rather than being sent from the diff: the Pi's output belongs to
+ * the terminal that runs it, so the terminal is what has to exist before there is anything to read.
+ */
+export interface ReviewLaunch {
+  ids: string[];
+  markdown: string;
+}
+
+/**
+ * Opens an interactive Pi in a terminal of this checkout with the review already in front of it.
+ *
+ * No session and no queue, because neither exists for this destination: every send starts a new Pi
+ * rather than naming one that is already running. The round comes back still `dispatching` — it
+ * names the terminal and nothing yet proves the review was read.
+ */
+export function launchPiReviewTerminal(
+  request: ReviewLaunch,
+  checkoutId: string,
+  cols: number,
+  rows: number,
+  onOutput: Channel<ArrayBuffer>,
+): Promise<{ round: ReviewRound; session: Session; workspace: WorkspaceState }> {
+  return invoke("review_round_launch_pi", {
+    request: { checkoutId, ...request, cols, rows },
+    onOutput,
+  });
+}
+
+/**
+ * Asks what a Pi session's own reports prove about the rounds it was sent, and settles them.
+ *
+ * Delivery is confirmed only from a marker that session reported reading, and a round is closed
+ * only from the settlement Pi announced. Never a send: this is the one command in this file that
+ * cannot start a Pi, and a round it leaves unconfirmed stays exactly where it was.
+ */
+export function settlePiReviewRound(checkoutId: string, sessionId: string): Promise<ReviewRound[]> {
+  return invoke<ReviewRound[]>("review_round_settle_pi", { checkoutId, sessionId });
+}
+
 /** Sends the rounds held back while the agent was busy. Returns how many went out. */
 export function flushReviewRounds(checkoutId: string): Promise<number> {
   return invoke<number>("review_round_flush", { checkoutId });

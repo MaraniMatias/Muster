@@ -1573,7 +1573,9 @@ mod tests {
         let round = ReviewRound {
             id: "review-round:temporary".into(),
             checkout_id: checkout_id.clone(),
+            provider: crate::domain::agent::AgentProvider::OpenCode,
             session_id: None,
+            terminal_id: None,
             status: "queued".into(),
             marker: "muster-review:review-round:temporary".into(),
             note_ids: vec![note_id.clone()],
@@ -2233,7 +2235,9 @@ mod tests {
             let round = ReviewRound {
                 id: round_id.into(),
                 checkout_id: old_id.clone(),
+                provider: crate::domain::agent::AgentProvider::OpenCode,
                 session_id: Some("session:historical-agent".into()),
+                terminal_id: None,
                 status: status.into(),
                 marker: format!("muster-review:{round_id}"),
                 note_ids: vec![note_id],

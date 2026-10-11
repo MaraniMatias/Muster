@@ -5,6 +5,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import type { ArchivedCheckout, Checkout, Repo, Session, TerminalSessionStatus } from "../domain/workspace";
+import type { TerminalAgentSession } from "../presentation/agent-sessions";
 
 const mocks = vi.hoisted(() => ({
   getGitCheckoutDiffStats: vi.fn(),
@@ -49,6 +50,30 @@ function checkout(overrides: Partial<Checkout> = {}): Checkout {
 
 function session(id: string, name: string, checkoutId = "checkout:primary"): Session {
   return { id, type: "shell", checkoutId, name, createdAt: "now", status: "inactive" };
+}
+
+/**
+ * One row session, as the presentation layer hands it over.
+ *
+ * OpenCode by default, because that is what every fixture here was before Pi arrived and a test
+ * that means Pi now says so in one word. `attention` defaults to what a reader would infer from the
+ * two booleans so a fixture only states it when the attention itself is what is under test.
+ */
+function rowSession(overrides: Partial<TerminalAgentSession> = {}): TerminalAgentSession {
+  const running = overrides.running ?? false;
+  const awaitingReply = overrides.awaitingReply ?? false;
+  return {
+    id: "ses_row",
+    provider: "opencode",
+    terminalId: null,
+    title: "Session",
+    attention: awaitingReply ? "blocked" : running ? "busy" : "none",
+    agent: null,
+    running,
+    awaitingReply,
+    updatedAt: Date.now(),
+    ...overrides,
+  };
 }
 
 // reka hands the list to the body, so a repo's menu is read off the document and not off the panel.
@@ -785,7 +810,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_1",
                 title: "Copy ids into lists",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -793,7 +821,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_2",
                 title: "An old session from another checkout's checkout",
+                provider: "opencode",
+                attention: "none",
                 agent: null,
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -825,6 +856,252 @@ describe("Sidebar workdir rows", () => {
     wrapper.unmount();
   });
 
+  describe("a Pi terminal", () => {
+    /**
+     * One Pi terminal in one worktree, drawn from whatever the runtime and the bridge say.
+     *
+     * The runtime deliberately reports `node`: Pi is a Node program, so that is what the OS calls it
+     * and what this fixture uses. Nothing in the row may depend on that name being `pi`, because for
+     * a real terminal it never is.
+     */
+    function mountPi(
+      row: TerminalAgentSession | null,
+      overrides: {
+        terminalId?: string;
+        status?: TerminalSessionStatus;
+        checkoutId?: string;
+      } = {},
+    ) {
+      const checkoutId = overrides.checkoutId ?? "checkout:pi";
+      const terminalId = overrides.terminalId ?? "session:pi";
+      return mount(Sidebar, {
+        props: {
+          repos: [
+            repo({
+              checkouts: [{ ...checkout({ id: checkoutId }), sessions: [session(terminalId, "zsh", checkoutId)] }],
+            }),
+          ],
+          activeCheckoutId: checkoutId,
+          activeSessionId: null,
+          isOpening: false,
+          agentRows: { [checkoutId]: { sessions: row ? [row] : [] } },
+          sessionRuntimeStatuses: {
+            [terminalId]: overrides.status ?? {
+              state: "running",
+              foregroundProcess: true,
+              foregroundApp: "node",
+            },
+          },
+        },
+      });
+    }
+
+    it("names the session the bridge reported, not the process the OS calls", () => {
+      // Pi writes no `OC | …` title and its executable is reported as `node`, so neither the title
+      // chain nor the program name can name this row. What names it is the terminal the bridge said
+      // the session is running in, which is a value Muster minted for that terminal itself.
+      const wrapper = mountPi(
+        rowSession({
+          id: "ses_pi",
+          provider: "pi",
+          terminalId: "session:pi",
+          title: "Review the sidebar",
+          running: true,
+          attention: "busy",
+        }),
+      );
+
+      const row = wrapper.get(".workdir-child");
+      expect(row.get(".nm").text()).toBe("Review the sidebar");
+      // Pi has no agent catalog and no colors, so there is no mode to name and nothing to tint
+      // with. The label says which program this is, and the row keeps the accent.
+      expect(row.get(".dm").text()).toBe("pi");
+      expect(row.classes()).toContain("state-working");
+      expect(row.get(".workdir-icon").classes()).toContain("lucide-loader-circle");
+      expect(row.classes()).not.toContain("agent-tinted");
+      // The clock is the session's own last update, read from the bridge.
+      expect(row.get(".workdir-end-time").text()).toMatch(/^\d+s$/);
+      wrapper.unmount();
+    });
+
+    it.each([
+      ["busy", false, "state-working", "lucide-loader-circle", "Working"],
+      ["blocked", true, "state-waiting", "lucide-circle-question-mark", "Waiting"],
+      ["failed", false, "state-failed", "lucide-sparkles", "failed"],
+      ["none", false, "state-idle", "lucide-sparkles", "Idle"],
+    ] as const)("draws a Pi session whose attention is %s", (attention, awaitingReply, state, icon, note) => {
+      // Every state a row can draw has to work for Pi too, and the attention comes from the session
+      // rather than from an agent: Pi never has one, so reading it out of the agent would draw a
+      // working turn as idle grey and a failed one as idle rather than in the danger colour.
+      const wrapper = mountPi(
+        rowSession({
+          id: "ses_pi",
+          provider: "pi",
+          terminalId: "session:pi",
+          title: "Review the sidebar",
+          running: attention === "busy",
+          awaitingReply,
+          attention,
+        }),
+      );
+
+      const row = wrapper.get(".workdir-child");
+      expect(row.classes()).toContain(state);
+      expect(row.get(".workdir-icon").classes()).toContain(icon);
+      // A failure keeps the danger colour and gives up the tint, exactly as an OpenCode row does.
+      expect(row.classes()).not.toContain("agent-tinted");
+      expect(row.get(".workdir-select").attributes("title")).toContain(note);
+      wrapper.unmount();
+    });
+
+    it("keeps a disconnected Pi session unavailable rather than calling it idle", () => {
+      // The bridge dropped mid-turn: nothing is answering, so whether a reply is owed is unknown.
+      // `null` means that, and it is drawn as the fact it is — never as a confirmed quiet row.
+      const wrapper = mountPi(
+        rowSession({
+          id: "ses_pi",
+          provider: "pi",
+          terminalId: "session:pi",
+          title: "Review the sidebar",
+          running: true,
+          awaitingReply: null,
+          attention: "busy",
+        }),
+      );
+
+      const row = wrapper.get(".workdir-child");
+      expect(row.classes()).toContain("state-idle");
+      const label = row.get(".workdir-select").attributes("title");
+      expect(label).toContain("Session state unavailable");
+      expect(label).not.toContain("Idle");
+      wrapper.unmount();
+    });
+
+    it("draws nothing from another terminal's session when Pi exits and a new one starts", () => {
+      // The reported failure this guards: a terminal whose Pi ended, with a second Pi already
+      // running in a different terminal of the same worktree. The first row must go back to saying
+      // what it knows — a plain terminal — rather than wearing the live session's title and state.
+      const checkoutId = "checkout:pi";
+      const wrapper = mount(Sidebar, {
+        props: {
+          repos: [
+            repo({
+              checkouts: [
+                {
+                  ...checkout({ id: checkoutId }),
+                  sessions: [session("session:pi", "zsh", checkoutId), session("session:other", "zsh", checkoutId)],
+                },
+              ],
+            }),
+          ],
+          activeCheckoutId: checkoutId,
+          activeSessionId: null,
+          isOpening: false,
+          agentRows: {
+            [checkoutId]: {
+              sessions: [
+                rowSession({
+                  id: "ses_live",
+                  provider: "pi",
+                  terminalId: "session:other",
+                  title: "Working elsewhere",
+                  running: true,
+                  attention: "busy",
+                }),
+              ],
+            },
+          },
+          sessionRuntimeStatuses: {
+            // The terminal the live session is NOT in reports a plain shell: Pi there has exited.
+            "session:pi": { state: "running", foregroundProcess: false },
+            "session:other": { state: "running", foregroundProcess: true, foregroundApp: "node" },
+          },
+        },
+      });
+
+      const exited = wrapper.get('.workdir-child[data-session-id="session:pi"]');
+      expect(exited.get(".nm").text()).toBe("zsh");
+      // A plain terminal draws no detail at all, which is the half of the claim that matters: there
+      // is no agent line here for the live session's title or state to have leaked into.
+      expect(exited.find(".dm").exists()).toBe(false);
+      expect(exited.classes()).toContain("state-idle");
+      // And the terminal it really is in still speaks for itself.
+      const live = wrapper.get('.workdir-child[data-session-id="session:other"]');
+      expect(live.get(".nm").text()).toBe("Working elsewhere");
+      expect(live.classes()).toContain("state-working");
+      wrapper.unmount();
+    });
+
+    it("never lends an OpenCode terminal a Pi session that shares its title", () => {
+      // The two providers are folded into one list, so one title can be on both sides of it. The
+      // title inference belongs to OpenCode alone, and the identity match belongs to Pi alone; a row
+      // that let either path reach across would be reading one provider's answer as the other's.
+      const wrapper = mount(Sidebar, {
+        props: {
+          repos: [
+            repo({
+              checkouts: [
+                {
+                  ...checkout({ id: "checkout:mix" }),
+                  sessions: [
+                    session("session:oc", "zsh", "checkout:mix"),
+                    session("session:pi", "zsh", "checkout:mix"),
+                  ],
+                },
+              ],
+            }),
+          ],
+          activeCheckoutId: "checkout:mix",
+          activeSessionId: null,
+          isOpening: false,
+          agentRows: {
+            "checkout:mix": {
+              sessions: [
+                rowSession({
+                  id: "ses_oc",
+                  provider: "opencode",
+                  title: "Ship the panel",
+                  running: false,
+                  awaitingReply: false,
+                  attention: "none",
+                  agent: { label: "coder", color: null, attention: "none" },
+                }),
+                rowSession({
+                  id: "ses_pi",
+                  provider: "pi",
+                  terminalId: "session:pi",
+                  title: "Ship the panel",
+                  running: true,
+                  attention: "busy",
+                }),
+              ],
+            },
+          },
+          sessionRuntimeStatuses: {
+            "session:oc": {
+              state: "running",
+              foregroundProcess: true,
+              foregroundApp: "opencode",
+              terminalTitle: "OC | Ship the panel",
+            },
+            "session:pi": { state: "running", foregroundProcess: true, foregroundApp: "node" },
+          },
+        },
+      });
+
+      // The OpenCode terminal keeps its own session's answer, rather than going ambiguous or
+      // resolving onto the Pi one that happens to carry the same title.
+      const opencodeRow = wrapper.get('.workdir-child[data-session-id="session:oc"]');
+      expect(opencodeRow.get(".dm").text()).toBe("coder");
+      expect(opencodeRow.classes()).toContain("state-idle");
+      // And the Pi terminal is identified by its terminal, so the shared title is not what claims it.
+      const piRow = wrapper.get('.workdir-child[data-session-id="session:pi"]');
+      expect(piRow.get(".dm").text()).toBe("pi");
+      expect(piRow.classes()).toContain("state-working");
+      wrapper.unmount();
+    });
+  });
+
   it("matches a terminal whose title was cut, which is what a long session title gets", () => {
     // A title longer than 40 characters arrives cut to 37 with an ellipsis, so a real long session
     // title reaches the row as a prefix. A row that refused a genuine cut would draw the program
@@ -849,7 +1126,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_3",
                 title: long,
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -897,7 +1177,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_4",
                 title: "Add icon box, tinted chip, dot ring",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "coder", color: null, attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -905,7 +1188,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_5",
                 title: "Plan de implementación para la sidebar",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "plan", color: null, attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -966,7 +1252,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_6",
                 title: "Humanizer",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -974,7 +1263,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_7",
                 title: "Humanizer",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now() - 60_000,
@@ -1027,7 +1319,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_8",
                 title: "Copy ids into lists",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -1145,7 +1440,10 @@ describe("Sidebar workdir rows", () => {
                 {
                   id: "ses_row_9",
                   title: "Copy ids into lists",
+                  provider: "opencode",
+                  attention: "busy",
                   agent: { label: "plan", color: null, attention: "busy" },
+                  terminalId: null,
                   awaitingReply: false,
                   running: true,
                   updatedAt: Date.now(),
@@ -1214,7 +1512,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_10",
                 title: "Copy ids into lists",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "plan", color: "#FF966C", attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -1255,11 +1556,14 @@ describe("Sidebar workdir rows", () => {
 
   it("does not call unreadable candidate state idle or discard its ambiguous title", async () => {
     const checkoutId = "checkout:unknown";
-    const candidate = {
+    const candidate: TerminalAgentSession = {
       id: "ses_row_11",
       title: "Unknown",
+      provider: "opencode",
+      attention: "none",
       agent: null,
       running: false,
+      terminalId: null,
       awaitingReply: null,
       updatedAt: 1,
     };
@@ -1313,14 +1617,9 @@ describe("Sidebar workdir rows", () => {
         isOpening: false,
         agentRows: {
           [checkoutId]: {
-            sessions: sessions.map(({ id, title, attention }) => ({
-              id,
-              title,
-              agent: { label: "coder", color: "#4ED6BF", attention },
-              awaitingReply: false,
-              running: false,
-              updatedAt: Date.now(),
-            })),
+            sessions: sessions.map(({ id, title, attention }) =>
+              rowSession({ id, title, attention, agent: { label: "coder", color: "#4ED6BF", attention } }),
+            ),
           },
         },
         sessionRuntimeStatuses: {
@@ -2013,7 +2312,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_12",
                 title: "Copy ids",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -2063,7 +2365,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_13",
                 title: "Copy ids",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "coder", color: null, attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -2127,7 +2432,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_14",
                 title: "Copy ids",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "coder", color: "#4ED6BF", attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -2139,7 +2447,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_15",
                 title: "Plan it",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "plan", color: "#FF966C", attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -2198,7 +2509,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_16",
                 title: "Copy ids",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: "#4ED6BF", attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -2210,7 +2524,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_17",
                 title: "Plan it",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: "#FF966C", attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -2272,7 +2589,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_18",
                 title: "Copy ids into lists",
+                provider: "opencode",
+                attention: "blocked",
                 agent: { label: "plan", color: "#FF966C", attention: "blocked" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -2284,7 +2604,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_19",
                 title: "Fix it",
+                provider: "opencode",
+                attention: "failed",
                 agent: { label: "coder", color: "#4ED6BF", attention: "failed" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -2354,7 +2677,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_20",
                 title: "Copy ids",
+                provider: "opencode",
+                attention: "busy",
                 agent: { label: "coder", color: "#4ED6BF", attention: "busy" },
+                terminalId: null,
                 awaitingReply: false,
                 running: true,
                 updatedAt: Date.now(),
@@ -2514,7 +2840,10 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_21",
                 title: long,
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
+                terminalId: null,
                 awaitingReply: false,
                 running: false,
                 updatedAt: Date.now(),
@@ -2603,9 +2932,10 @@ describe("Sidebar workdir rows", () => {
             `checkout:${id}`,
             {
               sessions: [
-                {
+                rowSession({
                   id: "ses_row_22",
                   title: `Session ${id}`,
+                  attention: (["busy", "blocked", "failed", "none"] as const)[index]!,
                   agent: {
                     label: "coder",
                     color: null,
@@ -2613,8 +2943,7 @@ describe("Sidebar workdir rows", () => {
                   },
                   awaitingReply: index === 1,
                   running: index < 2,
-                  updatedAt: Date.now(),
-                },
+                }),
               ],
             },
           ]),
@@ -3378,7 +3707,10 @@ it.each([false, true])("draws a running session with no agent, awaiting reply: %
           sessions: [
             {
               id: "ses_row_23",
+              terminalId: null,
               title: "Untitled session",
+              provider: "opencode",
+              attention: awaitingReply ? "blocked" : "busy",
               agent: null,
               awaitingReply,
               running: true,
@@ -3942,8 +4274,11 @@ describe("a label is weighed against its row rather than cut between its halves"
               {
                 id: "ses_row_24",
                 title: "Review the duplicated rows",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 running: false,
+                terminalId: null,
                 awaitingReply: false,
                 updatedAt: Date.now(),
               },
@@ -4200,8 +4535,11 @@ describe("a label is weighed against its row rather than cut between its halves"
               {
                 id: "ses_row_24",
                 title: "Review the duplicated rows",
+                provider: "opencode",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 running: false,
+                terminalId: null,
                 awaitingReply: false,
                 updatedAt: now - 5_000,
               },

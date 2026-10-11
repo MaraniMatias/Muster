@@ -1,6 +1,6 @@
 # Muster
 
-Muster is a desktop workspace for people working with coding agents in Git worktrees. It keeps each repository and worktree’s files, diffs, and terminals together. Leave notes on specific diff lines, then send them to OpenCode or export them as Markdown for other agents. Muster doesn’t run agents; you start them in its terminals.
+Muster is a desktop workspace for people working with coding agents in Git worktrees. It keeps each repository and worktree’s files, diffs, and terminals together. Leave notes on specific diff lines, then send them to OpenCode, start a fresh Pi review session, or export them as Markdown. Muster does not run models; other CLI agents can be started in its terminals.
 
 - **Platforms:** macOS (Apple Silicon) · Linux (amd64 / arm64)
 - **License:** MIT
@@ -16,16 +16,16 @@ When several agents work in parallel, each worktree ends up with its own termina
 - Browse and edit files, and inspect Git changes and diffs.
 - Open multiple terminals in each repository or worktree; worktrees created outside Muster are detected too.
 - Leave notes on diff lines or ranges and track them as draft, sent, or resolved. A note is marked outdated when the code it refers to changes.
-- Send review rounds to OpenCode or export notes as Markdown for any CLI agent.
+- Send review rounds to an existing OpenCode session, start a new Pi terminal with selected notes as its first prompt, or export notes as Markdown for any CLI agent.
 
 ## What it is not
 
 - Not an IDE. The editor is for quick changes, not a replacement for your main editor.
 - Not an LLM harness. Muster does not call models or manage how agents run.
-- Not a GitHub or GitLab client. Review notes go to OpenCode or a Markdown export.
+- Not a GitHub or GitLab client. Review notes go to OpenCode, a fresh Pi terminal, or a Markdown export.
 - Not just a terminal. It also groups worktrees, shows diffs, and keeps review notes.
 
-You can use any CLI agent, or work without one. Only OpenCode has native session and review-delivery integration.
+You can use any CLI agent, or work without one. OpenCode has native session and in-session delivery integration; Pi has native session observation and receives each review in a newly opened interactive terminal.
 
 ## Install
 
@@ -45,7 +45,7 @@ Download the [latest release](https://github.com/MaraniMatias/Muster/releases/la
   ./Muster_<version>_amd64.AppImage
   ```
 
-For native OpenCode integration, install and run [OpenCode](https://opencode.ai). Other CLI agents work in Muster’s terminals; review notes can be exported as Markdown.
+For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.
 
 ## Quick start
 
@@ -53,7 +53,7 @@ For native OpenCode integration, install and run [OpenCode](https://opencode.ai)
 2. Select a checkout or create a worktree.
 3. Open a terminal in that checkout and start your agent.
 4. Try the code in another terminal, then open **Changes** and add notes to the relevant diff lines.
-5. Send notes to OpenCode or export them as Markdown, then get back to what you were working on.
+5. Send notes to OpenCode or Pi, or export them as Markdown, then get back to what you were working on.
 
 ## FAQ
 

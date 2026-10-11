@@ -328,6 +328,8 @@ fn main() {
             commands::review::review_note_resolve,
             commands::review::review_rounds,
             commands::review::review_round_dispatch,
+            commands::review::review_round_launch_pi,
+            commands::review::review_round_settle_pi,
             commands::review::review_rounds_requeue,
             commands::review::review_round_flush,
             commands::review::review_round_reconcile,

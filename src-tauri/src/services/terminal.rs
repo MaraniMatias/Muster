@@ -25,6 +25,13 @@ pub struct TerminalOptions {
     pub cols: u16,
     pub rows: u16,
     pub prompt: Option<String>,
+    /// The service a Pi extension in this terminal reports itself to.
+    ///
+    /// Part of what this terminal is rather than a separate argument, because it is asked for in
+    /// the same breath as the spawn and belongs to exactly one terminal: the credential it
+    /// produces names this terminal and its checkout, and the terminal's id is minted below. `None`
+    /// is an ordinary terminal — one whose Pi is simply not observed.
+    pub pi_bridge: Option<std::sync::Arc<crate::services::pi::PiBridge>>,
 }
 
 pub fn create(
@@ -43,6 +50,7 @@ pub fn create(
             cols,
             rows,
             prompt: None,
+            pi_bridge: None,
         },
         output,
     )
@@ -85,27 +93,21 @@ pub fn create_with_settings(
     script_dir: &Option<PathBuf>,
     output: OutputSink,
 ) -> Result<CreatedTerminal, String> {
-    let TerminalOptions { cols, rows, prompt } = options;
-    let cwd = database.terminal_checkout_path(checkout_id)?;
+    let TerminalOptions {
+        cols,
+        rows,
+        prompt,
+        pi_bridge,
+    } = options;
+    // Refused before anything is written for this terminal, so a checkout that is not there cannot
+    // leave a shell-integration script behind on the way to being told so.
+    database.terminal_checkout_path(checkout_id)?;
     reject_prompt(prompt.as_deref())?;
     let mut program = inherited_shell();
     let name = program
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "shell".into());
-    let session = Session {
-        id: format!(
-            "session:terminal:{}-{}-{}",
-            timestamp(),
-            std::process::id(),
-            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-        ),
-        session_type: SessionType::Shell,
-        checkout_id: checkout_id.to_string(),
-        name,
-        created_at: timestamp(),
-        status: SessionStatus::Active,
-    };
 
     let mut args = inherited_shell_args(&program);
     // Resolved before the spawn because `program` is moved into it below, and the hook text is a
@@ -122,29 +124,156 @@ pub fn create_with_settings(
     } else {
         None
     };
-    let mut child_env = Vec::new();
+    let mut env = Vec::new();
     if let Some(integration) = integration {
         program = integration.program;
         args = integration.args;
-        child_env = integration.env;
+        env = integration.env;
     }
-    backend.spawn(
+    create_program(
+        database,
+        backend,
+        checkout_id,
+        TerminalSize { cols, rows },
+        TerminalProgram {
+            program,
+            args,
+            env,
+            name,
+        },
+        pi_bridge,
+        output,
+    )
+}
+
+/// The size a terminal is opened at, which the window resizes from as soon as it has measured
+/// itself against its own font and zoom.
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Everything a terminal is, once what runs in it has been decided.
+///
+/// Separate from what this module knows about shells because not every terminal runs one: a Pi
+/// started to receive a review is handed the program itself, with no shell anywhere in the chain,
+/// so there is nothing for a review note to be interpreted by. That is the only property the two
+/// kinds of terminal have to share, and it is why they share this one spawn.
+pub struct TerminalProgram {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// The name the session row carries, read by a person and never used as a path or a command.
+    pub name: String,
+}
+
+/// Mints a session for a decided program, spawns it in the checkout's directory, and records it.
+///
+/// Every terminal is opened through here, so there is exactly one place where the PTY, the bridge
+/// credential and the stored session row are created together.
+pub fn create_program(
+    database: &Database,
+    backend: &TerminalBackend,
+    checkout_id: &str,
+    size: TerminalSize,
+    decided: TerminalProgram,
+    pi_bridge: Option<std::sync::Arc<crate::services::pi::PiBridge>>,
+    output: OutputSink,
+) -> Result<CreatedTerminal, String> {
+    create_program_with_pre_spawn(
+        database,
+        backend,
+        checkout_id,
+        size,
+        decided,
+        pi_bridge,
+        output,
+        |_| Ok(()),
+    )
+}
+
+/// Runs one identity-binding step after assigning the terminal ID but before the process can run.
+#[allow(clippy::too_many_arguments)]
+pub fn create_program_with_pre_spawn(
+    database: &Database,
+    backend: &TerminalBackend,
+    checkout_id: &str,
+    size: TerminalSize,
+    decided: TerminalProgram,
+    pi_bridge: Option<std::sync::Arc<crate::services::pi::PiBridge>>,
+    output: OutputSink,
+    before_spawn: impl FnOnce(&Session) -> Result<(), String>,
+) -> Result<CreatedTerminal, String> {
+    let TerminalProgram {
+        program,
+        args,
+        env,
+        name,
+    } = decided;
+    let cwd = database.terminal_checkout_path(checkout_id)?;
+    let session = Session {
+        id: format!(
+            "session:terminal:{}-{}-{}",
+            timestamp(),
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ),
+        session_type: SessionType::Shell,
+        checkout_id: checkout_id.to_string(),
+        name,
+        created_at: timestamp(),
+        status: SessionStatus::Active,
+    };
+    // Handed to everything this terminal starts, which is the only route by which a Pi running
+    // inside it can be identified: Pi is a Node program, so the OS reports its foreground name as
+    // `node` for every Node process on the machine and it says nothing about which terminal it is
+    // in. This value is minted for this one terminal, so it does. Absent is not a failure: a
+    // terminal whose Pi is not observed is still a usable terminal.
+    before_spawn(&session)?;
+    let mut env = env;
+    if let Some(pi_bridge) = pi_bridge.as_ref() {
+        if let Some(credential) = pi_bridge.issue_credential(&session.id, checkout_id) {
+            env.extend([
+                (
+                    std::ffi::OsString::from(crate::services::pi::BRIDGE_ENV),
+                    std::ffi::OsString::from(credential),
+                ),
+                (
+                    std::ffi::OsString::from(crate::services::pi::TERMINAL_ENV),
+                    std::ffi::OsString::from(&session.id),
+                ),
+                (
+                    std::ffi::OsString::from(crate::services::pi::CHECKOUT_ENV),
+                    std::ffi::OsString::from(checkout_id),
+                ),
+            ]);
+        }
+    }
+    if let Err(error) = backend.spawn(
         session.id.clone(),
         SpawnOptions {
             program,
             args,
             cwd,
-            cols,
-            rows,
-            env: child_env,
+            cols: size.cols,
+            rows: size.rows,
+            env,
         },
         output,
-    )?;
+    ) {
+        if let Some(pi_bridge) = pi_bridge.as_ref() {
+            pi_bridge.forget_terminal(&session.id);
+        }
+        return Err(error);
+    }
 
     match database.add_terminal_session(&session) {
         Ok(workspace) => Ok(CreatedTerminal { session, workspace }),
         Err(error) => {
             let _ = backend.close(&session.id);
+            if let Some(pi_bridge) = pi_bridge.as_ref() {
+                pi_bridge.forget_terminal(&session.id);
+            }
             Err(error)
         }
     }
@@ -525,9 +654,83 @@ mod tests {
     };
 
     use super::{
-        create_with_options, create_with_settings, inherited_shell_args, install_shell_integration,
-        rename, shell_integration_script, shell_quote, ShellIntegration, TerminalOptions,
+        create_program, create_program_with_pre_spawn, create_with_options, create_with_settings,
+        inherited_shell_args, install_shell_integration, rename, shell_integration_script,
+        shell_quote, ShellIntegration, TerminalOptions, TerminalProgram, TerminalSize,
     };
+
+    /// A terminal can be opened on something other than a shell, and what runs in it receives
+    /// its arguments as arguments.
+    ///
+    /// Nothing in this path interprets a string, which is the whole reason the Pi launch goes
+    /// through it: a review is the contents of a file, and those contents never become a command.
+    /// The argument list below is spelled exactly as the launcher builds one, so what the program
+    /// prints is what Pi would have been handed.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_runs_the_program_it_is_given_with_its_arguments_untouched() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let database = Database::open(directory.path().join("workspace.sqlite3")).unwrap();
+        let repo = plain_repo(&checkout);
+        database.register_plain_repo(repo.clone()).unwrap();
+        let backend = TerminalBackend::default();
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&collected);
+        let output: OutputSink = Box::new(move |bytes| {
+            kept.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(())
+        });
+
+        // Exercise the exact argv the Pi launcher builds, through the native PTY spawn. `echo` is
+        // the mocked executable; the prompt body itself is tested as a private file by pi_launch.
+        let bridge = crate::services::pi_launch::bridge_path(directory.path()).unwrap();
+        let prompt = crate::services::pi_launch::write_prompt(
+            directory.path(),
+            "muster-review:round:1762000000:4242:7",
+            "review body",
+        )
+        .unwrap();
+        let args = crate::services::pi_launch::arguments(&bridge, &prompt);
+        let created = create_program(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalProgram {
+                program: PathBuf::from("/bin/echo"),
+                args: args.clone(),
+                env: Vec::new(),
+                name: "pi".into(),
+            },
+            None,
+            output,
+        )
+        .unwrap();
+
+        assert_eq!(created.session.name, "pi");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let printed = loop {
+            let text = String::from_utf8_lossy(
+                &collected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned();
+            if text.contains(&args.join(" ")) || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            printed.contains(&args.join(" ")),
+            "the program was not handed the Pi launcher's argv untouched: {printed}"
+        );
+        backend.close(&created.session.id).unwrap();
+    }
 
     fn plain_repo(path: &Path) -> Repo {
         Repo::plain(path, "now").unwrap()
@@ -1289,6 +1492,7 @@ user_prompt_three() { printf '[THREE:%s]' \"$?\"; }
                 cols: 80,
                 rows: 24,
                 prompt: None,
+                pi_bridge: None,
             },
             &setting,
             &Some(script_dir.to_path_buf()),
@@ -1688,9 +1892,216 @@ user_prompt_three() { printf '[THREE:%s]' \"$?\"; }
                 cols: 80,
                 rows: 24,
                 prompt: Some("injected".into()),
+                pi_bridge: None,
             },
             Box::new(|_| Ok(())),
         )
         .is_err());
+    }
+
+    /// The credential has to arrive in the shell's environment, because that is the only route
+    /// from a terminal to the Pi running inside it.
+    ///
+    /// Read back out of a live shell rather than out of the arguments this function was given, so
+    /// what is asserted is the environment a process would actually inherit.
+    #[test]
+    fn a_pi_round_binding_failure_happens_before_spawn_or_credential_issue() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let database = Database::open(directory.path().join("workspace.sqlite3")).unwrap();
+        let repo = plain_repo(&checkout);
+        database.register_plain_repo(repo.clone()).unwrap();
+        let backend = TerminalBackend::default();
+        let bridge = crate::services::pi::PiBridge::new();
+        let mut terminal_id = None;
+
+        let error = create_program_with_pre_spawn(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalProgram {
+                program: directory.path().join("must-not-spawn"),
+                args: Vec::new(),
+                env: Vec::new(),
+                name: "pi".into(),
+            },
+            Some(Arc::clone(&bridge)),
+            Box::new(|_| Ok(())),
+            |session| {
+                terminal_id = Some(session.id.clone());
+                Err("round binding failed".into())
+            },
+        )
+        .err()
+        .expect("binding failure is returned");
+
+        assert_eq!(error, "round binding failed");
+        assert_eq!(bridge.credential_count(), 0);
+        assert!(database
+            .terminal_session_checkout(terminal_id.as_deref().unwrap())
+            .unwrap()
+            .is_none());
+        bridge.stop();
+    }
+
+    #[test]
+    fn a_failed_program_spawn_forgets_its_pi_bridge_credential() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let database = Database::open(directory.path().join("workspace.sqlite3")).unwrap();
+        let repo = plain_repo(&checkout);
+        database.register_plain_repo(repo.clone()).unwrap();
+        let backend = TerminalBackend::default();
+        let bridge = crate::services::pi::PiBridge::new();
+
+        assert!(create_program(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalProgram {
+                program: directory.path().join("missing-pi"),
+                args: Vec::new(),
+                env: Vec::new(),
+                name: "pi".into(),
+            },
+            Some(Arc::clone(&bridge)),
+            Box::new(|_| Ok(())),
+        )
+        .is_err());
+        assert_eq!(bridge.credential_count(), 0);
+        bridge.stop();
+    }
+
+    #[test]
+    fn a_terminal_hands_its_pi_bridge_credential_to_everything_it_starts() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let database = Database::open(directory.path().join("workspace.sqlite3")).unwrap();
+        let repo = plain_repo(&checkout);
+        database.register_plain_repo(repo.clone()).unwrap();
+        let backend = TerminalBackend::default();
+        let bridge = crate::services::pi::PiBridge::new();
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // One sink per terminal, both feeding the same byte log: this test asks about two
+        // terminals at once, and each is read from where its own output begins.
+        let sink = || -> OutputSink {
+            let kept = Arc::clone(&collected);
+            Box::new(move |bytes| {
+                kept.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(())
+            })
+        };
+
+        let created = create_with_settings(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalOptions {
+                cols: 80,
+                rows: 24,
+                prompt: None,
+                pi_bridge: Some(Arc::clone(&bridge)),
+            },
+            &None,
+            &None,
+            sink(),
+        )
+        .unwrap();
+
+        let ask = |backend: &TerminalBackend, session: &str| -> usize {
+            let before = collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            backend
+                .write(
+                    session,
+                    format!(
+                        "printf '\\036%s\\037' \"${}\"\n",
+                        crate::services::pi::BRIDGE_ENV
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            before
+        };
+
+        let first = reported_credential(&collected, ask(&backend, &created.session.id));
+        // The value points at the bridge that is actually listening, which is what makes a refused
+        // connection in the extension a diagnostic rather than a mystery.
+        assert_eq!(
+            first.split(':').take(2).collect::<Vec<_>>().join(":"),
+            bridge
+                .address()
+                .map(|address| address.to_string())
+                .expect("the bridge is listening once a terminal has asked for a credential"),
+            "the terminal was handed something that is not this app's bridge: {first}"
+        );
+        assert_eq!(
+            first.split(':').count(),
+            3,
+            "the value carries no credential of its own: {first}"
+        );
+
+        // A second terminal gets its own credential rather than sharing the first's, which is
+        // what stops a Pi in one terminal from speaking for another.
+        let second = create_with_settings(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalOptions {
+                cols: 80,
+                rows: 24,
+                prompt: None,
+                pi_bridge: Some(Arc::clone(&bridge)),
+            },
+            &None,
+            &None,
+            sink(),
+        )
+        .unwrap();
+        let second_credential = reported_credential(&collected, ask(&backend, &second.session.id));
+        assert_ne!(
+            first, second_credential,
+            "two terminals were handed the same credential"
+        );
+        backend.close(&second.session.id).unwrap();
+        backend.close(&created.session.id).unwrap();
+    }
+
+    /// The credential a shell printed, read out of the bytes it wrote from `offset` on.
+    ///
+    /// Polled rather than waited on with a marker: a marker typed into the shell comes back
+    /// echoed before the shell has run it, so it would end the wait before the value it was
+    /// waiting for had been printed at all.
+    fn reported_credential(collected: &Arc<std::sync::Mutex<Vec<u8>>>, offset: usize) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = {
+                let seen = collected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                String::from_utf8_lossy(&seen[offset..]).into_owned()
+            };
+            if let Some(start) = text.find('\u{1e}') {
+                let value = start + '\u{1e}'.len_utf8();
+                if let Some(end) = text[value..].find('\u{1f}') {
+                    return text[value..value + end].trim().to_string();
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell printed no bridge credential: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }

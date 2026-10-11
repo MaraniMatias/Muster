@@ -1,8 +1,11 @@
-# Phase 4 — pi as a review destination
+# Phase 4 — Pi as a review destination (superseded research)
 
-Status: specified, not implemented. Depends on phase 1 (`docs/review-export.md`) for
-`ReviewTarget`; same one-shot shape as phases 2 and 3 (`docs/phase-2-codex.md`,
-`docs/phase-3-claude-code.md`).
+**Superseded.** This is historical research for Pi 0.87.1's RPC mode, which Muster did not
+implement. The current integration uses the Pi v1.1.0 extension API and protocol v2; see
+[the current Pi integration inventory](../pi-integration.md) for implemented behavior, tests,
+and limitations. Keep this research for provenance, not as an implementation plan.
+
+Status: superseded by the implementation documented in `docs/pi-integration.md`.
 
 **Not parity with OpenCode.** As in every non-OpenCode phase: Muster can name the program in front
 of one of its terminals (`src-tauri/src/terminal/process.rs:21-34` macOS, `:55` Linux; surfaced as

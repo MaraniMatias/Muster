@@ -203,11 +203,12 @@ const busyChoiceOpen = ref(false);
 const targetOpen = ref(false);
 const targetQuery = ref("");
 const targetIndex = ref(0);
+const openCodeSessions = computed(() => (sender?.sessions ?? []).filter((session) => session.provider === "opencode"));
 /** A list this short is picked by looking at it; past this it earns a search of its own. */
-const searchesTargets = computed(() => sender?.target === "opencode" && (sender.sessions.length ?? 0) > 5);
+const searchesTargets = computed(() => sender?.target === "opencode" && openCodeSessions.value.length > 5);
 /** Newest first, the order the rest of the app reads sessions in. */
 const targetRows = computed(() => {
-  const rows = sortAgentSessions(sender?.sessions ?? []);
+  const rows = sortAgentSessions(openCodeSessions.value);
   const query = targetQuery.value.trim().toLowerCase();
   return query ? rows.filter((row) => row.title.toLowerCase().includes(query)) : rows;
 });
@@ -235,11 +236,46 @@ const sendableNotes = computed(() => {
 });
 const draftCount = computed(() => sendableNotes.value.filter((note) => note.status === "draft").length);
 const outdatedCount = computed(() => props.review.notes.filter((note) => note.outdated).length);
-const targetSession = computed(() => sender?.sessions.find((session) => session.id === sender.targetId) ?? undefined);
+const targetSession = computed(
+  () =>
+    sender?.sessions.find((session) => session.provider === "opencode" && session.id === sender.targetId) ?? undefined,
+);
 /** A blocked session is not working, so only a real turn makes the send a decision. */
-const targetBusy = computed(() => agentAttention(targetSession.value) === "busy");
+const targetBusy = computed(() => sender?.target === "opencode" && agentAttention(targetSession.value) === "busy");
 const showBusyChoice = computed(() => sender?.target === "opencode" && busyChoiceOpen.value && targetBusy.value);
 const canSend = computed(() => sendableNotes.value.length > 0);
+/**
+ * What the button says it will do, which is the only place the destination is named to a reader.
+ *
+ * Pi is a third sentence rather than a session: nothing is chosen and nothing is waited for, so
+ * "Send to opencode" would be a claim about a destination that does not exist for it.
+ */
+const sendLabel = computed(() => {
+  if (sender?.target === "markdown") return "Export as Markdown";
+  return sender?.target === "pi" ? "Send to Pi" : "Send to opencode";
+});
+
+/**
+ * What the Pi destination can honestly report, as one line, or nothing.
+ *
+ * Three separate counts because they are three separate facts. A launch nobody has confirmed
+ * reading is not a delivered review, a delivered review is not a finished turn, and a finished
+ * turn is not the same as the notes being resolved — which is judged separately, from the diff,
+ * and is never drawn here. A send that could not start says why, because a Pi launch fails
+ * before it records anything and a toast that expires is all there would otherwise be.
+ */
+const piFeedbackLine = computed(() => {
+  const feedback = sender?.piFeedback;
+  if (!feedback) return "";
+  const counts = [
+    feedback.pending ? `${feedback.pending} waiting for Pi` : "",
+    feedback.delivered ? `${feedback.delivered} delivered` : "",
+    feedback.settled ? `${feedback.settled} finished` : "",
+  ].filter(Boolean);
+  const line = counts.join(" · ");
+  if (!feedback.error) return line;
+  return line ? `${line} · ${feedback.error}` : feedback.error;
+});
 
 function sendNow(queue: boolean) {
   busyChoiceOpen.value = false;
@@ -249,9 +285,14 @@ function sendNow(queue: boolean) {
   );
 }
 
-/** A working agent cannot be interrupted, so the button asks instead of sending into a turn. */
+/**
+ * A working agent cannot be interrupted, so the button asks instead of sending into a turn.
+ *
+ * Only OpenCode has a turn to interrupt: a Pi send starts a fresh one every time, so there is
+ * nothing to be interrupted and nothing to queue behind.
+ */
 function requestSend() {
-  if (sender?.target === "markdown") {
+  if (sender?.target !== "opencode") {
     sendNow(false);
     return;
   }
@@ -267,14 +308,15 @@ function chooseTarget(sessionId: string) {
   targetOpen.value = false;
 }
 
-/** The two destinations a review can leave by, so the picker is a list rather than a control. */
+/** The three destinations a review can leave by, so the picker is a list rather than a control. */
 const reviewTargets = [
   { value: "markdown", label: "Markdown" },
   { value: "opencode", label: "OpenCode" },
+  { value: "pi", label: "Pi" },
 ];
 
 function chooseReviewTarget(target?: string) {
-  if (target === "markdown" || target === "opencode") sender?.selectReviewTarget(target);
+  if (target === "markdown" || target === "opencode" || target === "pi") sender?.selectReviewTarget(target);
 }
 
 /**
@@ -556,11 +598,11 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
             type="button"
             data-testid="send-review"
             :disabled="!canSend"
-            :aria-label="sender.target === 'markdown' ? 'Export as Markdown' : 'Send to opencode'"
+            :aria-label="sendLabel"
             class="muster-button muster-button-tinted muster-button-md"
             @click="requestSend"
           >
-            {{ sender.target === "markdown" ? "Export as Markdown" : "Send to opencode" }}
+            {{ sendLabel }}
           </button>
           <SelectControl
             :model-value="sender.target"
@@ -572,7 +614,7 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
           <!-- One session is the default target, so the picker only earns its place above one.
                It is the app's own menu rather than a native select, and it earns a search only
                once there are more rows than a short list is worth reading. -->
-          <PopoverRoot v-if="sender.target === 'opencode' && sender.sessions.length > 1" v-model:open="targetOpen">
+          <PopoverRoot v-if="sender.target === 'opencode' && openCodeSessions.length > 1" v-model:open="targetOpen">
             <PopoverTrigger
               data-testid="send-target"
               aria-label="Send review to"
@@ -664,6 +706,17 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
           class="text-[0.6875rem] text-(--muster-text-faint)"
         >
           {{ sender.unfinishedRounds }} {{ sender.unfinishedRounds === 1 ? "round" : "rounds" }} not finished
+        </p>
+        <!-- Pi's own counts, because its rounds are confirmed and closed by what the Pi reports
+             rather than by a turn being observed to end. Same words as the line above, but none
+             of the OpenCode machinery: no session to choose, nothing to queue, nothing to retry. -->
+        <p
+          v-if="sender.target === 'pi' && piFeedbackLine"
+          data-testid="pi-feedback"
+          role="status"
+          class="text-[0.6875rem] text-(--muster-text-faint)"
+        >
+          {{ piFeedbackLine }}
         </p>
         <label v-if="outdatedCount > 0" class="flex items-center gap-1.5 text-[0.6875rem] text-(--muster-text-faint)">
           <input v-model="includeOutdated" type="checkbox" class="muster-check" data-testid="include-outdated" />

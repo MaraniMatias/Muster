@@ -24,12 +24,20 @@ vi.mock("../lib/ipc", () => ({
   stopAgent: mocks.stopAgent,
 }));
 
-import { applyAgentEvent, useAgentRelocations, useAgentSessions, useTerminalAgentRows } from "./agent-sessions";
+import {
+  AGENT_EVENT,
+  applyAgentEvent,
+  useAgentRelocations,
+  useAgentSessions,
+  useTerminalAgentRows,
+} from "./agent-sessions";
 
 function session(overrides: Partial<AgentSession> = {}): AgentSession {
   return {
     id: "ses_one",
     checkoutId: "checkout:first",
+    provider: "opencode",
+    terminalId: null,
     title: "review",
     running: false,
     idleAt: 1,
@@ -243,6 +251,35 @@ describe("useAgentSessions", () => {
     await vi.advanceTimersByTimeAsync(6000);
     expect(mocks.listAgentSessions.mock.calls.length).toBe(callsWhenIdle);
     expect(state.turnsCompleted).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("never counts Pi settlement as OpenCode completion, and tracks its own session completion", async () => {
+    vi.useFakeTimers();
+    const opencode = session({ id: "ses_oc", running: true });
+    const pi = session({ id: "ses_pi", provider: "pi", terminalId: "terminal:pi", running: true });
+    mocks.listen.mockImplementation(async () => vi.fn());
+    mocks.listAgentSessions.mockResolvedValue([opencode, pi]);
+    const state = useAgentSessions(
+      computed(() => checkout),
+      computed(() => gitRepo),
+    );
+    await settle();
+
+    mocks.listAgentSessions.mockResolvedValue([opencode, { ...pi, running: false }]);
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+    expect(state.turnsCompleted).toBe(0);
+    expect(state.completedSessionIds).toEqual([]);
+
+    mocks.listAgentSessions.mockResolvedValue([
+      { ...opencode, running: false },
+      { ...pi, running: false },
+    ]);
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+    expect(state.turnsCompleted).toBe(1);
+    expect(state.completedSessionIds).toEqual(["ses_oc"]);
     vi.useRealTimers();
   });
 
@@ -587,8 +624,23 @@ describe("useTerminalAgentRows", () => {
     );
   }
 
+  /**
+   * Delivers an event to every subscription this file's hooks took.
+   *
+   * Both hooks subscribe to the one stream and filter it themselves — one follows the active
+   * checkout, this one follows every checkout that has a terminal — so the handler is captured on
+   * the way in rather than looked up by name afterwards.
+   */
+  function emit(payload: Partial<AgentEvent>): void {
+    for (const handler of handlers) handler({ payload: event(payload) });
+  }
+  const handlers: Array<(message: { payload: AgentEvent }) => void> = [];
   beforeEach(() => {
-    mocks.listen.mockImplementation(async () => vi.fn());
+    handlers.length = 0;
+    mocks.listen.mockImplementation(async (name: string, handler: (message: { payload: AgentEvent }) => void) => {
+      if (name === AGENT_EVENT) handlers.push(handler);
+      return vi.fn();
+    });
     mocks.listAgentAgents.mockResolvedValue([
       { id: "build", name: "Build", mode: "primary", color: null, hidden: false },
       { id: "coder", name: "Coder", mode: "all", color: "#4ed6bf", hidden: false },
@@ -613,7 +665,10 @@ describe("useTerminalAgentRows", () => {
     expect(state.byCheckout["checkout:first"].sessions).toEqual([
       {
         id: "ses_one",
+        provider: "opencode",
+        terminalId: null,
         title: "review",
+        attention: "busy",
         agent: { label: "Coder", color: "#4ed6bf", attention: "busy" },
         running: true,
         awaitingReply: false,
@@ -623,7 +678,10 @@ describe("useTerminalAgentRows", () => {
     expect(state.byCheckout["checkout:second"].sessions).toEqual([
       {
         id: "ses_two",
+        provider: "opencode",
+        terminalId: null,
         title: "review",
+        attention: "none",
         agent: { label: "Plan", color: null, attention: "none" },
         running: false,
         awaitingReply: false,
@@ -683,8 +741,20 @@ describe("useTerminalAgentRows", () => {
 
     // The clock rides along because it is the only duration a terminal row has: the elapsed time in a
     // row's trailing slot is this session's own last update, read from the service and nowhere else.
+    // The attention rides along too, because a session with no agent still has one — that is the
+    // whole of what a Pi row has, and reading the state out of the agent would leave it empty.
     expect(state.byCheckout["checkout:first"].sessions).toEqual([
-      { id: "ses_fresh", title: "review", agent: null, running: false, awaitingReply, updatedAt: 1 },
+      {
+        id: "ses_fresh",
+        provider: "opencode",
+        terminalId: null,
+        title: "review",
+        attention: awaitingReply ? "blocked" : "none",
+        agent: null,
+        running: false,
+        awaitingReply,
+        updatedAt: 1,
+      },
     ]);
   });
 
@@ -697,7 +767,17 @@ describe("useTerminalAgentRows", () => {
       perCheckout({ "checkout:first": [{ id: "ses_one", agent: null, awaitingReply }] });
       await state.reload();
       expect(state.row("checkout:first").sessions).toEqual([
-        { id: "ses_one", title: "review", agent: null, running: false, awaitingReply, updatedAt: 1 },
+        {
+          id: "ses_one",
+          provider: "opencode",
+          terminalId: null,
+          title: "review",
+          attention: awaitingReply ? "blocked" : "none",
+          agent: null,
+          running: false,
+          awaitingReply,
+          updatedAt: 1,
+        },
       ]);
     }
     scope.stop();
@@ -1007,6 +1087,46 @@ describe("useTerminalAgentRows", () => {
     await vi.advanceTimersByTimeAsync(30000);
     expect(mocks.listAgentCandidateSessions).toHaveBeenCalledTimes(whenReleased);
     vi.useRealTimers();
+  });
+
+  it("re-reads the one checkout an event names, in a worktree nobody has selected", async () => {
+    // The sidebar reads every worktree at once, so an event for one nobody has open still changes
+    // something on screen. Waiting for the slow pass would leave the row stale for seconds after a
+    // session appeared or left, and the fast pass cannot hear it either: it asks only about
+    // checkouts already known to be busy, which is exactly the set a session that just started is
+    // not in yet.
+    perCheckout({ "checkout:first": [], "checkout:second": [] });
+    const state = useTerminalAgentRows(computed(() => ["checkout:first", "checkout:second"]));
+    await settle();
+    mocks.listAgentCandidateSessions.mockClear();
+
+    perCheckout({
+      "checkout:first": [],
+      "checkout:second": [{ id: "ses_pi", provider: "pi", terminalId: "session:two" }],
+    });
+    emit({ checkoutId: "checkout:second", sessionId: "ses_pi", kind: "unknown", rawType: "pi.session_started" });
+    await settle();
+
+    // Only the checkout the events named is asked about — the event carries the checkout it
+    // happened in, so every other worktree's terminals are left alone — and its row carries the
+    // Pi session with the terminal it was matched by.
+    expect(mocks.listAgentCandidateSessions.mock.calls.map(([id]) => id)).toEqual(["checkout:second"]);
+    expect(state.row("checkout:second").sessions[0]?.terminalId).toBe("session:two");
+    expect(state.row("checkout:first").sessions).toEqual([]);
+  });
+
+  it("ignores an event for a checkout this hook does not hold", async () => {
+    perCheckout({ "checkout:first": [] });
+    useTerminalAgentRows(computed(() => ["checkout:first"]));
+    await settle();
+    mocks.listAgentCandidateSessions.mockClear();
+
+    emit({ checkoutId: "checkout:elsewhere", sessionId: "ses_pi", kind: "turnStarted", rawType: "pi.agent_start" });
+    await settle();
+
+    // A row that is not on screen has nothing to redraw, and asking about a worktree this hook
+    // never listed would put an answer in a row nobody reads.
+    expect(mocks.listAgentCandidateSessions).not.toHaveBeenCalled();
   });
 });
 

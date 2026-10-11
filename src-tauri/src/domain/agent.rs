@@ -1,12 +1,56 @@
 use serde::Serialize;
 
-/// One OpenCode session Muster knows about, scoped to the checkout that owns it.
+/// Which agent program a session belongs to.
+///
+/// These are two separate programs that happen to answer similar questions, so a session says
+/// which one it came from and nothing may read one provider's answer as the other's. Session ids
+/// are only ever meaningful inside their own provider, which is exactly why the two cannot be
+/// pooled into one list without this travelling with each entry.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProvider {
+    OpenCode,
+    Pi,
+}
+
+impl AgentProvider {
+    /// The name this provider is stored and sent under.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentProvider::OpenCode => "opencode",
+            AgentProvider::Pi => "pi",
+        }
+    }
+
+    /// Reads a stored provider back, refusing anything this build does not name.
+    ///
+    /// The column is CHECK-constrained as well, so this is the second of the two refusals and
+    /// the one a hand-edited or half-written file has to go through.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "opencode" => Some(AgentProvider::OpenCode),
+            "pi" => Some(AgentProvider::Pi),
+            _ => None,
+        }
+    }
+}
+
+/// One agent session Muster knows about, scoped to the checkout that owns it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
-    /// OpenCode's own `ses_…` id, only ever valid inside its checkout's server.
+    /// The program's own session id, only ever valid inside its checkout's provider.
     pub id: String,
     pub checkout_id: String,
+    /// The program this session belongs to; everything else here is read through it.
+    pub provider: AgentProvider,
+    /// The Muster terminal session this agent session is running in, when the provider says so.
+    ///
+    /// Pi's extension reports this, so a Pi row names its session by identity instead of by
+    /// reading a title off the terminal. OpenCode offers no such route — it cannot say which TUI
+    /// process has which session open — so it is always absent there and that row falls back to
+    /// title inference, which is a weaker thing this contract keeps named apart.
+    pub terminal_id: Option<String>,
     pub title: String,
     /// When the server last saw this session go idle, if ever.
     ///
@@ -22,6 +66,8 @@ pub struct AgentSession {
     /// The model behind it, as `provider/id#variant`.
     pub model: Option<String>,
     /// The session this one was spawned from, which is how a subagent is tied to its parent.
+    ///
+    /// OpenCode-only: Pi has no native subagent parentage, so this is always absent for it.
     pub parent_id: Option<String>,
     /// The service reports this session as draining a turn right now.
     ///
@@ -53,7 +99,8 @@ pub struct AgentRelocation {
 /// One agent a checkout's server offers, as OpenCode describes it.
 ///
 /// The color is OpenCode's own, so a row painted with it matches what the user sees in the
-/// TUI for the same agent.
+/// TUI for the same agent. The catalog is OpenCode-only: Pi has no agent list and no colors,
+/// so a Pi row draws without one rather than borrowing OpenCode's.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAgent {

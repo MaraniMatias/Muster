@@ -46,7 +46,7 @@ mod relocation;
 
 use crate::{
     domain::{
-        agent::{agent_event_kind, AgentAgent, AgentRelocation, AgentSession},
+        agent::{agent_event_kind, AgentAgent, AgentProvider, AgentRelocation, AgentSession},
         ipc::{IpcError, IpcErrorCode},
     },
     services::opencode::{self, ServiceEndpoint},
@@ -640,6 +640,11 @@ impl AgentBridge {
         AgentSession {
             id: raw.id.clone(),
             checkout_id: self.checkout_id.clone(),
+            provider: AgentProvider::OpenCode,
+            // OpenCode offers no route from a TUI process to a session id, so this bridge can
+            // never say which terminal is showing which session. It stays absent rather than
+            // being filled from a title the terminal happened to write.
+            terminal_id: None,
             title: if raw.title.is_empty() {
                 "OpenCode session".to_string()
             } else {
@@ -1391,6 +1396,7 @@ fn generation_scoped_sink(
 pub(crate) struct WorktreeRemovalGuard {
     state: Arc<Mutex<RemovalState>>,
     checkout_id: String,
+    _pi: crate::services::pi::PiRemovalGuard,
     committed: bool,
 }
 
@@ -1887,6 +1893,19 @@ struct SessionWork {
     seen: Instant,
 }
 
+#[derive(Clone)]
+struct PiSessionWork {
+    origin: Option<PathBuf>,
+    effective: Option<PathBuf>,
+    generation: String,
+    sequence: u64,
+    targets: Vec<PathBuf>,
+    ambiguous: bool,
+    seen: Instant,
+}
+
+type PiWorkLocations = (Vec<(String, Option<PathBuf>)>, Vec<String>);
+
 /// Keep history reads moving through the bounded newest-session page across polling ticks.
 fn rotate_sessions_after(sessions: &mut [ApiSession], cursor: Option<&str>) {
     if let Some(index) = cursor.and_then(|cursor| sessions.iter().position(|s| s.id == cursor)) {
@@ -1942,6 +1961,7 @@ pub struct AgentService {
     /// [`AgentService::relocations`], which is the only thing that reads or writes it.
     session_locations: Mutex<HashMap<String, SessionLocation>>,
     session_work: Mutex<HashMap<String, SessionWork>>,
+    pi_session_work: Mutex<HashMap<String, PiSessionWork>>,
     relocation_snapshot: Mutex<()>,
     /// Last session whose history was read, for fair reads across the newest-page limit.
     relocation_history_cursor: Mutex<Option<String>>,
@@ -1959,6 +1979,13 @@ pub struct AgentService {
     /// session and activity reads happen before it starts; this is not a whole-snapshot cap.
     /// A field so a test can spend less of it than the shipped request timeout.
     pending_read_budget: Duration,
+    /// The loopback service Pi extensions report to.
+    ///
+    /// A sibling of `bridges` rather than another entry in it: those are one OpenCode server per
+    /// checkout, started on demand and owned by whoever runs OpenCode, while this one is started
+    /// by this app, is shared by every terminal, and answers for the other agent program. Merging
+    /// them would mean every OpenCode path had to know which provider it was talking to.
+    pi: Arc<crate::services::pi::PiBridge>,
 }
 
 impl AgentService {
@@ -2049,6 +2076,7 @@ impl AgentService {
             busy_turns: Arc::new(Mutex::new(HashMap::new())),
             session_locations: Mutex::new(HashMap::new()),
             session_work: Mutex::new(HashMap::new()),
+            pi_session_work: Mutex::new(HashMap::new()),
             relocation_snapshot: Mutex::new(()),
             relocation_history_cursor: Mutex::new(None),
             pending_moves: Mutex::new(HashMap::new()),
@@ -2061,40 +2089,57 @@ impl AgentService {
             startup_stop_wait,
             startup_wait: startup_stop_wait,
             pending_read_budget: PENDING_READ_BUDGET,
+            pi: crate::services::pi::PiBridge::new(),
         }
     }
 
     /// Sets where normalized events are delivered. Without one the bridges still work,
     /// they just do not report live turn state.
     pub fn set_event_sink(&self, sink: EventSink) {
-        let forward = sink;
-        let busy_turns = Arc::clone(&self.busy_turns);
-        let sink: EventSink = Arc::new(move |event| {
-            if let Some(session_id) = event.session_id.as_deref() {
-                if let Ok(mut turns) = busy_turns.lock() {
-                    let checkout = turns.entry(event.checkout_id.clone()).or_default();
-                    match event.kind {
-                        crate::domain::agent::AgentEventKind::TurnStarted
-                        | crate::domain::agent::AgentEventKind::TurnFinished
-                        | crate::domain::agent::AgentEventKind::PermissionAsked
-                        | crate::domain::agent::AgentEventKind::QuestionAsked => {
-                            checkout.insert(session_id.to_string(), TrackedTurn::Started);
+        // Two subscriptions to the same delivery rather than one shared between the OpenCode
+        // bridges and the Pi reporters: both sides normalize to one event shape, and the turn
+        // tracking below is OpenCode's bookkeeping, so what is shared is the destination, not the
+        // work done on the way to it.
+        let tracked: EventSink = {
+            let forward = Arc::clone(&sink);
+            let busy_turns = Arc::clone(&self.busy_turns);
+            Arc::new(move |event| {
+                if let Some(session_id) = event.session_id.as_deref() {
+                    if let Ok(mut turns) = busy_turns.lock() {
+                        let checkout = turns.entry(event.checkout_id.clone()).or_default();
+                        match event.kind {
+                            crate::domain::agent::AgentEventKind::TurnStarted
+                            | crate::domain::agent::AgentEventKind::TurnFinished
+                            | crate::domain::agent::AgentEventKind::PermissionAsked
+                            | crate::domain::agent::AgentEventKind::QuestionAsked => {
+                                checkout.insert(session_id.to_string(), TrackedTurn::Started);
+                            }
+                            crate::domain::agent::AgentEventKind::TurnFailed => {
+                                checkout.remove(session_id);
+                            }
+                            _ => {}
                         }
-                        crate::domain::agent::AgentEventKind::TurnFailed => {
-                            checkout.remove(session_id);
+                        if checkout.is_empty() {
+                            turns.remove(&event.checkout_id);
                         }
-                        _ => {}
-                    }
-                    if checkout.is_empty() {
-                        turns.remove(&event.checkout_id);
                     }
                 }
-            }
-            forward(event);
-        });
+                forward(event);
+            })
+        };
+        let for_pi = Arc::clone(&sink);
         if let Ok(mut slot) = self.sink.lock() {
-            *slot = Some(sink);
+            *slot = Some(tracked);
         }
+        self.pi.set_event_sink(for_pi);
+    }
+
+    /// The loopback service a terminal's Pi reports to.
+    ///
+    /// Public because a terminal being spawned is the only place a credential can be minted: the
+    /// terminal is what hands it to the Pi inside it.
+    pub fn pi(&self) -> &Arc<crate::services::pi::PiBridge> {
+        &self.pi
     }
 
     /// A service that finds no OpenCode, for the tests that need a holder for generations and
@@ -2123,6 +2168,28 @@ impl AgentService {
     ) -> T {
         let lock = self.checkout_operation_lock(checkout_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        operation()
+    }
+
+    /// Serializes an operation that changes ownership between checkouts. Sorting makes opposite
+    /// moves acquire the same locks in the same order, while a removal's single-checkout lock still
+    /// excludes either side of the move.
+    pub(crate) fn with_checkout_operations<T>(
+        &self,
+        checkout_ids: &[&str],
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let mut checkout_ids = checkout_ids.to_vec();
+        checkout_ids.sort_unstable();
+        checkout_ids.dedup();
+        let locks = checkout_ids
+            .iter()
+            .map(|checkout_id| self.checkout_operation_lock(checkout_id))
+            .collect::<Vec<_>>();
+        let _guards = locks
+            .iter()
+            .map(|lock| lock.lock().unwrap_or_else(|error| error.into_inner()))
+            .collect::<Vec<_>>();
         operation()
     }
 
@@ -2211,6 +2278,7 @@ impl AgentService {
         let removal = WorktreeRemovalGuard {
             state: Arc::clone(&self.removal_state),
             checkout_id: checkout_id.to_string(),
+            _pi: self.pi.reserve_checkout_removal(checkout_id),
             committed: false,
         };
         let slot = self
@@ -2249,7 +2317,7 @@ impl AgentService {
             .get(checkout_id)
             .cloned();
         let Some(slot) = slot else {
-            return Ok(Vec::new());
+            return Ok(self.pi.active_worktree_sessions(checkout_id));
         };
         let bridge = {
             let state = slot
@@ -2258,7 +2326,9 @@ impl AgentService {
                 .map_err(|_| BridgeError::Failed("the agent bridge state is poisoned".into()))?;
             match &*state {
                 BridgeState::Ready(bridge) => Arc::clone(bridge),
-                BridgeState::Failed(_) => return Ok(Vec::new()),
+                BridgeState::Failed(_) => {
+                    return Ok(self.pi.active_worktree_sessions(checkout_id));
+                }
                 BridgeState::Starting { .. } | BridgeState::Stopping | BridgeState::Stopped => {
                     return Err(BridgeError::Unavailable(
                         "the agent bridge is starting or stopping; retry worktree removal".into(),
@@ -2285,7 +2355,7 @@ impl AgentService {
         drop(turns);
         let mut seen = HashSet::new();
         let mut idle = HashSet::new();
-        let mut active = Vec::new();
+        let mut active = self.pi.active_worktree_sessions(checkout_id);
         for raw in listed {
             if raw.check_scope(bridge.directory()).is_err() {
                 continue;
@@ -2316,6 +2386,8 @@ impl AgentService {
                 active.push(AgentSession {
                     id: session_id.clone(),
                     checkout_id: checkout_id.to_string(),
+                    provider: AgentProvider::OpenCode,
+                    terminal_id: None,
                     title: "OpenCode prompt status is unknown".into(),
                     idle_at: None,
                     awaiting_reply: Some(false),
@@ -2570,6 +2642,112 @@ impl AgentService {
         }
     }
 
+    fn pi_work_locations(
+        &self,
+        checkouts: &[(String, PathBuf)],
+        checkout_index: &CheckoutIndex,
+        now: Instant,
+        baseline: bool,
+    ) -> Result<PiWorkLocations, BridgeError> {
+        let mut work = self
+            .pi_session_work
+            .lock()
+            .map_err(|_| BridgeError::Failed("the Pi relocation state is poisoned".into()))?;
+        if baseline {
+            work.clear();
+        }
+        work.retain(|_, entry| now.duration_since(entry.seen) <= SESSION_LOCATION_TTL);
+        let mut located = Vec::new();
+        let mut clear_pending = Vec::new();
+        for session in self.pi.work_sessions() {
+            let id = session.session_id.clone();
+            let origin = checkouts
+                .iter()
+                .find(|(checkout_id, _)| *checkout_id == session.checkout_id)
+                .map(|(_, path)| path.clone());
+            let new_session = !work.contains_key(&id);
+            let entry = work.entry(id.clone()).or_insert_with(|| PiSessionWork {
+                origin: origin.clone(),
+                effective: origin.clone(),
+                generation: String::new(),
+                sequence: 0,
+                targets: Vec::new(),
+                ambiguous: false,
+                seen: now,
+            });
+            // Pi's initial checkout is known from its terminal credential. Seed it before a first
+            // observed write can replace `effective`, or that write would look like a baseline.
+            if new_session && !baseline && origin.is_some() {
+                self.session_locations
+                    .lock()
+                    .map_err(|_| {
+                        BridgeError::Failed("the agent relocation state is poisoned".into())
+                    })?
+                    .entry(id.clone())
+                    .or_insert(SessionLocation {
+                        checkout_id: Some(session.checkout_id.clone()),
+                        seen: now,
+                    });
+            }
+            let origin_changed = match (&entry.origin, &origin) {
+                (Some(left), Some(right)) => !same_directory(left, right),
+                (None, None) => false,
+                _ => true,
+            };
+            if origin_changed {
+                entry.origin = origin.clone();
+                entry.effective = origin;
+                entry.generation.clear();
+                entry.sequence = 0;
+                entry.targets.clear();
+                entry.ambiguous = false;
+            }
+            entry.seen = now;
+            if entry.generation != session.generation || entry.sequence != session.sequence {
+                entry.generation = session.generation;
+                entry.sequence = session.sequence;
+                entry.targets = session.targets;
+                entry.ambiguous = session.ambiguous;
+                if entry.ambiguous {
+                    entry.targets.clear();
+                    clear_pending.push(id.clone());
+                }
+            }
+            if !entry.ambiguous && !entry.targets.is_empty() {
+                if let Some(directory) = checkout_index.work_directory(&entry.targets) {
+                    entry.effective = Some(directory);
+                } else {
+                    // Do not replay an older move while this activity is ambiguous or unregistered.
+                    clear_pending.push(id.clone());
+                }
+            }
+            located.push((id, entry.effective.clone()));
+        }
+        Ok((located, clear_pending))
+    }
+
+    fn record_pi_relocations(
+        &self,
+        checkouts: &[(String, PathBuf)],
+        located: &[(String, Option<PathBuf>)],
+        clear_pending: &[String],
+        now: Instant,
+    ) -> Result<(), BridgeError> {
+        if !clear_pending.is_empty() {
+            let mut pending = self
+                .pending_moves
+                .lock()
+                .map_err(|_| BridgeError::Failed("the pending move list is poisoned".into()))?;
+            for session_id in clear_pending {
+                pending.remove(session_id);
+            }
+        }
+        if !located.is_empty() {
+            self.record_relocations_with_baseline(checkouts, located.to_vec(), now, false)?;
+        }
+        Ok(())
+    }
+
     /// Sessions that are working in a worktree of `checkouts` other than the one they were in.
     /// The API location remains authoritative for explicit moves; executed tool targets also
     /// identify work outside that location without changing the running TUI or its shell.
@@ -2634,11 +2812,14 @@ impl AgentService {
                 ))
             }
         };
-        // Any live bridge reads every location, so the read is asked of one that is already
+        let pi_now = Instant::now();
+        let checkout_index = CheckoutIndex::new(checkouts);
+        let (pi_located, pi_clear_pending) =
+            self.pi_work_locations(checkouts, &checkout_index, pi_now, baseline)?;
+        // Any OpenCode bridge reads every location, so the read is asked of one that is already
         // connected rather than of one this call would connect. A bridge is opened for a
-        // checkout the panel is already talking to, which is also the only kind of checkout a
-        // session can move out of, so there is nothing to be gained by opening another one for
-        // a worktree nobody has a terminal in — and an event reader would be left running.
+        // checkout the panel is already talking to, which is also the only kind of checkout an
+        // OpenCode session can move out of, so there is nothing to be gained by opening another one.
         let anchor = {
             let bridges = self
                 .bridges
@@ -2659,26 +2840,33 @@ impl AgentService {
                     .lock()
                     .map_err(|_| BridgeError::Failed("the agent service is poisoned".into()))?
                     .clear();
-                self.pending_moves
-                    .lock()
-                    .map_err(|_| BridgeError::Failed("the agent service is poisoned".into()))?
-                    .clear();
-            } else if !checkouts.is_empty() {
-                return self.offer_pending_moves(Instant::now());
+                return self.record_relocations_with_baseline(checkouts, pi_located, pi_now, true);
             }
-            return Ok(Vec::new());
+            if !pi_located.is_empty() {
+                self.record_pi_relocations(checkouts, &pi_located, &pi_clear_pending, pi_now)?;
+            }
+            return if checkouts.is_empty() && pi_located.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.offer_pending_moves(Instant::now())
+            };
         };
         let bridge = match self.bridge(&anchor_id, &anchor_directory) {
             Ok(bridge) => bridge,
             Err(error) if baseline => return Err(error),
-            Err(_) => return self.offer_pending_moves(Instant::now()),
+            Err(_) => {
+                self.record_pi_relocations(checkouts, &pi_located, &pi_clear_pending, pi_now)?;
+                return self.offer_pending_moves(Instant::now());
+            }
         };
         let mut sessions = match bridge.session_locations_until(deadline) {
             Ok(sessions) => sessions,
             Err(error) if baseline => return Err(error),
-            Err(_) => return self.offer_pending_moves(Instant::now()),
+            Err(_) => {
+                self.record_pi_relocations(checkouts, &pi_located, &pi_clear_pending, pi_now)?;
+                return self.offer_pending_moves(Instant::now());
+            }
         };
-        let checkout_index = CheckoutIndex::new(checkouts);
         let now = Instant::now();
         let observed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2697,6 +2885,7 @@ impl AgentService {
                     "could not establish the agent relocation baseline".into(),
                 ))
             } else {
+                self.record_pi_relocations(checkouts, &pi_located, &pi_clear_pending, pi_now)?;
                 self.offer_pending_moves(Instant::now())
             };
         }
@@ -2710,7 +2899,10 @@ impl AgentService {
             ) {
                 Ok(running) => running,
                 Err(error) if baseline => return Err(error),
-                Err(_) => return self.offer_pending_moves(Instant::now()),
+                Err(_) => {
+                    self.record_pi_relocations(checkouts, &pi_located, &pi_clear_pending, pi_now)?;
+                    return self.offer_pending_moves(Instant::now());
+                }
             }
         } else {
             HashMap::new()
@@ -2722,7 +2914,7 @@ impl AgentService {
             .clone();
         rotate_sessions_after(&mut sessions, history_cursor.as_deref());
         let mut located = Vec::new();
-        let mut clear_pending = Vec::new();
+        let mut clear_pending = pi_clear_pending;
         for session in sessions {
             let origin = PathBuf::from(session.location.unwrap().directory);
             let entry = work
@@ -2808,6 +3000,7 @@ impl AgentService {
                 "could not establish the agent relocation baseline".into(),
             ));
         }
+        located.extend(pi_located);
         if !clear_pending.is_empty() {
             let mut pending = self
                 .pending_moves
@@ -3380,6 +3573,10 @@ impl AgentService {
 impl Drop for AgentService {
     fn drop(&mut self) {
         self.stop_all();
+        // The Pi bridge is this app's own socket rather than a child process, so nothing above
+        // stops it. Closing it here is what lets a reporter's thread fall out of `accept` and
+        // what drops the sessions it was describing.
+        self.pi.stop();
     }
 }
 
@@ -5777,6 +5974,123 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(DIRECTORY_HEADER)));
             assert_eq!(request.1, crate::services::opencode::authorization("test"));
+        }
+    }
+
+    #[test]
+    fn pi_write_relocates_from_its_credential_checkout_on_the_first_poll() {
+        let origin = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let agents = AgentService::without_service();
+        let credential = agents
+            .pi()
+            .issue_credential("terminal:pi", "origin")
+            .unwrap();
+        let token = credential.rsplit(':').next().unwrap();
+        let address = agents.pi().address().unwrap();
+        let mut reporter = TcpStream::connect(address).unwrap();
+        let hello = serde_json::json!({
+            "v": crate::services::pi::PROTOCOL_VERSION,
+            "type": "hello",
+            "token": token,
+            "terminalId": "terminal:pi",
+            "checkoutId": "origin",
+            "sessionId": "pi-session",
+            "work": {
+                "generation": "test-generation",
+                "sequence": 0,
+                "targets": [],
+                "ambiguous": false,
+            },
+        });
+        let state = serde_json::json!({
+            "v": crate::services::pi::PROTOCOL_VERSION,
+            "type": "state",
+            "work": {
+                "generation": "test-generation",
+                "sequence": 1,
+                "targets": [destination.path().join("changed.ts").display().to_string()],
+                "ambiguous": false,
+            },
+        });
+        for frame in [hello, state] {
+            reporter.write_all(format!("{frame}\n").as_bytes()).unwrap();
+        }
+        let checkouts = vec![
+            ("origin".into(), origin.path().to_path_buf()),
+            ("destination".into(), destination.path().to_path_buf()),
+        ];
+        for _ in 0..100 {
+            if agents
+                .pi()
+                .work_sessions()
+                .iter()
+                .any(|session| session.sequence == 1)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10));
+        }
+
+        assert_relocation(
+            &agents.relocations(&checkouts).unwrap(),
+            "pi-session",
+            "origin",
+            "destination",
+        );
+    }
+
+    #[test]
+    fn worktree_removal_reservation_blocks_new_pi_credentials() {
+        let agents = AgentService::without_service();
+        let removal = agents.reserve_worktree_removal("origin").unwrap();
+
+        assert!(agents
+            .pi()
+            .issue_credential("terminal:pi", "origin")
+            .is_none());
+        drop(removal);
+        assert!(agents
+            .pi()
+            .issue_credential("terminal:pi", "origin")
+            .is_some());
+    }
+
+    #[test]
+    fn terminal_moves_serialize_with_removal_of_either_checkout() {
+        for removed_checkout in ["checkout:a", "checkout:b"] {
+            let agents = Arc::new(AgentService::without_service());
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let remover = Arc::clone(&agents);
+            let removal_thread = std::thread::spawn(move || {
+                remover.with_checkout_operation(removed_checkout, || {
+                    let _reservation = remover.reserve_worktree_removal(removed_checkout).unwrap();
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (moved_tx, moved_rx) = mpsc::channel();
+            let mover = Arc::clone(&agents);
+            let move_thread = std::thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                mover.with_checkout_operations(&["checkout:a", "checkout:b"], || {
+                    moved_tx.send(()).unwrap();
+                });
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let serialized = moved_rx.recv_timeout(Duration::from_millis(50)).is_err();
+            release_tx.send(()).unwrap();
+            moved_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            removal_thread.join().unwrap();
+            move_thread.join().unwrap();
+            assert!(
+                serialized,
+                "move crossed the removal reservation for {removed_checkout}"
+            );
         }
     }
 

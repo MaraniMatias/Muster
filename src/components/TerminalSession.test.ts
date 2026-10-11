@@ -1,12 +1,14 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReviewRound } from "../domain/review";
 import type { Checkout, TerminalSessionStatus } from "../domain/workspace";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import {
   closeTerminal,
   createTerminal,
   getTerminalStatus,
+  launchPiReviewTerminal,
   loadTerminalLayout,
   moveTerminal,
   resizeTerminal,
@@ -232,6 +234,7 @@ vi.mock("../lib/ipc", () => ({
   closeTerminal: vi.fn(),
   createTerminal: vi.fn(),
   getTerminalStatus: vi.fn(),
+  launchPiReviewTerminal: vi.fn(),
   loadTerminalLayout: vi.fn(),
   moveTerminal: vi.fn(),
   resizeTerminal: vi.fn(),
@@ -332,11 +335,39 @@ describe("TerminalSession UI", () => {
     terminalLib.fitCalls = 0;
     vi.mocked(createTerminal).mockResolvedValue(created);
     vi.mocked(getTerminalStatus).mockResolvedValue({ state: "running" });
+    vi.mocked(launchPiReviewTerminal).mockReset();
     vi.mocked(closeTerminal).mockResolvedValue(workspace);
     // `clearAllMocks` empties the calls but keeps an implementation, so a test that leaves this one
     // refusing every size would refuse them for the rest of the file too.
     vi.mocked(resizeTerminal).mockReset();
     vi.mocked(writeTerminal).mockReset();
+  });
+
+  it("launches the requested Pi in an inactive terminal and emits its pending round", async () => {
+    const launch = { ids: ["note:one"], markdown: "# Review" };
+    const round: ReviewRound = {
+      id: "round:pi",
+      checkoutId: "checkout:repo",
+      provider: "pi",
+      sessionId: null,
+      terminalId: "session:new",
+      status: "dispatching",
+      marker: "muster-review:round:1:2:3",
+      noteIds: ["note:one"],
+      createdAt: "now",
+      updatedAt: "now",
+    };
+    vi.mocked(launchPiReviewTerminal).mockResolvedValue({ ...created, round });
+    const wrapper = mount(TerminalSession, {
+      props: { checkoutId: "checkout:repo", active: false, launch },
+    });
+    await flushPromises();
+
+    expect(launchPiReviewTerminal).toHaveBeenCalledWith(launch, "checkout:repo", 80, 24, expect.anything());
+    expect(createTerminal).not.toHaveBeenCalled();
+    expect(wrapper.emitted("reviewLaunched")).toEqual([[round]]);
+    expect(wrapper.emitted("created")).toHaveLength(1);
+    wrapper.unmount();
   });
 
   it("keeps channel output binary and sends Unicode input and fitted dimensions to the session", async () => {

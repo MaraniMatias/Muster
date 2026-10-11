@@ -8,6 +8,7 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::agent::AgentProvider;
 use crate::domain::review::{ReviewNote, ReviewRound};
 use crate::domain::terminal_layout::CheckoutTerminalLayout;
 use crate::domain::workspace::{
@@ -15,8 +16,10 @@ use crate::domain::workspace::{
     WorkspaceState,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 17;
 const REVIEW_NOTE_COLUMNS: &str = "id, checkout_id, path, side, line_start, line_end, content, code, status, code_hash, outdated, round_id, created_at, updated_at";
+const REVIEW_ROUND_COLUMNS: &str =
+    "id, checkout_id, provider, session_id, terminal_id, status, marker, note_ids, created_at, updated_at";
 const ACTIVE_CHECKOUT: &str = "active_checkout_id";
 const ACTIVE_SESSION: &str = "active_session_id";
 const WORKTREE_LOCATION: &str = "worktree_location";
@@ -1021,17 +1024,21 @@ impl Database {
         Ok(state)
     }
 
+    /// Which program a checkout's reviews are delivered to, or `markdown` when it exports.
+    ///
+    /// Both agents are named here rather than only OpenCode because each one opens a different
+    /// path to the same place, and the stored preference has to survive being the second.
     pub fn review_target(&self, checkout_id: &str) -> Result<String, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let key = format!("review_target:{checkout_id}");
         Ok(match get_preference(&connection, &key)?.as_deref() {
-            Some("opencode") => "opencode".into(),
+            Some(stored) if AgentProvider::from_name(stored).is_some() => stored.into(),
             _ => "markdown".into(),
         })
     }
 
     pub fn set_review_target(&self, checkout_id: &str, target: &str) -> Result<(), String> {
-        if !matches!(target, "markdown" | "opencode") {
+        if target != "markdown" && AgentProvider::from_name(target).is_none() {
             return Err("review target is not supported".into());
         }
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
@@ -1914,12 +1921,14 @@ impl Database {
             .map_err(|error| format!("could not encode notes: {error}"))?;
         transaction
             .execute(
-                "INSERT INTO review_rounds (id, checkout_id, session_id, status, marker, note_ids, prompt, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO review_rounds (id, checkout_id, provider, session_id, terminal_id, status, marker, note_ids, prompt, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     round.id,
                     round.checkout_id,
+                    round.provider.as_str(),
                     round.session_id,
+                    round.terminal_id,
                     round.status,
                     round.marker,
                     encoded,
@@ -1976,10 +1985,10 @@ impl Database {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let rounds = {
             let mut statement = connection
-                .prepare(
-                    "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                     FROM review_rounds WHERE checkout_id = ?1 ORDER BY created_at DESC, rowid DESC",
-                )
+                .prepare(&format!(
+                    "SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds
+                     WHERE checkout_id = ?1 ORDER BY created_at DESC, rowid DESC"
+                ))
                 .map_err(db_error)?;
             let collected = statement
                 .query_map([checkout_id], read_review_round)
@@ -2012,48 +2021,215 @@ impl Database {
         }
         connection
             .query_row(
-                "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                 FROM review_rounds WHERE id = ?1",
+                &format!("SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds WHERE id = ?1"),
                 [id],
                 read_review_round,
             )
             .map_err(db_error)
     }
 
-    pub fn set_review_round_session(
+    /// Names the terminal a Pi round was launched into.
+    ///
+    /// Refused on anything that is not a Pi round still waiting for one, so the terminal that gets
+    /// attached is the one this launch created rather than one a caller could choose.
+    pub fn bind_pi_round_terminal(
         &self,
         id: &str,
         checkout_id: &str,
-        session_id: &str,
+        terminal_id: &str,
     ) -> Result<ReviewRound, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let changed = connection
             .execute(
-                "UPDATE review_rounds SET session_id = ?1, updated_at = ?2
-                 WHERE id = ?3 AND checkout_id = ?4",
-                params![session_id, timestamp(), id, checkout_id],
+                "UPDATE review_rounds SET terminal_id = ?1, updated_at = ?2
+                 WHERE id = ?3 AND checkout_id = ?4 AND provider = 'pi' AND terminal_id IS NULL",
+                params![terminal_id, timestamp(), id, checkout_id],
             )
             .map_err(db_error)?;
         if changed == 0 {
-            return Err("review round does not belong to the requested checkout".into());
+            return Err("review round is not a Pi round waiting for a terminal".into());
         }
         connection
             .query_row(
-                "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                 FROM review_rounds WHERE id = ?1",
+                &format!("SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds WHERE id = ?1"),
                 [id],
                 read_review_round,
             )
             .map_err(db_error)
     }
 
-    /// Puts every still-pending round of the checkout back to `queued`.
+    /// Ties a Pi round to the session that appeared in the terminal it was launched into.
+    ///
+    /// Guarded on the terminal rather than on a round id, because the terminal is what a Pi
+    /// session is matched by: the id here comes from a `hello` whose credential was minted for
+    /// exactly that terminal and whose own claim for it had to agree. A round is only ever bound
+    /// once, and only while it still has no session, so a later session replacing one in the same
+    /// terminal does not rewrite history — the round records the session that received it.
+    ///
+    /// Returns whether a round was bound, which is `false` for every checkout with no waiting Pi
+    /// round and for a terminal that is not one.
+    pub fn bind_pi_round_session(
+        &self,
+        checkout_id: &str,
+        terminal_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE review_rounds SET session_id = ?1, updated_at = ?2
+                 WHERE checkout_id = ?3 AND terminal_id = ?4
+                   AND provider = 'pi' AND session_id IS NULL",
+                params![session_id, timestamp(), checkout_id, terminal_id],
+            )
+            .map_err(db_error)?;
+        Ok(changed > 0)
+    }
+
+    /// Confirms a Pi round from the marker a session reported reading.
+    ///
+    /// Guarded on all four things that have to be the same round rather than on a round id
+    /// anybody supplied: the marker, the checkout, the terminal the launch opened, and the
+    /// session that reported. A receipt from another session, another terminal or another
+    /// checkout therefore matches nothing and confirms nothing, and `None` is that answer rather
+    /// than an error.
+    ///
+    /// Refused once the round has left `dispatching`, which is what makes this safe to run again:
+    /// the transition is the pin, so a receipt that arrives twice, from a reconnect or from a
+    /// second frame of the same session, cannot move a round that is already further on.
+    pub fn confirm_pi_round_delivery(
+        &self,
+        checkout_id: &str,
+        terminal_id: &str,
+        session_id: &str,
+        marker: &str,
+    ) -> Result<Option<ReviewRound>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE review_rounds SET status = 'dispatched', updated_at = ?1
+                 WHERE checkout_id = ?2 AND terminal_id = ?3 AND session_id = ?4
+                   AND marker = ?5 AND provider = 'pi' AND status = 'dispatching'",
+                params![timestamp(), checkout_id, terminal_id, session_id, marker],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds
+                     WHERE id = (
+                         SELECT id FROM review_rounds
+                         WHERE checkout_id = ?1 AND terminal_id = ?2 AND session_id = ?3
+                           AND marker = ?4 AND provider = 'pi' AND status = 'dispatched'
+                     )"
+                ),
+                params![checkout_id, terminal_id, session_id, marker],
+                read_review_round,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// Closes the Pi round a settled session was sent.
+    ///
+    /// Scoped to the session rather than to "the newest round of the checkout", because a
+    /// checkout can have more than one Pi terminal running at once and a settlement says nothing
+    /// about any round but the one that session received. The newest is taken because a session
+    /// is bound to one round at a time and an older one is history.
+    pub fn ack_pi_round(
+        &self,
+        checkout_id: &str,
+        terminal_id: &str,
+        session_id: &str,
+    ) -> Result<Option<ReviewRound>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE review_rounds SET status = 'acked', updated_at = ?1
+                 WHERE id = (
+                     SELECT id FROM review_rounds
+                     WHERE checkout_id = ?2 AND terminal_id = ?3 AND session_id = ?4
+                       AND provider = 'pi' AND status = 'dispatched'
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1
+                 )",
+                params![timestamp(), checkout_id, terminal_id, session_id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds
+                 WHERE checkout_id = ?1 AND terminal_id = ?2 AND session_id = ?3
+                   AND provider = 'pi' AND status = 'acked'
+                 ORDER BY updated_at DESC, rowid DESC LIMIT 1"
+                ),
+                params![checkout_id, terminal_id, session_id],
+                read_review_round,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// Undoes a Pi round that was never handed to a terminal, putting its notes back as drafts.
+    ///
+    /// Only a round with neither a terminal nor a session, which is the one shape that provably
+    /// never left this process: a launch that failed on its way to a terminal cannot have been
+    /// read by a Pi, and keeping it would hold notes marked `sent` for a send that did not
+    /// happen. Anything further along is left exactly where it is — from a terminal onward the
+    /// question is whether a Pi read it, and that is settled by a receipt rather than by undoing.
+    ///
+    /// A note that was resolved between the record and the failure is not touched: it was
+    /// resolved on its own, and it does not become a draft again because an unrelated launch
+    /// failed.
+    pub fn discard_pi_round(&self, id: &str, checkout_id: &str) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection.unchecked_transaction().map_err(db_error)?;
+        let round: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM review_rounds
+                 WHERE id = ?1 AND checkout_id = ?2 AND provider = 'pi'
+                   AND terminal_id IS NULL AND session_id IS NULL",
+                params![id, checkout_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some(round) = round else {
+            let _ = transaction.rollback();
+            return Ok(false);
+        };
+        transaction
+            .execute(
+                "UPDATE review_notes SET status = 'draft', round_id = NULL, updated_at = ?1
+                 WHERE round_id = ?2 AND status = 'sent'",
+                params![timestamp(), round],
+            )
+            .map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM review_rounds WHERE id = ?1", params![round])
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(true)
+    }
+
+    /// Puts every still-pending OpenCode round of the checkout back to `queued`.
+    ///
+    /// OpenCode only, and the filter is the point rather than a shortcut: a Pi round is pending for
+    /// a different reason and cannot be settled by looking for its marker in a transcript, so
+    /// requeueing it would move a send that is running into a state that reads as "waiting for a
+    /// free agent" and that nothing will ever flush.
     pub fn requeue_review_rounds(&self, checkout_id: &str) -> Result<usize, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         connection
             .execute(
                 "UPDATE review_rounds SET status = 'queued', updated_at = ?1
-                 WHERE checkout_id = ?2 AND status = 'dispatching'",
+                 WHERE checkout_id = ?2 AND status = 'dispatching' AND provider = 'opencode'",
                 params![timestamp(), checkout_id],
             )
             .map_err(db_error)
@@ -2124,16 +2300,21 @@ fn read_review_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewNote> {
 }
 
 fn read_review_round(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewRound> {
-    let note_ids: String = row.get(5)?;
+    let provider: String = row.get(2)?;
+    let note_ids: String = row.get(7)?;
     Ok(ReviewRound {
         id: row.get(0)?,
         checkout_id: row.get(1)?,
-        session_id: row.get(2)?,
-        status: row.get(3)?,
-        marker: row.get(4)?,
+        // Refused rather than defaulted: the column is NOT NULL and CHECK-constrained, so an
+        // unknown name is a hand-edited row and not a shape this build has a reading for.
+        provider: AgentProvider::from_name(&provider).ok_or(rusqlite::Error::InvalidQuery)?,
+        session_id: row.get(3)?,
+        terminal_id: row.get(4)?,
+        status: row.get(5)?,
+        marker: row.get(6)?,
         note_ids: serde_json::from_str(&note_ids).unwrap_or_default(),
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -2481,7 +2662,9 @@ fn create_schema(connection: &Connection) -> Result<(), String> {
             CREATE TABLE review_rounds (
                 id TEXT PRIMARY KEY NOT NULL,
                 checkout_id TEXT NOT NULL REFERENCES checkouts(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL CHECK (provider IN ('opencode', 'pi')),
                 session_id TEXT,
+                terminal_id TEXT,
                 status TEXT NOT NULL CHECK (
                     status IN ('queued', 'dispatching', 'dispatched', 'acked', 'relocated')
                 ),
@@ -2925,6 +3108,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::domain::{
+        agent::AgentProvider,
         review::review_anchor_hash,
         terminal_layout::{CheckoutTerminalLayout, TerminalLayoutNode, TerminalLayoutTab},
         workspace::{
@@ -2966,7 +3150,9 @@ mod tests {
         let round = ReviewRound {
             id: id.into(),
             checkout_id: checkout_id.into(),
+            provider: AgentProvider::OpenCode,
             session_id: Some("session:historic".into()),
+            terminal_id: None,
             status: status.into(),
             marker: format!("muster-review:{id}"),
             note_ids: vec![note_id],
@@ -3090,11 +3276,11 @@ mod tests {
     /// A file with no stamp gets the whole schema, a file already stamped with this build's
     /// version is left alone, and a file from any other version is refused by name.
     #[test]
-    fn a_fresh_file_gets_schema_15_and_a_foreign_one_is_refused() {
+    fn a_fresh_file_gets_schema_17_and_a_foreign_one_is_refused() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("workspace.sqlite3");
         let database = Database::open(&path).expect("fresh database");
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 17);
         let checkout_path = temp.path().join("checkout");
         fs::create_dir(&checkout_path).unwrap();
         let repo = plain_repo(&checkout_path, "now");
@@ -3143,15 +3329,15 @@ mod tests {
                 .execute_batch(
                     "CREATE TABLE preserved (value TEXT NOT NULL);
                      INSERT INTO preserved VALUES ('keep');
-                     PRAGMA user_version = 14;",
+                     PRAGMA user_version = 15;",
                 )
                 .unwrap();
         }
         let error = Database::open(&foreign_path)
             .err()
             .expect("a file from another schema version is refused");
-        assert!(error.contains("schema version 14"), "{error}");
-        assert!(error.contains("this build speaks version 15"), "{error}");
+        assert!(error.contains("schema version 15"), "{error}");
+        assert!(error.contains("this build speaks version 17"), "{error}");
         assert!(error.contains("deleting"), "{error}");
         assert!(error.contains("empty workspace"), "{error}");
 
@@ -3160,7 +3346,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            14
+            15
         );
         assert_eq!(
             connection
@@ -3484,6 +3670,14 @@ mod tests {
             .set_review_target("checkout:one", "opencode")
             .unwrap();
         assert_eq!(database.review_target("checkout:one").unwrap(), "opencode");
+        // The second provider is a destination like the first: the stored preference has to
+        // survive being it, or choosing Pi would silently read back as Markdown.
+        database.set_review_target("checkout:one", "pi").unwrap();
+        assert_eq!(database.review_target("checkout:one").unwrap(), "pi");
+        database
+            .set_review_target("checkout:one", "markdown")
+            .unwrap();
+        assert_eq!(database.review_target("checkout:one").unwrap(), "markdown");
         assert_eq!(database.review_target("checkout:two").unwrap(), "markdown");
         assert!(database.set_review_target("checkout:one", "codex").is_err());
         database
@@ -3499,6 +3693,84 @@ mod tests {
             database.review_target("checkout:three").unwrap(),
             "markdown"
         );
+    }
+
+    /// A round records which program delivered it, because the two are delivered to and
+    /// confirmed differently and a round read without that cannot tell them apart.
+    #[test]
+    fn a_round_records_the_provider_it_was_delivered_to() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("checkout");
+        fs::create_dir(&folder).unwrap();
+        let path = temp.path().join("workspace.sqlite3");
+        let repo = plain_repo(&folder, "now");
+        let checkout_id = repo.checkouts[0].id.clone();
+        let database = Database::open(&path).unwrap();
+        database.register_plain_repo(repo).unwrap();
+        for (id, provider) in [
+            ("round:opencode", AgentProvider::OpenCode),
+            ("round:pi", AgentProvider::Pi),
+        ] {
+            let note_id = format!("note:{id}");
+            database
+                .add_review_note(&ReviewNote {
+                    id: note_id.clone(),
+                    checkout_id: checkout_id.clone(),
+                    path: "src/lib.rs".into(),
+                    side: "new".into(),
+                    line_start: 7,
+                    line_end: None,
+                    content: "check this".into(),
+                    code: "let answer = 42;".into(),
+                    status: "draft".into(),
+                    code_hash: review_anchor_hash("let answer = 42;"),
+                    outdated: false,
+                    round_id: None,
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                })
+                .unwrap();
+            let round = ReviewRound {
+                id: id.into(),
+                checkout_id: checkout_id.clone(),
+                provider,
+                session_id: Some("ses_one".into()),
+                terminal_id: None,
+                status: "dispatched".into(),
+                marker: format!("muster-review:{id}"),
+                note_ids: vec![note_id],
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            };
+            database
+                .add_review_round(&round, &round.note_ids, Some("prompt"))
+                .unwrap();
+        }
+
+        // Both survive a restart as themselves rather than as one provider's round.
+        drop(database);
+        let reopened = Database::open(&path).unwrap();
+        let stored: Vec<_> = reopened
+            .review_rounds(&checkout_id)
+            .unwrap()
+            .into_iter()
+            .map(|round| (round.id, round.provider))
+            .collect();
+        assert!(stored.contains(&("round:opencode".into(), AgentProvider::OpenCode)));
+        assert!(stored.contains(&("round:pi".into(), AgentProvider::Pi)));
+
+        // A name this build does not have is refused by the column itself.
+        let connection = reopened.connection.lock().unwrap();
+        assert!(connection
+            .execute(
+                "INSERT INTO review_rounds
+                 (id, checkout_id, provider, session_id, status, marker, note_ids, created_at, updated_at)
+                 VALUES ('round:bogus', ?1, 'codex', NULL, 'queued', 'm', '[]', 'now', 'now')",
+                [&checkout_id],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("CHECK constraint failed"));
     }
 
     #[test]

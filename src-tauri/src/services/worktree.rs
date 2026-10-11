@@ -470,6 +470,7 @@ fn remove_locked(
         database
             .remove_terminal_session(session_id)
             .map_err(operation_error)?;
+        agents.pi().forget_terminal(session_id);
     }
 
     agents.stop_for_worktree_removal(checkout_id);
@@ -989,7 +990,7 @@ mod tests {
     use std::{
         fs,
         io::{BufRead, BufReader, Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         os::unix::process::ExitStatusExt,
         path::{Path, PathBuf},
         process::{Command, ExitStatus, Output},
@@ -2428,6 +2429,75 @@ mod tests {
         .unwrap_err()
         .message
         .contains("primary"));
+    }
+
+    #[test]
+    fn live_and_disconnected_pi_sessions_block_worktree_removal() {
+        let temp = tempdir().unwrap();
+        let (database, root, _) = fixture(temp.path());
+        let checkout_id = add_worktree(&database, &root, temp.path(), "pi-active");
+        let agents = AgentService::without_service();
+        let credential = agents
+            .pi()
+            .issue_credential("terminal:pi", &checkout_id)
+            .unwrap();
+        let token = credential.rsplit(':').next().unwrap();
+        let mut stream = TcpStream::connect(agents.pi().address().unwrap()).unwrap();
+        let hello = serde_json::json!({
+            "v": crate::services::pi::PROTOCOL_VERSION,
+            "type": "hello",
+            "token": token,
+            "terminalId": "terminal:pi",
+            "checkoutId": checkout_id,
+            "sessionId": "pi-session",
+            "title": "Pi session",
+            "work": {
+                "generation": "test-generation",
+                "sequence": 0,
+                "targets": [],
+                "ambiguous": false,
+            },
+        });
+        stream.write_all(format!("{hello}\n").as_bytes()).unwrap();
+
+        for _ in 0..100 {
+            if !agents
+                .pi()
+                .active_worktree_sessions(&checkout_id)
+                .is_empty()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let active = removal_info(&database, &agents, &checkout_id).unwrap();
+        assert_eq!(active.active_agent_sessions.len(), 1);
+        assert!(active.active_agent_sessions[0].name.contains("Pi session"));
+
+        drop(stream);
+        for _ in 0..100 {
+            if agents.pi().active_worktree_sessions(&checkout_id)[0]
+                .title
+                .contains("status unknown")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let unknown = removal_info(&database, &agents, &checkout_id).unwrap();
+        assert!(unknown.active_agent_sessions[0]
+            .name
+            .contains("status unknown"));
+        let confirmed = confirmation(&unknown, false, vec![], vec![], false);
+        let error = remove(
+            &database,
+            &TerminalBackend::default(),
+            &agents,
+            &checkout_id,
+            &confirmed,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("stop the active agent session"));
     }
 
     #[test]

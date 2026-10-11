@@ -21,6 +21,7 @@ interface Adapters {
   getWorkspace(): WorkspaceState;
   getFollowMode(): "off" | "cd" | "agent" | "both";
   terminalShowsSession(checkoutId: string, terminalId: string, agentSessionId: string): boolean;
+  isPiTerminal(terminalId: string): boolean;
   shouldFollowWindow(sessionId: string, fromCheckoutId: string): boolean;
   moveSession(
     sessionId: string,
@@ -256,7 +257,7 @@ export function useTerminalMovement(adapters: Adapters) {
         .repos.flatMap((repo) => repo.checkouts)
         .find((checkout) => checkout.sessions.some((session) => session.id === sessionId));
       if (currentSource && manual.get(sessionId) === pending) pending.sourceCheckoutId = currentSource.id;
-      return adapters.moveSession(sessionId, targetCheckoutId, index, true, selectTarget);
+      return adapters.moveSession(sessionId, targetCheckoutId, index, !adapters.isPiTerminal(sessionId), selectTarget);
     });
     const queuedMove = move.then(
       () => undefined,
