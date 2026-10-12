@@ -20,6 +20,7 @@ import type { AppLayoutState, CheckoutUiState } from "../domain/ui-state";
 import type { AppSettings, ReviewStorageMode } from "../domain/settings";
 import type { AgentAgent, AgentRelocation, AgentSession } from "../domain/agent";
 import type { DocumentOrigin } from "../domain/main-document";
+import type { CompatibilitySnapshot } from "../domain/compatibility";
 
 export interface CreatedTerminal {
   session: Session;
@@ -278,16 +279,16 @@ export function dispatchReviewRound(request: {
  * the terminal that runs it, so the terminal is what has to exist before there is anything to read.
  */
 export interface ReviewLaunch {
-  ids: string[];
   markdown: string;
 }
+
+export type TerminalLaunch = { kind: "pi-review"; request: ReviewLaunch };
 
 /**
  * Opens an interactive Pi in a terminal of this checkout with the review already in front of it.
  *
- * No session and no queue, because neither exists for this destination: every send starts a new Pi
- * rather than naming one that is already running. The round comes back still `dispatching` — it
- * names the terminal and nothing yet proves the review was read.
+ * No session and no queue: each send opens a new interactive Pi terminal with a private `@file` prompt.
+ * Success means that terminal was opened, not that Pi confirmed reading the review.
  */
 export function launchPiReviewTerminal(
   request: ReviewLaunch,
@@ -295,22 +296,11 @@ export function launchPiReviewTerminal(
   cols: number,
   rows: number,
   onOutput: Channel<ArrayBuffer>,
-): Promise<{ round: ReviewRound; session: Session; workspace: WorkspaceState }> {
-  return invoke("review_round_launch_pi", {
+): Promise<CreatedTerminal> {
+  return invoke("review_launch_pi", {
     request: { checkoutId, ...request, cols, rows },
     onOutput,
   });
-}
-
-/**
- * Asks what a Pi session's own reports prove about the rounds it was sent, and settles them.
- *
- * Delivery is confirmed only from a marker that session reported reading, and a round is closed
- * only from the settlement Pi announced. Never a send: this is the one command in this file that
- * cannot start a Pi, and a round it leaves unconfirmed stays exactly where it was.
- */
-export function settlePiReviewRound(checkoutId: string, sessionId: string): Promise<ReviewRound[]> {
-  return invoke<ReviewRound[]>("review_round_settle_pi", { checkoutId, sessionId });
 }
 
 /** Sends the rounds held back while the agent was busy. Returns how many went out. */
@@ -434,6 +424,10 @@ export function selectCheckout(checkoutId: string | null): Promise<WorkspaceStat
 
 export function selectSession(sessionId: string | null): Promise<WorkspaceState> {
   return invoke<WorkspaceState>("select_session", { sessionId });
+}
+
+export function getCompatibilitySnapshot(): Promise<CompatibilitySnapshot> {
+  return invoke<CompatibilitySnapshot>("compatibility_snapshot");
 }
 
 export function createTerminal(

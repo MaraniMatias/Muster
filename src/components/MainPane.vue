@@ -5,8 +5,7 @@ import type { EditorSettings, TerminalSettings } from "../domain/settings";
 import type { Checkout, TerminalSessionStatus, WorkspaceState } from "../domain/workspace";
 import type { ActiveGitSnapshot } from "../presentation/active-git-snapshot";
 import type { ActiveReviewNotes } from "../presentation/review-notes";
-import type { ReviewRound } from "../domain/review";
-import type { ReviewLaunch } from "../lib/ipc";
+import type { TerminalLaunch } from "../lib/ipc";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import DocumentPane from "./DocumentPane.vue";
 import SessionPane from "./SessionPane.vue";
@@ -30,7 +29,7 @@ const props = withDefaults(
     review: ReviewApi;
     activeSessionId: string | null;
     isOpening: boolean;
-    shellRequest?: { checkoutId: string; token: number; reviewLaunch?: ReviewLaunch } | null;
+    shellRequest?: { checkoutId: string; token: number; launch?: TerminalLaunch } | null;
     registeredSessionIds?: string[];
     refreshRevision?: number;
     /** The checkout-relative paths the last file activity named, for a document that resolves
@@ -63,8 +62,7 @@ const emit = defineEmits<{
   openFolder: [];
   workspaceUpdated: [workspace: WorkspaceState, shellRequestToken?: number];
   shellCreated: [token: number, checkoutId: string, sessionId: string];
-  /** The round a Pi launched for a review is holding, still unconfirmed. */
-  reviewRoundLaunched: [round: ReviewRound];
+  reviewLaunchOpened: [checkoutId: string];
   reviewLaunchFailed: [message: string];
   sessionStatusChanged: [sessionId: string, status: TerminalSessionStatus | null];
   /**
@@ -154,7 +152,7 @@ function finishPreviewResize(event: PointerEvent) {
         @open-folder="$emit('openFolder')"
         @workspace-updated="(workspace, shellRequestToken) => $emit('workspaceUpdated', workspace, shellRequestToken)"
         @shell-created="(token, checkoutId, sessionId) => $emit('shellCreated', token, checkoutId, sessionId)"
-        @review-round-launched="(round) => $emit('reviewRoundLaunched', round)"
+        @review-launch-opened="(checkoutId) => $emit('reviewLaunchOpened', checkoutId)"
         @review-launch-failed="(message) => $emit('reviewLaunchFailed', message)"
         @session-status-changed="(sessionId, status) => $emit('sessionStatusChanged', sessionId, status)"
         @session-order="(checkoutId, order) => $emit('sessionOrder', checkoutId, order)"

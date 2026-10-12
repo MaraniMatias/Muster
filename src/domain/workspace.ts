@@ -5,8 +5,12 @@ export type SessionType = "shell" | "agent";
 export type SessionStatus = "active" | "inactive";
 export type TerminalProcessState = "running" | "exited";
 
+export type PiTaskState = "working" | "blocked" | "done" | "error";
+
 export interface TerminalSessionStatus {
   state: TerminalProcessState;
+  /** Pi task state from OSC 7501 or the OSC 9;4 fallback, scoped to its foreground process. */
+  piTaskState?: PiTaskState;
   exitCode?: number;
   foregroundProcess?: boolean;
   /** The program in front of the shell, by name: `opencode`, `nvim`. Absent when it is idle. */
@@ -126,7 +130,7 @@ export function displayCheckoutPath(path: string, homePath: string | undefined):
  * status, one that is not on the panel, has to be named by.
  */
 export function sessionTitle(session: Session, status?: TerminalSessionStatus | null): string {
-  return status?.terminalTitle || status?.foregroundApp || session.name;
+  return status?.terminalTitle || (status?.foregroundApp === "pi" ? "Pi" : status?.foregroundApp) || session.name;
 }
 
 /**
@@ -223,7 +227,7 @@ export function agentSessionTitle(status: TerminalSessionStatus | null | undefin
  * writes its prompt there and an editor writes its file, and both name a place rather than a session.
  */
 export function sessionRowTitle(session: Session, status: TerminalSessionStatus | null | undefined): string {
-  return agentSessionTitle(status) || status?.foregroundApp || session.name;
+  return agentSessionTitle(status) || (status?.foregroundApp === "pi" ? "Pi" : status?.foregroundApp) || session.name;
 }
 
 /**

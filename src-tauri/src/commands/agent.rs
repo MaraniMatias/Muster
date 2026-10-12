@@ -8,74 +8,12 @@ use crate::{
         ipc::{IpcError, IpcErrorCode},
     },
     persistence::Database,
-    services::{
-        agent::{self, AgentService},
-        review_round,
-    },
+    services::agent::{self, AgentService},
 };
 use std::sync::Arc;
 
 fn operation_error(error: impl std::fmt::Display) -> IpcError {
     IpcError::new(IpcErrorCode::OperationFailed, error.to_string())
-}
-
-/// Folds the Pi sessions reported for this checkout into the OpenCode answer.
-///
-/// Two programs answering one question, so they are pooled here rather than behind a selector:
-/// a row that has to ask which provider it is looking at is a row that will eventually be drawn
-/// for the wrong one.
-///
-/// The one thing that changes is what happens when OpenCode is not running. That has always been
-/// an error, and it still is — unless a Pi reported something, in which case there is a real
-/// answer and refusing to return it would mean a machine using Pi correctly shows no sessions at
-/// all. A provider that is absent is not a failure when another provider answered.
-fn with_pi_sessions(
-    database: &Database,
-    agents: &AgentService,
-    checkout_id: &str,
-    opencode: Result<Vec<AgentSession>, IpcError>,
-) -> Result<Vec<AgentSession>, IpcError> {
-    let pi = agents.pi().sessions(checkout_id);
-    bind_pi_review_rounds(database, agents, checkout_id, &pi);
-    match opencode {
-        Ok(mut sessions) => {
-            sessions.extend(pi);
-            Ok(sessions)
-        }
-        Err(error) if pi.is_empty() => Err(error),
-        Err(_) => Ok(pi),
-    }
-}
-
-/// Ties a waiting Pi review round to the session that appeared in the terminal it was launched
-/// into.
-///
-/// Done here because this is where a Pi session is first seen, and it is where the two halves meet:
-/// the round was recorded with a terminal and no session, and the session arrives naming the
-/// terminal it is in. The id comes from a credential minted for that one terminal, so this binds a
-/// round to a session in the terminal it asked for and to nothing else.
-///
-/// **This records identity, not delivery.** The round stays `dispatching`; whether the review was
-/// read is settled from a receipt the session reports, which is
-/// [`crate::services::review_round::settle_pi_rounds`]'s job and is not something a session
-/// appearing can answer.
-fn bind_pi_review_rounds(
-    database: &Database,
-    agents: &AgentService,
-    checkout_id: &str,
-    sessions: &[AgentSession],
-) {
-    for session in sessions {
-        let Some(terminal_id) = session.terminal_id.as_deref() else {
-            continue;
-        };
-        let _ =
-            review_round::bind_pi_round_session(database, checkout_id, terminal_id, &session.id);
-        // Settled here as well as from the command, because this is a read that has just been
-        // told what the session holds. Asking again costs nothing: every transition is refused
-        // once taken, so a receipt that arrives twice confirms nothing twice.
-        let _ = review_round::settle_pi_rounds(database, agents, checkout_id, &session.id);
-    }
 }
 
 /// The directory a checkout lives in, resolved once and reused by every agent call.
@@ -120,15 +58,14 @@ pub async fn agent_sessions(
     let agents: Arc<AgentService> = Arc::clone(agents.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let directory = checkout_directory(&database, &checkout_id)?;
-        let opencode = with_current_checkout(
+        with_current_checkout(
             &database,
             &agents,
             &checkout_id,
             &directory,
             generation,
             || agents.sessions(&checkout_id, &directory),
-        );
-        with_pi_sessions(&database, &agents, &checkout_id, opencode)
+        )
     })
     .await
     .map_err(operation_error)?
@@ -152,15 +89,14 @@ pub async fn agent_candidate_sessions(
     let agents: Arc<AgentService> = Arc::clone(agents.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let directory = checkout_directory(&database, &checkout_id)?;
-        let opencode = with_current_checkout(
+        with_current_checkout(
             &database,
             &agents,
             &checkout_id,
             &directory,
             generation,
             || agents.candidate_sessions(&checkout_id, &directory),
-        );
-        with_pi_sessions(&database, &agents, &checkout_id, opencode)
+        )
     })
     .await
     .map_err(operation_error)?

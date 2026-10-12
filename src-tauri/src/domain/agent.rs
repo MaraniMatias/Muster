@@ -10,29 +10,6 @@ use serde::Serialize;
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
     OpenCode,
-    Pi,
-}
-
-impl AgentProvider {
-    /// The name this provider is stored and sent under.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AgentProvider::OpenCode => "opencode",
-            AgentProvider::Pi => "pi",
-        }
-    }
-
-    /// Reads a stored provider back, refusing anything this build does not name.
-    ///
-    /// The column is CHECK-constrained as well, so this is the second of the two refusals and
-    /// the one a hand-edited or half-written file has to go through.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "opencode" => Some(AgentProvider::OpenCode),
-            "pi" => Some(AgentProvider::Pi),
-            _ => None,
-        }
-    }
 }
 
 /// One agent session Muster knows about, scoped to the checkout that owns it.
@@ -44,13 +21,6 @@ pub struct AgentSession {
     pub checkout_id: String,
     /// The program this session belongs to; everything else here is read through it.
     pub provider: AgentProvider,
-    /// The Muster terminal session this agent session is running in, when the provider says so.
-    ///
-    /// Pi's extension reports this, so a Pi row names its session by identity instead of by
-    /// reading a title off the terminal. OpenCode offers no such route — it cannot say which TUI
-    /// process has which session open — so it is always absent there and that row falls back to
-    /// title inference, which is a weaker thing this contract keeps named apart.
-    pub terminal_id: Option<String>,
     pub title: String,
     /// When the server last saw this session go idle, if ever.
     ///

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use tauri::{
     ipc::{Channel, Response},
@@ -8,9 +8,8 @@ use tauri::{
 use crate::{
     config::ConfigFile,
     domain::{
-        agent::AgentProvider,
         ipc::IpcError,
-        review::{review_round_marker, ReviewRound},
+        review::{ReviewRound, AGENT_PROMPT_PREFIX},
     },
     persistence::Database,
     services::{
@@ -191,6 +190,46 @@ pub async fn review_rounds(
         .map_err(operation_error)?
 }
 
+fn record_review_round_for_session(
+    database: &Database,
+    agents: &AgentService,
+    directory: &Path,
+    generation: u64,
+    request: &ReviewRoundDispatchRequest,
+) -> Result<ReviewRound, IpcError> {
+    agents
+        .with_checkout_generation(
+            &request.checkout_id,
+            generation,
+            || {
+                database
+                    .terminal_checkout_path(&request.checkout_id)
+                    .is_ok_and(|current| current == directory)
+            },
+            || {
+                agents.owned_session(&request.checkout_id, directory, &request.session_id)?;
+                Ok(if request.queue {
+                    review_round::queue_round(
+                        database,
+                        &request.checkout_id,
+                        &request.session_id,
+                        &request.ids,
+                        &request.markdown,
+                    )
+                } else {
+                    review_round::begin_round(
+                        database,
+                        &request.checkout_id,
+                        &request.session_id,
+                        &request.ids,
+                        &request.markdown,
+                    )
+                })
+            },
+        )
+        .map_err(agent::map_error)?
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewRoundDispatchRequest {
@@ -225,32 +264,10 @@ pub async fn review_round_dispatch(
     tauri::async_runtime::spawn_blocking(move || {
         let directory = super::agent::checkout_directory(&database, &request.checkout_id)?;
         review_round::check_review_markdown(&request.markdown)?;
-        // Whichever the caller asked for, this links the notes — which is also what rejects a
-        // foreign note id — and stores the exact message the round will be sent with.
-        //
-        // The queued case has to be recorded as `queued`, not as `dispatching`: `queued` is the
-        // state `flush_rounds` selects, so a round recorded as `dispatching` reads as a send in
-        // flight, is never flushed, and sits there until some reconnect happens to requeue it.
-        // This command is the OpenCode path: it names a session that already exists on that
-        // checkout's server. A Pi send opens a terminal instead, so it arrives by another command.
-        let round = if request.queue {
-            review_round::queue_round(
-                &database,
-                &request.checkout_id,
-                &request.session_id,
-                &request.ids,
-                &request.markdown,
-            )?
-        } else {
-            review_round::begin_round(
-                &database,
-                &request.checkout_id,
-                AgentProvider::OpenCode,
-                &request.session_id,
-                &request.ids,
-                &request.markdown,
-            )?
-        };
+        // Validate the current target and record the round atomically with respect to checkout
+        // removal or service replacement.
+        let round =
+            record_review_round_for_session(&database, &agents, &directory, generation, &request)?;
         // Queued: the round is recorded and the notes are committed to it, but the agent is
         // left alone. Nothing about the send has to be remembered by the caller.
         if request.queue {
@@ -281,110 +298,43 @@ pub async fn review_round_dispatch(
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReviewRoundLaunchPiRequest {
+pub struct ReviewLaunchPiRequest {
     pub checkout_id: String,
-    /// The notes this round carries. Validated by the round itself, which is what rejects an id
-    /// belonging to another checkout.
-    pub ids: Vec<String>,
-    /// The exported review. Built by the caller, which owns the Markdown format.
     pub markdown: String,
     pub cols: u16,
     pub rows: u16,
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReviewRoundLaunched {
-    pub round: ReviewRound,
-    pub session: crate::domain::workspace::Session,
-    pub workspace: crate::domain::workspace::WorkspaceState,
-}
-
-/// Records a Pi round and writes its startup prompt, undoing the round if preparation fails.
-fn prepare_pi_review_launch(
-    database: &Database,
-    checkout_id: &str,
-    ids: &[String],
-    markdown: &str,
-    round_id: &str,
-    app_dir: &std::path::Path,
-) -> Result<(ReviewRound, std::path::PathBuf), IpcError> {
-    let round =
-        review_round::begin_pi_round_with_id(database, checkout_id, ids, markdown, round_id)?;
-    let prompt_file = (|| {
-        let prompt = database
-            .review_round_prompt(&round.id, checkout_id)
-            .map_err(operation_error)?
-            .ok_or_else(|| operation_error("the recorded round has no message to send"))?;
-        pi_launch::write_prompt(app_dir, &round.marker, &prompt).map_err(operation_error)
-    })();
-    match prompt_file {
-        Ok(path) => Ok((round, path)),
-        Err(error) => {
-            let _ = database.discard_pi_round(&round.id, checkout_id);
-            Err(error)
-        }
-    }
-}
-
-fn pi_delivery_confirmed(status: &str) -> bool {
-    matches!(status, "dispatched" | "acked")
-}
-
-/// Opens an interactive Pi with one review round already in front of it.
-///
-/// **There is no session to choose and no busy agent to wait for**, which is why this is its own
-/// command rather than a case of `review_round_dispatch`: a Pi round is delivered by starting a
-/// Pi, so a destination that existed already is not a thing the caller could have named. Every
-/// send opens a new terminal in the checkout asked for, and each one carries its own round.
-///
-/// The order is the one every round is recorded on — the round and its marker exist before the
-/// message can reach the agent — with the parts that can fail entirely in front of it: the program,
-/// the bridge file and the prompt file are all resolved and written before a row is recorded, so a
-/// machine with no Pi installed produces an error and no claim. What is left after a successful
-/// spawn is a round that names its provider and its terminal and is otherwise unconfirmed. It is
-/// **not** `dispatched`, because nobody has yet read anything back out of the Pi that received it.
+/// Opens a new interactive Pi terminal with this review as its initial prompt.
 #[tauri::command]
-pub async fn review_round_launch_pi(
-    request: ReviewRoundLaunchPiRequest,
+pub async fn review_launch_pi(
+    request: ReviewLaunchPiRequest,
     on_output: Channel<Response>,
     app: AppHandle,
     database: State<'_, Database>,
     backend: State<'_, Arc<TerminalBackend>>,
     config: State<'_, ConfigFile>,
     agents: State<'_, Arc<AgentService>>,
-) -> Result<ReviewRoundLaunched, IpcError> {
+) -> Result<super::terminal::CreatedTerminal, IpcError> {
     super::terminal::validate_dimensions(request.cols, request.rows)?;
     let database = database.inner().clone();
     let backend = backend.inner().clone();
     let agents = Arc::clone(agents.inner());
     let checkout_id = request.checkout_id.clone();
-    // The app's own folder in the user's home, where `config.yml` lives. Nothing Pi needs is ever
-    // written into the user's Pi configuration; see `docs/pi-integration.md`.
     let app_dir = crate::config::dir_of(config.inner())
         .map(|dir| dir.to_path_buf())
         .ok_or_else(|| operation_error("this app's settings folder could not be located"))?;
     tauri::async_runtime::spawn_blocking(move || {
         agents.with_checkout_operation(&checkout_id, || {
-            review_round::check_review_markdown(&request.markdown)?;
-            let round_id = review_round::new_round_id();
-            let marker = review_round_marker(&round_id);
-            review_round::check_round_prompt_size(&request.markdown, &marker)?;
-            let program = pi_launch::resolve_program()
-                .ok_or_else(|| operation_error("Pi is not installed, or not on this app's PATH"))?;
-            let bridge = pi_launch::bridge_path(&app_dir).map_err(operation_error)?;
-            let (round, prompt_file) = prepare_pi_review_launch(
-                &database,
-                &request.checkout_id,
-                &request.ids,
-                &request.markdown,
-                &round_id,
-                &app_dir,
-            )?;
-
+            review_round::check_round_prompt_size(&request.markdown, "")?;
+            let program = pi_launch::resolve_program().ok_or_else(|| {
+                operation_error("Pi is not installed in a location Muster can run")
+            })?;
+            let prompt = format!("{}{}", AGENT_PROMPT_PREFIX, request.markdown);
+            let prompt_file =
+                pi_launch::write_prompt(&app_dir, &prompt).map_err(operation_error)?;
             let (flow, output) = super::terminal::terminal_output(&app, on_output);
-            let mut bound_round = None;
-            let created = match terminal::create_program_with_pre_spawn(
+            match terminal::create_program(
                 &database,
                 &backend,
                 &request.checkout_id,
@@ -394,91 +344,26 @@ pub async fn review_round_launch_pi(
                 },
                 TerminalProgram {
                     program,
-                    args: pi_launch::arguments(&bridge, &prompt_file),
+                    args: pi_launch::arguments(&prompt_file),
                     env: Vec::new(),
-                    // What the row in the sidebar says, so this terminal is recognisable among the
-                    // shells it was opened next to.
-                    name: "pi".into(),
+                    name: "Pi".into(),
                 },
-                Some(Arc::clone(agents.pi())),
                 output,
-                |session| {
-                    bound_round = Some(
-                        review_round::bind_pi_round(
-                            &database,
-                            &request.checkout_id,
-                            &round.id,
-                            &session.id,
-                        )
-                        .map_err(|error| error.message)?,
-                    );
-                    Ok(())
-                },
             ) {
-                Ok(created) => created,
-                Err(error) => {
-                    // No session, so nothing will ever answer this gate.
-                    flow.stop();
-                    // Nothing was ever handed to a terminal, so there is no claim left to settle and
-                    // the round goes back the way it came: its notes are drafts again rather than
-                    // notes marked sent for a Pi that was never started, and the file it would have
-                    // been read from is deleted rather than left for a day.
-                    let _ = database.discard_pi_round(&round.id, &request.checkout_id);
-                    pi_launch::remove_prompt(&app_dir, &round.marker);
-                    return Err(operation_error(error));
+                Ok(created) => {
+                    flow.name(created.session.id.clone());
+                    Ok(super::terminal::CreatedTerminal {
+                        session: created.session,
+                        workspace: created.workspace,
+                    })
                 }
-            };
-            // The window answers for this session only, and cannot be named until the session exists.
-            flow.name(created.session.id.clone());
-            let round =
-                bound_round.expect("pre-spawn binding succeeded before the process started");
-            Ok(ReviewRoundLaunched {
-                round,
-                session: created.session,
-                workspace: created.workspace,
-            })
-        })
-    })
-    .await
-    .map_err(operation_error)?
-}
-
-/// Settles what one Pi session's own reports prove about the rounds it was sent.
-///
-/// Asked from the two Pi reports that mean something — the session appearing, and its turn
-/// settling — and never as part of a send, so nothing reachable from here can start a second Pi.
-/// A round that is still unconfirmed when this answers is left exactly where it was: there is no
-/// automatic retransmission, because the only route to a Pi is opening one and opening one is
-/// the user's send.
-///
-/// A confirmed delivery also removes the file its review was written to, which is safe only
-/// because a receipt cannot exist while Pi is still reading it: Pi reads the `@file` during
-/// startup and records the prompt before it introduces itself.
-#[tauri::command]
-pub async fn review_round_settle_pi(
-    checkout_id: String,
-    session_id: String,
-    database: State<'_, Database>,
-    agents: State<'_, Arc<AgentService>>,
-    config: State<'_, ConfigFile>,
-) -> Result<Vec<ReviewRound>, IpcError> {
-    let database = database.inner().clone();
-    let agents = Arc::clone(agents.inner());
-    // Looked for here rather than inside the blocking task, and not required: a settlement that
-    // confirmed nothing has no file to clean up, and failing one over a settings folder it did not
-    // need would be worse than the file it would have removed.
-    let app_dir = crate::config::dir_of(config.inner()).map(|dir| dir.to_path_buf());
-    tauri::async_runtime::spawn_blocking(move || {
-        let settled =
-            review_round::settle_pi_rounds(&database, &agents, &checkout_id, &session_id)?;
-        if let Some(app_dir) = app_dir {
-            for round in &settled {
-                if pi_delivery_confirmed(&round.status) {
-                    pi_launch::remove_prompt(&app_dir, &round.marker);
+                Err(error) => {
+                    flow.stop();
+                    pi_launch::remove_prompt(&prompt_file);
+                    Err(operation_error(error))
                 }
             }
-        }
-        Ok(settled)
+        })
     })
     .await
     .map_err(operation_error)?
@@ -591,7 +476,7 @@ mod tests {
     };
 
     use super::{
-        pi_delivery_confirmed, prepare_pi_review_launch, review_round_dispatch, review_round_flush,
+        record_review_round_for_session, review_round_dispatch, review_round_flush,
         ReviewRoundDispatchRequest,
     };
 
@@ -642,22 +527,16 @@ mod tests {
         port
     }
 
-    #[test]
-    fn a_confirmed_or_acked_pi_round_is_safe_to_clean_up() {
-        assert!(!pi_delivery_confirmed("dispatching"));
-        assert!(pi_delivery_confirmed("dispatched"));
-        assert!(pi_delivery_confirmed("acked"));
-    }
-
-    #[test]
-    fn failed_pi_prompt_preparation_discards_the_round_and_restores_its_notes() {
-        let temp = tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
-        std::fs::create_dir_all(&checkout).unwrap();
+    fn checkout_with_note(
+        temp: &tempfile::TempDir,
+    ) -> (Database, String, std::path::PathBuf, String) {
+        let directory = temp.path().join("checkout");
+        std::fs::create_dir_all(&directory).unwrap();
         let database = Database::open(temp.path().join("workspace.sqlite3")).unwrap();
-        let repo = Repo::plain(&checkout, "now").unwrap();
+        let repo = Repo::plain(&directory, "now").unwrap();
         let checkout_id = repo.checkouts[0].id.clone();
         database.register_plain_repo(repo).unwrap();
+        let directory = database.terminal_checkout_path(&checkout_id).unwrap();
         let note = review::add_note(
             &database,
             &checkout_id,
@@ -671,23 +550,131 @@ mod tests {
             },
         )
         .unwrap();
-        let app_dir = temp.path().join("app");
-        std::fs::create_dir_all(app_dir.join("pi")).unwrap();
-        std::fs::write(app_dir.join("pi/prompts"), "not a directory").unwrap();
+        (database, checkout_id, directory, note.id)
+    }
 
-        assert!(prepare_pi_review_launch(
-            &database,
-            &checkout_id,
-            &[note.id],
-            "# Code Review",
-            "round:1:2:3",
-            &app_dir,
-        )
-        .is_err());
-        assert!(database.review_rounds(&checkout_id).unwrap().is_empty());
-        let note = &database.review_notes(&checkout_id).unwrap()[0];
+    fn round_request(
+        checkout_id: &str,
+        session_id: &str,
+        ids: Vec<String>,
+        queue: bool,
+    ) -> ReviewRoundDispatchRequest {
+        ReviewRoundDispatchRequest {
+            checkout_id: checkout_id.into(),
+            session_id: session_id.into(),
+            ids,
+            markdown: "# Code Review".into(),
+            queue,
+        }
+    }
+
+    fn assert_no_claim(database: &Database, checkout_id: &str, note_id: &str) {
+        assert!(database.review_rounds(checkout_id).unwrap().is_empty());
+        let note = database
+            .review_notes(checkout_id)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .unwrap();
         assert_eq!(note.status, "draft");
         assert_eq!(note.round_id, None);
+    }
+
+    #[test]
+    fn a_round_requires_a_live_target_on_its_current_checkout_service() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, directory, note_id) = checkout_with_note(&temp);
+        let ids = vec![note_id.clone()];
+        let without_service = AgentService::without_service();
+        let generation = without_service.checkout_generation(&checkout_id).unwrap();
+        let request = round_request(&checkout_id, "ses_busy", ids.clone(), true);
+        assert!(record_review_round_for_session(
+            &database,
+            &without_service,
+            &directory,
+            generation,
+            &request,
+        )
+        .is_err());
+        assert_no_claim(&database, &checkout_id, &note_id);
+
+        let missing_port = mock_responses(vec![serde_json::json!({"data": null})]);
+        let missing = AgentService::with_test_server(missing_port);
+        let generation = missing.checkout_generation(&checkout_id).unwrap();
+        let request = round_request(&checkout_id, "ses_missing", ids.clone(), true);
+        assert!(record_review_round_for_session(
+            &database, &missing, &directory, generation, &request,
+        )
+        .is_err());
+        assert_no_claim(&database, &checkout_id, &note_id);
+
+        let missing_immediate =
+            AgentService::with_test_server(mock_responses(vec![serde_json::json!({"data": null})]));
+        let generation = missing_immediate.checkout_generation(&checkout_id).unwrap();
+        let request = round_request(&checkout_id, "ses_missing", ids.clone(), false);
+        assert!(record_review_round_for_session(
+            &database,
+            &missing_immediate,
+            &directory,
+            generation,
+            &request,
+        )
+        .is_err());
+        assert_no_claim(&database, &checkout_id, &note_id);
+
+        let foreign_path = temp.path().join("other-checkout");
+        let foreign_port = mock_responses(vec![serde_json::json!({
+            "data": {
+                "id": "ses_foreign",
+                "location": {"directory": foreign_path.to_string_lossy()},
+            }
+        })]);
+        let foreign = AgentService::with_test_server(foreign_port);
+        let generation = foreign.checkout_generation(&checkout_id).unwrap();
+        let request = round_request(&checkout_id, "ses_foreign", ids, true);
+        assert!(record_review_round_for_session(
+            &database, &foreign, &directory, generation, &request,
+        )
+        .is_err());
+        assert_no_claim(&database, &checkout_id, &note_id);
+    }
+
+    #[test]
+    fn a_busy_service_session_can_be_queued_without_a_prompt() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, directory, note_id) = checkout_with_note(&temp);
+        let session = serde_json::json!({
+            "id": "ses_busy",
+            "location": {"directory": directory.to_string_lossy()},
+        });
+        let port = mock_responses(vec![
+            serde_json::json!({"data": session}),
+            serde_json::json!({"data": {"ses_busy": {"type": "running"}}}),
+            serde_json::json!({"data": []}),
+            serde_json::json!({"data": []}),
+        ]);
+        let agents = AgentService::with_test_server(port);
+        let generation = agents.checkout_generation(&checkout_id).unwrap();
+        let request = round_request(&checkout_id, "ses_busy", vec![note_id.clone()], true);
+        let round =
+            record_review_round_for_session(&database, &agents, &directory, generation, &request)
+                .unwrap();
+
+        assert_eq!(round.status, "queued");
+        assert_eq!(
+            database.review_rounds(&checkout_id).unwrap(),
+            vec![round.clone()]
+        );
+        assert_eq!(
+            database
+                .review_round_prompt(&round.id, &checkout_id)
+                .unwrap()
+                .as_deref(),
+            Some(super::review_round::build_round_prompt("# Code Review", &round.marker).as_str())
+        );
+        let note = &database.review_notes(&checkout_id).unwrap()[0];
+        assert_eq!(note.status, "sent");
+        assert_eq!(note.round_id.as_deref(), Some(round.id.as_str()));
     }
 
     /// Queued has to persist `queued`, because that is the state the send path selects.
@@ -706,6 +693,7 @@ mod tests {
         let repo = Repo::plain(&directory, "now").unwrap();
         let checkout_id = repo.checkouts[0].id.clone();
         database.register_plain_repo(repo).unwrap();
+        let directory = database.terminal_checkout_path(&checkout_id).unwrap();
         let note = review::add_note(
             &database,
             &checkout_id,
@@ -725,6 +713,11 @@ mod tests {
             "location": {"directory": directory.to_string_lossy()},
         });
         let port = mock_responses(vec![
+            // Dispatch validates the busy target but does not prompt or otherwise wake it.
+            serde_json::json!({"data": session.clone()}),
+            serde_json::json!({"data": {"ses_target": {"type": "running"}}}),
+            serde_json::json!({"data": []}),
+            serde_json::json!({"data": []}),
             // The transcript the flush reads before it sends anything: no marker, so the round
             // reads as never delivered and the stored message has to go out.
             serde_json::json!({"data": session.clone()}),

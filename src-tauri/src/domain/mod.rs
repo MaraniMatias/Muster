@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod compatibility;
 pub mod files;
 pub mod folder;
 pub mod ipc;

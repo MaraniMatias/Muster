@@ -6,13 +6,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, h, provide, reactive, ref } from "vue";
 import type { VNodeChild } from "vue";
 import type { AgentSession } from "../domain/agent";
+import { availableReviewTargets } from "../domain/compatibility";
 import { buildReviewMarkdown } from "../domain/review";
-import type { ReviewNote, ReviewTarget } from "../domain/review";
+import type { ReviewNote, ReviewRound, ReviewTarget } from "../domain/review";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import type { Checkout } from "../domain/workspace";
 import type { ActiveGitSnapshot } from "../presentation/active-git-snapshot";
 import { REVIEW_SENDER } from "../presentation/review-notes";
-import type { NewReviewNoteInput, PiReviewFeedback, ReviewSender } from "../presentation/review-notes";
+import type { NewReviewNoteInput, ReviewSender } from "../presentation/review-notes";
 import { theme } from "../presentation/theme";
 import { diffRowHeight } from "./use-large-diff";
 
@@ -308,12 +309,24 @@ function note(overrides: Partial<ReviewNote> = {}): ReviewNote {
   };
 }
 
+function reviewRound(id: string, status: ReviewRound["status"], noteIds: string[]): ReviewRound {
+  return {
+    id,
+    checkoutId: checkout.id,
+    sessionId: "ses_one",
+    status,
+    marker: `muster-review:${id}`,
+    noteIds,
+    createdAt: "1",
+    updatedAt: "1",
+  };
+}
+
 function session(id: string, overrides: Partial<AgentSession> = {}): AgentSession {
   return {
     id,
     checkoutId: checkout.id,
     provider: "opencode",
-    terminalId: null,
     title: id,
     running: false,
     idleAt: 1,
@@ -328,9 +341,10 @@ function session(id: string, overrides: Partial<AgentSession> = {}): AgentSessio
   };
 }
 
-function reviewApi(notes: ReviewNote[] = []) {
+function reviewApi(notes: ReviewNote[] = [], rounds: ReviewRound[] = []) {
   return reactive({
     notes,
+    rounds,
     addNote: vi.fn<(input: NewReviewNoteInput) => Promise<boolean>>(async () => true),
     updateNote: vi.fn(async () => true),
     deleteNote: vi.fn(async () => true),
@@ -345,18 +359,23 @@ function senderStub(
   targetId: string | null = "ses_one",
   unfinishedRounds = 0,
   reviewTarget: ReviewTarget = "opencode",
-  piFeedback: PiReviewFeedback | null = null,
+  availableTargets: ReviewTarget[] = ["markdown", "opencode", "pi"],
 ) {
   const sessionList = ref(sessions);
+  const targetList = ref(availableTargets);
   const target = ref(targetId);
   const unfinished = ref(unfinishedRounds);
   const destination = ref(reviewTarget);
+  const error = ref("");
   const send = vi.fn(async () => undefined);
   const selectTarget = vi.fn();
   const selectReviewTarget = vi.fn((next: ReviewTarget) => (destination.value = next));
   const sender: ReviewSender = {
     get target() {
       return destination.value;
+    },
+    get availableTargets() {
+      return targetList.value;
     },
     get sessions() {
       return sessionList.value;
@@ -367,14 +386,14 @@ function senderStub(
     get unfinishedRounds() {
       return unfinished.value;
     },
-    get piFeedback() {
-      return piFeedback;
+    get error() {
+      return error.value;
     },
     selectTarget,
     selectReviewTarget,
     send,
   };
-  return { sender, send, selectTarget, selectReviewTarget };
+  return { sender, send, selectTarget, selectReviewTarget, error };
 }
 
 /**
@@ -1011,28 +1030,6 @@ describe("FileDiff", () => {
     wrapper.unmount();
   });
 
-  it("keeps Pi sessions out of the OpenCode review picker and its search threshold", async () => {
-    const piSessions = Array.from({ length: 6 }, (_, index) =>
-      session("ses_pi_" + index, {
-        provider: "pi",
-        terminalId: "terminal:pi:" + index,
-        title: "Pi session " + index,
-        updatedAt: 99 + index,
-      }),
-    );
-    const stub = senderStub(
-      [session("ses_oc", { title: "OpenCode session", updatedAt: 1 }), ...piSessions],
-      "ses_pi_0",
-    );
-    const wrapper = mountDiff({ review: reviewApi([note()]) }, stub.sender);
-    await flushPromises();
-
-    expect(wrapper.find('[data-testid="send-target"]').exists()).toBe(false);
-    expect(wrapper.find('input[aria-label="Search sessions"]').exists()).toBe(false);
-    expect(wrapper.get('[data-testid="send-review"]').text()).toBe("Send to opencode");
-    wrapper.unmount();
-  });
-
   it("offers a destination only above one session, and reports rounds left unconfirmed", async () => {
     const one = senderStub([session("ses_one")]);
     const single = mountDiff({ review: reviewApi([note()]) }, one.sender);
@@ -1231,6 +1228,42 @@ describe("FileDiff", () => {
     wrapper.unmount();
   });
 
+  it("shows review dispatch conflicts beside the send control", async () => {
+    const stub = senderStub();
+    const wrapper = mountDiff({ review: reviewApi([note()]) }, stub.sender);
+    stub.error.value = "review note is already claimed by an unfinished review round";
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="review-send-error"]').text()).toContain("already claimed");
+    wrapper.unmount();
+  });
+
+  it("holds unfinished round claims back but allows a completed note to be resent to Pi", async () => {
+    const review = reviewApi(
+      [
+        note({ id: "draft" }),
+        note({ id: "queued", status: "sent", roundId: "round:queued" }),
+        note({ id: "dispatching", status: "sent", roundId: "round:dispatching" }),
+        note({ id: "dispatched", status: "sent", roundId: "round:dispatched" }),
+        note({ id: "unknown", status: "sent", roundId: "round:missing" }),
+        note({ id: "acked", status: "sent", roundId: "round:acked" }),
+      ],
+      [
+        reviewRound("round:queued", "queued", ["queued"]),
+        reviewRound("round:dispatching", "dispatching", ["dispatching"]),
+        reviewRound("round:dispatched", "dispatched", ["dispatched"]),
+        reviewRound("round:acked", "acked", ["acked"]),
+      ],
+    );
+    const stub = senderStub([], null, 3, "pi");
+    const wrapper = mountDiff({ review }, stub.sender);
+    await flushPromises();
+
+    await wrapper.get('[data-testid="send-review"]').trigger("click");
+    expect(stub.send).toHaveBeenCalledWith(["draft", "acked"], false);
+    wrapper.unmount();
+  });
+
   it("the markdown target does not change which notes are included", async () => {
     const review = reviewApi([
       note({ id: "draft" }),
@@ -1354,89 +1387,39 @@ describe("FileDiff", () => {
     wrapper.unmount();
   });
 
-  /** The destination is a stored per-checkout choice, so the list has to offer all three. */
-  it("offers Pi beside the other two destinations", async () => {
-    const stub = senderStub();
+  it("filters review destinations by installed executables only", async () => {
+    const cases = [
+      { piInstalled: false, openCodeInstalled: false, labels: ["Markdown"] },
+      { piInstalled: true, openCodeInstalled: false, labels: ["Markdown", "Pi"] },
+      { piInstalled: false, openCodeInstalled: true, labels: ["Markdown", "OpenCode"] },
+      { piInstalled: true, openCodeInstalled: true, labels: ["Markdown", "OpenCode", "Pi"] },
+    ];
+    for (const item of cases) {
+      const targets = availableReviewTargets(item);
+      const stub = senderStub([], null, 0, "markdown", targets);
+      const wrapper = mountDiff({ review: reviewApi([note()]) }, stub.sender);
+      await flushPromises();
+
+      const labels = wrapper
+        .findAll('[aria-label="Review destination"] [role="option"]')
+        .map((option) => option.text());
+      expect(labels).toEqual(item.labels);
+      wrapper.unmount();
+    }
+  });
+
+  it("explains that OpenCode needs a connected session and refuses a send without one", async () => {
+    const stub = senderStub([], null, 0, "opencode", ["markdown", "opencode"]);
     const wrapper = mountDiff({ review: reviewApi([note()]) }, stub.sender);
     await flushPromises();
 
-    await wrapper.get('[data-testid="review-target"]').trigger("click");
-    const labels = wrapper.findAll('[role="option"]').map((option) => option.text());
-    expect(labels).toEqual(expect.arrayContaining(["Markdown", "OpenCode", "Pi"]));
+    expect(wrapper.get('[data-testid="missing-opencode-target"]').text()).toContain(
+      "Start OpenCode and open a session",
+    );
+    expect(wrapper.get('[data-testid="send-review"]').attributes("disabled")).toBeDefined();
+    await wrapper.get('[data-testid="send-review"]').trigger("click");
+    expect(stub.send).not.toHaveBeenCalled();
     wrapper.unmount();
-  });
-
-  /**
-   * A Pi round is confirmed and closed by what the Pi itself reports, so the counts are three
-   * separate facts rather than one "not finished" number borrowed from OpenCode.
-   *
-   * Waiting is not delivered, delivered is not finished, and none of the three is the notes being
-   * resolved — that is judged separately, from the diff, and is never claimed here.
-   */
-  it("reports what is known about Pi rounds without adding a session list or a busy choice", async () => {
-    const all = senderStub([session("ses_one", { running: true })], "ses_one", 3, "pi", {
-      pending: 1,
-      delivered: 2,
-      settled: 1,
-      error: "",
-    }).sender;
-    const wrapper = mountDiff({ review: reviewApi([note()]) }, all);
-    await flushPromises();
-
-    const feedback = wrapper.get('[data-testid="pi-feedback"]');
-    expect(feedback.text()).toBe("1 waiting for Pi · 2 delivered · 1 finished");
-    expect(feedback.attributes("role")).toBe("status");
-    // Still no session to choose and nothing to hold the send back for: this is a line of
-    // information about what happened, not a control.
-    expect(wrapper.find('[data-testid="send-target"]').exists()).toBe(false);
-    expect(wrapper.find('[data-testid="send-busy"]').exists()).toBe(false);
-    expect(wrapper.find('[data-testid="unfinished-rounds"]').exists()).toBe(false);
-    wrapper.unmount();
-
-    // Only the parts that are true are drawn, so a count of zero is never shown as "0 delivered".
-    const waiting = senderStub([], null, 0, "pi", { pending: 1, delivered: 0, settled: 0, error: "" }).sender;
-    const onlyWaiting = mountDiff({ review: reviewApi([note()]) }, waiting);
-    await flushPromises();
-    expect(onlyWaiting.get('[data-testid="pi-feedback"]').text()).toBe("1 waiting for Pi");
-    onlyWaiting.unmount();
-  });
-
-  /**
-   * A Pi send fails before it can record anything, so there is no round to draw the failure on.
-   *
-   * A toast expires; this is what is still on the panel afterwards, and only a launch that worked
-   * takes it away.
-   */
-  it("says why a Pi send did not start, and only for Pi", async () => {
-    const failing = senderStub([], null, 0, "pi", {
-      pending: 0,
-      delivered: 0,
-      settled: 0,
-      error: "Pi is not installed, or not on this app's PATH",
-    }).sender;
-    const wrapper = mountDiff({ review: reviewApi([note()]) }, failing);
-    await flushPromises();
-    expect(wrapper.get('[data-testid="pi-feedback"]').text()).toBe("Pi is not installed, or not on this app's PATH");
-    wrapper.unmount();
-
-    // The same counts on another destination are somebody else's business, and a destination with
-    // nothing to say draws nothing at all.
-    const other = senderStub([], null, 0, "opencode", {
-      pending: 1,
-      delivered: 1,
-      settled: 1,
-      error: "",
-    }).sender;
-    const quiet = mountDiff({ review: reviewApi([note()]) }, other);
-    await flushPromises();
-    expect(quiet.find('[data-testid="pi-feedback"]').exists()).toBe(false);
-    quiet.unmount();
-
-    const silent = senderStub([], null, 0, "pi", null).sender;
-    const nothing = mountDiff({ review: reviewApi([note()]) }, silent);
-    await flushPromises();
-    expect(nothing.find('[data-testid="pi-feedback"]').exists()).toBe(false);
-    nothing.unmount();
   });
 
   /**

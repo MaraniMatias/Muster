@@ -8,7 +8,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import { isIpcError } from "../domain/ipc";
 import { terminalHasProcess } from "../domain/workspace";
-import type { TerminalSessionStatus } from "../domain/workspace";
+
 import type { TerminalCursorStyle, TerminalScrollbarMode } from "../domain/settings";
 import {
   closeTerminal,
@@ -18,8 +18,11 @@ import {
   resizeTerminal,
   writeTerminal,
 } from "../lib/ipc";
-import type { ReviewLaunch } from "../lib/ipc";
-import type { ReviewRound } from "../domain/review";
+import type { TerminalLaunch } from "../lib/ipc";
+import { registerPiProgramStatus } from "../lib/pi-program-status";
+import type { PiProgramStatusEvent } from "../lib/pi-program-status";
+import { PI_PROGRAM_STATUS_REPLY } from "../lib/pi-program-status";
+import type { PiTaskState, TerminalSessionStatus } from "../domain/workspace";
 import {
   attachTerminalRenderer,
   createMusterTerminal,
@@ -64,13 +67,8 @@ const props = withDefaults(
     cursorBlink?: boolean;
     cursorStyle?: TerminalCursorStyle;
     zoom?: number;
-    /**
-     * Set when this terminal is a Pi started to receive a review rather than a shell.
-     *
-     * Read once, when the session starts: it says what the terminal was opened to become, and a
-     * terminal that is already running is not the same one re-decided.
-     */
-    launch?: ReviewLaunch;
+    /** Set when this terminal is a new Pi review launch. Read once, when the session starts. */
+    launch?: TerminalLaunch;
   }>(),
   {
     visible: true,
@@ -88,13 +86,6 @@ const props = withDefaults(
 );
 const emit = defineEmits<{
   created: [result: Awaited<ReturnType<typeof createTerminal>>];
-  /**
-   * The round a launched Pi's terminal is holding.
-   *
-   * A separate answer from `created` because it means something different: the terminal existing
-   * is not the round arriving, which is why the round travels with it and stays pending.
-   */
-  reviewLaunched: [round: ReviewRound];
   closed: [workspace: Awaited<ReturnType<typeof closeTerminal>>];
   statusChanged: [status: TerminalSessionStatus];
   failed: [message: string];
@@ -135,10 +126,30 @@ let terminalTitle: string | null = null;
  */
 let lastCommandExit: number | undefined;
 let shellIntegration: { dispose(): void } | undefined;
+let programStatusDisposer: { dispose(): void } | undefined;
+let nativePiTaskState: PiTaskState | null = null;
+let nativePiStatusReceived = false;
+let piProgressWorking = false;
+let pendingPiProgress: boolean | null = null;
+let pendingPiStatus: Extract<PiProgramStatusEvent, { kind: "status" }> | null = null;
+let pendingPiStatusQueries = 0;
+let programStatusPolled = false;
+let programGenerationPending = false;
+let piStatusDiagnosticActive = false;
+let piStatusQueryDiagnosticLogged = false;
+let piStatusReplyDeferredLogged = false;
+let piStatusReplyQueuedLogged = false;
+let piStatusReplyWrittenLogged = false;
+let piStatusReplyFailedLogged = false;
+let piStatusReplyDroppedLogged = false;
+let piStatusReportDiagnostic: string | null = null;
+let piProgressDiagnostic: string | null = null;
+let piStatusContextDiagnostic: string | null = null;
 let channel: Channel<ArrayBuffer> | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let statusTimer: number | undefined;
 let statusPollInFlight = false;
+let piStatusPollAgain = false;
 let statusPollError: string | null = null;
 const MAX_TERMINAL_INPUT_BYTES = 1024 * 1024;
 const MAX_QUEUED_TERMINAL_INPUTS = 128;
@@ -424,10 +435,13 @@ function syncStatusPolling() {
 function updateStatus(status: TerminalSessionStatus) {
   // Preserve the shell integration result across status polls, whose payload omits it; otherwise the
   // sidebar's glyph would flicker back to grey between polls.
+  syncPiProgramStatusContext(status);
+  const piTaskState = effectivePiTaskState();
   state.value = {
     ...status,
     ...(terminalTitle !== null && { terminalTitle }),
     ...(lastCommandExit !== undefined && { lastCommandExit }),
+    ...(piTaskState && { piTaskState }),
   };
   emit("statusChanged", state.value);
   if (status.state !== "exited") return;
@@ -442,8 +456,6 @@ function updateStatus(status: TerminalSessionStatus) {
   // already gone, and so never reaches the confirmation that stopping a live process needs: that
   // question stays where it belongs, on the close the user asked for.
   //
-  // This runs for any status report, including the one `requestClose` makes on its own way out,
-  // and the `closing` guard there turns that second call into a no-op instead of a loop.
   void requestClose();
 }
 
@@ -478,14 +490,16 @@ async function pollStatus() {
     }
   } finally {
     statusPollInFlight = false;
-    // If ownership changed while the old request was pending, ask for the current session now
-    // rather than waiting for the next interval. The one-in-flight guard still bounds IPC calls.
+    const refreshPiStatus = piStatusPollAgain;
+    piStatusPollAgain = false;
+    // An OSC report during this read owes one fresh status check; ownership changes do too.
+    // The guard still bounds IPC calls to one at a time.
     if (
       !disposed &&
       !closing.value &&
       state.value.state === "running" &&
       sessionId &&
-      (sessionId !== id || props.checkoutId !== checkoutId)
+      (refreshPiStatus || sessionId !== id || props.checkoutId !== checkoutId)
     ) {
       void pollStatus();
     }
@@ -605,6 +619,209 @@ function queueInput(value: string): Promise<boolean> {
     },
   );
   return write.catch(() => false);
+}
+
+function isPiForeground(status: TerminalSessionStatus): boolean {
+  return status.state === "running" && status.foregroundProcess === true && status.foregroundApp === "pi";
+}
+
+function piForegroundContext(status: TerminalSessionStatus): "none" | "other" | "pi" {
+  if (status.state !== "running" || status.foregroundProcess !== true) return "none";
+  return status.foregroundApp === "pi" ? "pi" : "other";
+}
+
+function logPiStatusDiagnostic(event: string, details: Record<string, string | boolean | null>) {
+  if (import.meta.env.DEV) console.debug("[native Pi status]", event, details);
+}
+
+function canTrustPiOutput(status = state.value): boolean {
+  return (
+    (isPiForeground(status) && !programGenerationPending) ||
+    (!programStatusPolled && props.launch?.kind === "pi-review" && status.state === "running")
+  );
+}
+
+function effectivePiTaskState(): PiTaskState | null {
+  return nativePiStatusReceived ? nativePiTaskState : piProgressWorking ? "working" : null;
+}
+
+function publishPiTaskState() {
+  const next = effectivePiTaskState();
+  if ((state.value.piTaskState ?? null) === next) return;
+  const updated = { ...state.value };
+  delete updated.piTaskState;
+  if (next) updated.piTaskState = next;
+  state.value = updated;
+  emit("statusChanged", updated);
+}
+
+function applyPiProgramStatus(event: Extract<PiProgramStatusEvent, { kind: "status" }>) {
+  nativePiStatusReceived = true;
+  nativePiTaskState = event.state === "idle" || event.state === "clear" ? null : event.state;
+  publishPiTaskState();
+}
+
+function applyPiProgress(event: Extract<PiProgramStatusEvent, { kind: "progress" }>) {
+  piProgressWorking = event.state === "working";
+  publishPiTaskState();
+}
+
+function queuePiProgramStatusReply() {
+  if (!piStatusReplyQueuedLogged) {
+    piStatusReplyQueuedLogged = true;
+    logPiStatusDiagnostic("reply-queued", {
+      foreground: piForegroundContext(state.value),
+      foregroundProcess: state.value.foregroundProcess === true,
+    });
+  }
+  void queueInput(PI_PROGRAM_STATUS_REPLY).then((written) => {
+    if (written && !piStatusReplyWrittenLogged) {
+      piStatusReplyWrittenLogged = true;
+      logPiStatusDiagnostic("reply-write-succeeded", {
+        foreground: piForegroundContext(state.value),
+        foregroundProcess: state.value.foregroundProcess === true,
+      });
+    } else if (!written && !piStatusReplyFailedLogged) {
+      piStatusReplyFailedLogged = true;
+      logPiStatusDiagnostic("reply-write-failed", {
+        foreground: piForegroundContext(state.value),
+        foregroundProcess: state.value.foregroundProcess === true,
+      });
+    }
+  });
+}
+
+function sendPiProgramStatusReply() {
+  if (sessionId) {
+    queuePiProgramStatusReply();
+  } else if (pendingPiStatusQueries < 8) {
+    pendingPiStatusQueries += 1;
+    if (!piStatusReplyDeferredLogged) {
+      piStatusReplyDeferredLogged = true;
+      logPiStatusDiagnostic("reply-deferred", { pending: true });
+    }
+  } else if (!piStatusReplyDroppedLogged) {
+    piStatusReplyDroppedLogged = true;
+    logPiStatusDiagnostic("reply-not-queued", { reason: "startup-queue-full" });
+  }
+}
+
+function flushPiProgramStatusQueries() {
+  if (!sessionId) return;
+  const count = pendingPiStatusQueries;
+  pendingPiStatusQueries = 0;
+  for (let index = 0; index < count; index += 1) queuePiProgramStatusReply();
+}
+
+function requestPiStatusPoll() {
+  if (disposed || closing.value || !sessionId) return;
+  if (statusPollInFlight) {
+    piStatusPollAgain = true;
+    return;
+  }
+  void pollStatus();
+}
+
+function readPiProgramStatus(event: PiProgramStatusEvent) {
+  if (event.kind === "progress") {
+    piStatusDiagnosticActive = true;
+    const reportKey = `${event.state}:${piForegroundContext(state.value)}`;
+    if (reportKey !== piProgressDiagnostic) {
+      piProgressDiagnostic = reportKey;
+      logPiStatusDiagnostic("progress-report", {
+        state: event.state,
+        trusted: canTrustPiOutput(),
+        foreground: piForegroundContext(state.value),
+        foregroundProcess: state.value.foregroundProcess === true,
+      });
+    }
+    if (canTrustPiOutput()) applyPiProgress(event);
+    else {
+      pendingPiProgress = event.state === "working";
+      requestPiStatusPoll();
+    }
+    return;
+  }
+  if (event.kind === "query") {
+    piStatusDiagnosticActive = true;
+    if (!piStatusQueryDiagnosticLogged) {
+      piStatusQueryDiagnosticLogged = true;
+      logPiStatusDiagnostic("query-received", {
+        foreground: piForegroundContext(state.value),
+        foregroundProcess: state.value.foregroundProcess === true,
+      });
+    }
+    sendPiProgramStatusReply();
+    return;
+  }
+  piStatusDiagnosticActive = true;
+  const reportKey = `${event.state}:${event.statusKind ?? ""}:${piForegroundContext(state.value)}`;
+  if (reportKey !== piStatusReportDiagnostic) {
+    piStatusReportDiagnostic = reportKey;
+    logPiStatusDiagnostic("status-report", {
+      state: event.state,
+      kind: event.statusKind,
+      app: event.app ?? "unspecified",
+      trusted: canTrustPiOutput(),
+      foreground: piForegroundContext(state.value),
+      foregroundProcess: state.value.foregroundProcess === true,
+    });
+  }
+  if (canTrustPiOutput()) applyPiProgramStatus(event);
+  else {
+    pendingPiStatus = event;
+    requestPiStatusPoll();
+  }
+}
+
+function syncPiProgramStatusContext(status: TerminalSessionStatus) {
+  const foreground = piForegroundContext(status);
+  if (foreground === "pi") piStatusDiagnosticActive = true;
+  const contextKey = `${status.state}:${foreground}`;
+  if (contextKey !== piStatusContextDiagnostic) {
+    piStatusContextDiagnostic = contextKey;
+    if (piStatusDiagnosticActive) {
+      logPiStatusDiagnostic("foreground-context", {
+        state: status.state,
+        foreground,
+        foregroundProcess: status.foregroundProcess === true,
+      });
+    }
+  }
+  programStatusPolled = true;
+  programGenerationPending = false;
+  if (!isPiForeground(status)) {
+    if (!piStatusPollAgain) {
+      pendingPiStatus = null;
+      pendingPiProgress = null;
+    }
+    nativePiTaskState = null;
+    nativePiStatusReceived = false;
+    piProgressWorking = false;
+    return;
+  }
+  piStatusPollAgain = false;
+  if (pendingPiStatus) {
+    nativePiStatusReceived = true;
+    nativePiTaskState =
+      pendingPiStatus.state === "idle" || pendingPiStatus.state === "clear" ? null : pendingPiStatus.state;
+    pendingPiStatus = null;
+  }
+  if (pendingPiProgress !== null) {
+    piProgressWorking = pendingPiProgress;
+    pendingPiProgress = null;
+  }
+  flushPiProgramStatusQueries();
+}
+
+function clearPiProgramStatus() {
+  pendingPiStatus = null;
+  pendingPiProgress = null;
+  nativePiTaskState = null;
+  nativePiStatusReceived = false;
+  piProgressWorking = false;
+  piProgressDiagnostic = null;
+  publishPiTaskState();
 }
 
 /**
@@ -829,30 +1046,16 @@ async function startSession() {
     // The same session, the same output channel and the same PTY either way: what differs is only
     // what runs in it. A review Pi is handed its notes through this call and is never written to
     // afterwards, so nothing here is a place input could be injected.
-    let created: Awaited<ReturnType<typeof createTerminal>>;
-    // The round the backend recorded for a Pi it just started. Carried alongside rather than read
-    // off the answer because a terminal existing says a Pi was started, not that it read anything:
-    // the round arrives pending, and its own state is what says so.
-    let launchedRound: ReviewRound | null = null;
-    if (launch) {
-      const launched = await launchPiReviewTerminal(
-        launch,
-        props.checkoutId,
-        initialSize.cols,
-        initialSize.rows,
-        channel,
-      );
-      created = launched;
-      launchedRound = launched.round;
-    } else {
-      created = await createTerminal(props.checkoutId, initialSize.cols, initialSize.rows, channel);
-    }
+    const created =
+      launch?.kind === "pi-review"
+        ? await launchPiReviewTerminal(launch.request, props.checkoutId, initialSize.cols, initialSize.rows, channel)
+        : await createTerminal(props.checkoutId, initialSize.cols, initialSize.rows, channel);
     if (disposed) {
       await closeTerminal(props.checkoutId, created.session.id);
       return;
     }
     sessionId = created.session.id;
-    if (launchedRound) emit("reviewLaunched", launchedRound);
+    flushPiProgramStatusQueries();
     // The writer may already have counted output the backend sent before the session had a name
     // to be answered under, and the first report is what lets the reader's gate be opened by an
     // answer rather than by its own timeout.
@@ -926,6 +1129,7 @@ terminal.onResize(({ cols, rows }) => queueResize(cols, rows));
 // answering from the shell's very first prompt, and output is delivered over the channel from the
 // moment the session is created: a handler registered after the first paint would miss the exit code
 // of whatever ran first.
+programStatusDisposer = registerPiProgramStatus(terminal, readPiProgramStatus);
 shellIntegration = registerShellIntegration(terminal, (event) => {
   // The prompt boundaries are what say whether anything on screen is editable, and they are answered
   // from inside this handler on purpose: the cell a prompt ended on is the one the terminal's cursor
@@ -940,8 +1144,16 @@ shellIntegration = registerShellIntegration(terminal, (event) => {
   // before the next line can be typed — so clearing there wiped the exit code a failing command had
   // just reported, every single time, and the row could never be red. The prompt says the shell is
   // ready for the next line; it says nothing about the line that just ran.
-  if (event.kind === "command-started") lastCommandExit = undefined;
-  if (event.kind === "command-finished") lastCommandExit = event.exitCode;
+  if (event.kind === "command-started") {
+    lastCommandExit = undefined;
+    programStatusPolled = false;
+    programGenerationPending = true;
+    clearPiProgramStatus();
+  }
+  if (event.kind === "command-finished") {
+    lastCommandExit = event.exitCode;
+    clearPiProgramStatus();
+  }
   state.value = { ...state.value, lastCommandExit };
   emit("statusChanged", state.value);
 });
@@ -1077,6 +1289,8 @@ onUnmounted(() => {
   rendererRecovery?.dispose();
   outputWriter?.dispose();
   shellIntegration?.dispose();
+  programStatusDisposer?.dispose();
+  clearPiProgramStatus();
   if (sessionId) {
     // Nothing is going to parse this session's output any more, so the reader behind it is told
     // so: it lets go of the gate rather than holding the PTY until its own timeout, and it stops

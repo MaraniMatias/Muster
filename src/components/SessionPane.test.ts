@@ -2,7 +2,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Checkout, Session, WorkspaceState } from "../domain/workspace";
-import type { ReviewLaunch } from "../lib/ipc";
+import type { TerminalLaunch } from "../lib/ipc";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import { addSessionToLayout, createTerminalLayout } from "../domain/terminal-layout";
 import { loadTerminalLayout, moveTerminal, saveTerminalLayout } from "../lib/ipc";
@@ -19,7 +19,7 @@ const terminalMock = vi.hoisted(() => ({
   closedIds: [] as string[],
   /** The directories the mock terminal was told to change into, and whether it could. */
   directoryChanges: [] as string[],
-  launches: [] as ReviewLaunch[],
+  launches: [] as TerminalLaunch[],
   busy: false,
 }));
 
@@ -63,7 +63,7 @@ vi.mock("./TerminalSession.vue", async () => {
         });
         onMounted(() => {
           terminalMock.mounts++;
-          if (props.launch) terminalMock.launches.push(props.launch as ReviewLaunch);
+          if (props.launch) terminalMock.launches.push(props.launch as TerminalLaunch);
           if (!terminalMock.autoCreate) return;
           sessionId = terminalMock.createdCount++ === 0 ? "session:live" : `session:live-${terminalMock.createdCount}`;
           const session: Session = {
@@ -291,13 +291,19 @@ describe("SessionPane terminal UI", () => {
     let finishLayout!: (value: null) => void;
     vi.mocked(loadTerminalLayout).mockReturnValue(new Promise((resolve) => (finishLayout = resolve)));
     const other: Checkout = { ...checkout, id: "checkout:/work/other", path: "/work/other" };
-    const firstLaunch: ReviewLaunch = { ids: ["note:one"], markdown: "# First" };
-    const secondLaunch: ReviewLaunch = { ids: ["note:two"], markdown: "# Second" };
+    const firstLaunch: TerminalLaunch = {
+      kind: "pi-review",
+      request: { markdown: "# First" },
+    };
+    const secondLaunch: TerminalLaunch = {
+      kind: "pi-review",
+      request: { markdown: "# Second" },
+    };
     const wrapper = mount(SessionPane, {
       props: { checkout, checkouts: [checkout, other], activeSessionId: null, isOpening: false, shellRequest: null },
     });
-    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 1, reviewLaunch: firstLaunch } });
-    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 2, reviewLaunch: secondLaunch } });
+    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 1, launch: firstLaunch } });
+    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 2, launch: secondLaunch } });
     await wrapper.setProps({ checkout: other });
     expect(loadTerminalLayout).toHaveBeenCalledOnce();
 
@@ -320,7 +326,11 @@ describe("SessionPane terminal UI", () => {
       props: { checkout, checkouts: [checkout], activeSessionId: null, isOpening: false, shellRequest: null },
     });
     await wrapper.setProps({
-      shellRequest: { checkoutId: checkout.id, token: 1, reviewLaunch: { ids: ["note:one"], markdown: "# Review" } },
+      shellRequest: {
+        checkoutId: checkout.id,
+        token: 1,
+        launch: { kind: "pi-review", request: { markdown: "# Review" } },
+      },
     });
     await wrapper.setProps({
       checkout: { ...checkout, isMissing: true },

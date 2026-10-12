@@ -1,7 +1,6 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReviewRound } from "../domain/review";
 import type { Checkout, TerminalSessionStatus } from "../domain/workspace";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import {
@@ -15,6 +14,7 @@ import {
   saveTerminalLayout,
   writeTerminal,
 } from "../lib/ipc";
+import type { TerminalLaunch } from "../lib/ipc";
 import { useToasts } from "../presentation/toasts";
 import { theme } from "../presentation/theme";
 import { PTY_OUTPUT_REPORT_STEP_BYTES } from "../lib/terminal-renderer";
@@ -343,29 +343,17 @@ describe("TerminalSession UI", () => {
     vi.mocked(writeTerminal).mockReset();
   });
 
-  it("launches the requested Pi in an inactive terminal and emits its pending round", async () => {
-    const launch = { ids: ["note:one"], markdown: "# Review" };
-    const round: ReviewRound = {
-      id: "round:pi",
-      checkoutId: "checkout:repo",
-      provider: "pi",
-      sessionId: null,
-      terminalId: "session:new",
-      status: "dispatching",
-      marker: "muster-review:round:1:2:3",
-      noteIds: ["note:one"],
-      createdAt: "now",
-      updatedAt: "now",
-    };
-    vi.mocked(launchPiReviewTerminal).mockResolvedValue({ ...created, round });
+  it("opens the requested Pi review in a new inactive terminal", async () => {
+    const request = { ids: ["note:one"], markdown: "# Review" };
+    const launch: TerminalLaunch = { kind: "pi-review", request };
+    vi.mocked(launchPiReviewTerminal).mockResolvedValue(created);
     const wrapper = mount(TerminalSession, {
       props: { checkoutId: "checkout:repo", active: false, launch },
     });
     await flushPromises();
 
-    expect(launchPiReviewTerminal).toHaveBeenCalledWith(launch, "checkout:repo", 80, 24, expect.anything());
+    expect(launchPiReviewTerminal).toHaveBeenCalledWith(request, "checkout:repo", 80, 24, expect.anything());
     expect(createTerminal).not.toHaveBeenCalled();
-    expect(wrapper.emitted("reviewLaunched")).toEqual([[round]]);
     expect(wrapper.emitted("created")).toHaveLength(1);
     wrapper.unmount();
   });
@@ -593,6 +581,279 @@ describe("TerminalSession UI", () => {
     await vi.advanceTimersByTimeAsync(750);
     const cleared = wrapper.emitted("statusChanged")?.at(-1)?.[0] as { lastCommandExit?: number };
     expect(cleared.lastCommandExit).toBeUndefined();
+    wrapper.unmount();
+    vi.useRealTimers();
+  });
+
+  it("answers Pi OSC queries before confirming task state with terminal identity", async () => {
+    let resolveStatus!: (status: TerminalSessionStatus) => void;
+    vi.mocked(getTerminalStatus).mockReturnValueOnce(new Promise((resolve) => (resolveStatus = resolve)));
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    const osc = terminalMock.oscHandlers.get(7501);
+    expect(osc).toBeDefined();
+    osc?.("?");
+    await flushPromises();
+    osc?.("state=working:app=pi");
+    expect(writeTerminal).toHaveBeenCalledTimes(1);
+    expect(wrapper.emitted("statusChanged")).toBeUndefined();
+    const queryReply = vi.mocked(writeTerminal).mock.calls[0]?.[2];
+    expect(queryReply).toBeDefined();
+    expect(new TextDecoder().decode(queryReply!)).toBe("\u001b]7501;?\u001b\\");
+
+    resolveStatus({ state: "running", foregroundProcess: true, foregroundApp: "pi" });
+    await flushPromises();
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "working" });
+    wrapper.unmount();
+    expect(terminalMock.oscHandlers.has(7501)).toBe(false);
+  });
+
+  it("queues initial direct-Pi OSC queries until the new terminal is named", async () => {
+    let resolveCreate!: (result: typeof created) => void;
+    vi.mocked(createTerminal).mockReturnValueOnce(new Promise((resolve) => (resolveCreate = resolve)));
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    const osc = terminalMock.oscHandlers.get(7501);
+    expect(osc?.("?")).toBe(true);
+    expect(writeTerminal).not.toHaveBeenCalled();
+
+    resolveCreate(created);
+    await flushPromises();
+    expect(writeTerminal).toHaveBeenCalledTimes(1);
+    const queryReply = vi.mocked(writeTerminal).mock.calls[0]?.[2];
+    expect(queryReply).toBeDefined();
+    expect(new TextDecoder().decode(queryReply!)).toBe("\u001b]7501;?\u001b\\");
+    wrapper.unmount();
+  });
+
+  it("queues Pi OSC query replies until the newly launched terminal is named", async () => {
+    let resolveLaunch!: (result: typeof created) => void;
+    vi.mocked(launchPiReviewTerminal).mockReturnValueOnce(new Promise((resolve) => (resolveLaunch = resolve)));
+    const launch: TerminalLaunch = { kind: "pi-review", request: { markdown: "# Review" } };
+    const wrapper = mount(TerminalSession, {
+      props: { checkoutId: "checkout:repo", active: false, launch },
+    });
+    await flushPromises();
+
+    const osc = terminalMock.oscHandlers.get(7501);
+    expect(osc?.("?")).toBe(true);
+    expect(writeTerminal).not.toHaveBeenCalled();
+
+    resolveLaunch(created);
+    await flushPromises();
+    expect(writeTerminal).toHaveBeenCalledTimes(1);
+    const queryReply = vi.mocked(writeTerminal).mock.calls[0]?.[2];
+    expect(queryReply).toBeDefined();
+    expect(new TextDecoder().decode(queryReply!)).toBe("\u001b]7501;?\u001b\\");
+    wrapper.unmount();
+  });
+
+  it("activates manually started Pi after an idle-shell poll without OSC 133 hooks", async () => {
+    let resolvePiStatus!: (status: TerminalSessionStatus) => void;
+    vi.mocked(getTerminalStatus)
+      .mockResolvedValueOnce({ state: "running", foregroundProcess: true, foregroundApp: "zsh" })
+      .mockReturnValueOnce(new Promise((resolve) => (resolvePiStatus = resolve)));
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+    expect(getTerminalStatus).toHaveBeenCalledTimes(1);
+
+    const osc = terminalMock.oscHandlers.get(7501);
+    expect(osc?.("?")).toBe(true);
+    await flushPromises();
+    const queryReply = vi.mocked(writeTerminal).mock.calls[0]?.[2];
+    expect(queryReply).toBeDefined();
+    expect(new TextDecoder().decode(queryReply!)).toBe("\u001b]7501;?\u001b\\");
+    expect(osc?.("state=working:app=opencode")).toBe(false);
+    expect(osc?.("state=blocked:kind=unknown:app=pi")).toBe(false);
+    expect(getTerminalStatus).toHaveBeenCalledTimes(1);
+
+    expect(osc?.("state=working:app=pi")).toBe(true);
+    await flushPromises();
+    expect(getTerminalStatus).toHaveBeenCalledTimes(2);
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).not.toHaveProperty("piTaskState");
+
+    resolvePiStatus({ state: "running", foregroundProcess: true, foregroundApp: "pi" });
+    await flushPromises();
+    const statuses = (wrapper.emitted("statusChanged") ?? []).map(([status]) => status as TerminalSessionStatus);
+    expect(statuses.at(-1)).toMatchObject({ foregroundApp: "pi", piTaskState: "working" });
+    expect(statuses.filter((status) => status.piTaskState).every((status) => status.foregroundApp === "pi")).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("uses OSC 9;4 as Pi activity and clears to neutral rather than complete", async () => {
+    vi.mocked(getTerminalStatus).mockResolvedValue({
+      state: "running",
+      foregroundProcess: true,
+      foregroundApp: "pi",
+    });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    const progress = terminalMock.oscHandlers.get(9);
+    expect(progress?.("4;3")).toBe(true);
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "working" });
+    expect(progress?.("4;0")).toBe(true);
+    const cleared = wrapper.emitted("statusChanged")?.at(-1)?.[0];
+    expect(cleared).not.toHaveProperty("piTaskState");
+    expect(cleared).not.toHaveProperty("done");
+    wrapper.unmount();
+  });
+
+  it("keeps native Pi states authoritative over OSC 9;4 progress", async () => {
+    vi.mocked(getTerminalStatus).mockResolvedValue({
+      state: "running",
+      foregroundProcess: true,
+      foregroundApp: "pi",
+    });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    const status = terminalMock.oscHandlers.get(7501);
+    const progress = terminalMock.oscHandlers.get(9);
+    status?.("state=working:app=pi");
+    progress?.("4;0");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "working" });
+    status?.("state=done:app=pi");
+    progress?.("4;3");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "done" });
+    status?.("state=error:app=pi");
+    progress?.("4;3");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "error" });
+    wrapper.unmount();
+  });
+
+  it("holds OSC 9;4 activity until a fresh poll confirms foreground Pi", async () => {
+    let resolveStatus!: (status: TerminalSessionStatus) => void;
+    vi.mocked(getTerminalStatus)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveStatus = resolve)))
+      .mockResolvedValue({ state: "running", foregroundProcess: true, foregroundApp: "pi" });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+    expect(getTerminalStatus).toHaveBeenCalledTimes(1);
+
+    terminalMock.oscHandlers.get(9)?.("4;3");
+    expect(wrapper.emitted("statusChanged")).toBeUndefined();
+    resolveStatus({ state: "running", foregroundProcess: true, foregroundApp: "pi" });
+    await flushPromises();
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({
+      foregroundApp: "pi",
+      piTaskState: "working",
+    });
+    wrapper.unmount();
+  });
+
+  it("rejects OSC 9;4 activity while another program is foreground", async () => {
+    vi.mocked(getTerminalStatus).mockResolvedValue({
+      state: "running",
+      foregroundProcess: true,
+      foregroundApp: "zsh",
+    });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    terminalMock.oscHandlers.get(9)?.("4;3");
+    await flushPromises();
+    const statuses = (wrapper.emitted("statusChanged") ?? []).map(([status]) => status as TerminalSessionStatus);
+    expect(statuses.every((status) => status.piTaskState === undefined)).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("accepts native Pi reports in hidden panes only while Pi is foreground", async () => {
+    vi.mocked(getTerminalStatus).mockResolvedValue({
+      state: "running",
+      foregroundProcess: true,
+      foregroundApp: "pi",
+    });
+    const wrapper = mount(TerminalSession, {
+      props: { checkoutId: "checkout:repo", active: true, visible: false },
+    });
+    await flushPromises();
+
+    terminalMock.oscHandlers.get(7501)?.("state=working:app=pi");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "working" });
+    wrapper.unmount();
+  });
+
+  it("rejects a Pi report when the OS has not identified Pi as the foreground process", async () => {
+    vi.mocked(getTerminalStatus).mockResolvedValue({
+      state: "running",
+      foregroundProcess: false,
+      foregroundApp: "pi",
+    });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    terminalMock.oscHandlers.get(7501)?.("state=working:app=pi");
+    await flushPromises();
+    const statuses = (wrapper.emitted("statusChanged") ?? []).map(([status]) => status as TerminalSessionStatus);
+    expect(statuses.every((status) => status.piTaskState === undefined)).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("keeps Pi diagnostics bounded and omits terminal message contents", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    try {
+      await flushPromises();
+
+      const osc = terminalMock.oscHandlers.get(7501);
+      const progress = terminalMock.oscHandlers.get(9);
+      osc?.("?");
+      osc?.("state=working:app=pi:msg=c2VjcmV0");
+      osc?.("state=working:app=pi:msg=c2VjcmV0");
+      progress?.("4;3");
+      progress?.("4;3");
+      progress?.("4;0");
+      progress?.("4;0");
+      await flushPromises();
+
+      expect(debug.mock.calls.filter(([, event]) => event === "query-received")).toHaveLength(1);
+      expect(debug.mock.calls.filter(([, event]) => event === "reply-queued")).toHaveLength(1);
+      expect(debug.mock.calls.filter(([, event]) => event === "reply-write-succeeded")).toHaveLength(1);
+      expect(debug.mock.calls.filter(([, event]) => event === "status-report")).toHaveLength(1);
+      expect(debug.mock.calls.filter(([, event]) => event === "progress-report")).toHaveLength(2);
+      expect(JSON.stringify(debug.mock.calls)).not.toContain("c2VjcmV0");
+      expect(JSON.stringify(debug.mock.calls)).not.toContain("secret");
+    } finally {
+      wrapper.unmount();
+      debug.mockRestore();
+    }
+  });
+
+  it("diagnoses failed Pi status reply writes without logging the error text", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    vi.mocked(writeTerminal).mockRejectedValueOnce(new Error("private terminal error"));
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    try {
+      await flushPromises();
+
+      terminalMock.oscHandlers.get(7501)?.("?");
+      await flushPromises();
+
+      expect(debug.mock.calls.filter(([, event]) => event === "reply-queued")).toHaveLength(1);
+      expect(debug.mock.calls.filter(([, event]) => event === "reply-write-failed")).toHaveLength(1);
+      expect(JSON.stringify(debug.mock.calls)).not.toContain("private terminal error");
+    } finally {
+      wrapper.unmount();
+      debug.mockRestore();
+    }
+  });
+
+  it("clears Pi task state when its foreground process changes and ignores stale reports", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getTerminalStatus)
+      .mockResolvedValueOnce({ state: "running", foregroundProcess: true, foregroundApp: "pi" })
+      .mockResolvedValue({ state: "running", foregroundProcess: true, foregroundApp: "zsh" });
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+    terminalMock.oscHandlers.get(7501)?.("state=error:app=pi");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).toMatchObject({ piTaskState: "error" });
+
+    await vi.advanceTimersByTimeAsync(750);
+    terminalMock.oscHandlers.get(7501)?.("state=done:app=pi");
+    expect(wrapper.emitted("statusChanged")?.at(-1)?.[0]).not.toHaveProperty("piTaskState");
     wrapper.unmount();
     vi.useRealTimers();
   });
@@ -1094,7 +1355,7 @@ describe("TerminalSession UI", () => {
     wrapper.unmount();
   });
 
-  it("launches a terminal without any prompt, because reviews go to the agent bridge", async () => {
+  it("opens an ordinary terminal without a review prompt", async () => {
     const wrapper = mount(TerminalSession, {
       props: { checkoutId: "checkout:repo", active: true },
     });

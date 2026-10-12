@@ -33,7 +33,8 @@ const props = withDefaults(
     review: Pick<
       ActiveReviewNotes,
       "notes" | "addNote" | "updateNote" | "deleteNote" | "verifyAnchors" | "clearOutdated" | "resolveNote"
-    >;
+    > &
+      Partial<Pick<ActiveReviewNotes, "rounds">>;
     /** Null is the whole change set: one diff per changed file, stacked in status order. */
     path: string | null;
     scrollTop: number;
@@ -229,7 +230,14 @@ watch(targetQuery, () => {
   targetIndex.value = 0;
 });
 const sendableNotes = computed(() => {
-  const pending = props.review.notes.filter(isReviewableNote);
+  const pending = props.review.notes.filter((note) => {
+    if (!isReviewableNote(note)) return false;
+    if (note.roundId === null) return true;
+    const round = props.review.rounds?.find((candidate) => candidate.id === note.roundId);
+    // Keep notes claimed by a queued or unconfirmed round out of another prompt. A completed
+    // round is available for an explicit follow-up, including one sent to Pi.
+    return round?.status === "acked" || round?.status === "relocated";
+  });
   // An outdated note points at a line that has since changed, so it is held back unless the
   // user says otherwise: that is the same rule the note's own card states.
   return includeOutdated.value ? pending : pending.filter((note) => !note.outdated);
@@ -243,7 +251,8 @@ const targetSession = computed(
 /** A blocked session is not working, so only a real turn makes the send a decision. */
 const targetBusy = computed(() => sender?.target === "opencode" && agentAttention(targetSession.value) === "busy");
 const showBusyChoice = computed(() => sender?.target === "opencode" && busyChoiceOpen.value && targetBusy.value);
-const canSend = computed(() => sendableNotes.value.length > 0);
+const noOpenCodeTarget = computed(() => sender?.target === "opencode" && openCodeSessions.value.length === 0);
+const canSend = computed(() => sendableNotes.value.length > 0 && !noOpenCodeTarget.value);
 /**
  * What the button says it will do, which is the only place the destination is named to a reader.
  *
@@ -255,30 +264,9 @@ const sendLabel = computed(() => {
   return sender?.target === "pi" ? "Send to Pi" : "Send to opencode";
 });
 
-/**
- * What the Pi destination can honestly report, as one line, or nothing.
- *
- * Three separate counts because they are three separate facts. A launch nobody has confirmed
- * reading is not a delivered review, a delivered review is not a finished turn, and a finished
- * turn is not the same as the notes being resolved — which is judged separately, from the diff,
- * and is never drawn here. A send that could not start says why, because a Pi launch fails
- * before it records anything and a toast that expires is all there would otherwise be.
- */
-const piFeedbackLine = computed(() => {
-  const feedback = sender?.piFeedback;
-  if (!feedback) return "";
-  const counts = [
-    feedback.pending ? `${feedback.pending} waiting for Pi` : "",
-    feedback.delivered ? `${feedback.delivered} delivered` : "",
-    feedback.settled ? `${feedback.settled} finished` : "",
-  ].filter(Boolean);
-  const line = counts.join(" · ");
-  if (!feedback.error) return line;
-  return line ? `${line} · ${feedback.error}` : feedback.error;
-});
-
 function sendNow(queue: boolean) {
   busyChoiceOpen.value = false;
+  if (!canSend.value) return;
   void sender?.send(
     sendableNotes.value.map((note) => note.id),
     queue,
@@ -292,6 +280,7 @@ function sendNow(queue: boolean) {
  * nothing to be interrupted and nothing to queue behind.
  */
 function requestSend() {
+  if (!canSend.value) return;
   if (sender?.target !== "opencode") {
     sendNow(false);
     return;
@@ -308,15 +297,22 @@ function chooseTarget(sessionId: string) {
   targetOpen.value = false;
 }
 
-/** The three destinations a review can leave by, so the picker is a list rather than a control. */
-const reviewTargets = [
-  { value: "markdown", label: "Markdown" },
-  { value: "opencode", label: "OpenCode" },
-  { value: "pi", label: "Pi" },
-];
+/** Installed destinations plus Markdown, so the picker cannot offer a missing executable. */
+const reviewTargets = computed(
+  () =>
+    sender?.availableTargets.map((value) => ({
+      value,
+      label: value === "opencode" ? "OpenCode" : value === "pi" ? "Pi" : "Markdown",
+    })) ?? [{ value: "markdown", label: "Markdown" }],
+);
 
 function chooseReviewTarget(target?: string) {
-  if (target === "markdown" || target === "opencode" || target === "pi") sender?.selectReviewTarget(target);
+  if (
+    (target === "markdown" || target === "opencode" || target === "pi") &&
+    sender?.availableTargets.includes(target)
+  ) {
+    sender.selectReviewTarget(target);
+  }
 }
 
 /**
@@ -611,6 +607,14 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
             testid="review-target"
             @update:model-value="chooseReviewTarget"
           />
+          <p
+            v-if="noOpenCodeTarget"
+            data-testid="missing-opencode-target"
+            role="status"
+            class="text-[0.6875rem] text-(--muster-text-faint)"
+          >
+            No connected OpenCode session. Start OpenCode and open a session before sending.
+          </p>
           <!-- One session is the default target, so the picker only earns its place above one.
                It is the app's own menu rather than a native select, and it earns a search only
                once there are more rows than a short list is worth reading. -->
@@ -707,16 +711,13 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
         >
           {{ sender.unfinishedRounds }} {{ sender.unfinishedRounds === 1 ? "round" : "rounds" }} not finished
         </p>
-        <!-- Pi's own counts, because its rounds are confirmed and closed by what the Pi reports
-             rather than by a turn being observed to end. Same words as the line above, but none
-             of the OpenCode machinery: no session to choose, nothing to queue, nothing to retry. -->
         <p
-          v-if="sender.target === 'pi' && piFeedbackLine"
-          data-testid="pi-feedback"
-          role="status"
-          class="text-[0.6875rem] text-(--muster-text-faint)"
+          v-if="sender?.error"
+          data-testid="review-send-error"
+          role="alert"
+          class="text-xs text-(--muster-text-danger)"
         >
-          {{ piFeedbackLine }}
+          {{ sender.error }}
         </p>
         <label v-if="outdatedCount > 0" class="flex items-center gap-1.5 text-[0.6875rem] text-(--muster-text-faint)">
           <input v-model="includeOutdated" type="checkbox" class="muster-check" data-testid="include-outdated" />

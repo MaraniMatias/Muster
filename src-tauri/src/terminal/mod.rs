@@ -34,6 +34,8 @@ struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<ChildState>,
     process_id: Option<u32>,
+    /// Direct Pi launches have no shell parent to distinguish as a foreground job.
+    direct_pi: bool,
     #[cfg(unix)]
     terminal_session_id: Option<u32>,
     closing: AtomicBool,
@@ -103,6 +105,11 @@ impl TerminalBackend {
         #[cfg(not(unix))]
         let master_fd = -1;
 
+        let direct_pi = options
+            .program
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("pi"));
         let mut command = CommandBuilder::new(options.program);
         command.args(options.args);
         command.cwd(options.cwd);
@@ -140,6 +147,7 @@ impl TerminalBackend {
                 child_released: false,
             }),
             process_id,
+            direct_pi,
             #[cfg(unix)]
             terminal_session_id,
             closing: AtomicBool::new(false),
@@ -241,14 +249,49 @@ impl TerminalBackend {
                 foreground_app: None,
                 working_directory: None,
             },
-            None => TerminalSessionStatus {
-                state: TerminalProcessState::Running,
-                exit_code: None,
-                foreground_process: session.foreground_process(),
-                foreground_app: session.foreground_app(),
-                working_directory: session.working_directory(),
-            },
+            None => {
+                let (foreground_process, foreground_app) = session.foreground_status();
+                TerminalSessionStatus {
+                    state: TerminalProcessState::Running,
+                    exit_code: None,
+                    foreground_process,
+                    foreground_app,
+                    working_directory: session.working_directory(),
+                }
+            }
         })
+    }
+
+    /// Live Pi processes and their OS-reported current directories, across every registered PTY.
+    pub(crate) fn pi_process_locations(&self) -> Result<Vec<(String, Option<PathBuf>)>, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry.session())))
+            .collect::<Vec<_>>();
+        let mut processes = Vec::new();
+        for (id, session) in sessions {
+            if !session.is_running()? {
+                continue;
+            }
+            let pid = if session.direct_pi {
+                session.process_id
+            } else {
+                let Some(pid) = session.foreground_group() else {
+                    continue;
+                };
+                if !process::executable_name(pid)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("pi"))
+                {
+                    continue;
+                }
+                Some(pid)
+            };
+            processes.push((id, pid.and_then(process::current_directory)));
+        }
+        Ok(processes)
     }
 
     pub fn close(&self, id: &str) -> Result<bool, String> {
@@ -299,6 +342,30 @@ impl TerminalBackend {
 }
 
 impl Session {
+    fn is_running(&self) -> Result<bool, String> {
+        let mut process = self.child.lock().map_err(|error| error.to_string())?;
+        if process.exit_code.is_none() {
+            if let Some(status) = process
+                .child
+                .as_mut()
+                .ok_or_else(|| "terminal child is unavailable".to_string())?
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                process.exit_code = Some(status.exit_code());
+            }
+        }
+        Ok(process.exit_code.is_none())
+    }
+
+    fn foreground_status(&self) -> (bool, Option<String>) {
+        if self.direct_pi {
+            (true, Some("pi".into()))
+        } else {
+            (self.foreground_process(), self.foreground_app())
+        }
+    }
+
     fn foreground_process(&self) -> bool {
         self.foreground_group()
             .zip(self.process_id)
@@ -1970,6 +2037,7 @@ mod tests {
         assert!(!resting.foreground_process);
         // A shell in front of itself is the resting state and has nothing to name.
         assert_eq!(resting.foreground_app, None);
+        assert!(backend.pi_process_locations().unwrap().is_empty());
 
         backend.write("foreground", b"sleep 10\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1984,6 +2052,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        assert!(backend.pi_process_locations().unwrap().is_empty());
         // The row in the sidebar shows this, so it has to be the job's own name.
         assert_eq!(
             backend

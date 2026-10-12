@@ -14,7 +14,6 @@ import {
   flushReviewRounds,
   requeueReviewRounds,
   resolveReviewNote,
-  settlePiReviewRound,
   verifyReviewNoteAnchors,
 } from "../lib/ipc";
 
@@ -46,15 +45,6 @@ export interface ActiveReviewNotes {
    * first. The caller must have picked a session; nothing is sent without a target.
    */
   dispatchRound(sessionId: string, ids: string[], markdown: string, queue?: boolean): Promise<ReviewRound | null>;
-  /**
-   * Puts a round the backend already recorded into the list.
-   *
-   * For the Pi send, whose round is recorded where the Pi is actually started rather than by the
-   * caller: the diff cannot dispatch it, and the terminal that reports it back is already the one
-   * holding it. Adding it to the list is all this claims — the round arrives pending, and stays that
-   * way until the session itself is asked.
-   */
-  recordRound(round: ReviewRound): void;
   /** Re-reads the notes, so what the backend decided about them is what is drawn. */
   refreshNotes(): Promise<void>;
   /**
@@ -70,42 +60,8 @@ export interface ActiveReviewNotes {
    * absent never arrived, so retrying it cannot duplicate a delivered review.
    */
   reconcileRounds(): Promise<number>;
-  /**
-   * Closes the newest confirmed round whose turn has finished.
-   *
-   * "Acked" means the agent's turn is over, not that the notes are resolved: what the turn
-   * did to each line is judged separately, from the diff.
-   *
-   * OpenCode only, because that is the round whose completion is inferred here. A Pi announces
-   * its own settlement and is closed by `settlePiRound` from that announcement; closing it from
-   * this would be closing it on an inference it explicitly does not make.
-   */
+  /** Closes the newest OpenCode round whose turn has finished. */
   ackFinishedTurn(sessionId: string): Promise<ReviewRound | null>;
-  /**
-   * Settles what one Pi session's own reports prove about the rounds it was sent.
-   *
-   * Asked from the two Pi reports that mean something — the session appearing, and its turn
-   * settling — and never as part of a send, so nothing here can retransmit a review. The event's
-   * checkout follows a moved terminal; its rounds remain owned by the checkout they were launched from.
-   */
-  settlePiRound(sessionId: string, reportedCheckoutId?: string): Promise<ReviewRound[]>;
-}
-
-/**
- * What is known about this checkout's Pi rounds, in the three words the destination can honestly
- * report and no more.
- *
- * `pending` is a launch whose Pi has not been observed to read the review, `delivered` is one it
- * has reported reading and whose turn it has not finished, and `settled` is one whose turn it
- * said it finished — which is not the same as the notes being resolved, and is drawn as its own
- * count for exactly that reason.
- */
-export interface PiReviewFeedback {
-  pending: number;
-  delivered: number;
-  settled: number;
-  /** Why the last send did not start, when it did not. */
-  error: string;
 }
 
 /**
@@ -122,6 +78,8 @@ export interface PiReviewFeedback {
 export interface ReviewSender {
   /** The checkout's delivery destination. No saved choice means Markdown. */
   readonly target: ReviewTarget;
+  /** Destinations with an installed executable; independent of current sessions. */
+  readonly availableTargets: ReviewTarget[];
   /** The checkout's sessions, for the destination picker. */
   readonly sessions: AgentSession[];
   /** The session a review goes to, or null while the checkout has none. */
@@ -130,14 +88,8 @@ export interface ReviewSender {
   selectReviewTarget(target: ReviewTarget): void;
   /** Rounds whose turn has not finished, which is what the count under the button reports. */
   readonly unfinishedRounds: number;
-  /**
-   * What is known about this checkout's Pi rounds, or `null` while there is nothing to say.
-   *
-   * A separate read from `unfinishedRounds` because that one is OpenCode's: a Pi round is
-   * confirmed and closed from what the Pi itself reported, so it needs its own counts rather
-   * than being folded into a number that says only "not acked".
-   */
-  readonly piFeedback: PiReviewFeedback | null;
+  /** The latest review operation error, shown beside the send control. */
+  readonly error: string;
   /** Records one round with the chosen notes and delivers it to the target. */
   send(ids: string[], queue: boolean): Promise<void>;
 }
@@ -170,12 +122,10 @@ export function useReviewNotes(
       | "clearOutdated"
       | "resolveNote"
       | "dispatchRound"
-      | "recordRound"
       | "refreshNotes"
       | "flushQueuedRounds"
       | "reconcileRounds"
       | "ackFinishedTurn"
-      | "settlePiRound"
     >
   >({
     checkoutId: null,
@@ -249,23 +199,34 @@ export function useReviewNotes(
   async function dispatchRound(sessionId: string, ids: string[], markdown: string, queue = false) {
     const checkoutId = state.checkoutId;
     if (!checkoutId || ids.length === 0 || !sessionId) return null;
+    const requestGeneration = generation;
+    const isCurrent = () => state.checkoutId === checkoutId && generation === requestGeneration;
+    state.error = "";
     try {
       const round = await dispatchReviewRound({ checkoutId, sessionId, ids, markdown, queue });
-      if (state.checkoutId !== checkoutId) return null;
+      if (!isCurrent()) return null;
       state.rounds = [round, ...state.rounds.filter((item) => item.id !== round.id)];
       // The backend owns the notes now: re-read instead of assuming what it decided.
-      await refreshNotes(checkoutId);
+      const notes = await listReviewNotes(checkoutId);
+      if (!isCurrent()) return null;
+      state.notes = sortNotes(notes);
       state.error = "";
       return round;
     } catch (cause) {
-      if (state.checkoutId === checkoutId) fail(cause);
+      if (!isCurrent()) return null;
+      fail(cause);
+      // A failed response is ambiguous: the backend may have committed the round before the
+      // send failed. Refresh both records so its claim is visible; never retry it here.
+      try {
+        const [rounds, notes] = await Promise.all([listReviewRounds(checkoutId), listReviewNotes(checkoutId)]);
+        if (!isCurrent()) return null;
+        state.rounds = rounds;
+        state.notes = sortNotes(notes);
+      } catch {
+        // Keep the original dispatch failure; the next explicit refresh can try again.
+      }
       return null;
     }
-  }
-
-  function recordRound(round: ReviewRound) {
-    if (state.checkoutId !== round.checkoutId) return;
-    state.rounds = [round, ...state.rounds.filter((item) => item.id !== round.id)];
   }
 
   async function flushQueuedRounds() {
@@ -312,9 +273,7 @@ export function useReviewNotes(
     const checkoutId = state.checkoutId;
     if (!checkoutId) return null;
     // A turn closes only a round for the OpenCode session whose running-to-idle transition was read.
-    const round = state.rounds.find(
-      (item) => item.status === "dispatched" && item.provider === "opencode" && item.sessionId === sessionId,
-    );
+    const round = state.rounds.find((item) => item.status === "dispatched" && item.sessionId === sessionId);
     if (!round) return null;
     try {
       const acked = await ackReviewRound(checkoutId, round.id);
@@ -328,30 +287,7 @@ export function useReviewNotes(
     }
   }
 
-  /**
-   * Settles what one Pi session's own reports prove about the rounds it was sent.
-   *
-   * The list is re-read rather than patched from the answer, because a settlement also moves
-   * the notes behind the round and the whole of that is the backend's to decide. Asking twice
-   * moves nothing: every transition is refused once taken.
-   */
-  async function settlePiRound(sessionId: string, reportedCheckoutId = state.checkoutId) {
-    if (!reportedCheckoutId) return [];
-    try {
-      const settled = await settlePiReviewRound(reportedCheckoutId, sessionId);
-      if (!settled.length || !state.checkoutId || !settled.some((round) => round.checkoutId === state.checkoutId)) {
-        return settled;
-      }
-      state.rounds = await listReviewRounds(state.checkoutId);
-      await refreshNotes(state.checkoutId);
-      state.error = "";
-      return settled;
-    } catch (cause) {
-      if (state.checkoutId === reportedCheckoutId) fail(cause);
-      return [];
-    }
-  }
-
+  /** Re-reads the notes so local state follows the backend. */
   async function refreshNotes(checkoutId = state.checkoutId) {
     if (!checkoutId) return;
     try {
@@ -434,11 +370,9 @@ export function useReviewNotes(
     clearOutdated,
     resolveNote,
     dispatchRound,
-    recordRound,
     refreshNotes,
     flushQueuedRounds,
     reconcileRounds,
     ackFinishedTurn,
-    settlePiRound,
   });
 }

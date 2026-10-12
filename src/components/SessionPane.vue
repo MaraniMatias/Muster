@@ -14,8 +14,7 @@ import {
 } from "../domain/terminal-layout";
 import type { CheckoutTerminalLayout } from "../domain/terminal-layout";
 import { loadTerminalLayout, moveTerminal, saveTerminalLayout } from "../lib/ipc";
-import type { ReviewLaunch } from "../lib/ipc";
-import type { ReviewRound } from "../domain/review";
+import type { TerminalLaunch } from "../lib/ipc";
 import { useToasts } from "../presentation/toasts";
 import Button from "./ui/button/Button.vue";
 import TerminalSession from "./TerminalSession.vue";
@@ -40,11 +39,10 @@ const props = defineProps<{
   /**
    * A request for one more terminal in this checkout.
    *
-   * Carries what the terminal is opened to become, and `reviewLaunch` is the only thing that is
-   * ever anything but absent: a request with nothing to launch opens a shell. The token is what
-   * makes the answer find its way back, and the pane answers each token once.
+   * Carries a Pi review request; the token makes the answer find its way back, and the pane
+   * answers each token once.
    */
-  shellRequest?: { checkoutId: string; token: number; reviewLaunch?: ReviewLaunch } | null;
+  shellRequest?: { checkoutId: string; token: number; launch?: TerminalLaunch } | null;
   registeredSessionIds?: string[];
   terminalSettings?: TerminalSettings;
   zoom?: number;
@@ -56,15 +54,8 @@ const emit = defineEmits<{
   workspaceUpdated: [workspace: WorkspaceState, shellRequestToken?: number];
   sessionStatusChanged: [sessionId: string, status: TerminalSessionStatus | null];
   shellCreated: [token: number, checkoutId: string, sessionId: string];
-  /** The round a Pi launched for a review is holding, still unconfirmed. */
-  reviewRoundLaunched: [round: ReviewRound];
-  /**
-   * Why a terminal opening a review for Pi did not start one.
-   *
-   * Published apart from the toast because this is not an ordinary terminal that failed to start:
-   * it is a send that went nowhere, and the panel the send came from records no round for it —
-   * there is nothing to hang one on — so the only lasting trace of it is this.
-   */
+  /** A successful PTY launch only; it does not confirm Pi read the review. */
+  reviewLaunchOpened: [checkoutId: string];
   reviewLaunchFailed: [message: string];
   /**
    * The order this checkout's terminals are now listed in, published on every save.
@@ -85,7 +76,7 @@ interface TerminalView {
   session: Session | null;
   shellRequestToken?: number;
   /** What this terminal was opened to become; absent means an ordinary shell. */
-  launch?: ReviewLaunch;
+  launch?: TerminalLaunch;
 }
 type SessionMoveResult = {
   moved: boolean;
@@ -144,6 +135,10 @@ function reportTerminalError(cause: unknown) {
   pushToast(message);
 }
 
+function reportLaunchFailure(launch: TerminalLaunch | undefined, message: string) {
+  if (launch?.kind === "pi-review") emit("reviewLaunchFailed", message);
+}
+
 function saveLayout(checkoutId: string, layout: CheckoutTerminalLayout) {
   layouts.value[checkoutId] = layout;
   emit("sessionOrder", checkoutId, [...layout.sessionOrder]);
@@ -196,7 +191,7 @@ function initializeLayout(target: Checkout) {
 async function createTerminalSession(
   additional = false,
   shellRequestToken?: number,
-  launch?: ReviewLaunch,
+  launch?: TerminalLaunch,
   requestedCheckoutId?: string,
 ) {
   const target = requestedCheckoutId
@@ -204,10 +199,14 @@ async function createTerminalSession(
       (props.checkout?.id === requestedCheckoutId ? props.checkout : null))
     : props.checkout;
   if (!target || target.isMissing || (!additional && views.value.some((view) => view.checkoutId === target.id))) {
-    if (launch) emit("reviewLaunchFailed", "The checkout for this Pi review is no longer available.");
+    const message =
+      launch?.kind === "pi-review"
+        ? "The checkout for this Pi review is no longer available."
+        : "The checkout for this Pi terminal action is no longer available.";
+    reportLaunchFailure(launch, message);
     return;
   }
-  // Every explicit Pi send owns a new terminal, even while another terminal for this checkout is
+  // Every explicit Pi action owns a new terminal, even while another terminal for this checkout is
   // still starting. Normal shell requests retain the one-at-a-time guard.
   if (!launch && startingCheckoutIds.value.has(target.id)) return;
   startingCheckoutIds.value = new Set(startingCheckoutIds.value).add(target.id);
@@ -217,7 +216,12 @@ async function createTerminalSession(
       (props.checkouts ?? []).find((item) => item.id === target.id) ??
       (props.checkout?.id === target.id ? props.checkout : null);
     if (!currentTarget || currentTarget.isMissing) {
-      if (launch) emit("reviewLaunchFailed", "The checkout for this Pi review is no longer available.");
+      reportLaunchFailure(
+        launch,
+        launch?.kind === "pi-review"
+          ? "The checkout for this Pi review is no longer available."
+          : "The checkout for this Pi terminal action is no longer available.",
+      );
       return;
     }
     const key = `pending-${nextViewId.value++}`;
@@ -334,23 +338,10 @@ function onCreated(key: string, result: { session: Session; workspace: Workspace
   const layout = layouts.value[view.checkoutId] ?? createTerminalLayout([]);
   void saveLayout(view.checkoutId, addSessionToLayout(layout, result.session));
   emit("workspaceUpdated", result.workspace, view.shellRequestToken);
+  if (view.launch?.kind === "pi-review") emit("reviewLaunchOpened", view.checkoutId);
   if (view.shellRequestToken !== undefined) {
     emit("shellCreated", view.shellRequestToken, view.checkoutId, result.session.id);
   }
-}
-
-/**
- * The round a launched Pi's terminal is holding.
- *
- * Published separately from the session it rides on, because they answer different questions: the
- * terminal existing says a Pi was started, and the round says what was handed to it. Nothing here
- * confirms the round arrived — the backend leaves it pending until the session itself has been
- * asked.
- */
-function onReviewLaunched(key: string, round: ReviewRound) {
-  const view = views.value.find((item) => item.key === key);
-  if (!view) return;
-  emit("reviewRoundLaunched", round);
 }
 
 function onStatusChanged(sessionId: string, status: TerminalSessionStatus) {
@@ -374,9 +365,7 @@ function onClosed(key: string, workspace: WorkspaceState) {
 
 function onFailed(key: string, message: string) {
   const view = views.value.find((item) => item.key === key);
-  // A terminal opening a review for Pi is a send, and a send that never started has no round to
-  // be reported on — so this is the one failure here that outlives its toast.
-  if (view?.launch) emit("reviewLaunchFailed", message);
+  if (view?.launch?.kind === "pi-review") emit("reviewLaunchFailed", message);
   terminalRefs.delete(key);
   if (view?.session) {
     emit("sessionStatusChanged", view.session.id, null);
@@ -387,7 +376,7 @@ function onFailed(key: string, message: string) {
   }
   if (pendingViewKey.value === key) pendingViewKey.value = null;
   views.value = views.value.filter((item) => item.key !== key);
-  pushToast(message);
+  if (view?.launch?.kind !== "pi-review") pushToast(message);
 }
 
 watch(
@@ -412,7 +401,7 @@ watch(
   ([token, checkoutId]) => {
     const request = props.shellRequest;
     if (!token || token === answeredShellToken || !request) return;
-    const launch = request.reviewLaunch;
+    const launch = request.launch;
     if (!launch && request.checkoutId !== checkoutId) return;
     const target =
       props.checkout?.id === request.checkoutId
@@ -422,12 +411,12 @@ watch(
       // A request can arrive before the first workspace read; leave it pending until checkouts land.
       if (!props.checkout && !(props.checkouts ?? []).length) return;
       answeredShellToken = token;
-      if (launch) emit("reviewLaunchFailed", "The checkout for this Pi review is no longer available.");
+      reportLaunchFailure(launch, "The checkout for this Pi terminal action is no longer available.");
       return;
     }
     if (target.isMissing) {
       answeredShellToken = token;
-      if (launch) emit("reviewLaunchFailed", "The checkout for this Pi review is missing.");
+      reportLaunchFailure(launch, "The checkout for this Pi terminal action is missing.");
       return;
     }
     answeredShellToken = token;
@@ -475,7 +464,6 @@ watch(
           :zoom="zoom"
           :launch="view.launch"
           @created="onCreated(view.key, $event)"
-          @review-launched="onReviewLaunched(view.key, $event)"
           @closed="onClosed(view.key, $event)"
           @status-changed="onStatusChanged(view.session?.id ?? view.key, $event)"
           @failed="onFailed(view.key, $event)"

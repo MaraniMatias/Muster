@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { computed, ref } from "vue";
-import type { ReviewNote, ReviewRound } from "../domain/review";
+import type { ReviewNote } from "../domain/review";
 import type { Checkout, Repo } from "../domain/workspace";
 
 const mocks = vi.hoisted(() => ({
@@ -18,7 +18,6 @@ const mocks = vi.hoisted(() => ({
   flushReviewRounds: vi.fn(),
   requeueReviewRounds: vi.fn(),
   reconcileReviewRound: vi.fn(),
-  settlePiReviewRound: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", () => ({
@@ -35,7 +34,6 @@ vi.mock("../lib/ipc", () => ({
   flushReviewRounds: mocks.flushReviewRounds,
   requeueReviewRounds: mocks.requeueReviewRounds,
   reconcileReviewRound: mocks.reconcileReviewRound,
-  settlePiReviewRound: mocks.settlePiReviewRound,
 }));
 
 import { useReviewNotes } from "./review-notes";
@@ -54,23 +52,6 @@ function note(overrides: Partial<ReviewNote> = {}): ReviewNote {
     outdated: false,
     roundId: null,
     status: "draft",
-    createdAt: "1",
-    updatedAt: "1",
-    ...overrides,
-  };
-}
-
-/** A Pi round: it names a terminal and a session, and it is never dispatched by the UI. */
-function piRound(overrides: Partial<ReviewRound> = {}): ReviewRound {
-  return {
-    id: "round:pi",
-    checkoutId: "checkout:first",
-    provider: "pi",
-    terminalId: "session:terminal:one",
-    sessionId: "ses_pi",
-    status: "dispatching",
-    marker: "muster-review:round:1762000000:4242:7",
-    noteIds: ["note:1"],
     createdAt: "1",
     updatedAt: "1",
     ...overrides,
@@ -210,6 +191,65 @@ describe("useReviewNotes", () => {
     expect(await state.dispatchRound("", ["note:1"], "# Code Review")).toBeNull();
     expect(await state.dispatchRound("ses_one", [], "# Code Review")).toBeNull();
     expect(mocks.dispatchReviewRound).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes ambiguous dispatch errors without retrying the claim", async () => {
+    mocks.listReviewNotes.mockClear();
+    mocks.listReviewRounds.mockClear();
+    mocks.dispatchReviewRound.mockClear();
+    const persistedRound = {
+      id: "round:uncertain",
+      checkoutId: "checkout:first",
+      sessionId: "ses_one",
+      status: "dispatching" as const,
+      marker: "muster-review:round:uncertain",
+      noteIds: ["note:1"],
+      createdAt: "1",
+      updatedAt: "2",
+    };
+    mocks.listReviewNotes
+      .mockResolvedValueOnce([note()])
+      .mockResolvedValueOnce([note({ status: "sent", roundId: persistedRound.id })]);
+    mocks.listReviewRounds.mockResolvedValueOnce([]).mockResolvedValueOnce([persistedRound]);
+    mocks.dispatchReviewRound.mockRejectedValue(new Error("prompt response was lost"));
+    const state = useReviewNotes(harness().checkout, harness().repo);
+    await settle();
+
+    expect(await state.dispatchRound("ses_one", ["note:1"], "# Code Review")).toBeNull();
+    expect(mocks.dispatchReviewRound).toHaveBeenCalledTimes(1);
+    expect(state.rounds).toEqual([persistedRound]);
+    expect(state.notes[0]).toMatchObject({ status: "sent", roundId: persistedRound.id });
+    expect(state.error).toBe("prompt response was lost");
+  });
+
+  it("does not apply an ambiguous dispatch refresh after checkout navigation", async () => {
+    let resolveRounds!: (rounds: never[]) => void;
+    let resolveNotes!: (notes: ReviewNote[]) => void;
+    mocks.listReviewNotes
+      .mockResolvedValueOnce([note()])
+      .mockReturnValueOnce(new Promise((resolve) => (resolveNotes = resolve)))
+      .mockResolvedValueOnce([note({ id: "note:second", checkoutId: "checkout:second" })]);
+    mocks.listReviewRounds
+      .mockResolvedValueOnce([])
+      .mockReturnValueOnce(new Promise((resolve) => (resolveRounds = resolve)))
+      .mockResolvedValueOnce([]);
+    mocks.dispatchReviewRound.mockRejectedValue(new Error("response lost"));
+    const refs = harness();
+    const state = useReviewNotes(refs.checkout, refs.repo);
+    await settle();
+
+    const dispatch = state.dispatchRound("ses_one", ["note:1"], "# Code Review");
+    await settle();
+    refs.checkoutRef.value = second;
+    await settle();
+    resolveRounds([]);
+    resolveNotes([note({ status: "sent", roundId: "round:old" })]);
+    await dispatch;
+    await settle();
+
+    expect(state.checkoutId).toBe("checkout:second");
+    expect(state.notes.map((item) => item.id)).toEqual(["note:second"]);
+    expect(state.rounds).toEqual([]);
   });
 
   it("holds a round back when the user asks to wait for the agent", async () => {
@@ -375,18 +415,6 @@ describe("useReviewNotes", () => {
         createdAt: "1",
         updatedAt: "1",
       },
-      {
-        id: "round:pi",
-        checkoutId: "checkout:first",
-        provider: "pi",
-        terminalId: "session:terminal:one",
-        sessionId: "ses_pi",
-        status: "dispatched",
-        marker: "muster-review:round:pi",
-        noteIds: ["note:1"],
-        createdAt: "1",
-        updatedAt: "1",
-      },
     ]);
     mocks.ackReviewRound.mockResolvedValue({
       id: "round:live",
@@ -403,73 +431,11 @@ describe("useReviewNotes", () => {
     await settle();
 
     const acked = await state.ackFinishedTurn("ses_one");
-    // Only the live one closes; an already acked round is not touched again, and a Pi round is
-    // left alone whatever its state — it is closed by the settlement the Pi itself announced,
-    // and closing it on a turn observed to end is the inference that bridge refuses to make.
+    // Only the newest dispatched round for this session closes; other-session and acked rounds stay unchanged.
     expect(acked?.id).toBe("round:live");
     expect(mocks.ackReviewRound).toHaveBeenCalledTimes(1);
     expect(mocks.ackReviewRound).toHaveBeenCalledWith("checkout:first", "round:live");
-    expect(state.rounds.find((item) => item.id === "round:pi")?.status).toBe("dispatched");
     expect(state.rounds.find((item) => item.id === "round:other-session")?.status).toBe("dispatched");
-  });
-
-  /**
-   * A Pi round is settled from the Pi's own reports and from nowhere else, and asking again
-   * changes nothing: every transition the backend makes is refused once it has been taken, so a
-   * reconnect or a second settlement is not a second delivery.
-   */
-  it("settles a Pi round from what the Pi reported, and only that", async () => {
-    mocks.listReviewNotes.mockResolvedValue([note({ status: "sent" })]);
-    // The list is re-read rather than patched, so the backend is what decides: what it reports
-    // after the settlement is what the store holds.
-    let stored = piRound({ status: "dispatching" });
-    mocks.listReviewRounds.mockImplementation(async () => [stored]);
-    mocks.settlePiReviewRound.mockImplementation(async () => {
-      stored = piRound({ status: "dispatched" });
-      return [stored];
-    });
-    const state = useReviewNotes(harness().checkout, harness().repo);
-    await settle();
-
-    const settled = await state.settlePiRound("ses_pi");
-    expect(mocks.settlePiReviewRound).toHaveBeenCalledWith("checkout:first", "ses_pi");
-    expect(settled.map((item) => item.status)).toEqual(["dispatched"]);
-    expect(state.rounds[0].status).toBe("dispatched");
-
-    // Nothing was sent: this is not a route that could retransmit a review. Counted rather than
-    // asserted absent, because this file's mocks carry across the tests in it.
-    const sendsBefore = mocks.dispatchReviewRound.mock.calls.length;
-    const flushesBefore = mocks.flushReviewRounds.mock.calls.length;
-    await state.settlePiRound("ses_pi");
-    expect(mocks.dispatchReviewRound).toHaveBeenCalledTimes(sendsBefore);
-    expect(mocks.flushReviewRounds).toHaveBeenCalledTimes(flushesBefore);
-
-    // A failure leaves the round where it was rather than guessing at it, and asking again
-    // when nothing moved is not a second delivery.
-    mocks.settlePiReviewRound.mockRejectedValue({ code: "operation_failed", message: "the bridge is gone" });
-    expect(await state.settlePiRound("ses_pi")).toEqual([]);
-    expect(state.rounds[0].status).toBe("dispatched");
-    expect(state.error).toBe("the bridge is gone");
-  });
-
-  it("settles a moved Pi session against its current checkout and refreshes the original round owner", async () => {
-    mocks.listReviewNotes.mockResolvedValue([note({ status: "sent" })]);
-    let stored = piRound({ status: "dispatching" });
-    mocks.listReviewRounds.mockImplementation(async (checkoutId: string) =>
-      checkoutId === "checkout:first" ? [stored] : [],
-    );
-    mocks.settlePiReviewRound.mockImplementation(async () => {
-      stored = piRound({ status: "dispatched" });
-      return [stored];
-    });
-    const state = useReviewNotes(harness().checkout, harness().repo);
-    await settle();
-
-    const settled = await state.settlePiRound("ses_pi", "checkout:moved");
-    expect(mocks.settlePiReviewRound).toHaveBeenCalledWith("checkout:moved", "ses_pi");
-    expect(settled[0]?.checkoutId).toBe("checkout:first");
-    expect(mocks.listReviewRounds).toHaveBeenLastCalledWith("checkout:first");
-    expect(state.rounds[0]?.status).toBe("dispatched");
   });
 
   it("surfaces failures and keeps the notes readable", async () => {

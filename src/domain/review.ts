@@ -1,5 +1,3 @@
-import type { AgentProvider } from "./agent";
-
 export type ReviewSide = "old" | "new";
 
 /**
@@ -9,7 +7,7 @@ export type ReviewSide = "old" | "new";
  * terminal in the same checkout and starts the program there. They are different journeys to the
  * same place, which is why the destination is named rather than "the agent".
  */
-export type ReviewTarget = "markdown" | AgentProvider;
+export type ReviewTarget = "markdown" | "opencode" | "pi";
 export type ReviewNoteStatus = "draft" | "sent" | "resolved";
 
 export interface ReviewAnchorCheck {
@@ -52,24 +50,8 @@ export type ReviewRoundStatus = "queued" | "dispatching" | "dispatched" | "acked
 export interface ReviewRound {
   id: string;
   checkoutId: string;
-  /**
-   * Which program this round was delivered to.
-   *
-   * The two are delivered to differently and confirmed differently, so this travels with the
-   * round rather than being looked up: an OpenCode round names a session that already existed,
-   * while a Pi round is sent by opening a terminal and carries the session that terminal ran.
-   */
-  provider: AgentProvider;
-  /** The provider's session this round targeted; retained after relocation for history. */
-  sessionId: string | null;
-  /**
-   * The terminal a Pi round was launched into, absent for an OpenCode round.
-   *
-   * A Pi send has no session to name — it opens one — so this is the half of its identity that is
-   * known when the round is recorded, and the half a session that appears in that terminal is
-   * matched back on. Absent here means "delivered by naming a session", which is the other kind.
-   */
-  terminalId: string | null;
+  /** The OpenCode session this round targets; retained after relocation for history. */
+  sessionId: string;
   status: ReviewRoundStatus;
   /** Embedded in the prompt, which is what makes a reconnect safe. */
   marker: string;

@@ -240,10 +240,6 @@ pub async fn terminal_create(
                     cols: request.cols,
                     rows: request.rows,
                     prompt: request.prompt,
-                    // Asked for here rather than built by the frontend: a credential names one terminal,
-                    // and the terminal's id is minted inside the service. A value passed over IPC
-                    // would mean inventing an id here and binding the credential to it.
-                    pi_bridge: Some(std::sync::Arc::clone(agents.pi())),
                 },
                 &shell_integration,
                 &script_dir,
@@ -348,10 +344,7 @@ pub async fn terminal_close(
     tauri::async_runtime::spawn_blocking(move || {
         agents.with_checkout_operation(&checkout_id, || {
             validate_session_owner(&database, &session_id, &checkout_id)?;
-            let workspace =
-                terminal::close(&database, &backend, &session_id).map_err(operation_error)?;
-            agents.pi().forget_terminal(&session_id);
-            Ok(workspace)
+            terminal::close(&database, &backend, &session_id).map_err(operation_error)
         })
     })
     .await
@@ -390,13 +383,9 @@ pub async fn terminal_move(
             &[checkout_id.as_str(), target_checkout_id.as_str()],
             || {
                 validate_session_owner(&database, &session_id, &checkout_id)?;
-                let workspace = database
+                database
                     .move_terminal_session(&session_id, &target_checkout_id, select_target)
-                    .map_err(operation_error)?;
-                agents
-                    .pi()
-                    .rehome_terminal(&session_id, &checkout_id, &target_checkout_id);
-                Ok(workspace)
+                    .map_err(operation_error)
             },
         )
     })

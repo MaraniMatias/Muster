@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   prepareAppExit: vi.fn(),
   reportFrontendDiagnostic: vi.fn(),
   getVersion: vi.fn().mockResolvedValue("9.9.9"),
+  getCompatibilitySnapshot: vi.fn(),
   getTerminalStatus: vi.fn(),
   loadReviewTarget: vi.fn(),
   saveReviewTarget: vi.fn(),
@@ -80,8 +81,7 @@ const mocks = vi.hoisted(() => ({
   agentSessions: [] as Array<{
     id: string;
     checkoutId: string;
-    provider: "opencode" | "pi";
-    terminalId?: string | null;
+    provider: "opencode";
     title: string;
     busy: boolean;
     awaitingReply: boolean;
@@ -91,17 +91,13 @@ const mocks = vi.hoisted(() => ({
   agentTargetId: null as string | null,
   createAgentSession: vi.fn(),
   dispatchReviewRound: vi.fn(),
-  recordReviewRound: vi.fn(),
   refreshReviewNotes: vi.fn(async () => undefined),
   reconcileRounds: vi.fn(),
   flushQueuedRounds: vi.fn(),
   ackFinishedTurn: vi.fn(),
-  settlePiRound: vi.fn(async () => []),
   // Turn completions are observed, so the watcher needs a real reactive source.
   turns: null as { value: number } | null,
   completedSessionIds: [] as string[],
-  // Live agent events are observed too, and a Pi settlement is asked about from one.
-  agentEvents: null as { report(event: unknown): void; reset(): void } | null,
 }));
 
 vi.mock("reka-ui", async () => {
@@ -291,6 +287,7 @@ vi.mock("./lib/ipc", () => ({
   listRecentPaths: mocks.listRecentPaths,
   exportReviewMarkdown: mocks.exportReviewMarkdown,
   getReviewFolder: mocks.getReviewFolder,
+  getCompatibilitySnapshot: mocks.getCompatibilitySnapshot,
   clearReviewFolder: mocks.clearReviewFolder,
   loadReviewTarget: mocks.loadReviewTarget,
   loadAppLayout: mocks.loadAppLayout,
@@ -389,38 +386,23 @@ vi.mock("./presentation/review-notes", () => ({
     clearOutdated: vi.fn(),
     resolveNote: vi.fn(),
     dispatchRound: mocks.dispatchReviewRound,
-    recordRound: mocks.recordReviewRound,
     refreshNotes: mocks.refreshReviewNotes,
     reconcileRounds: mocks.reconcileRounds,
     flushQueuedRounds: mocks.flushQueuedRounds,
     ackFinishedTurn: mocks.ackFinishedTurn,
-    settlePiRound: mocks.settlePiRound,
   }),
 }));
 vi.mock("./presentation/agent-sessions", async () => {
   const { reactive } = await import("vue");
   const turns = reactive({ value: 0 });
   mocks.turns = turns;
-  // The event stream is real reactive state, because the shell watches it for the two Pi reports
-  // that can settle a review round.
-  const events = reactive<{ events: unknown[] }>({ events: [] });
-  mocks.agentEvents = {
-    // Reassigned rather than pushed into, which is how the real store reports one: the shell
-    // watches the list itself, so replacing it is what a watcher here tracks.
-    report: (event: unknown) => (events.events = [...events.events, event]),
-    reset: () => (events.events = []),
-  };
   return {
-    AGENT_EVENT: "muster://agent-event",
     useAgentSessions: () => ({
       checkoutId: "checkout:one",
       sessions: mocks.agentSessions,
       targetId: mocks.agentTargetId,
       state: "ready",
       error: "",
-      get events() {
-        return events.events;
-      },
       reload: vi.fn(),
       createSession: mocks.createAgentSession,
       selectTarget: vi.fn(),
@@ -506,7 +488,7 @@ const SessionPaneStub = defineComponent({
     "workspaceUpdated",
     "shellCreated",
     "sessionOrder",
-    "reviewRoundLaunched",
+    "reviewLaunchOpened",
     "reviewLaunchFailed",
   ],
   setup(props, { expose }) {
@@ -591,6 +573,9 @@ const FileDiffStub = defineComponent({
     return () =>
       h("div", [
         h("span", { "data-testid": "file-diff" }, props.path ?? "all"),
+        h("span", { "data-testid": "review-target-state" }, sender?.target ?? ""),
+        h("span", { "data-testid": "review-available-targets" }, sender?.availableTargets.join(",") ?? ""),
+        h("button", { "data-testid": "select-review-pi", onClick: () => sender?.selectReviewTarget("pi") }),
         h("button", { "data-testid": "diff-scroll", onClick: () => emit("scrollPositionChanged", 132) }),
         // The diff's own close button, for the same reason the document stub carries one.
         h("button", { "data-testid": "close-preview", onClick: () => emit("close") }),
@@ -602,9 +587,6 @@ const FileDiffStub = defineComponent({
               false,
             ),
         }),
-        // The shell's own Pi feedback, so a test can read what the panel the send came from
-        // would draw. The real component draws it from this same sender.
-        sender?.piFeedback ? h("span", { "data-testid": "pi-feedback" }, JSON.stringify(sender.piFeedback)) : null,
       ]);
   },
 });
@@ -734,12 +716,9 @@ describe("App UI integration", () => {
     mocks.moveSession.mockReset();
     mocks.moveSession.mockResolvedValue({ moved: true, directoryChange: "not-requested" });
     mocks.dispatchReviewRound.mockReset();
-    mocks.recordReviewRound.mockReset();
     mocks.reconcileRounds.mockReset();
     mocks.flushQueuedRounds.mockReset();
     mocks.ackFinishedTurn.mockReset();
-    mocks.settlePiRound.mockClear();
-    mocks.agentEvents?.reset();
     if (mocks.turns) mocks.turns.value = 0;
     mocks.loadAppLayout.mockResolvedValue({ ...DEFAULT_APP_LAYOUT });
     mocks.loadSettings.mockResolvedValue(cloneSettings(DEFAULT_SETTINGS));
@@ -757,6 +736,10 @@ describe("App UI integration", () => {
     mocks.prepareAppExit.mockResolvedValue(undefined);
     mocks.reportFrontendDiagnostic.mockResolvedValue(undefined);
     mocks.getTerminalStatus.mockResolvedValue({ state: "running", foregroundProcess: false });
+    mocks.getCompatibilitySnapshot.mockResolvedValue({
+      piInstalled: true,
+      openCodeInstalled: true,
+    });
     mocks.loadReviewTarget.mockResolvedValue("markdown");
     mocks.saveReviewTarget.mockResolvedValue(undefined);
     mocks.exportReviewMarkdown.mockResolvedValue({ path: "2026-03-14-1532.md", origin: "review-default" });
@@ -3565,15 +3548,12 @@ describe("App UI integration", () => {
     },
   );
 
-  it("dispatches the review only to an OpenCode session when Pi is newer and selected", async () => {
+  it("dispatches the review to the selected OpenCode session", async () => {
     mocks.loadReviewTarget.mockResolvedValue("opencode");
     mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
     mocks.reviewNotes = [reviewNoteFixture()];
-    mocks.agentSessions = [
-      agentSessionFixture("ses_one", 10),
-      { ...agentSessionFixture("ses_pi", 99), provider: "pi", terminalId: "terminal:pi" },
-    ];
-    mocks.agentTargetId = "ses_pi";
+    mocks.agentSessions = [agentSessionFixture("ses_one", 10)];
+    mocks.agentTargetId = "ses_one";
     mocks.dispatchReviewRound.mockResolvedValue({
       id: "round:1",
       checkoutId: "checkout:one",
@@ -3646,169 +3626,149 @@ describe("App UI integration", () => {
     const request = main.props("shellRequest") as {
       checkoutId: string;
       token: number;
-      reviewLaunch?: { ids: string[]; markdown: string };
+      launch?: { kind: string; request?: { markdown: string } };
     };
     expect(request.checkoutId).toBe("checkout:one");
-    expect(request.reviewLaunch?.ids).toEqual(["note:1"]);
-    expect(request.reviewLaunch?.markdown).toContain("# Code Review ");
+    expect(request.launch?.kind).toBe("pi-review");
+    expect(request.launch?.request?.markdown).toContain("# Code Review ");
     expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
     expect(mocks.createAgentSession).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
-  /**
-   * A round whose Pi has been started is not a round that has landed.
-   *
-   * The terminal opening and the Pi reporting itself in say a Pi was launched and where; neither
-   * says the review was read. So the round joins the list still pending, its notes are re-read from
-   * the backend rather than assumed delivered, and nothing acks it.
-   */
-  it("keeps a launched Pi round pending until something confirms it", async () => {
+  it("reports successful Pi review launches as opened", async () => {
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    const pane = wrapper.getComponent({ name: "SessionPane" });
+
+    pane.vm.$emit("reviewLaunchOpened", "checkout:one");
+    await flushPromises();
+
+    expect(useToasts().toasts.value.at(-1)?.message).toBe("Review opened in Pi");
+    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("does not overwrite a saved Pi destination before compatibility loads", async () => {
+    let resolveCompatibility!: (snapshot: { piInstalled: boolean; openCodeInstalled: boolean }) => void;
+    mocks.getCompatibilitySnapshot.mockReturnValue(new Promise((resolve) => (resolveCompatibility = resolve)));
     mocks.loadReviewTarget.mockResolvedValue("pi");
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+    await flushPromises();
+
+    expect(mocks.loadReviewTarget).not.toHaveBeenCalled();
+    expect(mocks.saveReviewTarget).not.toHaveBeenCalled();
+    expect(wrapper.get('[data-testid="review-available-targets"]').text()).toBe("markdown");
+
+    resolveCompatibility({
+      piInstalled: true,
+      openCodeInstalled: false,
+    });
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="review-target-state"]').text()).toBe("pi");
+    expect(wrapper.get('[data-testid="review-available-targets"]').text()).toBe("markdown,pi");
+    expect(mocks.loadReviewTarget).toHaveBeenCalledWith("checkout:one");
+    expect(mocks.saveReviewTarget).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("falls back to Markdown and persists it when the saved program is not installed", async () => {
+    mocks.loadReviewTarget.mockResolvedValue("pi");
+    mocks.getCompatibilitySnapshot.mockResolvedValue({
+      piInstalled: false,
+      openCodeInstalled: false,
+    });
+    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+    await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="review-target-state"]').text()).toBe("markdown");
+    expect(mocks.saveReviewTarget).toHaveBeenCalledWith("checkout:one", "markdown");
+    wrapper.unmount();
+  });
+
+  it.each([
+    ["neither program", false, false, "markdown"],
+    ["Pi only", true, false, "markdown,pi"],
+    ["OpenCode only", false, true, "markdown,opencode"],
+    ["both programs", true, true, "markdown,opencode,pi"],
+  ] as const)(
+    "offers only confirmed review programs when %s are installed",
+    async (_label, piInstalled, openCodeInstalled, expected) => {
+      mocks.getCompatibilitySnapshot.mockResolvedValue({ piInstalled, openCodeInstalled });
+      const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+      await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+      await flushPromises();
+
+      expect(wrapper.get('[data-testid="review-available-targets"]').text()).toBe(expected);
+      wrapper.unmount();
+    },
+  );
+
+  it("keeps a manual destination through a pending preference load and compatibility refresh", async () => {
+    let resolveSavedTarget!: (target: "opencode" | "pi") => void;
+    let resolveRefresh!: (snapshot: { piInstalled: boolean; openCodeInstalled: boolean }) => void;
+    mocks.getCompatibilitySnapshot.mockResolvedValue({ piInstalled: true, openCodeInstalled: true });
+    mocks.loadReviewTarget.mockReturnValue(new Promise((resolve) => (resolveSavedTarget = resolve)));
     mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
     mocks.reviewNotes = [reviewNoteFixture()];
     const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
-    const pane = wrapper.getComponent({ name: "SessionPane" });
-
-    const round = {
-      id: "round:pi:1",
-      checkoutId: "checkout:one",
-      provider: "pi",
-      sessionId: null,
-      terminalId: "session:terminal:pi",
-      status: "dispatching",
-      marker: "muster-review:round:pi:1",
-      noteIds: ["note:1"],
-      createdAt: "1",
-      updatedAt: "1",
-    } as const;
-    pane.vm.$emit("reviewRoundLaunched", round);
-    await flushPromises();
-
-    expect(mocks.recordReviewRound).toHaveBeenCalledWith(round);
-    expect(mocks.refreshReviewNotes).toHaveBeenCalled();
-    // Recorded and re-read, never dispatched, reconciled or acked: the terminal opening and the Pi
-    // reporting itself in say a Pi was launched, not that the review was read.
-    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
-    expect(mocks.ackFinishedTurn).not.toHaveBeenCalled();
-    expect(mocks.reconcileRounds).not.toHaveBeenCalled();
-    wrapper.unmount();
-  });
-
-  /**
-   * What a Pi round needs is asked of the Pi, from the two reports it makes.
-   *
-   * The session appearing is when its receipts are readable, and a turn settling is the only
-   * completion a Pi announces — `turn_end` and `agent_end` are boundaries it can keep working
-   * past, so neither is one. Everything else on the stream is about a row, not about a round, so
-   * it is not asked about, and a report that has already been acted on is not asked about twice.
-   */
-  it("asks what a Pi reported about its round, and only from the two reports that mean something", async () => {
-    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
-    expect(mocks.settlePiRound).not.toHaveBeenCalled();
-
-    const report = async (rawType: string, sessionId: string | null) => {
-      mocks.agentEvents!.report({
-        checkoutId: "checkout:one",
-        sessionId,
-        kind: "turnFinished",
-        rawType,
-        data: null,
-      });
-      await flushPromises();
-    };
-
-    await report("pi.session_started", "ses_pi");
-    expect(mocks.settlePiRound).toHaveBeenCalledWith("ses_pi", "checkout:one");
-
-    // A later runtime report for the same session is re-checked: the first may have arrived
-    // before the launched round was bound, and backend settlement is idempotent.
-    await report("pi.session_started", "ses_pi");
-    expect(mocks.settlePiRound).toHaveBeenCalledTimes(2);
-
-    await report("pi.agent_settled", "ses_pi");
-    expect(mocks.settlePiRound).toHaveBeenCalledTimes(3);
-
-    // A prompt the person has to answer says nothing about a round, and neither does an event
-    // with no session to settle: there is nothing to ask about.
-    await report("pi.ui_prompt_start", "ses_pi");
-    await report("pi.ui_prompt_end", "ses_pi");
-    await report("turnFinished", "ses_opencode");
-    await report("pi.agent_settled", null);
-    expect(mocks.settlePiRound).toHaveBeenCalledTimes(3);
-
-    // And asking settles rounds; it is never a route that sends one.
-    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
-    expect(mocks.flushQueuedRounds).not.toHaveBeenCalled();
-    wrapper.unmount();
-  });
-
-  /**
-   * A Pi send that never started one leaves nothing to hang a failure on.
-   *
-   * It fails before anything is recorded — the backend undoes the round and its notes — so the
-   * only lasting trace is the reason, and it is drawn on the panel the send came from rather than
-   * in a toast nobody is looking at any more. A launch that works is what takes it away.
-   */
-  it("keeps why a Pi send did not start, until one does", async () => {
-    mocks.loadReviewTarget.mockResolvedValue("pi");
-    mocks.reviewNotes = [reviewNoteFixture()];
-    const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
-    const pane = wrapper.getComponent({ name: "SessionPane" });
-    // The panel the send came from, which is where the reason is drawn.
     await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
     await flushPromises();
-    const feedback = () =>
-      wrapper.find('[data-testid="pi-feedback"]').exists()
-        ? JSON.parse(wrapper.get('[data-testid="pi-feedback"]').text())
-        : null;
+    mocks.getCompatibilitySnapshot.mockReturnValue(new Promise((resolve) => (resolveRefresh = resolve)));
 
-    pane.vm.$emit("reviewLaunchFailed", "Pi is not installed, or not on this app's PATH");
+    await wrapper.get('[data-testid="select-review-pi"]').trigger("click");
+    mocks.saveReviewTarget.mockClear();
+    await wrapper.get('[data-testid="send-review"]').trigger("click");
+    resolveSavedTarget("opencode");
     await flushPromises();
-    expect(feedback()).toEqual({
-      pending: 0,
-      delivered: 0,
-      settled: 0,
-      error: "Pi is not installed, or not on this app's PATH",
-    });
+    expect(wrapper.get('[data-testid="review-target-state"]').text()).toBe("pi");
 
-    pane.vm.$emit("reviewRoundLaunched", {
-      id: "round:pi:2",
-      checkoutId: "checkout:one",
-      provider: "pi",
-      sessionId: null,
-      terminalId: "session:terminal:pi",
-      status: "dispatching",
-      marker: "muster-review:round:1762000000:4242:7",
-      noteIds: ["note:1"],
-      createdAt: "1",
-      updatedAt: "1",
-    } as const);
+    resolveRefresh({ piInstalled: true, openCodeInstalled: true });
     await flushPromises();
-    // A launch that worked takes the failure away. With the round the store holds still the one it
-    // always was, there is nothing left to draw at all — which is the honest reading: the reason
-    // is gone and no delivery has been claimed.
-    expect(feedback()?.error ?? "").toBe("");
+    const request = wrapper.getComponent({ name: "MainPane" }).props("shellRequest") as {
+      launch?: { kind: string };
+    };
+    expect(request.launch?.kind).toBe("pi-review");
+    expect(mocks.saveReviewTarget).not.toHaveBeenCalledWith("checkout:one", "markdown");
+    expect(mocks.exportReviewMarkdown).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
-  it("starts a session when the checkout has none, rather than dropping the review", async () => {
+  it.each(["pi", "opencode"] as const)(
+    "does not export or reset a selected %s target when availability refresh fails",
+    async (target) => {
+      mocks.loadReviewTarget.mockResolvedValue(target);
+      mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
+      mocks.reviewNotes = [reviewNoteFixture()];
+      if (target === "opencode") {
+        mocks.agentSessions = [agentSessionFixture("ses_one", 10)];
+        mocks.agentTargetId = "ses_one";
+      }
+      const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
+      await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
+      await flushPromises();
+      mocks.getCompatibilitySnapshot.mockRejectedValueOnce(new Error("compatibility lookup failed"));
+
+      await wrapper.get('[data-testid="send-review"]').trigger("click");
+      await flushPromises();
+
+      expect(wrapper.get('[data-testid="review-target-state"]').text()).toBe(target);
+      expect(mocks.exportReviewMarkdown).not.toHaveBeenCalled();
+      expect(mocks.saveReviewTarget).not.toHaveBeenCalledWith("checkout:one", "markdown");
+      expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+      expect(useToasts().toasts.value.at(-1)?.message).toContain("compatibility lookup failed");
+      wrapper.unmount();
+    },
+  );
+
+  it("does not auto-start OpenCode or record a review without a connected session", async () => {
     mocks.loadReviewTarget.mockResolvedValue("opencode");
     mocks.gitStatus = { branch: "feature", defaultBranch: "main" };
     mocks.reviewNotes = [reviewNoteFixture()];
-    mocks.agentSessions = [{ ...agentSessionFixture("ses_pi", 99), provider: "pi", terminalId: "terminal:pi" }];
-    mocks.agentTargetId = "ses_pi";
-    mocks.createAgentSession.mockResolvedValue(agentSessionFixture("ses_new", 10));
-    mocks.dispatchReviewRound.mockResolvedValue({
-      id: "round:1",
-      checkoutId: "checkout:one",
-      sessionId: "ses_new",
-      status: "dispatched",
-      marker: "muster-review:round:1",
-      noteIds: ["note:1"],
-      createdAt: "1",
-      updatedAt: "2",
-    });
+    mocks.agentSessions = [];
+    mocks.agentTargetId = null;
     const wrapper = await mountApp(workspaceWith(checkout("checkout:one")));
 
     await wrapper.get('[data-testid="open-all-changes"]').trigger("click");
@@ -3816,8 +3776,10 @@ describe("App UI integration", () => {
     await wrapper.get('[data-testid="send-review"]').trigger("click");
     await flushPromises();
 
-    expect(mocks.createAgentSession).toHaveBeenCalledTimes(1);
-    expect(mocks.dispatchReviewRound.mock.calls[0][0]).toBe("ses_new");
+    expect(mocks.createAgentSession).not.toHaveBeenCalled();
+    expect(mocks.dispatchReviewRound).not.toHaveBeenCalled();
+    expect(mocks.refreshReviewNotes).not.toHaveBeenCalled();
+    expect(useToasts().toasts.value.at(-1)?.message).toContain("No connected OpenCode session");
     wrapper.unmount();
   });
 
@@ -4426,6 +4388,30 @@ describe("App UI integration", () => {
       await wrapper.get('[data-testid="settings-button"]').trigger("click");
       return wrapper;
     };
+
+    it("reports detected review executables and refreshes compatibility", async () => {
+      mocks.getCompatibilitySnapshot.mockResolvedValue({
+        piInstalled: true,
+        openCodeInstalled: false,
+      });
+      const wrapper = await openSettings();
+      const section = wrapper.get('[data-testid="compatibility-section"]');
+      const status = (label: string) => {
+        const row = section.findAll("dt").find((item) => item.text() === label)!;
+        return row.element.nextElementSibling?.textContent?.trim();
+      };
+      expect(status("Pi executable")).toBe("Installed");
+      expect(status("OpenCode executable")).toBe("Not detected");
+
+      const snapshotCalls = mocks.getCompatibilitySnapshot.mock.calls.length;
+      await section
+        .findAll("button")
+        .find((button) => button.text() === "Refresh")!
+        .trigger("click");
+      await flushPromises();
+      expect(mocks.getCompatibilitySnapshot).toHaveBeenCalledTimes(snapshotCalls + 1);
+      wrapper.unmount();
+    });
 
     it("keeps settings hidden and zoom inert until the saved preferences load", async () => {
       let resolveSettings!: (settings: AppSettings) => void;

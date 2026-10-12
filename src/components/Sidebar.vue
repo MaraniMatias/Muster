@@ -27,7 +27,7 @@ import {
 import type { ArchivedCheckout, Checkout, Repo, Session, TerminalSessionStatus } from "../domain/workspace";
 import { AGENT_APP, agentSessionTitle, sessionRowTitle, workdirIconKind, workdirTitle } from "../domain/workspace";
 import type { AgentAttention } from "../domain/agent";
-import { matchAgentSessionTerminal, matchAgentSessionTitle } from "../domain/agent";
+import { matchAgentSessionTitle } from "../domain/agent";
 import type { MainView } from "../domain/main-document";
 import type { TerminalAgentRow } from "../presentation/agent-sessions";
 import { useDiffStats } from "../presentation/diff-stats";
@@ -582,17 +582,6 @@ const NO_AGENT_SESSION = "sin sesión";
  * then be a claim about a session that exists and is merely not distinguishable from its namesake.
  */
 const AMBIGUOUS_AGENT_SESSION = "varias con este nombre";
-
-/**
- * What a Pi row says beside the session's own name.
- *
- * The label an OpenCode row wears is the name of its agent — `plan`, `coder` — which comes from
- * that service's catalog. Pi has no catalog, no agents and no colors, so there is no mode to name
- * and nothing to paint with; what it has instead is the program itself, and that is what this row
- * says. It is the same fact the glyph and the name between them already carry, in the muted slot
- * where the row has room for one word.
- */
-const PI_PROVIDER_LABEL = "pi";
 
 interface WorkdirItem {
   session: Session;
@@ -1175,47 +1164,25 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
       const status = props.sessionRuntimeStatuses[session.id];
       const app = status?.foregroundApp;
       const candidates = props.agentRows[checkout.id]?.sessions ?? [];
-      /**
-       * The session this terminal is showing, and how that is known.
-       *
-       * Two providers, two ways, and a row asks the one its program can actually answer:
-       *
-       * - **Pi is matched by identity.** The bridge reports the terminal a session is running in, so
-       *   this is an equality check against a value Muster itself minted (`matchAgentSessionTerminal`).
-       *   The process name is not the gate: it depends on the runtime and platform, and even `pi`
-       *   is weaker evidence than the bridge's direct terminal identity. The cost is that the answer
-       *   depends on the bridge having said so, so it draws no state at all until then rather than
-       *   reaching for the nearest session.
-       * - **OpenCode is matched by inference.** It has no route from a TUI process to a session, so
-       *   the only thing that can name one is the title that terminal's own TUI wrote
-       *   (`agentSessionTitle`, which the runtime must confirm, then `matchAgentSessionTitle`). The
-       *   list it is matched against is the service's whole one, because a terminal's session is not
-       *   necessarily in the worktree the row is filed under — a terminal under this repository
-       *   routinely has its session open in a worktree beside it.
-       *
-       * Identity wins where both could answer, because it is told and the other is a guess. Neither
-       * path falls back to the other: a Pi session's title is never matched against an OpenCode
-       * terminal's, and an OpenCode session is never claimed for a terminal it did not name.
-       */
-      const openCodeTerminal = app === AGENT_APP;
-      const piMatch = matchAgentSessionTerminal(candidates, session.id);
-      const piSession = piMatch.kind === "one" ? piMatch.session : null;
+      const foregroundProcess = status?.foregroundProcess === true;
+      const openCodeTerminal = foregroundProcess && app === AGENT_APP;
+      const piTerminal = foregroundProcess && app === "pi";
       const match = openCodeTerminal ? matchAgentSessionTitle(candidates, agentSessionTitle(status)) : null;
-      const identified = piSession ?? (match?.kind === "one" ? match.session : null);
-      /** Anything this row draws an agent for: a matched session, or an OpenCode nobody named. */
-      const agentTerminal = Boolean(identified) || openCodeTerminal;
+      const identified = match?.kind === "one" ? match.session : null;
+      const agentTerminal = Boolean(identified) || openCodeTerminal || piTerminal;
       const unidentified = match?.kind === "ambiguous" ? AMBIGUOUS_AGENT_SESSION : NO_AGENT_SESSION;
-      /**
-       * One attention for the whole row, and the session's own answer wins.
-       *
-       * Read from the session rather than from its agent, because the two are not the same thing: a
-       * session is working, blocked, failed or quiet whatever it has an agent to name, and a Pi
-       * session never has one — so an attention read out of the agent alone drew a Pi turn that was
-       * working as idle grey, and a failed one as idle rather than in the danger colour.
-       */
       const attention: AgentAttention = identified?.attention ?? "none";
       const pendingUnknown = identified?.awaitingReply === null;
-      const agent = identified && !pendingUnknown ? AGENT_STATE[attention] : undefined;
+      const piTaskState = piTerminal ? status?.piTaskState : undefined;
+      const piState =
+        piTaskState === "working"
+          ? { state: "working" as const, text: "Working" }
+          : piTaskState === "error"
+            ? { state: "failed" as const, text: "Last task failed" }
+            : piTaskState === "done"
+              ? { state: "idle" as const, text: "Task complete" }
+              : undefined;
+      const agent = identified && !pendingUnknown ? AGENT_STATE[attention] : piState;
       /**
        * OpenCode's colour for this session's agent, on every state but a failed turn.
        *
@@ -1232,54 +1199,13 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
         canMove: canMoveTo(session),
         active: session.id === props.activeSessionId,
         dimmed: session.id === props.activeSessionId && !showingTerminal.value,
-        /**
-         * The row's name, which `sessionRowTitle` writes: the session this terminal is showing when
-         * its own title names one, the program in front of the shell otherwise, and the name it was
-         * opened with — or renamed to — when nothing is. Nothing about the workdir: that is the
-         * muted half beside it, and it is there so two identical shells are not identical rows.
-         *
-         * A Pi session is named by its own title rather than through that chain, because it writes
-         * no title into the terminal: what the OS reports for its executable is `node`, so the chain
-         * would name the row after a process instead of after the session that is running in it.
-         */
-        title: piSession ? piSession.title : sessionRowTitle(session, status),
-        /**
-         * The muted half beside the name, which says what is running rather than what is happening.
-         *
-         * An OpenCode session names its agent — `plan`, `coder` — because the catalog has one. A Pi
-         * session names its program instead, which is the whole of what it has: Pi has no catalog
-         * and no colors, so there is no mode to report and the row is drawn in the accent.
-         */
+        title: sessionRowTitle(session, status),
         detail: identified
-          ? identified.provider === "pi"
-            ? PI_PROVIDER_LABEL
-            : (identified.agent?.label ?? NO_AGENT_SESSION)
+          ? (identified.agent?.label ?? NO_AGENT_SESSION)
           : openCodeTerminal
             ? unidentified
             : undefined,
-        /**
-         * The glyph and its colour, which between them are the whole of the row's state.
-         *
-         * - An identified session wears its own agent colour while working, idle or asking, where it
-         *   has one. The spinner still moves while it works and the question mark says what a waiting
-         *   turn is doing; a failed turn keeps its danger colour, because that one is the row's own
-         *   news. Pi has no catalog and so no colour of its own, which leaves it in the accent on
-         *   every state but the failure — and that one stays the error colour for both providers.
-         * - A plain terminal with something in front of the shell is a process that is up, which is
-         *   green and which nothing else in the panel is.
-         * - A plain terminal whose last command failed is red. The backend cannot see that at all: the
-         *   command did not kill the shell, so it is a grandchild of the process the app spawns and no
-         *   `waitpid` reaches it. The answer arrives from the OSC 133 hook (`services/terminal.rs`) as
-         *   `lastCommandExit`, read *before* the foreground process, because a session with a failed
-         *   command behind it is exactly the row that must be red. The hook clears the field when the
-         *   next command starts, so red means "the last command you ran failed" and green means one is
-         *   in front of you now. A shell that has exited stays idle whatever code it left with: the
-         *   panel already names that state in the row's accessible name, and the colour is for the
-         *   thing nothing else can report.
-         * - Everything else is idle: an agent without its own colour and a terminal are grey. An
-         *   OpenCode whose session nobody identified lands here too, which is why it also says
-         *   `sin sesión` — a colour cannot say "nothing was observed" without lying about the state.
-         */
+        /** Pi task state is read only while Pi is the foreground process. */
         icon: agentTerminal
           ? agent?.state === "working"
             ? WORKDIR_ICONS.working

@@ -1,7 +1,5 @@
 use serde::Serialize;
 
-use crate::domain::agent::AgentProvider;
-
 pub const MAX_NOTE_CONTENT_BYTES: usize = 8 * 1024;
 pub const MAX_NOTE_CODE_BYTES: usize = 8 * 1024;
 /// A round ships at most this many notes, and the prompt that carries them.
@@ -42,27 +40,8 @@ pub struct ReviewNote {
 pub struct ReviewRound {
     pub id: String,
     pub checkout_id: String,
-    /// Which agent program this round was delivered to.
-    ///
-    /// The two providers are delivered to differently and confirmed differently, so a round
-    /// carries which one it belongs to: an OpenCode round names a session that already existed,
-    /// while a Pi round is sent by opening a new terminal and carries the session that terminal
-    /// ended up running. Reading a round without its provider cannot tell those apart.
-    pub provider: AgentProvider,
-    /// The provider's session this round targeted; retained after relocation for history.
-    ///
-    /// Absent only until a Pi round's terminal has reported the session it started, and never
-    /// supplied by the caller: a Pi send opens a terminal, so the session does not exist yet when
-    /// the round is recorded. That is the difference between "the destination is Pi" and "this is
-    /// the session", and only the second one is a claim about a running program.
-    pub session_id: Option<String>,
-    /// The Muster terminal a Pi round was launched into, set as the terminal is created.
-    ///
-    /// This is the half of a Pi round's identity that is known at record time and the half that
-    /// makes the later session binding unambiguous: a Pi session is matched by the terminal it
-    /// reports itself to be in, so without this a session could not be tied back to the round that
-    /// asked for it. Always absent for an OpenCode round, which names a session rather than a pane.
-    pub terminal_id: Option<String>,
+    /// The OpenCode session this round targets; retained after relocation for history.
+    pub session_id: String,
     /// "queued", "dispatching", "dispatched", "acked" or "relocated".
     /// A relocated round is historical and is never retried against a different session.
     pub status: String,
@@ -94,8 +73,8 @@ pub fn review_round_marker(round_id: &str) -> String {
 ///
 /// The grammar is the one `record_round` generates and nothing looser: a round id is
 /// `round:` and three numbers. A receipt is evidence only because this app put the string
-/// in the message, so a marker-shaped run of characters somebody typed into a Pi is not one
-/// of them and must not confirm anything.
+/// in the message, so a marker-shaped run of characters typed into a session is not one of ours
+/// and must not confirm anything.
 pub fn is_review_round_marker(value: &str) -> bool {
     let Some(id) = value.strip_prefix(&format!("{ROUND_MARKER_PREFIX}:")) else {
         return false;

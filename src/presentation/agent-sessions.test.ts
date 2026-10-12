@@ -37,7 +37,6 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
     id: "ses_one",
     checkoutId: "checkout:first",
     provider: "opencode",
-    terminalId: null,
     title: "review",
     running: false,
     idleAt: 1,
@@ -254,30 +253,21 @@ describe("useAgentSessions", () => {
     vi.useRealTimers();
   });
 
-  it("never counts Pi settlement as OpenCode completion, and tracks its own session completion", async () => {
+  it("tracks an OpenCode session's running-to-idle transition", async () => {
     vi.useFakeTimers();
     const opencode = session({ id: "ses_oc", running: true });
-    const pi = session({ id: "ses_pi", provider: "pi", terminalId: "terminal:pi", running: true });
     mocks.listen.mockImplementation(async () => vi.fn());
-    mocks.listAgentSessions.mockResolvedValue([opencode, pi]);
+    mocks.listAgentSessions.mockResolvedValue([opencode]);
     const state = useAgentSessions(
       computed(() => checkout),
       computed(() => gitRepo),
     );
     await settle();
 
-    mocks.listAgentSessions.mockResolvedValue([opencode, { ...pi, running: false }]);
+    mocks.listAgentSessions.mockResolvedValue([{ ...opencode, running: false }]);
     await vi.advanceTimersByTimeAsync(2000);
     await settle();
-    expect(state.turnsCompleted).toBe(0);
-    expect(state.completedSessionIds).toEqual([]);
 
-    mocks.listAgentSessions.mockResolvedValue([
-      { ...opencode, running: false },
-      { ...pi, running: false },
-    ]);
-    await vi.advanceTimersByTimeAsync(2000);
-    await settle();
     expect(state.turnsCompleted).toBe(1);
     expect(state.completedSessionIds).toEqual(["ses_oc"]);
     vi.useRealTimers();
@@ -665,8 +655,6 @@ describe("useTerminalAgentRows", () => {
     expect(state.byCheckout["checkout:first"].sessions).toEqual([
       {
         id: "ses_one",
-        provider: "opencode",
-        terminalId: null,
         title: "review",
         attention: "busy",
         agent: { label: "Coder", color: "#4ed6bf", attention: "busy" },
@@ -678,8 +666,6 @@ describe("useTerminalAgentRows", () => {
     expect(state.byCheckout["checkout:second"].sessions).toEqual([
       {
         id: "ses_two",
-        provider: "opencode",
-        terminalId: null,
         title: "review",
         attention: "none",
         agent: { label: "Plan", color: null, attention: "none" },
@@ -741,13 +727,10 @@ describe("useTerminalAgentRows", () => {
 
     // The clock rides along because it is the only duration a terminal row has: the elapsed time in a
     // row's trailing slot is this session's own last update, read from the service and nowhere else.
-    // The attention rides along too, because a session with no agent still has one — that is the
-    // whole of what a Pi row has, and reading the state out of the agent would leave it empty.
+    // The attention is independent of the agent label, so a fresh session still has a useful row.
     expect(state.byCheckout["checkout:first"].sessions).toEqual([
       {
         id: "ses_fresh",
-        provider: "opencode",
-        terminalId: null,
         title: "review",
         attention: awaitingReply ? "blocked" : "none",
         agent: null,
@@ -769,8 +752,6 @@ describe("useTerminalAgentRows", () => {
       expect(state.row("checkout:first").sessions).toEqual([
         {
           id: "ses_one",
-          provider: "opencode",
-          terminalId: null,
           title: "review",
           attention: awaitingReply ? "blocked" : "none",
           agent: null,
@@ -1102,16 +1083,14 @@ describe("useTerminalAgentRows", () => {
 
     perCheckout({
       "checkout:first": [],
-      "checkout:second": [{ id: "ses_pi", provider: "pi", terminalId: "session:two" }],
+      "checkout:second": [session({ id: "ses_two", checkoutId: "checkout:second" })],
     });
-    emit({ checkoutId: "checkout:second", sessionId: "ses_pi", kind: "unknown", rawType: "pi.session_started" });
+    emit({ checkoutId: "checkout:second", sessionId: "ses_two", kind: "unknown", rawType: "session.created" });
     await settle();
 
-    // Only the checkout the events named is asked about — the event carries the checkout it
-    // happened in, so every other worktree's terminals are left alone — and its row carries the
-    // Pi session with the terminal it was matched by.
+    // Only the named checkout is refreshed, so the other worktree's row remains untouched.
     expect(mocks.listAgentCandidateSessions.mock.calls.map(([id]) => id)).toEqual(["checkout:second"]);
-    expect(state.row("checkout:second").sessions[0]?.terminalId).toBe("session:two");
+    expect(state.row("checkout:second").sessions[0]?.id).toBe("ses_two");
     expect(state.row("checkout:first").sessions).toEqual([]);
   });
 
@@ -1121,7 +1100,12 @@ describe("useTerminalAgentRows", () => {
     await settle();
     mocks.listAgentCandidateSessions.mockClear();
 
-    emit({ checkoutId: "checkout:elsewhere", sessionId: "ses_pi", kind: "turnStarted", rawType: "pi.agent_start" });
+    emit({
+      checkoutId: "checkout:elsewhere",
+      sessionId: "ses_outside",
+      kind: "turnStarted",
+      rawType: "session.updated",
+    });
     await settle();
 
     // A row that is not on screen has nothing to redraw, and asking about a worktree this hook
