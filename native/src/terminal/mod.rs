@@ -28,18 +28,18 @@ mod view;
 mod write_queue;
 
 pub use self::core::{
-    CellSnapshot, ColorSnapshot, CursorShapeSnapshot, CursorSnapshot, RowSnapshot, TerminalCore,
-    TerminalEvent, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_TITLE_CHARS,
+    CellSnapshot, ColorSnapshot, CursorShapeSnapshot, CursorSnapshot, PromptAnchor, RowSnapshot,
+    TerminalCore, TerminalEvent, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_TITLE_CHARS,
 };
 pub use self::input::{FocusState, Input};
 pub use self::keys::{encode_key, Key, KeyPress};
 pub use self::modes::TerminalModes;
 pub use self::paste::{encode_paste, PasteError, MAX_PASTE_BYTES};
 pub use self::session::{
-    login_shell, shutdown, CellMetrics, CloseHandle, CloseReport, Foreground, SessionError,
-    SessionStatus, ShellState, StreamState, TerminalHost, TerminalSession, TerminalSessionConfig,
-    TerminalSnapshot, TerminalWake, DEFAULT_DRAIN_DEADLINE, DEFAULT_SCROLLBACK_LINES,
-    DEFAULT_STATUS_INTERVAL,
+    login_shell, shutdown, CellMetrics, CloseHandle, CloseReport, Foreground, GridRange,
+    SessionError, SessionStatus, ShellState, StreamState, TerminalHost, TerminalSession,
+    TerminalSessionConfig, TerminalSnapshot, TerminalWake, DEFAULT_DRAIN_DEADLINE,
+    DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_INTERVAL,
 };
 pub use self::view::{xterm_256, CellSize, Palette, Placement, TerminalView};
 pub use self::write_queue::{EnqueueError, WriteQueue, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS};

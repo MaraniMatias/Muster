@@ -68,6 +68,16 @@ pub struct RowSnapshot {
     pub cells: Vec<CellSnapshot>,
 }
 
+/// A prompt boundary captured when OSC 133;B is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptAnchor {
+    /// Absolute grid line number (negative lines are scrollback).
+    pub line: i32,
+    /// First editable column.
+    pub column: usize,
+    /// Scroll position captured with the anchor.
+    pub display_offset: usize,
+}
 /// Where the cursor is, in viewport coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorSnapshot {
@@ -169,6 +179,14 @@ impl EventListener for ParkedEvents {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringScan {
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+}
+
 /// The parser, the grid, and the parser's own view of what it has been told.
 ///
 /// `Send` and not `Sync`, deliberately: this is owned by one thread, the PTY
@@ -185,12 +203,17 @@ pub struct TerminalCore {
     /// cell. A parser built per chunk would drop that state and the grid would
     /// drift from the byte stream permanently.
     parser: Processor,
+    string_scan: StringScan,
+    /// The payload of the OSC sequence being scanned, across reads.
+    osc: Vec<u8>,
     /// Everything the parser reported since the window last asked. Held here
     /// rather than translated on demand so a report is never made twice, and so
     /// nothing is reported before the window is ready to act on it.
     pending: Vec<TerminalEvent>,
     /// The last title the program asked for, already sanitised and bounded.
     title: Option<String>,
+    prompt_anchor: Option<PromptAnchor>,
+    command_exit: Option<i32>,
 }
 
 impl TerminalCore {
@@ -223,8 +246,12 @@ impl TerminalCore {
             term: Term::new(config, &size, listener),
             events,
             parser: Processor::new(),
+            string_scan: StringScan::Ground,
+            osc: Vec::new(),
             pending: Vec::new(),
             title: None,
+            prompt_anchor: None,
+            command_exit: None,
         }
     }
 
@@ -236,25 +263,106 @@ impl TerminalCore {
     /// all, and a call that cannot fail is a call the reader thread can make
     /// without a branch.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        let mut offset = 0;
+        let mut state = self.string_scan;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let previous = state;
+            state = match (state, byte) {
+                (StringScan::Ground, 0x1b) => StringScan::Escape,
+                (StringScan::Escape, b']') => {
+                    // The payload is accumulated here rather than sliced out of
+                    // this chunk: a marker can arrive split across two reads,
+                    // and a terminal that drops the half it already saw reports
+                    // no prompt at all.
+                    self.osc.clear();
+                    StringScan::Osc
+                }
+                (StringScan::Escape, 0x1b) => StringScan::Escape,
+                (StringScan::Escape, _) => StringScan::Ground,
 
-        // Translated here rather than in `take_events` because a title is state
-        // and everything else here is not: `title()` has to answer for the bytes
-        // fed so far, not for the bytes fed before the window last asked. The
-        // events themselves still wait in `pending` until it does.
+                (StringScan::Osc, 0x07) => StringScan::Ground,
+                (StringScan::Osc, 0x1b) => StringScan::OscEscape,
+                (StringScan::OscEscape, b'\\') => StringScan::Ground,
+                (StringScan::OscEscape, 0x1b) => StringScan::OscEscape,
+                (StringScan::OscEscape, _) => StringScan::Osc,
+                (StringScan::Osc, _) => {
+                    self.osc.push(byte);
+                    StringScan::Osc
+                }
+                (StringScan::Ground, _) => StringScan::Ground,
+            };
+            let terminated = (matches!(previous, StringScan::Osc) && byte == 0x07)
+                || (matches!(previous, StringScan::OscEscape) && byte == b'\\');
+            if terminated {
+                state = StringScan::Ground;
+                // The grid is read after the parser has consumed exactly up to
+                // the terminator and before anything after it, which is the
+                // position the marker was written at.
+                self.parser.advance(&mut self.term, &bytes[offset..=index]);
+                let marker = std::mem::take(&mut self.osc);
+                self.apply_shell_marker(&marker);
+                self.handle_events_at_position();
+                offset = index + 1;
+            }
+        }
+        if offset < bytes.len() {
+            self.parser.advance(&mut self.term, &bytes[offset..]);
+            self.handle_events_at_position();
+        }
+        self.string_scan = state;
+    }
+
+    /// What one OSC 133 payload means, applied at the position it was written.
+    ///
+    /// `B` is the prompt the person can still edit, `C` says a command is
+    /// running and `D` carries its exit status. Anything else is somebody
+    /// else's sequence and is left alone.
+    fn apply_shell_marker(&mut self, payload: &[u8]) {
+        let Some(marker) = payload.strip_prefix(b"133;") else {
+            return;
+        };
+        let text = String::from_utf8_lossy(marker);
+        // Split on the marker code itself: `C` and `D` both arrive with and
+        // without parameters, and a shell that sends the bare form must not be
+        // read as somebody else's sequence.
+        let (code, rest) = text.split_once(';').unwrap_or((text.as_ref(), ""));
+        match code {
+            "D" => self.command_exit = rest.parse().ok(),
+            "C" => {
+                self.command_exit = None;
+                self.prompt_anchor = None;
+            }
+            "B" => {
+                let grid = self.term.grid();
+                self.prompt_anchor = Some(PromptAnchor {
+                    line: grid.cursor.point.line.0,
+                    column: grid.cursor.point.column.0,
+                    display_offset: grid.display_offset(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_events_at_position(&mut self) {
         let parked =
             std::mem::take(&mut *self.events.lock().expect("terminal event buffer poisoned"));
-        let translated: Vec<TerminalEvent> = parked
-            .into_iter()
-            .filter_map(|event| self.translate(event))
-            .collect();
-
-        self.pending.extend(translated);
+        for event in parked {
+            if let Event::Title(raw) = &event {
+                if raw.strip_prefix("133;").is_some() {
+                    continue;
+                }
+            }
+            if let Some(event) = self.translate(event) {
+                self.pending.push(event);
+            }
+        }
     }
 
     /// Resize the grid. The scrollback survives; the scroll offset does too,
     /// clamped by the grid to whatever the shorter history can still show.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.prompt_anchor = None;
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
     }
@@ -335,6 +443,47 @@ impl TerminalCore {
     /// The current title, sanitised and bounded, or `None` if there is none.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    pub fn prompt_anchor(&self) -> Option<PromptAnchor> {
+        let anchor = self.prompt_anchor?;
+        let grid = self.term.grid();
+        // Only preserve an anchor while its line's display mapping is unchanged.
+        // Any scroll/reflow we cannot prove invalidates it rather than guessing.
+        (anchor.display_offset == grid.display_offset()
+            && (-(grid.total_lines() as i32)..grid.screen_lines() as i32).contains(&anchor.line))
+        .then_some(anchor)
+    }
+
+    pub fn move_prompt_caret(&mut self, row: usize, column: usize) -> Option<usize> {
+        let anchor = self.prompt_anchor()?;
+        let grid = self.term.grid();
+        let anchor_row = anchor.line + grid.display_offset() as i32;
+        let cursor_row = grid.cursor.point.line.0 + grid.display_offset() as i32;
+        // Movement is intentionally limited to the same physical line. The PTY
+        // does not expose Readline/ZLE's logical line mapping, so wrapped or
+        // multiline input is ambiguous and must remain inert.
+        if row as i32 != anchor_row || cursor_row != anchor_row || row != cursor_row as usize {
+            return None;
+        }
+        let start = anchor.column;
+        let end = grid.cursor.point.column.0;
+        // Before the prompt is not editable, and on the caret is nowhere to go.
+        // Past the caret is allowed in both directions: the shell's own line is
+        // longer than its cursor whenever the caret sits in the middle of it,
+        // and refusing that is refusing half the line.
+        if column < start || column == end {
+            return None;
+        }
+        Some(column.abs_diff(end))
+    }
+
+    pub fn invalidate_prompt_anchor(&mut self) {
+        self.prompt_anchor = None;
+    }
+
+    pub fn command_exit(&self) -> Option<i32> {
+        self.command_exit
     }
 
     /// Only the rows a view of this size can show, honouring the scroll offset.
@@ -460,6 +609,45 @@ impl TerminalCore {
 
     pub fn rows(&self) -> u16 {
         self.term.grid().screen_lines() as u16
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
+        self.term.selection.as_ref()?.to_range(&self.term)
+    }
+
+    /// Select the inclusive grid range described by viewport cells.
+    pub fn select(&mut self, start: (usize, usize), end: (usize, usize)) {
+        use alacritty_terminal::index::{Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+
+        let grid = self.term.grid();
+        let clamp = |(row, col): (usize, usize)| {
+            Point::new(
+                Line(
+                    row.min(grid.screen_lines().saturating_sub(1)) as i32
+                        - grid.display_offset() as i32,
+                ),
+                Column(col.min(grid.columns().saturating_sub(1))),
+            )
+        };
+        let start = clamp(start);
+        let end = clamp(end);
+        let (anchor, anchor_side, head, head_side) = if start <= end {
+            (start, Side::Left, end, Side::Right)
+        } else {
+            (start, Side::Right, end, Side::Left)
+        };
+        let mut selection = Selection::new(SelectionType::Simple, anchor, anchor_side);
+        selection.update(head, head_side);
+        self.term.selection = Some(selection);
     }
 }
 
@@ -653,6 +841,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn osc133_bel_and_st_are_forwarded_without_losing_split_input() {
+        for ending in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let marker = [b"\x1b]133;B".as_slice(), ending].concat();
+            for split in 1..marker.len() {
+                let mut terminal = TerminalCore::new(80, 24, 20);
+                terminal.feed(&marker[..split]);
+                terminal.feed(&marker[split..]);
+                terminal.feed(b"visible");
+                assert!(terminal.visible_rows()[0]
+                    .cells
+                    .iter()
+                    .any(|cell| cell.c == 'v'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_drag_selection_returns_the_selected_grid_text_forward_and_backward() {
+        let mut core = TerminalCore::new(8, 2, 10);
+        core.feed(b"hello\r\nworld");
+        core.select((0, 1), (0, 3));
+        assert_eq!(core.selection_text().as_deref(), Some("ell"));
+        core.select((0, 3), (0, 1));
+        assert_eq!(core.selection_text().as_deref(), Some("ell"));
+        core.select((0, 4), (1, 1));
+        assert_eq!(core.selection_text().as_deref(), Some("o\nwo"));
+        core.select((1, 1), (0, 4));
+        assert_eq!(core.selection_text().as_deref(), Some("o\nwo"));
+    }
+
+    /// `133;B` after `hello` anchors the prompt at column 5, the exact
+    /// position the marker was written at.
+    #[test]
+    fn a_prompt_marker_anchors_the_cursor_where_it_was_written() {
+        let mut core = core();
+        core.feed(b"hello\x1b]133;B\x07");
+        let anchor = core.prompt_anchor().expect("the marker recorded an anchor");
+        assert_eq!(
+            (anchor.line, anchor.column),
+            (0, 5),
+            "hello is five columns"
+        );
+    }
+
+    /// The same marker split across two reads, and terminated by ST rather than
+    /// BEL: both are how a real shell's output arrives.
+    #[test]
+    fn a_prompt_marker_split_across_reads_or_ended_by_st_still_anchors() {
+        let mut bel = core();
+        bel.feed(b"hi\x1b]133;");
+        assert!(
+            bel.prompt_anchor().is_none(),
+            "half a marker is not a marker"
+        );
+        bel.feed(b"B\x07");
+        assert_eq!(
+            bel.prompt_anchor().map(|a| (a.line, a.column)),
+            Some((0, 2)),
+            "the marker split across reads still anchors"
+        );
+
+        let mut st = core();
+        st.feed(b"hey\x1b]133;B\x1b\\");
+        assert_eq!(
+            st.prompt_anchor().map(|a| (a.line, a.column)),
+            Some((0, 3)),
+            "an ST-terminated marker anchors too"
+        );
+    }
+
+    /// `133;C` means a command is running: the line is no longer editable.
+    #[test]
+    fn a_command_marker_invalidates_the_prompt_anchor() {
+        let mut core = core();
+        core.feed(b"typed\x1b]133;B\x07");
+        assert!(core.prompt_anchor().is_some(), "the prompt is editable");
+        core.feed(b"\x1b]133;C\x07");
+        assert!(
+            core.prompt_anchor().is_none(),
+            "a running command is not a prompt"
+        );
+    }
+
+    /// Somebody else's OSC is still theirs: the parser handles it, and nothing
+    /// here mistakes it for a prompt.
+    #[test]
+    fn an_osc_that_is_not_a_marker_leaves_the_prompt_alone() {
+        let mut core = core();
+        core.feed(b"\x1b]1339;B\x07");
+        assert!(core.prompt_anchor().is_none(), "1339 is not 133");
+        core.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(
+            core.prompt_anchor().is_none(),
+            "a clipboard write is not a prompt"
+        );
+    }
+
+    /// A click inside the editable prompt moves the caret; a click on the
+    /// prompt's own prefix, on the caret, or on output above it does not.
+    #[test]
+    fn a_click_on_the_prompt_measures_the_move_and_nothing_else_does() {
+        let mut core = core();
+        core.feed(b"ab\x1b]133;B\x07cd");
+        assert!(
+            core.prompt_anchor().is_some(),
+            "the prompt is where the marker said it was"
+        );
+        assert_eq!(core.move_prompt_caret(0, 6), Some(2), "two to the right");
+        assert_eq!(core.move_prompt_caret(0, 2), Some(2), "two to the left");
+        assert_eq!(
+            core.move_prompt_caret(0, 4),
+            None,
+            "the caret is already there"
+        );
+        assert_eq!(core.move_prompt_caret(0, 1), None, "the prompt's own text");
+        assert_eq!(
+            core.move_prompt_caret(1, 0),
+            None,
+            "another row is not this line"
+        );
+    }
+
+    /// A running command has no editable line, so its output cannot be clicked
+    /// into.
+    #[test]
+    fn no_click_moves_anything_without_a_prompt() {
+        let mut core = core();
+        core.feed(b"ab");
+        assert_eq!(core.move_prompt_caret(0, 4), None, "no marker, no anchor");
     }
 
     #[test]

@@ -69,6 +69,20 @@ impl FocusState {
 pub fn press(keystroke: &Keystroke) -> Input {
     let modifiers = keystroke.modifiers;
 
+    // GPUI's default Tab binding moves focus before a bubbling key handler gets
+    // the event. The terminal owns both Tab variants, so mark them as handled
+    // here; the view still encodes Tab as byte 9 and keeps Shift+Tab distinct.
+    if keystroke.key == "tab" && !modifiers.platform {
+        return Input::Press(KeyPress {
+            key: Key::Tab,
+            shift: modifiers.shift,
+            ctrl: modifiers.control,
+            alt: !cfg!(target_os = "macos") && modifiers.alt,
+            meta: cfg!(target_os = "macos") && modifiers.alt,
+            text: None,
+        });
+    }
+
     // Command belongs to the application, not to whatever is in front of it.
     // This is not a nicety on macOS: Cmd+C has to stay a copy shortcut, and
     // the only way to get that is to refuse the key here. Ctrl is a different
@@ -188,6 +202,18 @@ mod tests {
     fn every_named_key_the_child_can_read_is_mapped() {
         assert_eq!(sent("enter"), Key::Enter);
         assert_eq!(sent("tab"), Key::Tab);
+        let Input::Press(tab) = press(&keystroke(
+            "tab",
+            None,
+            Modifiers {
+                shift: true,
+                ..Modifiers::none()
+            },
+        )) else {
+            panic!("Shift+Tab was not sent");
+        };
+        assert_eq!(tab.key, Key::Tab);
+        assert!(tab.shift);
         assert_eq!(sent("backspace"), Key::Backspace);
         assert_eq!(sent("escape"), Key::Escape);
         assert_eq!(sent("up"), Key::Up);

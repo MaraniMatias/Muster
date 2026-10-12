@@ -41,7 +41,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::core::{CursorSnapshot, RowSnapshot, TerminalCore, TerminalEvent};
+use super::core::{CursorSnapshot, PromptAnchor, RowSnapshot, TerminalCore, TerminalEvent};
 use super::keys::{encode_key, KeyPress};
 use super::modes::TerminalModes;
 use super::paste::{encode_paste, PasteError};
@@ -297,16 +297,26 @@ pub struct SessionStatus {
     pub poll_error: Option<String>,
 }
 
+/// One grid cell as `(row, column)`, in visible screen coordinates.
+pub type GridPoint = (usize, usize);
+/// An inclusive selection as its two endpoints, first cell included.
+pub type GridRange = (GridPoint, GridPoint);
+
 /// What the view draws, gathered in one pass so a frame is one lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     pub rows: Vec<RowSnapshot>,
+    /// Text selected in the terminal grid, if any.
+    pub selection: Option<String>,
+    /// Inclusive visible selection range (row, column) endpoints.
+    pub selection_range: Option<GridRange>,
     pub cursor: CursorSnapshot,
     pub modes: TerminalModes,
     pub title: Option<String>,
     pub alt_screen: bool,
     pub mouse_tracking: bool,
     pub display_offset: usize,
+    pub prompt_anchor: Option<PromptAnchor>,
 }
 
 /// Why the controller refused something.
@@ -1131,6 +1141,7 @@ impl TerminalSession {
             .args
             .clone()
             .unwrap_or_else(|| vec![LOGIN_FLAG.to_owned()]);
+        let env = config.env.clone();
 
         let shared = Arc::new(Shared::new(
             config.cols,
@@ -1175,7 +1186,7 @@ impl TerminalSession {
                     cwd: config.cwd,
                     cols: config.cols,
                     rows: config.rows,
-                    env: config.env,
+                    env,
                     reader_end: Some(Inner::reader_end(inner.side.clone())),
                 },
                 Inner::output_sink(inner.side.clone()),
@@ -1244,13 +1255,48 @@ impl TerminalSession {
         let core = self.inner.shared().core();
         TerminalSnapshot {
             rows: core.visible_rows(),
+            selection: core.selection_text(),
+            selection_range: core.selection_range().and_then(|range| {
+                let offset = core.display_offset() as i32;
+                let start_row = range.start.line.0 + offset;
+                let end_row = range.end.line.0 + offset;
+                (end_row >= 0).then_some((
+                    (
+                        start_row.max(0) as usize,
+                        if start_row < 0 {
+                            0
+                        } else {
+                            range.start.column.0
+                        },
+                    ),
+                    (end_row.max(0) as usize, range.end.column.0),
+                ))
+            }),
             cursor: core.cursor(),
             modes: core.modes(),
             title: core.title().map(str::to_owned),
             alt_screen: core.is_alt_screen(),
             mouse_tracking: core.is_mouse_tracking(),
             display_offset: core.display_offset(),
+            prompt_anchor: core.prompt_anchor(),
         }
+    }
+
+    /// Update terminal text selection from viewport grid coordinates.
+    pub fn select(&self, start: (usize, usize), end: (usize, usize)) {
+        self.inner.shared().core().select(start, end);
+    }
+
+    pub fn clear_selection(&self) {
+        self.inner.shared().core().clear_selection();
+    }
+
+    pub fn move_prompt_caret(&self, row: usize, column: usize) -> Option<usize> {
+        self.inner.shared().core().move_prompt_caret(row, column)
+    }
+
+    pub fn invalidate_prompt_anchor(&self) {
+        self.inner.shared().core().invalidate_prompt_anchor();
     }
 
     /// Everything known about the child. The last poll's answers, never a fresh
