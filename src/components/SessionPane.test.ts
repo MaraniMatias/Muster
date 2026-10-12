@@ -2,6 +2,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Checkout, Session, WorkspaceState } from "../domain/workspace";
+import type { TerminalLaunch } from "../lib/ipc";
 import { DEFAULT_SETTINGS } from "../domain/settings";
 import { addSessionToLayout, createTerminalLayout } from "../domain/terminal-layout";
 import { loadTerminalLayout, moveTerminal, saveTerminalLayout } from "../lib/ipc";
@@ -18,6 +19,7 @@ const terminalMock = vi.hoisted(() => ({
   closedIds: [] as string[],
   /** The directories the mock terminal was told to change into, and whether it could. */
   directoryChanges: [] as string[],
+  launches: [] as TerminalLaunch[],
   busy: false,
 }));
 
@@ -37,8 +39,7 @@ vi.mock("./TerminalSession.vue", async () => {
         active: { type: Boolean, default: false },
         visible: { type: Boolean, default: true },
         sessionType: { type: String, default: "shell" },
-        launchTarget: { type: Object, default: undefined },
-        launchPrompt: { type: String, default: undefined },
+        launch: { type: Object, default: undefined },
       },
       emits: ["created", "closed", "statusChanged", "failed"],
       setup(props, { emit, expose }) {
@@ -62,6 +63,7 @@ vi.mock("./TerminalSession.vue", async () => {
         });
         onMounted(() => {
           terminalMock.mounts++;
+          if (props.launch) terminalMock.launches.push(props.launch as TerminalLaunch);
           if (!terminalMock.autoCreate) return;
           sessionId = terminalMock.createdCount++ === 0 ? "session:live" : `session:live-${terminalMock.createdCount}`;
           const session: Session = {
@@ -113,6 +115,7 @@ beforeEach(() => {
   terminalMock.createdCount = 0;
   terminalMock.closedIds = [];
   terminalMock.directoryChanges = [];
+  terminalMock.launches = [];
   terminalMock.busy = false;
   vi.mocked(loadTerminalLayout).mockResolvedValue(null);
   vi.mocked(saveTerminalLayout).mockResolvedValue(undefined);
@@ -281,6 +284,65 @@ describe("SessionPane terminal UI", () => {
     await flushPromises();
 
     expect(terminalMock.mounts).toBe(1);
+    wrapper.unmount();
+  });
+
+  it("keeps every Pi launch on its requested checkout across navigation and concurrent layout startup", async () => {
+    let finishLayout!: (value: null) => void;
+    vi.mocked(loadTerminalLayout).mockReturnValue(new Promise((resolve) => (finishLayout = resolve)));
+    const other: Checkout = { ...checkout, id: "checkout:/work/other", path: "/work/other" };
+    const firstLaunch: TerminalLaunch = {
+      kind: "pi-review",
+      request: { markdown: "# First" },
+    };
+    const secondLaunch: TerminalLaunch = {
+      kind: "pi-review",
+      request: { markdown: "# Second" },
+    };
+    const wrapper = mount(SessionPane, {
+      props: { checkout, checkouts: [checkout, other], activeSessionId: null, isOpening: false, shellRequest: null },
+    });
+    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 1, launch: firstLaunch } });
+    await wrapper.setProps({ shellRequest: { checkoutId: checkout.id, token: 2, launch: secondLaunch } });
+    await wrapper.setProps({ checkout: other });
+    expect(loadTerminalLayout).toHaveBeenCalledOnce();
+
+    finishLayout(null);
+    await flushPromises();
+
+    expect(wrapper.findAllComponents({ name: "TerminalSession" })).toHaveLength(2);
+    expect(terminalMock.launches).toEqual([firstLaunch, secondLaunch]);
+    expect(
+      wrapper.findAllComponents({ name: "TerminalSession" }).every((item) => item.props("checkoutId") === checkout.id),
+    ).toBe(true);
+    expect(wrapper.props("checkout")?.id).toBe(other.id);
+    wrapper.unmount();
+  });
+
+  it("reports a Pi launch cancelled by its checkout disappearing during layout startup", async () => {
+    let finishLayout!: (value: null) => void;
+    vi.mocked(loadTerminalLayout).mockReturnValue(new Promise((resolve) => (finishLayout = resolve)));
+    const wrapper = mount(SessionPane, {
+      props: { checkout, checkouts: [checkout], activeSessionId: null, isOpening: false, shellRequest: null },
+    });
+    await wrapper.setProps({
+      shellRequest: {
+        checkoutId: checkout.id,
+        token: 1,
+        launch: { kind: "pi-review", request: { markdown: "# Review" } },
+      },
+    });
+    await wrapper.setProps({
+      checkout: { ...checkout, isMissing: true },
+      checkouts: [{ ...checkout, isMissing: true }],
+    });
+    finishLayout(null);
+    await flushPromises();
+
+    expect(terminalMock.mounts).toBe(0);
+    expect(wrapper.emitted("reviewLaunchFailed")).toEqual([
+      ["The checkout for this Pi review is no longer available."],
+    ]);
     wrapper.unmount();
   });
 

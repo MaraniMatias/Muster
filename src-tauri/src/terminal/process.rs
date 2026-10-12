@@ -8,6 +8,10 @@
 //! The same two questions are asked about the shell behind it: where it is. That is a
 //! `chdir` away from telling which worktree a terminal is working in without asking the shell
 //! to report it, which would mean asking every shell to be configured a particular way.
+//!
+//! On macOS, the executable path alone can name a runtime rather than the program: Pi runs as
+//! `node`, then changes its argument-list name to `pi`. That name is read first, with the
+//! executable path as a fallback when the process has no usable argument-list name.
 
 use std::path::Path;
 
@@ -91,7 +95,60 @@ mod imp {
         pvi_rdir: VnodeInfoPath,
     }
 
+    const MAX_ARGUMENT_BYTES: usize = 1 << 20;
+
     pub fn executable_name(pid: u32) -> Option<String> {
+        argument_name(pid).or_else(|| image_name(pid))
+    }
+
+    /// The name in the process's first argument, which may be more useful than its executable.
+    ///
+    /// Pi runs as `node` but sets its process title to `pi`; on macOS that changes argv[0], not
+    /// the path `proc_pidpath` returns. `KERN_PROCARGS2` is how the kernel publishes that argument
+    /// list. The size is queried before allocating, and the answer is bounded so one status poll
+    /// cannot allocate an untrusted amount of memory for a process name.
+    fn argument_name(pid: u32) -> Option<String> {
+        let mut selector = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut size: libc::size_t = 0;
+        // SAFETY: `selector` is a live array of the three entries handed over with its own length,
+        // and `size` is where the kernel writes the answer length. Null output pointers ask only
+        // for that length.
+        let queried = unsafe {
+            libc::sysctl(
+                selector.as_mut_ptr(),
+                selector.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if queried != 0 || size < std::mem::size_of::<libc::c_int>() || size > MAX_ARGUMENT_BYTES {
+            return None;
+        }
+
+        let mut answer = vec![0_u8; size];
+        // SAFETY: `answer` is a live allocation of exactly the size the first call reported, and
+        // `size` is where the kernel writes the number of bytes returned. A process that exited
+        // between the two calls is reported as a failure rather than read.
+        let read = unsafe {
+            libc::sysctl(
+                selector.as_mut_ptr(),
+                selector.len() as libc::c_uint,
+                answer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 || size > answer.len() {
+            return None;
+        }
+        first_argument(&answer[..size])
+    }
+
+    /// The executable path, used when the process has no usable name in argv[0].
+    fn image_name(pid: u32) -> Option<String> {
         let mut buffer = [0_u8; 4096];
         // SAFETY: `buffer` is a live allocation of exactly the length handed over, and
         // libproc writes at most that many bytes into it. A pid we did not ask about, or one
@@ -109,6 +166,26 @@ mod imp {
         let path = std::str::from_utf8(&buffer[..usize::try_from(written).ok()?.min(buffer.len())])
             .ok()?;
         file_name(path)
+    }
+
+    /// The first argument in a `KERN_PROCARGS2` answer.
+    ///
+    /// The answer starts with argc and the executable path, then pads the path area to a pointer
+    /// boundary before argv. Its offsets are variable-length; skipping the path without that
+    /// alignment would read padding instead of the program name.
+    fn first_argument(answer: &[u8]) -> Option<String> {
+        let count_size = std::mem::size_of::<libc::c_int>();
+        let count = libc::c_int::from_ne_bytes(answer.get(..count_size)?.try_into().ok()?);
+        if count < 1 {
+            return None;
+        }
+        let path = answer.get(count_size..)?;
+        let path_end = path.iter().position(|byte| *byte == 0)?;
+        let argument_start =
+            count_size + (path_end + 1).next_multiple_of(std::mem::size_of::<*const c_void>());
+        let argument = answer.get(argument_start..)?;
+        let end = argument.iter().position(|byte| *byte == 0)?;
+        file_name(std::str::from_utf8(&argument[..end]).ok()?)
     }
     pub fn wait_status_pid(info: &libc::siginfo_t) -> libc::pid_t {
         info.si_pid
@@ -229,6 +306,23 @@ mod tests {
         assert_eq!(file_name("vim").as_deref(), Some("vim"));
         assert_eq!(file_name("/"), None);
         assert_eq!(file_name(""), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn names_a_process_by_its_argument_list_name() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("muster-renamed")
+            .arg("30")
+            .spawn()
+            .expect("start a process with a distinct argument-list name");
+        let named = super::executable_name(child.id());
+        child.kill().expect("stop the test process");
+        child.wait().expect("reap the test process");
+
+        assert_eq!(named.as_deref(), Some("muster-renamed"));
     }
 
     #[cfg(target_os = "macos")]

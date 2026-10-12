@@ -36,45 +36,47 @@ its terminals, its diff state and its review notes.
 `portable-pty` 0.9 with OSC 133 shell integration written to disk, output flow control, and
 foreground-process introspection on both supported platforms.
 
-| Capability                                                                                                                                              | Where                                                           |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| PTY open + spawn, `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=Muster`                                                                   | `src-tauri/src/terminal/mod.rs:86-127`                          |
-| OSC 133 `C` and `D;$status` only — deliberately not the full prompt lifecycle                                                                           | `services/terminal.rs:205-224`                                  |
-| Hook scripts written to disk, `0600`, with a `ZDOTDIR` shim forwarding `.zshenv/.zshprofile/.zshrc/.zlogin`                                             | `services/terminal.rs:290-450`                                  |
-| Output gate: the reader blocks until the window acks parsed bytes, so nothing is dropped                                                                | `commands/terminal.rs:76-210`                                   |
-| Foreground process via `proc_pidpath` on macOS, `/proc/<pid>/comm` + `cwd` on Linux                                                                     | `terminal/process.rs:26-178`                                    |
-| Termination: SIGTERM → 200 ms grace → SIGKILL, to the foreground and shell groups, each verified against the PTY's own session with `tcgetsid`/`getsid` | `terminal/mod.rs:464-530, 642-744`                              |
-| **Drag a terminal to another worktree**, process and scrollback intact; optional `cd` into an idle shell; reports "moved but directory not changed"     | `Sidebar.vue:320-522`, `SessionPane.vue:229-286`                |
-| **Follow worktree**: terminals relocate themselves on shell `cd` and/or agent relocation (`off \| cd \| agent \| both`)                                 | `src/App.vue:193-222`, `src/domain/settings.ts:30-32`           |
-| Rename inline on double-click; close only after confirming against the real process; `exit` closes its own pane                                         | `Sidebar.vue:1516-1528`, `TerminalSession.vue:584-622, 395-410` |
-| xterm 6 with WebGL renderer + recovery watcher, custom overlay scrollbar, Shift+Enter fixed for both CSI-u and plain newline                            | `TerminalSession.vue:936-965, 214-362, 813-828`                 |
-| **ctrl/cmd+click a path in the output** opens it in the preview, and an `http(s)` address in the browser; a plain click opens nothing            | `lib/terminal-file-links.ts`, `lib/terminal-paths.ts`            |
+| Capability                                                                                                                                                                         | Where                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| PTY open + spawn, `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=Muster`                                                                                              | `src-tauri/src/terminal/mod.rs:86-127`                          |
+| OSC 133 `C` and `D;$status` only — deliberately not the full prompt lifecycle                                                                                                      | `services/terminal.rs:205-224`                                  |
+| Hook scripts written to disk, `0600`, with a `ZDOTDIR` shim forwarding `.zshenv/.zshprofile/.zshrc/.zlogin`                                                                        | `services/terminal.rs:290-450`                                  |
+| Output gate: the reader blocks until the window acks parsed bytes, so nothing is dropped                                                                                           | `commands/terminal.rs:76-210`                                   |
+| Foreground process via `proc_pidpath` on macOS, `/proc/<pid>/comm` + `cwd` on Linux                                                                                                | `terminal/process.rs:26-178`                                    |
+| Termination: SIGTERM → 200 ms grace → SIGKILL, to the foreground and shell groups, each verified against the PTY's own session with `tcgetsid`/`getsid`                            | `terminal/mod.rs:464-530, 642-744`                              |
+| **Drag a terminal to another worktree**, process and scrollback intact; optional `cd` into an idle shell; reports "moved but directory not changed"                                | `Sidebar.vue:320-522`, `SessionPane.vue:229-286`                |
+| **Follow worktree**: terminals relocate themselves on shell `cd` and/or agent relocation (`off \| cd \| agent \| both`)                                                            | `src/App.vue:193-222`, `src/domain/settings.ts:30-32`           |
+| Rename inline on double-click; close only after confirming against the real process; `exit` closes its own pane                                                                    | `Sidebar.vue:1516-1528`, `TerminalSession.vue:584-622, 395-410` |
+| xterm 6 with WebGL renderer + recovery watcher, custom overlay scrollbar, Shift+Enter fixed for both CSI-u and plain newline                                                       | `TerminalSession.vue:936-965, 214-362, 813-828`                 |
+| **ctrl/cmd+click a path in the output** opens it in the preview, and an `http(s)` address in the browser; a plain click opens nothing                                              | `lib/terminal-file-links.ts`, `lib/terminal-paths.ts`           |
 | A bare name is read against the **shell's own directory**, so an `ls` opens at the root of a checkout and below it alike; extension-less names (`LICENSE`) count on a listing line | `services/files.rs:406-468`, `terminal/mod.rs:326-329`          |
 
 ## 3. Diffs and review notes: the core loop
 
-| Capability                                                                                                                                                                                          | Where                                                                  |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Read-only Git surface, in full: `git_status`, `git_diff_stats`, `git_checkout_diff_stats`, `git_diff`, `git_diff_page`, `git_viewed_files`, `git_mark_viewed`, `git_watch_repo`, `git_unwatch_repo` | `src/lib/ipc.ts:112-140`                                               |
-| Unified syntax-highlighted diff, collapsible hunks, per-checkout `+N/-N` badges                                                                                                                     | `src/components/FileDiff.vue:838-920`, `Sidebar.vue:1436-1447`         |
-| Large diffs virtualized: 32-line pages, 8-page LRU, 3 concurrent requests, per-page in-place error, "diff changed while loading" detection                                                          | `src/components/use-large-diff.ts:8-15, 150-196`                       |
-| Diff limits are explicit refusals, not partial reads: >100k lines, >10k hunks, >32 MiB, >64 KiB/line                                                                                                | `FileDiff.vue:725-728`                                                 |
-| Note anchored to a **line or a range**, GitLab style: `+` fixes the end, a second `+` above sets the start; the first line can be re-picked from a dropdown                                         | `src/components/ReviewComposer.vue:35-43, 88-98`                       |
-| `draft → sent → resolved`, plus a separate sticky `outdated` flag                                                                                                                                   | `src/domain/review.ts:3`, `src-tauri/src/persistence/mod.rs:2460-2475` |
-| Anchor drift: the first anchored line is hashed (FNV-1a) and re-checked; `outdated` is sticky until the user clears it                                                                              | `src-tauri/src/domain/review.rs:78-86`, `services/review.rs:132-163`   |
-| Resolve is only offered when the diff can prove it; `unknown` is a real answer, not a guess                                                                                                         | `src/domain/review.ts:10-16`, `ReviewNoteList.vue:32-45`               |
-| **Round reconciliation**: the `muster-review:<id>` marker is written into the prompt, and on reconnect the transcript is searched for it to confirm or requeue                                      | `domain/review.rs:62-69`, `services/review_round.rs:36-42, 161-218`    |
-| Notes are marked `sent` **before** the agent is called, so a crash can neither fake nor hide delivery                                                                                               | `services/review_round.rs:50-68`                                       |
-| Outdated notes are held back unless explicitly included; busy target offers Send now / Queue / Not now                                                                                              | `FileDiff.vue:230-237, 244-263, 668-671`                               |
-| Export is CodeReview.nvim-compatible with per-extension language fences                                                                                                                             | `src/domain/review.ts:71-172`                                          |
-| Export writes `<timestamp>.md` with `create_new(true)` into the folder `reviews.storage` names: `~/.muster/tmp/reviews`, or `<checkout>/.muster/reviews` in the working directory              | `services/files.rs:75-105, 810-858`                                    |
-| The folder is chosen in Settings, named under the selector with its file count and size, and emptied of its exports from there; `workdir` is refused by the command itself                          | `services/files.rs:164-232`, `SettingsDialog.vue:288-321`              |
+| Capability                                                                                                                                                                                                                                                                | Where                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Read-only Git surface, in full: `git_status`, `git_diff_stats`, `git_checkout_diff_stats`, `git_diff`, `git_diff_page`, `git_viewed_files`, `git_mark_viewed`, `git_watch_repo`, `git_unwatch_repo`                                                                       | `src/lib/ipc.ts:112-140`                                               |
+| Unified syntax-highlighted diff, collapsible hunks, per-checkout `+N/-N` badges                                                                                                                                                                                           | `src/components/FileDiff.vue:838-920`, `Sidebar.vue:1436-1447`         |
+| Large diffs virtualized: 32-line pages, 8-page LRU, 3 concurrent requests, per-page in-place error, "diff changed while loading" detection                                                                                                                                | `src/components/use-large-diff.ts:8-15, 150-196`                       |
+| Diff limits are explicit refusals, not partial reads: >100k lines, >10k hunks, >32 MiB, >64 KiB/line                                                                                                                                                                      | `FileDiff.vue:725-728`                                                 |
+| Note anchored to a **line or a range**, GitLab style: `+` fixes the end, a second `+` above sets the start; the first line can be re-picked from a dropdown                                                                                                               | `src/components/ReviewComposer.vue:35-43, 88-98`                       |
+| `draft → sent → resolved`, plus a separate sticky `outdated` flag                                                                                                                                                                                                         | `src/domain/review.ts:3`, `src-tauri/src/persistence/mod.rs:2460-2475` |
+| Anchor drift: the first anchored line is hashed (FNV-1a) and re-checked; `outdated` is sticky until the user clears it                                                                                                                                                    | `src-tauri/src/domain/review.rs:78-86`, `services/review.rs:132-163`   |
+| Resolve is only offered when the diff can prove it; `unknown` is a real answer, not a guess                                                                                                                                                                               | `src/domain/review.ts:10-16`, `ReviewNoteList.vue:32-45`               |
+| **OpenCode round reconciliation**: the `muster-review:<id>` marker is written into the prompt, and on reconnect the transcript is searched for it to confirm or requeue; Pi rounds use session receipts and are never requeued                                                                 | `domain/review.rs:62-69`, `services/review_round.rs:36-42, 161-218`, `docs/pi-integration.md` |
+| Notes are marked `sent` **before** the agent is called, so a crash can neither fake nor hide delivery                                                                                                                                                                     | `services/review_round.rs:50-68`                                       |
+| **Pi rounds are confirmed from the other end**: the session reports `{marker, entry}` for each review it was shown, read from its own entries; delivery needs this round's own marker from its own session, and completion is `agent_settled` alone. Nothing re-sends one | `docs/pi-integration.md`, `services/review_round.rs`, `services/pi.rs` |
+| Outdated notes are held back unless explicitly included; a busy OpenCode target offers Send now / Queue / Not now; Pi always starts a new terminal and has no queue                                                                                                                                                              | `FileDiff.vue:230-237, 244-263, 668-671`, `docs/pi-integration.md`     |
+| Export is CodeReview.nvim-compatible with per-extension language fences                                                                                                                                                                                                   | `src/domain/review.ts:71-172`                                          |
+| Export writes `<timestamp>.md` with `create_new(true)` into the folder `reviews.storage` names: `~/.muster/tmp/reviews`, or `<checkout>/.muster/reviews` in the working directory                                                                                         | `services/files.rs:75-105, 810-858`                                    |
+| The folder is chosen in Settings, named under the selector with its file count and size, and emptied of its exports from there; `workdir` is refused by the command itself                                                                                                | `services/files.rs:164-232`, `SettingsDialog.vue:288-321`              |
 
 ## 4. Agent integration and everything around it
 
-**OpenCode is the only native harness.** `ReviewTarget = "markdown" | "opencode"` — two members,
-`src/domain/review.ts:2`. Muster never launches or ends an OpenCode service; it discovers one and
-talks to it.
+**Two harnesses, reached two different ways.** `ReviewTarget = "markdown" | "opencode" | "pi"`,
+`src/domain/review.ts:11`. Muster never launches or ends an OpenCode service; it discovers one and
+talks to it. Pi has no server: it reports through a loopback bridge its own extension writes to, and
+a review reaches it by starting one — see `docs/pi-integration.md`.
 
 | Capability                                                                                                                                                                      | Where                                                                     |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -106,10 +108,10 @@ webview zoom — so xterm re-rasterizes (`src/domain/zoom.ts:14-98`). Layout and
 live in SQLite, clamped on read, debounced, and flushed before close. Settings live outside the
 database, in `~/.muster/config.yml` (`src/domain/settings.ts:1-8`).
 
-**Persistence.** `SCHEMA_VERSION = 14`, one schema, no ladder; a file stamped with any other version
-is refused by name (`src-tauri/src/persistence/mod.rs:18, 2386-2400`). Ten tables: `repos`,
+**Persistence.** `SCHEMA_VERSION = 17`, one schema, no ladder; a file stamped with any other version
+is refused by name (`src-tauri/src/persistence/mod.rs:19, 2570-2585`). Ten tables: `repos`,
 `checkouts`, `sessions`, `recent_paths`, `preferences`, `checkout_terminal_layouts`,
-`viewed_files`, `checkout_ui_states`, `review_notes`, `review_rounds` (`mod.rs:2405-2491`).
+`viewed_files`, `checkout_ui_states`, `review_notes`, `review_rounds` (`mod.rs:2589-2677`).
 
 **Security.** Eight capabilities, asserted by value in `main.rs:390-415`; no `shell`, no `fs`, no
 `http`. Strict CSP without `unsafe-eval` or `*`. Three layers of path sandboxing: relative paths
@@ -127,26 +129,15 @@ backport, hash-checked tree-wide by `scripts/patched-glib.mjs`.
 
 ## 5. Written down, not built
 
-`docs/todo/` holds four specs. Three say `Status: specified, not implemented`; the fourth is an
-approved plan whose own header admits its inventory no longer matches the tree. Confirmed absent:
-searching `codex|claude|pi` across `src/lib`, `src/domain` and `src-tauri/src/domain` returns
-nothing, and `ReviewTarget` has exactly two members.
-
-| Spec                                      | Would add                                                                           |
-| ----------------------------------------- | ----------------------------------------------------------------------------------- |
-| `docs/todo/phase-2-codex.md`              | Codex as a review destination over `codex exec --json`, one-shot per round          |
-| `docs/todo/phase-3-claude-code.md`        | Claude Code over `--input-format/--output-format stream-json`, resume by session id |
-| `docs/todo/phase-4-pi.md`                 | `pi --mode rpc`, `agent_settled` as the turn boundary                               |
-| `docs/todo/supply-chain-security-plan.md` | SHA-pinned actions, `minimumReleaseAge`, dependency upgrades                        |
-
-All four docs cite exact source locations and close with a section on what a fake-process test does
-and does not prove. That is a design-maturity signal, not a feature — but it is worth knowing.
+`docs/todo/` retains historical integration specs and a security plan. Codex and Claude Code are
+not implemented. `phase-4-pi.md` is superseded research for Pi RPC; current Pi support uses the
+extension API documented in `docs/pi-integration.md`.
 
 ## 6. Do not claim
 
 | Claim                                                   | Reality                                                                                                                                                                                                                     |
 | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Supports Codex / Claude Code / pi"                     | Specs only. Two destinations exist.                                                                                                                                                                                         |
+| "Supports Codex / Claude Code / pi"                     | Codex and Claude Code are specs only. OpenCode and Pi have native integrations; Markdown export is also available.                                                                                                         |
 | "It's an IDE" / "it does Git"                           | Git is read-only plus worktree lifecycle. No `add`, `commit`, `stash`, `fetch`, `push`, `merge`, `rebase`, `log` or `blame` anywhere in production code. Branch refs are written only by `worktree add -b` and `branch -D`. |
 | "Terminals split into panes"                            | Not reachable. `normalizeTerminalLayout` collapses any stored layout to a single session (`src/domain/terminal-layout.ts:112-135`), and `resizeSplit` / `findSessionTab` / `SplitDirection` have no callers.                |
 | "You can stop the agent"                                | `agent_stop` is implemented and nothing calls it. `WorktreeDialog.vue:326-332` blocks removal while an agent is live and offers no way out.                                                                                 |

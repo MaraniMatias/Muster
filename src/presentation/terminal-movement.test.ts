@@ -11,7 +11,7 @@ type Move = (
   selectTarget: boolean,
 ) => Promise<{ moved: boolean; directoryChange: "not-requested" | "written" | "not-written" } | undefined>;
 
-function setup(moveSession: Move, shouldFollowWindow = false) {
+function setup(moveSession: Move, shouldFollowWindow = false, isPiTerminal = false) {
   const workspace = {
     activeCheckoutId: "one",
     activeSessionId: null,
@@ -35,6 +35,7 @@ function setup(moveSession: Move, shouldFollowWindow = false) {
       getFollowMode: () => "agent",
       terminalShowsSession: (_checkout, terminal, agentSession) =>
         terminal === "terminal" && agentSession === "agent-session",
+      isPiTerminal: () => isPiTerminal,
       shouldFollowWindow: () => shouldFollowWindow,
       moveSession,
       followMovedTerminal,
@@ -55,6 +56,15 @@ const flush = async () => {
 };
 
 describe("terminal movement controller", () => {
+  it("moves a Pi terminal without changing its working directory", async () => {
+    const move = vi.fn<Move>().mockResolvedValue({ moved: true, directoryChange: "not-requested" });
+    const { controller, scope } = setup(move, false, true);
+
+    expect(await controller.moveManually("terminal", "two", 0)).toBe(true);
+    expect(move).toHaveBeenCalledWith("terminal", "two", 0, false, true);
+    scope.stop();
+  });
+
   it("clears a pending manual-directory timeout when its scope stops", async () => {
     vi.useFakeTimers();
     const move = vi.fn<Move>().mockResolvedValue({ moved: true, directoryChange: "written" });

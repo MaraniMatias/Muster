@@ -46,11 +46,7 @@ pub fn rounds(database: &Database, checkout_id: &str) -> Result<Vec<ReviewRound>
         .review_rounds(checkout_id)
         .map_err(|error| IpcError::new(IpcErrorCode::InvalidCheckout, error))
 }
-
-/// Records a round as `dispatching` with its marker, and links its notes to it.
-///
-/// The notes are marked `sent` here too, before the agent is called, so a crash cannot leave
-/// notes looking delivered when they were not, nor undelivered when they were.
+/// Records a round as dispatching with its marker, and links its notes to it.
 pub fn begin_round(
     database: &Database,
     checkout_id: &str,
@@ -68,11 +64,7 @@ pub fn begin_round(
     )
 }
 
-/// Records the same round, but waiting for the agent to become free.
-///
-/// Everything is decided and stored up front (the notes, the marker, and the message
-/// itself) because the send happens later, possibly after a restart, and has to carry
-/// exactly what the user accepted.
+/// Records the round, message and notes while leaving the agent alone until its turn ends.
 pub fn queue_round(
     database: &Database,
     checkout_id: &str,
@@ -106,29 +98,30 @@ fn record_round(
     if session_id.is_empty() {
         return Err(invalid("a review round needs a target session"));
     }
+    let id = new_round_id();
+    let marker = review_round_marker(&id);
+    check_round_prompt_size(markdown, &marker)?;
     let now = timestamp();
-    let id = format!(
-        "round:{}:{}:{}",
-        now,
-        std::process::id(),
-        NEXT_ROUND_ID.fetch_add(1, Ordering::Relaxed)
-    );
     let round = ReviewRound {
-        id: id.clone(),
+        id,
         checkout_id: checkout_id.to_string(),
-        session_id: Some(session_id.to_string()),
+        session_id: session_id.to_string(),
         status: status.into(),
-        marker: review_round_marker(&id),
+        marker: marker.clone(),
         note_ids: note_ids.to_vec(),
         created_at: now.clone(),
         updated_at: now,
     };
-    // Stored with the message it will actually be sent with, marker included: a round that
-    // goes out later must carry exactly the bytes the user accepted, not a re-derivation.
-    let prompt = build_round_prompt(markdown, &round.marker);
+    let prompt = build_round_prompt(markdown, &marker);
     database
         .add_review_round(&round, note_ids, Some(&prompt))
-        .map_err(|error| foreign(&error))
+        .map_err(|error| {
+            if error == "review note does not belong to the requested checkout" {
+                foreign(&error)
+            } else {
+                failed(error)
+            }
+        })
 }
 
 /// Records that the message reached the agent.
@@ -175,10 +168,7 @@ pub fn reconcile_round(
     if !round.is_pending() {
         return Ok(round);
     }
-    let Some(session_id) = round.session_id.clone() else {
-        // Never had a target: nothing to check, so it waits for one.
-        return requeue(database, checkout_id, &round);
-    };
+    let session_id = round.session_id.clone();
     let landed = match generation {
         Some(generation) => agents.session_mentions_at_generation(
             checkout_id,
@@ -217,7 +207,7 @@ fn requeue(
         .map_err(|error| foreign(&error))
 }
 
-/// Puts every unconfirmed round of the checkout back to `queued` so they can be retried.
+/// Puts every unconfirmed OpenCode round of the checkout back to `queued` so they can be retried.
 pub fn requeue_all(database: &Database, checkout_id: &str) -> Result<usize, IpcError> {
     database.requeue_review_rounds(checkout_id).map_err(failed)
 }
@@ -247,10 +237,7 @@ pub fn flush_rounds(
         .collect::<Vec<_>>();
     let mut sent = 0;
     for round in pending.into_iter().rev() {
-        let Some(session_id) = round.session_id.clone() else {
-            // Never had a target, so there is nowhere to send it.
-            continue;
-        };
+        let session_id = round.session_id.clone();
         // Read before asking the agent: a round with no stored message cannot go out, so
         // there is no reason to query a server about it.
         let Some(prompt) = database
@@ -328,7 +315,27 @@ pub fn resolve_note(
         .map_err(|error| foreign(&error))
 }
 
-/// Rejects a prompt that cannot be delivered as one message, before a round is recorded.
+/// Rejects a missing review body before any launch preparation has side effects.
+pub fn check_review_markdown(markdown: &str) -> Result<(), IpcError> {
+    if markdown.trim().is_empty() {
+        return Err(failed("a review round cannot be empty"));
+    }
+    Ok(())
+}
+
+/// Checks the exact final prompt size without copying the review body.
+pub fn check_round_prompt_size(markdown: &str, marker: &str) -> Result<(), IpcError> {
+    check_review_markdown(markdown)?;
+    let prompt_bytes = AGENT_PROMPT_PREFIX.len() + marker.len() + markdown.len() + 4;
+    if prompt_bytes > MAX_ROUND_PROMPT_BYTES {
+        return Err(failed(
+            "the review is too large to send to the agent in one message",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects an already-built prompt that cannot be delivered as one message.
 pub fn check_prompt_size(prompt: &str) -> Result<(), IpcError> {
     if prompt.trim().is_empty() {
         return Err(failed("a review round cannot be empty"));
@@ -339,6 +346,15 @@ pub fn check_prompt_size(prompt: &str) -> Result<(), IpcError> {
         ));
     }
     Ok(())
+}
+
+pub fn new_round_id() -> String {
+    format!(
+        "round:{}:{}:{}",
+        timestamp(),
+        std::process::id(),
+        NEXT_ROUND_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The instructions and marker that `build_round_prompt` prepends to a round's review.
@@ -359,21 +375,40 @@ mod tests {
         io::{BufRead, BufReader, Write},
         net::TcpListener,
         path::{Path, PathBuf},
+        sync::{Arc, Barrier},
         thread,
     };
 
     use tempfile::{tempdir, TempDir};
 
     use crate::{
-        domain::review::{review_anchor_hash, review_round_marker, ReviewNote, ReviewRound},
+        domain::{
+            ipc::IpcError,
+            review::{
+                review_anchor_hash, review_round_marker, ReviewNote, ReviewRound,
+                AGENT_PROMPT_PREFIX, MAX_ROUND_PROMPT_BYTES,
+            },
+        },
         persistence::Database,
         services::agent::AgentService,
     };
 
     use super::{
-        ack_round, begin_round, build_round_prompt, check_prompt_size, confirm_round, flush_rounds,
-        queue_round, reconcile_round, requeue_all, resolve_note, rounds,
+        ack_round, begin_round, build_round_prompt, check_prompt_size, check_review_markdown,
+        check_round_prompt_size, confirm_round, flush_rounds, queue_round, reconcile_round,
+        requeue_all, resolve_note, rounds,
     };
+
+    /// Creates one OpenCode round for the test checkout.
+    fn opencode_round(
+        database: &Database,
+        checkout_id: &str,
+        session_id: &str,
+        note_ids: &[String],
+        markdown: &str,
+    ) -> Result<ReviewRound, IpcError> {
+        begin_round(database, checkout_id, session_id, note_ids, markdown)
+    }
 
     fn mock_json_responses(
         responses: Vec<serde_json::Value>,
@@ -477,7 +512,7 @@ mod tests {
         let (database, checkout_id, _) = database_with_two_checkouts(&temp);
         add_note(&database, &checkout_id, "a");
 
-        let round = begin_round(
+        let round = opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -486,7 +521,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(round.status, "dispatching");
-        assert_eq!(round.session_id.as_deref(), Some("ses_target"));
+        assert_eq!(round.session_id, "ses_target");
         assert!(round.marker.starts_with("muster-review:"));
 
         // The note is already linked and marked sent before any agent call happens.
@@ -511,7 +546,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let (database, checkout_id, _) = database_with_two_checkouts(&temp);
         add_note(&database, &checkout_id, "a");
-        let round = begin_round(
+        let round = opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -529,12 +564,277 @@ mod tests {
     }
 
     #[test]
+    fn pending_rounds_keep_their_note_claim_and_failed_batches_roll_back() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, _) = database_with_two_checkouts(&temp);
+
+        for status in ["queued", "dispatching", "dispatched"] {
+            let claimed_id = format!("claimed:{status}");
+            let fresh_id = format!("fresh:{status}");
+            let claimed_note_id = format!("note:{claimed_id}");
+            let fresh_note_id = format!("note:{fresh_id}");
+            add_note(&database, &checkout_id, &claimed_id);
+            add_note(&database, &checkout_id, &fresh_id);
+            let original = match status {
+                "queued" => queue_round(
+                    &database,
+                    &checkout_id,
+                    "ses_original",
+                    std::slice::from_ref(&claimed_note_id),
+                    "original review",
+                )
+                .unwrap(),
+                _ => {
+                    let round = begin_round(
+                        &database,
+                        &checkout_id,
+                        "ses_original",
+                        std::slice::from_ref(&claimed_note_id),
+                        "original review",
+                    )
+                    .unwrap();
+                    if status == "dispatched" {
+                        confirm_round(&database, &checkout_id, &round.id).unwrap()
+                    } else {
+                        round
+                    }
+                }
+            };
+            let before = rounds(&database, &checkout_id).unwrap();
+
+            assert!(queue_round(
+                &database,
+                &checkout_id,
+                "ses_retry",
+                &[fresh_note_id.clone(), claimed_note_id.clone()],
+                "retry review",
+            )
+            .is_err());
+            assert_eq!(rounds(&database, &checkout_id).unwrap(), before);
+            let notes = database.review_notes(&checkout_id).unwrap();
+            let fresh = notes.iter().find(|note| note.id == fresh_note_id).unwrap();
+            assert_eq!(fresh.status, "draft");
+            assert_eq!(fresh.round_id, None);
+            let claimed = notes
+                .iter()
+                .find(|note| note.id == claimed_note_id)
+                .unwrap();
+            assert_eq!(claimed.status, "sent");
+            assert_eq!(claimed.round_id.as_deref(), Some(original.id.as_str()));
+        }
+    }
+
+    #[test]
+    fn concurrent_round_claims_have_one_winner() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, _) = database_with_two_checkouts(&temp);
+        add_note(&database, &checkout_id, "shared");
+        let database = Arc::new(database);
+        let barrier = Arc::new(Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let database = Arc::clone(&database);
+                let checkout_id = checkout_id.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    queue_round(
+                        &database,
+                        &checkout_id,
+                        "ses_target",
+                        &["note:shared".into()],
+                        "# Review",
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let winners: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap().ok())
+            .collect();
+
+        assert_eq!(winners.len(), 1);
+        assert_eq!(rounds(&database, &checkout_id).unwrap(), winners);
+        let note = &database.review_notes(&checkout_id).unwrap()[0];
+        assert_eq!(note.round_id.as_deref(), Some(winners[0].id.as_str()));
+    }
+
+    #[test]
+    fn resolved_and_foreign_notes_roll_back_the_whole_round_and_completed_claims_can_resend() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, other_checkout_id) = database_with_two_checkouts(&temp);
+        add_note(&database, &checkout_id, "fresh");
+        add_note(&database, &checkout_id, "resolved");
+        add_note(&database, &other_checkout_id, "foreign");
+        database
+            .mark_review_notes_sent(&checkout_id, &["note:resolved".into()])
+            .unwrap();
+        database
+            .resolve_review_note("note:resolved", &checkout_id)
+            .unwrap();
+
+        for invalid_id in ["note:foreign", "note:resolved"] {
+            assert!(queue_round(
+                &database,
+                &checkout_id,
+                "ses_target",
+                &["note:fresh".into(), invalid_id.into()],
+                "# Review",
+            )
+            .is_err());
+            assert!(rounds(&database, &checkout_id).unwrap().is_empty());
+            let fresh = database
+                .review_notes(&checkout_id)
+                .unwrap()
+                .into_iter()
+                .find(|note| note.id == "note:fresh")
+                .unwrap();
+            assert_eq!(fresh.status, "draft");
+            assert_eq!(fresh.round_id, None);
+        }
+
+        add_note(&database, &checkout_id, "completed");
+        let first = begin_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:completed".into()],
+            "first review",
+        )
+        .unwrap();
+        confirm_round(&database, &checkout_id, &first.id).unwrap();
+        ack_round(&database, &checkout_id, &first.id).unwrap();
+
+        // An acknowledged sent note remains available for an explicit follow-up.
+        let second = queue_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:completed".into()],
+            "follow-up review",
+        )
+        .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(database.review_rounds(&checkout_id).unwrap().len(), 2);
+        let linked = database
+            .review_notes(&checkout_id)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.id == "note:completed")
+            .unwrap();
+        assert_eq!(linked.round_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(
+            rounds(&database, &checkout_id)
+                .unwrap()
+                .iter()
+                .find(|round| round.id == first.id)
+                .unwrap()
+                .status,
+            "acked"
+        );
+
+        add_note(&database, &checkout_id, "edited");
+        let edited_first = begin_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:edited".into()],
+            "editable review",
+        )
+        .unwrap();
+        confirm_round(&database, &checkout_id, &edited_first.id).unwrap();
+        ack_round(&database, &checkout_id, &edited_first.id).unwrap();
+        let draft = database
+            .update_review_note("note:edited", &checkout_id, "follow up")
+            .unwrap();
+        assert_eq!(draft.status, "draft");
+        assert_eq!(draft.round_id, None);
+        let edited_follow_up = queue_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:edited".into()],
+            "edited follow-up",
+        )
+        .unwrap();
+        assert!(ack_round(&database, &checkout_id, &edited_first.id).is_err());
+        let edited_link = database
+            .review_notes(&checkout_id)
+            .unwrap()
+            .into_iter()
+            .find(|note| note.id == "note:edited")
+            .unwrap();
+        assert_eq!(
+            edited_link.round_id.as_deref(),
+            Some(edited_follow_up.id.as_str())
+        );
+
+        add_note(&database, &checkout_id, "pi-sent");
+        database
+            .mark_review_notes_sent(&checkout_id, &["note:pi-sent".into()])
+            .unwrap();
+        let pi_follow_up = begin_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:pi-sent".into()],
+            "follow-up after Pi",
+        )
+        .unwrap();
+        assert_eq!(
+            database
+                .review_notes(&checkout_id)
+                .unwrap()
+                .into_iter()
+                .find(|note| note.id == "note:pi-sent")
+                .unwrap()
+                .round_id
+                .as_deref(),
+            Some(pi_follow_up.id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_pending_claim_cannot_be_rewritten_deleted_or_acked() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, _) = database_with_two_checkouts(&temp);
+        add_note(&database, &checkout_id, "claimed");
+        let round = queue_round(
+            &database,
+            &checkout_id,
+            "ses_target",
+            &["note:claimed".into()],
+            "exact saved review",
+        )
+        .unwrap();
+
+        assert!(database
+            .update_review_note("note:claimed", &checkout_id, "rewrite")
+            .is_err());
+        assert!(database
+            .delete_review_note("note:claimed", &checkout_id)
+            .is_err());
+        assert!(ack_round(&database, &checkout_id, &round.id).is_err());
+        assert_eq!(
+            database
+                .review_round_prompt(&round.id, &checkout_id)
+                .unwrap()
+                .as_deref(),
+            Some(build_round_prompt("exact saved review", &round.marker).as_str())
+        );
+        let note = &database.review_notes(&checkout_id).unwrap()[0];
+        assert_eq!(note.status, "sent");
+        assert_eq!(note.round_id.as_deref(), Some(round.id.as_str()));
+    }
+
+    #[test]
     fn reconciliation_confirms_a_present_marker_and_requeues_an_absent_one() {
         let temp = tempdir().unwrap();
         let (database, checkout_id, _) = database_with_two_checkouts(&temp);
         add_note(&database, &checkout_id, "landed");
         add_note(&database, &checkout_id, "missing");
-        let landed = begin_round(
+        let landed = opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -542,7 +842,7 @@ mod tests {
             "# Landed",
         )
         .unwrap();
-        let missing = begin_round(
+        let missing = opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -683,7 +983,7 @@ mod tests {
         let round = ReviewRound {
             id: "round:legacy".into(),
             checkout_id: checkout_id.clone(),
-            session_id: Some("ses_target".into()),
+            session_id: "ses_target".into(),
             status: "queued".into(),
             marker: review_round_marker("round:legacy"),
             note_ids: vec!["note:a".to_string()],
@@ -711,13 +1011,30 @@ mod tests {
     }
 
     #[test]
+    fn review_prompt_validation_checks_the_exact_final_size_and_rejects_empty_body() {
+        let marker = review_round_marker("round:1:2:3");
+        let fixed_bytes = AGENT_PROMPT_PREFIX.len() + marker.len() + 4;
+        let body = "x".repeat(MAX_ROUND_PROMPT_BYTES - fixed_bytes);
+        check_review_markdown(&body).expect("a nonempty review is valid");
+        check_round_prompt_size(&body, &marker).expect("the exact limit is accepted");
+        assert_eq!(
+            build_round_prompt(&body, &marker).len(),
+            MAX_ROUND_PROMPT_BYTES
+        );
+
+        let oversized = format!("{body}x");
+        assert!(check_round_prompt_size(&oversized, &marker).is_err());
+        assert!(check_round_prompt_size(" \n\t", &marker).is_err());
+    }
+
+    #[test]
     fn only_outstanding_notes_of_this_checkout_can_be_resolved() {
         let temp = tempdir().unwrap();
         let (database, checkout_id, other_checkout_id) = database_with_two_checkouts(&temp);
         add_note(&database, &checkout_id, "a");
         add_note(&database, &checkout_id, "b");
         let ids = vec!["note:a".to_string()];
-        begin_round(&database, &checkout_id, "ses_target", &ids, "# Code Review").unwrap();
+        opencode_round(&database, &checkout_id, "ses_target", &ids, "# Code Review").unwrap();
 
         let resolved = resolve_note(&database, &checkout_id, "note:a").unwrap();
         assert_eq!(resolved.status, "resolved");
@@ -736,7 +1053,7 @@ mod tests {
         add_note(&database, &other_checkout_id, "foreign");
         let agents = AgentService::without_service();
 
-        assert!(begin_round(
+        assert!(opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -752,7 +1069,7 @@ mod tests {
         );
 
         // And a round of this checkout cannot be confirmed through another one.
-        let round = begin_round(
+        let round = opencode_round(
             &database,
             &checkout_id,
             "ses_target",
@@ -855,10 +1172,25 @@ mod tests {
         let (database, checkout_id, _) = database_with_two_checkouts(&temp);
         add_note(&database, &checkout_id, "a");
 
-        assert!(begin_round(&database, &checkout_id, "ses_target", &[], "#").is_err());
-        assert!(begin_round(&database, &checkout_id, "", &["note:a".into()], "#").is_err());
+        assert!(opencode_round(&database, &checkout_id, "ses_target", &[], "#").is_err());
+        assert!(opencode_round(&database, &checkout_id, "", &["note:a".into()], "#").is_err());
         assert!(check_prompt_size("   ").is_err());
         assert!(check_prompt_size("fix the review").is_ok());
         assert!(check_prompt_size(&"x".repeat(600 * 1024)).is_err());
+    }
+
+    #[test]
+    fn a_round_without_a_target_is_refused() {
+        let temp = tempdir().unwrap();
+        let (database, checkout_id, _) = database_with_two_checkouts(&temp);
+        add_note(&database, &checkout_id, "one");
+        assert!(begin_round(
+            &database,
+            &checkout_id,
+            "",
+            &["note:one".to_string()],
+            "review",
+        )
+        .is_err());
     }
 }

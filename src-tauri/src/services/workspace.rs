@@ -626,7 +626,7 @@ pub fn close_missing_checkout(
                 "close active terminal sessions before closing this missing worktree",
             ));
         }
-        let info = worktree::removal_info(database, agents, checkout_id)?;
+        let info = worktree::removal_info(database, backend, agents, checkout_id)?;
         let confirmation = worktree::WorktreeRemovalConfirmation {
             confirm_dirty: false,
             confirmed_dirty_files: info.dirty_files,
@@ -1573,7 +1573,7 @@ mod tests {
         let round = ReviewRound {
             id: "review-round:temporary".into(),
             checkout_id: checkout_id.clone(),
-            session_id: None,
+            session_id: "session:temporary".into(),
             status: "queued".into(),
             marker: "muster-review:review-round:temporary".into(),
             note_ids: vec![note_id.clone()],
@@ -2233,7 +2233,7 @@ mod tests {
             let round = ReviewRound {
                 id: round_id.into(),
                 checkout_id: old_id.clone(),
-                session_id: Some("session:historical-agent".into()),
+                session_id: "session:historical-agent".into(),
                 status: status.into(),
                 marker: format!("muster-review:{round_id}"),
                 note_ids: vec![note_id],
@@ -2320,10 +2320,7 @@ mod tests {
             };
             assert_eq!(round.checkout_id, new_id);
             assert_eq!(round.status, expected_status);
-            assert_eq!(
-                round.session_id.as_deref(),
-                Some("session:historical-agent")
-            );
+            assert_eq!(round.session_id.as_str(), "session:historical-agent");
             assert_eq!(round.marker, format!("muster-review:{round_id}"));
             assert_eq!(round.note_ids, [note_id.as_str()]);
             assert_eq!(

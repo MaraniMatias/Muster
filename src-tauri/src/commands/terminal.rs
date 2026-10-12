@@ -13,7 +13,7 @@ use crate::{
         workspace::{Session, TerminalSessionStatus, WorkspaceState},
     },
     persistence::Database,
-    services::terminal,
+    services::{agent::AgentService, terminal},
     terminal::{
         OutputGate, OutputSink, TerminalBackend, MAX_TERMINAL_INPUT_BYTES, OUTPUT_RESUME_TIMEOUT,
     },
@@ -53,8 +53,8 @@ pub async fn terminal_layout_save(
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreatedTerminal {
-    session: Session,
-    workspace: WorkspaceState,
+    pub(crate) session: Session,
+    pub(crate) workspace: WorkspaceState,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,14 +89,14 @@ struct OutputFlow {
 }
 
 /// The registration through which one terminal's window answers its own reader and nobody else's.
-struct OutputFlowListener {
+pub(crate) struct OutputFlowListener {
     app: AppHandle,
     session_id: Arc<Mutex<Option<String>>>,
     listener: Arc<Mutex<Option<EventId>>>,
 }
 
 impl OutputFlowListener {
-    fn attach(app: &AppHandle, gate: Arc<OutputGate>) -> Self {
+    pub(crate) fn attach(app: &AppHandle, gate: Arc<OutputGate>) -> Self {
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let listener: Arc<Mutex<Option<EventId>>> = Arc::new(Mutex::new(None));
         let watched = Arc::clone(&session_id);
@@ -144,7 +144,7 @@ impl OutputFlowListener {
     }
 
     /// The session this reader belongs to, which only exists once the terminal has been created.
-    fn name(&self, session_id: String) {
+    pub(crate) fn name(&self, session_id: String) {
         *self
             .session_id
             .lock()
@@ -152,7 +152,7 @@ impl OutputFlowListener {
     }
 
     /// Takes the registration away, for the case where there is no session to answer for.
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if let Some(id) = self
             .listener
             .lock()
@@ -164,6 +164,46 @@ impl OutputFlowListener {
     }
 }
 
+/// The output side of a terminal that is about to be opened.
+///
+/// One place, because a terminal is not only the PTY: the bytes a process writes have to reach a
+/// window that parses them, and that window has to be able to say how far behind it is or the
+/// reader behind it will hold them until a process blocks in `write`. The Pi launch opens a
+/// terminal like any other, so it answers exactly the same two questions through exactly this sink.
+pub(crate) fn terminal_output(
+    app: &AppHandle,
+    on_output: Channel<Response>,
+) -> (OutputFlowListener, OutputSink) {
+    // The reader's half of the flow control with the window that draws this session's output:
+    // one gate per session, and the only thing that can open it is that window saying how far
+    // behind it is.
+    let gate = Arc::new(OutputGate::new(OUTPUT_RESUME_TIMEOUT));
+    let flow = OutputFlowListener::attach(app, Arc::clone(&gate));
+    let output: OutputSink = Box::new(move |bytes| {
+        // Held before the hand-off rather than after it: a window that is already two
+        // megabytes behind must not be handed another chunk, and while this waits the PTY is
+        // not drained, so the process behind it blocks in `write` the way it would behind a
+        // full terminal. Nothing is dropped here, which is the whole of the bargain.
+        gate.hold();
+        // Counted before the hand-off rather than after it, which is the only order in which no
+        // byte can fall between the two counts: the window can be parsing this chunk and
+        // answering about it before the send carrying it has returned, and a total that
+        // arrives ahead of its own bytes would clamp itself to a count they were counted
+        // outside of. Nothing here discards or retries output to make room — the bytes are
+        // handed over whole, in order, or the session has no window left to hand them to.
+        gate.delivered(bytes.len());
+        if let Err(error) = on_output.send(Response::new(bytes.to_vec())) {
+            // Nobody is left to answer a gate whose window is gone, and the reader has to keep
+            // draining either way, so from here this is not a gate. That is also what retires
+            // the bytes counted above for a hand-off that did not happen.
+            gate.release();
+            return Err(error.to_string());
+        }
+        Ok(())
+    });
+    (flow, output)
+}
+
 #[tauri::command]
 pub async fn terminal_create(
     request: TerminalCreateRequest,
@@ -172,6 +212,7 @@ pub async fn terminal_create(
     database: State<'_, Database>,
     backend: State<'_, std::sync::Arc<TerminalBackend>>,
     config: State<'_, ConfigFile>,
+    agents: State<'_, std::sync::Arc<AgentService>>,
 ) -> Result<CreatedTerminal, IpcError> {
     validate_dimensions(request.cols, request.rows)?;
     let database = database.inner().clone();
@@ -180,69 +221,47 @@ pub async fn terminal_create(
     // integration script a terminal sources is written.
     let script_dir = config::dir_of(config.inner()).map(|dir| dir.to_path_buf());
     let config = config.inner().0.clone();
+    let agents: std::sync::Arc<AgentService> = std::sync::Arc::clone(agents.inner());
+    let checkout_id = request.checkout_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // The reader's half of the flow control with the window that draws this session's output:
-        // one gate per session, and the only thing that can open it is that window saying how far
-        // behind it is.
-        let gate = Arc::new(OutputGate::new(OUTPUT_RESUME_TIMEOUT));
-        let flow = OutputFlowListener::attach(&app, Arc::clone(&gate));
-        let output: OutputSink = Box::new(move |bytes| {
-            // Held before the hand-off rather than after it: a window that is already two
-            // megabytes behind must not be handed another chunk, and while this waits the PTY is
-            // not drained, so the process behind it blocks in `write` the way it would behind a
-            // full terminal. Nothing is dropped here, which is the whole of the bargain.
-            gate.hold();
-            // Counted before the hand-off rather than after it, which is the only order in which no
-            // byte can fall between the two counts: the window can be parsing this chunk and
-            // answering about it before the send carrying it has returned, and a total that
-            // arrives ahead of its own bytes would clamp itself to a count they were counted
-            // outside of. Nothing here discards or retries output to make room — the bytes are
-            // handed over whole, in order, or the session has no window left to hand them to.
-            gate.delivered(bytes.len());
-            if let Err(error) = on_output.send(Response::new(bytes.to_vec())) {
-                // Nobody is left to answer a gate whose window is gone, and the reader has to keep
-                // draining either way, so from here this is not a gate. That is also what retires
-                // the bytes counted above for a hand-off that did not happen.
-                gate.release();
-                return Err(error.to_string());
+        agents.with_checkout_operation(&checkout_id, || {
+            let (flow, output) = terminal_output(&app, on_output);
+            // Read here rather than asked for over IPC, which is what keeps the setting off the wire: the
+            // shape of `terminal_create` is unchanged, so a frontend that has never heard of the setting
+            // produces terminals that honour it.
+            let shell_integration = config::load(&config)
+                .ok()
+                .map(|settings| settings.terminal.shell_integration);
+            match terminal::create_with_settings(
+                &database,
+                &backend,
+                &request.checkout_id,
+                terminal::TerminalOptions {
+                    cols: request.cols,
+                    rows: request.rows,
+                    prompt: request.prompt,
+                },
+                &shell_integration,
+                &script_dir,
+                output,
+            ) {
+                Ok(created) => {
+                    // The window answers for this session only, and cannot be named until the session
+                    // exists. An answer that gets here first is not this session's and is ignored; the
+                    // gate opens on its own timeout rather than holding anything in the meantime.
+                    flow.name(created.session.id.clone());
+                    Ok(CreatedTerminal {
+                        session: created.session,
+                        workspace: created.workspace,
+                    })
+                }
+                Err(error) => {
+                    // No session, so nothing will ever answer this gate.
+                    flow.stop();
+                    Err(operation_error(error))
+                }
             }
-            Ok(())
-        });
-        // Read here rather than asked for over IPC, which is what keeps the setting off the wire: the
-        // shape of `terminal_create` is unchanged, so a frontend that has never heard of the setting
-        // produces terminals that honour it.
-        let shell_integration = config::load(&config)
-            .ok()
-            .map(|settings| settings.terminal.shell_integration);
-        match terminal::create_with_settings(
-            &database,
-            &backend,
-            &request.checkout_id,
-            terminal::TerminalOptions {
-                cols: request.cols,
-                rows: request.rows,
-                prompt: request.prompt,
-            },
-            &shell_integration,
-            &script_dir,
-            output,
-        ) {
-            Ok(created) => {
-                // The window answers for this session only, and cannot be named until the session
-                // exists. An answer that gets here first is not this session's and is ignored; the
-                // gate opens on its own timeout rather than holding anything in the meantime.
-                flow.name(created.session.id.clone());
-                Ok(CreatedTerminal {
-                    session: created.session,
-                    workspace: created.workspace,
-                })
-            }
-            Err(error) => {
-                // No session, so nothing will ever answer this gate.
-                flow.stop();
-                Err(operation_error(error))
-            }
-        }
+        })
     })
     .await
     .map_err(operation_error)?
@@ -317,12 +336,16 @@ pub async fn terminal_close(
     session_id: String,
     database: State<'_, Database>,
     backend: State<'_, std::sync::Arc<TerminalBackend>>,
+    agents: State<'_, std::sync::Arc<AgentService>>,
 ) -> Result<WorkspaceState, IpcError> {
     let database = database.inner().clone();
     let backend = backend.inner().clone();
+    let agents = std::sync::Arc::clone(agents.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        validate_session_owner(&database, &session_id, &checkout_id)?;
-        terminal::close(&database, &backend, &session_id).map_err(operation_error)
+        agents.with_checkout_operation(&checkout_id, || {
+            validate_session_owner(&database, &session_id, &checkout_id)?;
+            terminal::close(&database, &backend, &session_id).map_err(operation_error)
+        })
     })
     .await
     .map_err(operation_error)?
@@ -351,13 +374,20 @@ pub async fn terminal_move(
     target_checkout_id: String,
     select_target: bool,
     database: State<'_, Database>,
+    agents: State<'_, std::sync::Arc<AgentService>>,
 ) -> Result<WorkspaceState, IpcError> {
     let database = database.inner().clone();
+    let agents = std::sync::Arc::clone(agents.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        validate_session_owner(&database, &session_id, &checkout_id)?;
-        database
-            .move_terminal_session(&session_id, &target_checkout_id, select_target)
-            .map_err(operation_error)
+        agents.with_checkout_operations(
+            &[checkout_id.as_str(), target_checkout_id.as_str()],
+            || {
+                validate_session_owner(&database, &session_id, &checkout_id)?;
+                database
+                    .move_terminal_session(&session_id, &target_checkout_id, select_target)
+                    .map_err(operation_error)
+            },
+        )
     })
     .await
     .map_err(operation_error)?
@@ -386,7 +416,8 @@ fn validate_session_owner(
     Ok(())
 }
 
-fn validate_dimensions(cols: u16, rows: u16) -> Result<(), IpcError> {
+/// Rejects a PTY that has no size. Shared with the Pi launch, which is a terminal too.
+pub(crate) fn validate_dimensions(cols: u16, rows: u16) -> Result<(), IpcError> {
     if cols == 0 || rows == 0 {
         return Err(IpcError::new(
             IpcErrorCode::InvalidTerminalDimensions,

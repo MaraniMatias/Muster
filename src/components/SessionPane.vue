@@ -14,6 +14,7 @@ import {
 } from "../domain/terminal-layout";
 import type { CheckoutTerminalLayout } from "../domain/terminal-layout";
 import { loadTerminalLayout, moveTerminal, saveTerminalLayout } from "../lib/ipc";
+import type { TerminalLaunch } from "../lib/ipc";
 import { useToasts } from "../presentation/toasts";
 import Button from "./ui/button/Button.vue";
 import TerminalSession from "./TerminalSession.vue";
@@ -35,7 +36,13 @@ const props = defineProps<{
   activeSessionId: string | null;
   isOpening: boolean;
   visible?: boolean;
-  shellRequest?: { checkoutId: string; token: number } | null;
+  /**
+   * A request for one more terminal in this checkout.
+   *
+   * Carries a Pi review request; the token makes the answer find its way back, and the pane
+   * answers each token once.
+   */
+  shellRequest?: { checkoutId: string; token: number; launch?: TerminalLaunch } | null;
   registeredSessionIds?: string[];
   terminalSettings?: TerminalSettings;
   zoom?: number;
@@ -47,6 +54,9 @@ const emit = defineEmits<{
   workspaceUpdated: [workspace: WorkspaceState, shellRequestToken?: number];
   sessionStatusChanged: [sessionId: string, status: TerminalSessionStatus | null];
   shellCreated: [token: number, checkoutId: string, sessionId: string];
+  /** A successful PTY launch only; it does not confirm Pi read the review. */
+  reviewLaunchOpened: [checkoutId: string];
+  reviewLaunchFailed: [message: string];
   /**
    * The order this checkout's terminals are now listed in, published on every save.
    *
@@ -65,6 +75,8 @@ interface TerminalView {
   checkoutId: string;
   session: Session | null;
   shellRequestToken?: number;
+  /** What this terminal was opened to become; absent means an ordinary shell. */
+  launch?: TerminalLaunch;
 }
 type SessionMoveResult = {
   moved: boolean;
@@ -123,6 +135,10 @@ function reportTerminalError(cause: unknown) {
   pushToast(message);
 }
 
+function reportLaunchFailure(launch: TerminalLaunch | undefined, message: string) {
+  if (launch?.kind === "pi-review") emit("reviewLaunchFailed", message);
+}
+
 function saveLayout(checkoutId: string, layout: CheckoutTerminalLayout) {
   layouts.value[checkoutId] = layout;
   emit("sessionOrder", checkoutId, [...layout.sessionOrder]);
@@ -172,17 +188,45 @@ function initializeLayout(target: Checkout) {
   return pending;
 }
 
-async function createTerminalSession(additional = false, shellRequestToken?: number) {
-  const target = props.checkout;
-  if (!target || target.isMissing || (!additional && views.value.some((view) => view.checkoutId === target.id))) return;
-  if (startingCheckoutIds.value.has(target.id)) return;
+async function createTerminalSession(
+  additional = false,
+  shellRequestToken?: number,
+  launch?: TerminalLaunch,
+  requestedCheckoutId?: string,
+) {
+  const target = requestedCheckoutId
+    ? ((props.checkouts ?? []).find((item) => item.id === requestedCheckoutId) ??
+      (props.checkout?.id === requestedCheckoutId ? props.checkout : null))
+    : props.checkout;
+  if (!target || target.isMissing || (!additional && views.value.some((view) => view.checkoutId === target.id))) {
+    const message =
+      launch?.kind === "pi-review"
+        ? "The checkout for this Pi review is no longer available."
+        : "The checkout for this Pi terminal action is no longer available.";
+    reportLaunchFailure(launch, message);
+    return;
+  }
+  // Every explicit Pi action owns a new terminal, even while another terminal for this checkout is
+  // still starting. Normal shell requests retain the one-at-a-time guard.
+  if (!launch && startingCheckoutIds.value.has(target.id)) return;
   startingCheckoutIds.value = new Set(startingCheckoutIds.value).add(target.id);
   try {
     await initializeLayout(target);
-    if (props.checkout?.id !== target.id || target.isMissing) return;
+    const currentTarget =
+      (props.checkouts ?? []).find((item) => item.id === target.id) ??
+      (props.checkout?.id === target.id ? props.checkout : null);
+    if (!currentTarget || currentTarget.isMissing) {
+      reportLaunchFailure(
+        launch,
+        launch?.kind === "pi-review"
+          ? "The checkout for this Pi review is no longer available."
+          : "The checkout for this Pi terminal action is no longer available.",
+      );
+      return;
+    }
     const key = `pending-${nextViewId.value++}`;
     pendingViewKey.value = key;
-    views.value.push({ key, checkoutId: target.id, session: null, shellRequestToken });
+    views.value.push({ key, checkoutId: target.id, session: null, shellRequestToken, launch });
   } finally {
     const pending = new Set(startingCheckoutIds.value);
     pending.delete(target.id);
@@ -294,6 +338,7 @@ function onCreated(key: string, result: { session: Session; workspace: Workspace
   const layout = layouts.value[view.checkoutId] ?? createTerminalLayout([]);
   void saveLayout(view.checkoutId, addSessionToLayout(layout, result.session));
   emit("workspaceUpdated", result.workspace, view.shellRequestToken);
+  if (view.launch?.kind === "pi-review") emit("reviewLaunchOpened", view.checkoutId);
   if (view.shellRequestToken !== undefined) {
     emit("shellCreated", view.shellRequestToken, view.checkoutId, result.session.id);
   }
@@ -320,6 +365,7 @@ function onClosed(key: string, workspace: WorkspaceState) {
 
 function onFailed(key: string, message: string) {
   const view = views.value.find((item) => item.key === key);
+  if (view?.launch?.kind === "pi-review") emit("reviewLaunchFailed", message);
   terminalRefs.delete(key);
   if (view?.session) {
     emit("sessionStatusChanged", view.session.id, null);
@@ -330,7 +376,7 @@ function onFailed(key: string, message: string) {
   }
   if (pendingViewKey.value === key) pendingViewKey.value = null;
   views.value = views.value.filter((item) => item.key !== key);
-  pushToast(message);
+  if (view?.launch?.kind !== "pi-review") pushToast(message);
 }
 
 watch(
@@ -350,11 +396,31 @@ let answeredShellToken = 0;
  * the workdir lands instead of being dropped and needing a second click.
  */
 watch(
-  () => [props.shellRequest?.token, props.checkout?.id] as const,
+  () =>
+    [props.shellRequest?.token, props.checkout?.id, (props.checkouts ?? []).map((item) => item.id).join("\0")] as const,
   ([token, checkoutId]) => {
-    if (!token || token === answeredShellToken || props.shellRequest?.checkoutId !== checkoutId) return;
+    const request = props.shellRequest;
+    if (!token || token === answeredShellToken || !request) return;
+    const launch = request.launch;
+    if (!launch && request.checkoutId !== checkoutId) return;
+    const target =
+      props.checkout?.id === request.checkoutId
+        ? props.checkout
+        : (props.checkouts ?? []).find((item) => item.id === request.checkoutId);
+    if (!target) {
+      // A request can arrive before the first workspace read; leave it pending until checkouts land.
+      if (!props.checkout && !(props.checkouts ?? []).length) return;
+      answeredShellToken = token;
+      reportLaunchFailure(launch, "The checkout for this Pi terminal action is no longer available.");
+      return;
+    }
+    if (target.isMissing) {
+      answeredShellToken = token;
+      reportLaunchFailure(launch, "The checkout for this Pi terminal action is missing.");
+      return;
+    }
     answeredShellToken = token;
-    void createTerminalSession(true, token);
+    void createTerminalSession(true, token, launch, launch ? request.checkoutId : undefined);
   },
 );
 
@@ -396,6 +462,7 @@ watch(
           :cursor-blink="terminalSettings?.cursorBlink ?? true"
           :cursor-style="terminalSettings?.cursorStyle ?? 'block'"
           :zoom="zoom"
+          :launch="view.launch"
           @created="onCreated(view.key, $event)"
           @closed="onClosed(view.key, $event)"
           @status-changed="onStatusChanged(view.session?.id ?? view.key, $event)"

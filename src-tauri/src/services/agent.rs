@@ -46,7 +46,7 @@ mod relocation;
 
 use crate::{
     domain::{
-        agent::{agent_event_kind, AgentAgent, AgentRelocation, AgentSession},
+        agent::{agent_event_kind, AgentAgent, AgentProvider, AgentRelocation, AgentSession},
         ipc::{IpcError, IpcErrorCode},
     },
     services::opencode::{self, ServiceEndpoint},
@@ -640,6 +640,7 @@ impl AgentBridge {
         AgentSession {
             id: raw.id.clone(),
             checkout_id: self.checkout_id.clone(),
+            provider: AgentProvider::OpenCode,
             title: if raw.title.is_empty() {
                 "OpenCode session".to_string()
             } else {
@@ -2082,33 +2083,35 @@ impl AgentService {
     /// Sets where normalized events are delivered. Without one the bridges still work,
     /// they just do not report live turn state.
     pub fn set_event_sink(&self, sink: EventSink) {
-        let forward = sink;
-        let busy_turns = Arc::clone(&self.busy_turns);
-        let sink: EventSink = Arc::new(move |event| {
-            if let Some(session_id) = event.session_id.as_deref() {
-                if let Ok(mut turns) = busy_turns.lock() {
-                    let checkout = turns.entry(event.checkout_id.clone()).or_default();
-                    match event.kind {
-                        crate::domain::agent::AgentEventKind::TurnStarted
-                        | crate::domain::agent::AgentEventKind::TurnFinished
-                        | crate::domain::agent::AgentEventKind::PermissionAsked
-                        | crate::domain::agent::AgentEventKind::QuestionAsked => {
-                            checkout.insert(session_id.to_string(), TrackedTurn::Started);
+        let tracked: EventSink = {
+            let forward = Arc::clone(&sink);
+            let busy_turns = Arc::clone(&self.busy_turns);
+            Arc::new(move |event| {
+                if let Some(session_id) = event.session_id.as_deref() {
+                    if let Ok(mut turns) = busy_turns.lock() {
+                        let checkout = turns.entry(event.checkout_id.clone()).or_default();
+                        match event.kind {
+                            crate::domain::agent::AgentEventKind::TurnStarted
+                            | crate::domain::agent::AgentEventKind::TurnFinished
+                            | crate::domain::agent::AgentEventKind::PermissionAsked
+                            | crate::domain::agent::AgentEventKind::QuestionAsked => {
+                                checkout.insert(session_id.to_string(), TrackedTurn::Started);
+                            }
+                            crate::domain::agent::AgentEventKind::TurnFailed => {
+                                checkout.remove(session_id);
+                            }
+                            _ => {}
                         }
-                        crate::domain::agent::AgentEventKind::TurnFailed => {
-                            checkout.remove(session_id);
+                        if checkout.is_empty() {
+                            turns.remove(&event.checkout_id);
                         }
-                        _ => {}
-                    }
-                    if checkout.is_empty() {
-                        turns.remove(&event.checkout_id);
                     }
                 }
-            }
-            forward(event);
-        });
+                forward(event);
+            })
+        };
         if let Ok(mut slot) = self.sink.lock() {
-            *slot = Some(sink);
+            *slot = Some(tracked);
         }
     }
 
@@ -2138,6 +2141,28 @@ impl AgentService {
     ) -> T {
         let lock = self.checkout_operation_lock(checkout_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        operation()
+    }
+
+    /// Serializes an operation that changes ownership between checkouts. Sorting makes opposite
+    /// moves acquire the same locks in the same order, while a removal's single-checkout lock still
+    /// excludes either side of the move.
+    pub(crate) fn with_checkout_operations<T>(
+        &self,
+        checkout_ids: &[&str],
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let mut checkout_ids = checkout_ids.to_vec();
+        checkout_ids.sort_unstable();
+        checkout_ids.dedup();
+        let locks = checkout_ids
+            .iter()
+            .map(|checkout_id| self.checkout_operation_lock(checkout_id))
+            .collect::<Vec<_>>();
+        let _guards = locks
+            .iter()
+            .map(|lock| lock.lock().unwrap_or_else(|error| error.into_inner()))
+            .collect::<Vec<_>>();
         operation()
     }
 
@@ -2331,6 +2356,7 @@ impl AgentService {
                 active.push(AgentSession {
                     id: session_id.clone(),
                     checkout_id: checkout_id.to_string(),
+                    provider: AgentProvider::OpenCode,
                     title: "OpenCode prompt status is unknown".into(),
                     idle_at: None,
                     awaiting_reply: Some(false),
@@ -2649,11 +2675,11 @@ impl AgentService {
                 ))
             }
         };
-        // Any live bridge reads every location, so the read is asked of one that is already
+        let checkout_index = CheckoutIndex::new(checkouts);
+        // Any OpenCode bridge reads every location, so the read is asked of one that is already
         // connected rather than of one this call would connect. A bridge is opened for a
-        // checkout the panel is already talking to, which is also the only kind of checkout a
-        // session can move out of, so there is nothing to be gained by opening another one for
-        // a worktree nobody has a terminal in — and an event reader would be left running.
+        // checkout the panel is already talking to, which is also the only kind of checkout an
+        // OpenCode session can move out of, so there is nothing to be gained by opening another one.
         let anchor = {
             let bridges = self
                 .bridges
@@ -2674,26 +2700,33 @@ impl AgentService {
                     .lock()
                     .map_err(|_| BridgeError::Failed("the agent service is poisoned".into()))?
                     .clear();
-                self.pending_moves
-                    .lock()
-                    .map_err(|_| BridgeError::Failed("the agent service is poisoned".into()))?
-                    .clear();
-            } else if !checkouts.is_empty() {
-                return self.offer_pending_moves(Instant::now());
+                return self.record_relocations_with_baseline(
+                    checkouts,
+                    Vec::new(),
+                    Instant::now(),
+                    true,
+                );
             }
-            return Ok(Vec::new());
+            return if checkouts.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.offer_pending_moves(Instant::now())
+            };
         };
         let bridge = match self.bridge(&anchor_id, &anchor_directory) {
             Ok(bridge) => bridge,
             Err(error) if baseline => return Err(error),
-            Err(_) => return self.offer_pending_moves(Instant::now()),
+            Err(_) => {
+                return self.offer_pending_moves(Instant::now());
+            }
         };
         let mut sessions = match bridge.session_locations_until(deadline) {
             Ok(sessions) => sessions,
             Err(error) if baseline => return Err(error),
-            Err(_) => return self.offer_pending_moves(Instant::now()),
+            Err(_) => {
+                return self.offer_pending_moves(Instant::now());
+            }
         };
-        let checkout_index = CheckoutIndex::new(checkouts);
         let now = Instant::now();
         let observed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2725,7 +2758,9 @@ impl AgentService {
             ) {
                 Ok(running) => running,
                 Err(error) if baseline => return Err(error),
-                Err(_) => return self.offer_pending_moves(Instant::now()),
+                Err(_) => {
+                    return self.offer_pending_moves(Instant::now());
+                }
             }
         } else {
             HashMap::new()
@@ -5889,6 +5924,44 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(DIRECTORY_HEADER)));
             assert_eq!(request.1, crate::services::opencode::authorization("test"));
+        }
+    }
+
+    #[test]
+    fn terminal_moves_serialize_with_removal_of_either_checkout() {
+        for removed_checkout in ["checkout:a", "checkout:b"] {
+            let agents = Arc::new(AgentService::without_service());
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let remover = Arc::clone(&agents);
+            let removal_thread = std::thread::spawn(move || {
+                remover.with_checkout_operation(removed_checkout, || {
+                    let _reservation = remover.reserve_worktree_removal(removed_checkout).unwrap();
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (moved_tx, moved_rx) = mpsc::channel();
+            let mover = Arc::clone(&agents);
+            let move_thread = std::thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                mover.with_checkout_operations(&["checkout:a", "checkout:b"], || {
+                    moved_tx.send(()).unwrap();
+                });
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let serialized = moved_rx.recv_timeout(Duration::from_millis(50)).is_err();
+            release_tx.send(()).unwrap();
+            moved_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            removal_thread.join().unwrap();
+            move_thread.join().unwrap();
+            assert!(
+                serialized,
+                "move crossed the removal reservation for {removed_checkout}"
+            );
         }
     }
 

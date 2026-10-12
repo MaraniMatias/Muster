@@ -5,6 +5,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import type { ArchivedCheckout, Checkout, Repo, Session, TerminalSessionStatus } from "../domain/workspace";
+import type { TerminalAgentSession } from "../presentation/agent-sessions";
 
 const mocks = vi.hoisted(() => ({
   getGitCheckoutDiffStats: vi.fn(),
@@ -49,6 +50,28 @@ function checkout(overrides: Partial<Checkout> = {}): Checkout {
 
 function session(id: string, name: string, checkoutId = "checkout:primary"): Session {
   return { id, type: "shell", checkoutId, name, createdAt: "now", status: "inactive" };
+}
+
+/**
+ * One row session, as the presentation layer hands it over.
+ *
+ * These fixtures are OpenCode sessions, the only agent sessions listed for terminal rows.
+ * `attention` defaults to what a reader would infer from the two booleans so a fixture only states it
+ * when the attention itself is what is under test.
+ */
+function rowSession(overrides: Partial<TerminalAgentSession> = {}): TerminalAgentSession {
+  const running = overrides.running ?? false;
+  const awaitingReply = overrides.awaitingReply ?? false;
+  return {
+    id: "ses_row",
+    title: "Session",
+    attention: awaitingReply ? "blocked" : running ? "busy" : "none",
+    agent: null,
+    running,
+    awaitingReply,
+    updatedAt: Date.now(),
+    ...overrides,
+  };
 }
 
 // reka hands the list to the body, so a repo's menu is read off the document and not off the panel.
@@ -785,6 +808,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_1",
                 title: "Copy ids into lists",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -793,6 +817,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_2",
                 title: "An old session from another checkout's checkout",
+                attention: "none",
                 agent: null,
                 awaitingReply: false,
                 running: false,
@@ -825,6 +850,64 @@ describe("Sidebar workdir rows", () => {
     wrapper.unmount();
   });
 
+  describe("a Pi terminal", () => {
+    function mountPi(status: TerminalSessionStatus) {
+      const checkoutId = "checkout:pi";
+      return mount(Sidebar, {
+        props: {
+          repos: [
+            repo({
+              checkouts: [{ ...checkout({ id: checkoutId }), sessions: [session("session:pi", "zsh", checkoutId)] }],
+            }),
+          ],
+          activeCheckoutId: checkoutId,
+          activeSessionId: null,
+          isOpening: false,
+          sessionRuntimeStatuses: { "session:pi": status },
+        },
+      });
+    }
+
+    it("recognizes foreground Pi without inferring a session", () => {
+      const wrapper = mountPi({ state: "running", foregroundProcess: true, foregroundApp: "pi" });
+      const row = wrapper.get(".workdir-child");
+      expect(row.get(".nm").text()).toBe("Pi");
+      expect(row.find(".dm").exists()).toBe(false);
+      expect(row.classes()).toContain("state-idle");
+      expect(row.get(".workdir-select").attributes("aria-label")).toBe("Terminal session: Pi");
+      wrapper.unmount();
+    });
+
+    it.each([
+      ["working", "state-working", "lucide-loader-circle", "Working"],
+      ["blocked", "state-idle", "lucide-sparkles", ""],
+      ["done", "state-idle", "lucide-sparkles", "Task complete"],
+      ["error", "state-failed", "lucide-sparkles", "Last task failed"],
+    ] as const)("uses native Pi task state %s", (piTaskState, state, icon, note) => {
+      const wrapper = mountPi({ state: "running", foregroundProcess: true, foregroundApp: "pi", piTaskState });
+      const row = wrapper.get(".workdir-child");
+      expect(row.classes()).toContain(state);
+      expect(row.get(".workdir-icon").classes()).toContain(icon);
+      expect(row.get(".workdir-select").attributes("title")).toContain(note);
+      expect(wrapper.text()).not.toContain("Waiting");
+      wrapper.unmount();
+    });
+
+    it("ignores stale Pi state when another process is in the foreground", () => {
+      const wrapper = mountPi({
+        state: "running",
+        foregroundProcess: false,
+        foregroundApp: "zsh",
+        piTaskState: "error",
+      });
+      const row = wrapper.get(".workdir-child");
+      expect(row.get(".nm").text()).toBe("zsh");
+      expect(row.classes()).toContain("state-idle");
+      expect(row.get(".workdir-select").attributes("title")).not.toContain("failed");
+      wrapper.unmount();
+    });
+  });
+
   it("matches a terminal whose title was cut, which is what a long session title gets", () => {
     // A title longer than 40 characters arrives cut to 37 with an ellipsis, so a real long session
     // title reaches the row as a prefix. A row that refused a genuine cut would draw the program
@@ -849,6 +932,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_3",
                 title: long,
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -897,6 +981,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_4",
                 title: "Add icon box, tinted chip, dot ring",
+                attention: "none",
                 agent: { label: "coder", color: null, attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -905,6 +990,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_5",
                 title: "Plan de implementación para la sidebar",
+                attention: "busy",
                 agent: { label: "plan", color: null, attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -966,6 +1052,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_6",
                 title: "Humanizer",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -974,6 +1061,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_7",
                 title: "Humanizer",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -1027,6 +1115,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_8",
                 title: "Copy ids into lists",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -1145,6 +1234,7 @@ describe("Sidebar workdir rows", () => {
                 {
                   id: "ses_row_9",
                   title: "Copy ids into lists",
+                  attention: "busy",
                   agent: { label: "plan", color: null, attention: "busy" },
                   awaitingReply: false,
                   running: true,
@@ -1214,6 +1304,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_10",
                 title: "Copy ids into lists",
+                attention: "busy",
                 agent: { label: "plan", color: "#FF966C", attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -1255,9 +1346,10 @@ describe("Sidebar workdir rows", () => {
 
   it("does not call unreadable candidate state idle or discard its ambiguous title", async () => {
     const checkoutId = "checkout:unknown";
-    const candidate = {
+    const candidate: TerminalAgentSession = {
       id: "ses_row_11",
       title: "Unknown",
+      attention: "none",
       agent: null,
       running: false,
       awaitingReply: null,
@@ -1313,14 +1405,9 @@ describe("Sidebar workdir rows", () => {
         isOpening: false,
         agentRows: {
           [checkoutId]: {
-            sessions: sessions.map(({ id, title, attention }) => ({
-              id,
-              title,
-              agent: { label: "coder", color: "#4ED6BF", attention },
-              awaitingReply: false,
-              running: false,
-              updatedAt: Date.now(),
-            })),
+            sessions: sessions.map(({ id, title, attention }) =>
+              rowSession({ id, title, attention, agent: { label: "coder", color: "#4ED6BF", attention } }),
+            ),
           },
         },
         sessionRuntimeStatuses: {
@@ -2013,6 +2100,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_12",
                 title: "Copy ids",
+                attention: "busy",
                 agent: { label: "coder", color: null, attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -2063,6 +2151,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_13",
                 title: "Copy ids",
+                attention: "none",
                 agent: { label: "coder", color: null, attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -2127,6 +2216,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_14",
                 title: "Copy ids",
+                attention: "none",
                 agent: { label: "coder", color: "#4ED6BF", attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -2139,6 +2229,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_15",
                 title: "Plan it",
+                attention: "busy",
                 agent: { label: "plan", color: "#FF966C", attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -2198,6 +2289,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_16",
                 title: "Copy ids",
+                attention: "busy",
                 agent: { label: "coder", color: "#4ED6BF", attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -2210,6 +2302,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_17",
                 title: "Plan it",
+                attention: "none",
                 agent: { label: "plan", color: "#FF966C", attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -2272,6 +2365,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_18",
                 title: "Copy ids into lists",
+                attention: "blocked",
                 agent: { label: "plan", color: "#FF966C", attention: "blocked" },
                 awaitingReply: false,
                 running: true,
@@ -2284,6 +2378,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_19",
                 title: "Fix it",
+                attention: "failed",
                 agent: { label: "coder", color: "#4ED6BF", attention: "failed" },
                 awaitingReply: false,
                 running: false,
@@ -2354,6 +2449,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_20",
                 title: "Copy ids",
+                attention: "busy",
                 agent: { label: "coder", color: "#4ED6BF", attention: "busy" },
                 awaitingReply: false,
                 running: true,
@@ -2514,6 +2610,7 @@ describe("Sidebar workdir rows", () => {
               {
                 id: "ses_row_21",
                 title: long,
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 awaitingReply: false,
                 running: false,
@@ -2603,9 +2700,10 @@ describe("Sidebar workdir rows", () => {
             `checkout:${id}`,
             {
               sessions: [
-                {
+                rowSession({
                   id: "ses_row_22",
                   title: `Session ${id}`,
+                  attention: (["busy", "blocked", "failed", "none"] as const)[index]!,
                   agent: {
                     label: "coder",
                     color: null,
@@ -2613,8 +2711,7 @@ describe("Sidebar workdir rows", () => {
                   },
                   awaitingReply: index === 1,
                   running: index < 2,
-                  updatedAt: Date.now(),
-                },
+                }),
               ],
             },
           ]),
@@ -3379,6 +3476,7 @@ it.each([false, true])("draws a running session with no agent, awaiting reply: %
             {
               id: "ses_row_23",
               title: "Untitled session",
+              attention: awaitingReply ? "blocked" : "busy",
               agent: null,
               awaitingReply,
               running: true,
@@ -3942,6 +4040,7 @@ describe("a label is weighed against its row rather than cut between its halves"
               {
                 id: "ses_row_24",
                 title: "Review the duplicated rows",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 running: false,
                 awaitingReply: false,
@@ -4200,6 +4299,7 @@ describe("a label is weighed against its row rather than cut between its halves"
               {
                 id: "ses_row_24",
                 title: "Review the duplicated rows",
+                attention: "none",
                 agent: { label: "plan", color: null, attention: "none" },
                 running: false,
                 awaitingReply: false,

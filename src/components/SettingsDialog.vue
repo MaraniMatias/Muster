@@ -19,6 +19,7 @@ import type { ReviewFolder } from "../domain/files";
 import { DEFAULT_SETTINGS, SETTINGS_SECTIONS, cloneSettings, valueAt, withValue } from "../domain/settings";
 import type { AppSettings, ReviewStorageMode, SettingsField, SettingsPath, SettingsValue } from "../domain/settings";
 import { SHORTCUT_GROUPS, shortcutChord } from "../domain/shortcuts";
+import type { CompatibilitySnapshot } from "../domain/compatibility";
 import { trapDialogTab } from "../lib/dialog-focus";
 import Button from "./ui/button/Button.vue";
 import SelectControl from "./ui/select/SelectControl.vue";
@@ -45,6 +46,9 @@ const props = defineProps<{
    * than as a number that might be wrong.
    */
   reviewFolder?: ReviewFolder | null;
+  compatibility: CompatibilitySnapshot | null;
+  compatibilityLoading: boolean;
+  compatibilityError: string;
 }>();
 
 const emit = defineEmits<{
@@ -62,6 +66,7 @@ const emit = defineEmits<{
    */
   reviewStorageChanged: [storage: ReviewStorageMode];
   clearReviewFolder: [storage: ReviewStorageMode];
+  refreshCompatibility: [];
 }>();
 
 const draft = ref<AppSettings>(props.settings);
@@ -312,6 +317,51 @@ function onDialogKeydown(event: KeyboardEvent) {
               </Button>
             </template>
           </div>
+        </section>
+
+        <section data-testid="compatibility-section" class="border-t border-(--muster-border) pt-5">
+          <div class="flex items-center justify-between gap-3">
+            <h3 class="text-[0.6875rem] font-semibold tracking-wide text-(--muster-text-faint) uppercase">
+              Compatibility
+            </h3>
+            <Button
+              variant="ghost"
+              size="sm"
+              :disabled="saving || compatibilityLoading"
+              @click="emit('refreshCompatibility')"
+            >
+              {{ compatibilityLoading ? "Refreshing…" : "Refresh" }}
+            </Button>
+          </div>
+          <dl class="mt-3 grid grid-cols-[1fr_auto] gap-x-4 gap-y-2 text-xs" aria-live="polite">
+            <dt class="text-(--muster-text-secondary)">Pi executable</dt>
+            <dd class="text-(--muster-text)">
+              {{
+                compatibility
+                  ? compatibility.piInstalled
+                    ? "Installed"
+                    : "Not detected"
+                  : compatibilityLoading
+                    ? "Checking…"
+                    : "Not checked"
+              }}
+            </dd>
+            <dt class="text-(--muster-text-secondary)">OpenCode executable</dt>
+            <dd class="text-(--muster-text)">
+              {{
+                compatibility
+                  ? compatibility.openCodeInstalled
+                    ? "Installed"
+                    : "Not detected"
+                  : compatibilityLoading
+                    ? "Checking…"
+                    : "Not checked"
+              }}
+            </dd>
+          </dl>
+          <p v-if="compatibilityError" role="alert" class="mt-2 text-xs text-(--muster-danger-fg)">
+            Compatibility could not be refreshed: {{ compatibilityError }}
+          </p>
         </section>
 
         <!-- Also a matter of record rather than of preference, for the same reason About is, and so

@@ -45,6 +45,8 @@ export interface ActiveReviewNotes {
    * first. The caller must have picked a session; nothing is sent without a target.
    */
   dispatchRound(sessionId: string, ids: string[], markdown: string, queue?: boolean): Promise<ReviewRound | null>;
+  /** Re-reads the notes, so what the backend decided about them is what is drawn. */
+  refreshNotes(): Promise<void>;
   /**
    * Sends the rounds that were held back while the agent was busy.
    *
@@ -58,13 +60,8 @@ export interface ActiveReviewNotes {
    * absent never arrived, so retrying it cannot duplicate a delivered review.
    */
   reconcileRounds(): Promise<number>;
-  /**
-   * Closes the newest confirmed round whose turn has finished.
-   *
-   * "Acked" means the agent's turn is over, not that the notes are resolved: what the turn
-   * did to each line is judged separately, from the diff.
-   */
-  ackFinishedTurn(): Promise<ReviewRound | null>;
+  /** Closes the newest OpenCode round whose turn has finished. */
+  ackFinishedTurn(sessionId: string): Promise<ReviewRound | null>;
 }
 
 /**
@@ -81,6 +78,8 @@ export interface ActiveReviewNotes {
 export interface ReviewSender {
   /** The checkout's delivery destination. No saved choice means Markdown. */
   readonly target: ReviewTarget;
+  /** Destinations with an installed executable; independent of current sessions. */
+  readonly availableTargets: ReviewTarget[];
   /** The checkout's sessions, for the destination picker. */
   readonly sessions: AgentSession[];
   /** The session a review goes to, or null while the checkout has none. */
@@ -89,6 +88,8 @@ export interface ReviewSender {
   selectReviewTarget(target: ReviewTarget): void;
   /** Rounds whose turn has not finished, which is what the count under the button reports. */
   readonly unfinishedRounds: number;
+  /** The latest review operation error, shown beside the send control. */
+  readonly error: string;
   /** Records one round with the chosen notes and delivers it to the target. */
   send(ids: string[], queue: boolean): Promise<void>;
 }
@@ -121,6 +122,7 @@ export function useReviewNotes(
       | "clearOutdated"
       | "resolveNote"
       | "dispatchRound"
+      | "refreshNotes"
       | "flushQueuedRounds"
       | "reconcileRounds"
       | "ackFinishedTurn"
@@ -197,16 +199,32 @@ export function useReviewNotes(
   async function dispatchRound(sessionId: string, ids: string[], markdown: string, queue = false) {
     const checkoutId = state.checkoutId;
     if (!checkoutId || ids.length === 0 || !sessionId) return null;
+    const requestGeneration = generation;
+    const isCurrent = () => state.checkoutId === checkoutId && generation === requestGeneration;
+    state.error = "";
     try {
       const round = await dispatchReviewRound({ checkoutId, sessionId, ids, markdown, queue });
-      if (state.checkoutId !== checkoutId) return null;
+      if (!isCurrent()) return null;
       state.rounds = [round, ...state.rounds.filter((item) => item.id !== round.id)];
       // The backend owns the notes now: re-read instead of assuming what it decided.
-      await refreshNotes(checkoutId);
+      const notes = await listReviewNotes(checkoutId);
+      if (!isCurrent()) return null;
+      state.notes = sortNotes(notes);
       state.error = "";
       return round;
     } catch (cause) {
-      if (state.checkoutId === checkoutId) fail(cause);
+      if (!isCurrent()) return null;
+      fail(cause);
+      // A failed response is ambiguous: the backend may have committed the round before the
+      // send failed. Refresh both records so its claim is visible; never retry it here.
+      try {
+        const [rounds, notes] = await Promise.all([listReviewRounds(checkoutId), listReviewNotes(checkoutId)]);
+        if (!isCurrent()) return null;
+        state.rounds = rounds;
+        state.notes = sortNotes(notes);
+      } catch {
+        // Keep the original dispatch failure; the next explicit refresh can try again.
+      }
       return null;
     }
   }
@@ -251,10 +269,11 @@ export function useReviewNotes(
     }
   }
 
-  async function ackFinishedTurn() {
+  async function ackFinishedTurn(sessionId: string) {
     const checkoutId = state.checkoutId;
     if (!checkoutId) return null;
-    const round = state.rounds.find((item) => item.status === "dispatched");
+    // A turn closes only a round for the OpenCode session whose running-to-idle transition was read.
+    const round = state.rounds.find((item) => item.status === "dispatched" && item.sessionId === sessionId);
     if (!round) return null;
     try {
       const acked = await ackReviewRound(checkoutId, round.id);
@@ -268,7 +287,9 @@ export function useReviewNotes(
     }
   }
 
-  async function refreshNotes(checkoutId: string) {
+  /** Re-reads the notes so local state follows the backend. */
+  async function refreshNotes(checkoutId = state.checkoutId) {
+    if (!checkoutId) return;
     try {
       const notes = await listReviewNotes(checkoutId);
       if (state.checkoutId !== checkoutId) return;
@@ -349,6 +370,7 @@ export function useReviewNotes(
     clearOutdated,
     resolveNote,
     dispatchRound,
+    refreshNotes,
     flushQueuedRounds,
     reconcileRounds,
     ackFinishedTurn,

@@ -33,7 +33,8 @@ const props = withDefaults(
     review: Pick<
       ActiveReviewNotes,
       "notes" | "addNote" | "updateNote" | "deleteNote" | "verifyAnchors" | "clearOutdated" | "resolveNote"
-    >;
+    > &
+      Partial<Pick<ActiveReviewNotes, "rounds">>;
     /** Null is the whole change set: one diff per changed file, stacked in status order. */
     path: string | null;
     scrollTop: number;
@@ -203,11 +204,12 @@ const busyChoiceOpen = ref(false);
 const targetOpen = ref(false);
 const targetQuery = ref("");
 const targetIndex = ref(0);
+const openCodeSessions = computed(() => (sender?.sessions ?? []).filter((session) => session.provider === "opencode"));
 /** A list this short is picked by looking at it; past this it earns a search of its own. */
-const searchesTargets = computed(() => sender?.target === "opencode" && (sender.sessions.length ?? 0) > 5);
+const searchesTargets = computed(() => sender?.target === "opencode" && openCodeSessions.value.length > 5);
 /** Newest first, the order the rest of the app reads sessions in. */
 const targetRows = computed(() => {
-  const rows = sortAgentSessions(sender?.sessions ?? []);
+  const rows = sortAgentSessions(openCodeSessions.value);
   const query = targetQuery.value.trim().toLowerCase();
   return query ? rows.filter((row) => row.title.toLowerCase().includes(query)) : rows;
 });
@@ -228,30 +230,58 @@ watch(targetQuery, () => {
   targetIndex.value = 0;
 });
 const sendableNotes = computed(() => {
-  const pending = props.review.notes.filter(isReviewableNote);
+  const pending = props.review.notes.filter((note) => {
+    if (!isReviewableNote(note)) return false;
+    if (note.roundId === null) return true;
+    const round = props.review.rounds?.find((candidate) => candidate.id === note.roundId);
+    // Keep notes claimed by a queued or unconfirmed round out of another prompt. A completed
+    // round is available for an explicit follow-up, including one sent to Pi.
+    return round?.status === "acked" || round?.status === "relocated";
+  });
   // An outdated note points at a line that has since changed, so it is held back unless the
   // user says otherwise: that is the same rule the note's own card states.
   return includeOutdated.value ? pending : pending.filter((note) => !note.outdated);
 });
 const draftCount = computed(() => sendableNotes.value.filter((note) => note.status === "draft").length);
 const outdatedCount = computed(() => props.review.notes.filter((note) => note.outdated).length);
-const targetSession = computed(() => sender?.sessions.find((session) => session.id === sender.targetId) ?? undefined);
+const targetSession = computed(
+  () =>
+    sender?.sessions.find((session) => session.provider === "opencode" && session.id === sender.targetId) ?? undefined,
+);
 /** A blocked session is not working, so only a real turn makes the send a decision. */
-const targetBusy = computed(() => agentAttention(targetSession.value) === "busy");
+const targetBusy = computed(() => sender?.target === "opencode" && agentAttention(targetSession.value) === "busy");
 const showBusyChoice = computed(() => sender?.target === "opencode" && busyChoiceOpen.value && targetBusy.value);
-const canSend = computed(() => sendableNotes.value.length > 0);
+const noOpenCodeTarget = computed(() => sender?.target === "opencode" && openCodeSessions.value.length === 0);
+const canSend = computed(() => sendableNotes.value.length > 0 && !noOpenCodeTarget.value);
+/**
+ * What the button says it will do, which is the only place the destination is named to a reader.
+ *
+ * Pi is a third sentence rather than a session: nothing is chosen and nothing is waited for, so
+ * "Send to opencode" would be a claim about a destination that does not exist for it.
+ */
+const sendLabel = computed(() => {
+  if (sender?.target === "markdown") return "Export as Markdown";
+  return sender?.target === "pi" ? "Send to Pi" : "Send to opencode";
+});
 
 function sendNow(queue: boolean) {
   busyChoiceOpen.value = false;
+  if (!canSend.value) return;
   void sender?.send(
     sendableNotes.value.map((note) => note.id),
     queue,
   );
 }
 
-/** A working agent cannot be interrupted, so the button asks instead of sending into a turn. */
+/**
+ * A working agent cannot be interrupted, so the button asks instead of sending into a turn.
+ *
+ * Only OpenCode has a turn to interrupt: a Pi send starts a fresh one every time, so there is
+ * nothing to be interrupted and nothing to queue behind.
+ */
 function requestSend() {
-  if (sender?.target === "markdown") {
+  if (!canSend.value) return;
+  if (sender?.target !== "opencode") {
     sendNow(false);
     return;
   }
@@ -267,14 +297,22 @@ function chooseTarget(sessionId: string) {
   targetOpen.value = false;
 }
 
-/** The two destinations a review can leave by, so the picker is a list rather than a control. */
-const reviewTargets = [
-  { value: "markdown", label: "Markdown" },
-  { value: "opencode", label: "OpenCode" },
-];
+/** Installed destinations plus Markdown, so the picker cannot offer a missing executable. */
+const reviewTargets = computed(
+  () =>
+    sender?.availableTargets.map((value) => ({
+      value,
+      label: value === "opencode" ? "OpenCode" : value === "pi" ? "Pi" : "Markdown",
+    })) ?? [{ value: "markdown", label: "Markdown" }],
+);
 
 function chooseReviewTarget(target?: string) {
-  if (target === "markdown" || target === "opencode") sender?.selectReviewTarget(target);
+  if (
+    (target === "markdown" || target === "opencode" || target === "pi") &&
+    sender?.availableTargets.includes(target)
+  ) {
+    sender.selectReviewTarget(target);
+  }
 }
 
 /**
@@ -556,11 +594,11 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
             type="button"
             data-testid="send-review"
             :disabled="!canSend"
-            :aria-label="sender.target === 'markdown' ? 'Export as Markdown' : 'Send to opencode'"
+            :aria-label="sendLabel"
             class="muster-button muster-button-tinted muster-button-md"
             @click="requestSend"
           >
-            {{ sender.target === "markdown" ? "Export as Markdown" : "Send to opencode" }}
+            {{ sendLabel }}
           </button>
           <SelectControl
             :model-value="sender.target"
@@ -569,10 +607,18 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
             testid="review-target"
             @update:model-value="chooseReviewTarget"
           />
+          <p
+            v-if="noOpenCodeTarget"
+            data-testid="missing-opencode-target"
+            role="status"
+            class="text-[0.6875rem] text-(--muster-text-faint)"
+          >
+            No connected OpenCode session. Start OpenCode and open a session before sending.
+          </p>
           <!-- One session is the default target, so the picker only earns its place above one.
                It is the app's own menu rather than a native select, and it earns a search only
                once there are more rows than a short list is worth reading. -->
-          <PopoverRoot v-if="sender.target === 'opencode' && sender.sessions.length > 1" v-model:open="targetOpen">
+          <PopoverRoot v-if="sender.target === 'opencode' && openCodeSessions.length > 1" v-model:open="targetOpen">
             <PopoverTrigger
               data-testid="send-target"
               aria-label="Send review to"
@@ -664,6 +710,14 @@ function toggleHunkFromLibrary(event: MouseEvent, index: number) {
           class="text-[0.6875rem] text-(--muster-text-faint)"
         >
           {{ sender.unfinishedRounds }} {{ sender.unfinishedRounds === 1 ? "round" : "rounds" }} not finished
+        </p>
+        <p
+          v-if="sender?.error"
+          data-testid="review-send-error"
+          role="alert"
+          class="text-xs text-(--muster-text-danger)"
+        >
+          {{ sender.error }}
         </p>
         <label v-if="outdatedCount > 0" class="flex items-center gap-1.5 text-[0.6875rem] text-(--muster-text-faint)">
           <input v-model="includeOutdated" type="checkbox" class="muster-check" data-testid="include-outdated" />

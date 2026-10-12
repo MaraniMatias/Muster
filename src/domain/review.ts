@@ -1,5 +1,13 @@
 export type ReviewSide = "old" | "new";
-export type ReviewTarget = "markdown" | "opencode";
+
+/**
+ * Where a checkout's reviews leave by.
+ *
+ * `opencode` sends to a session that already exists on that checkout's server; `pi` opens a new
+ * terminal in the same checkout and starts the program there. They are different journeys to the
+ * same place, which is why the destination is named rather than "the agent".
+ */
+export type ReviewTarget = "markdown" | "opencode" | "pi";
 export type ReviewNoteStatus = "draft" | "sent" | "resolved";
 
 export interface ReviewAnchorCheck {
@@ -42,7 +50,8 @@ export type ReviewRoundStatus = "queued" | "dispatching" | "dispatched" | "acked
 export interface ReviewRound {
   id: string;
   checkoutId: string;
-  sessionId: string | null;
+  /** The OpenCode session this round targets; retained after relocation for history. */
+  sessionId: string;
   status: ReviewRoundStatus;
   /** Embedded in the prompt, which is what makes a reconnect safe. */
   marker: string;

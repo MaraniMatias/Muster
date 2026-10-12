@@ -270,16 +270,29 @@ fn register_created_worktree(
 
 pub fn removal_info(
     database: &Database,
+    backend: &TerminalBackend,
     agents: &crate::services::agent::AgentService,
     checkout_id: &str,
 ) -> Result<WorktreeRemovalInfo, IpcError> {
     agents.with_checkout_operation(checkout_id, || {
-        removal_info_locked(database, agents, checkout_id)
+        removal_info_locked(database, backend, agents, checkout_id)
     })
+}
+
+fn pi_process_protects_checkout(working_directory: Option<&Path>, checkout: &Path) -> bool {
+    let Some(working_directory) = working_directory.and_then(|path| path.canonicalize().ok())
+    else {
+        return true;
+    };
+    checkout
+        .canonicalize()
+        .map(|checkout| working_directory.starts_with(checkout))
+        .unwrap_or(true)
 }
 
 fn removal_info_locked(
     database: &Database,
+    backend: &TerminalBackend,
     agents: &crate::services::agent::AgentService,
     checkout_id: &str,
 ) -> Result<WorktreeRemovalInfo, IpcError> {
@@ -343,24 +356,57 @@ fn removal_info_locked(
         0
     };
 
-    let active_sessions = context
-        .checkout
-        .sessions
-        .iter()
-        .filter(|session| {
-            session.status == SessionStatus::Active && session.session_type == SessionType::Shell
-        })
-        .map(ActiveWorktreeSession::from)
-        .collect();
-    let active_agent_sessions = agents
+    let agents = agents
         .active_worktree_agent_sessions(&context.checkout.id)
-        .map_err(crate::services::agent::map_error)?
+        .map_err(crate::services::agent::map_error)?;
+    let pi_processes = backend.pi_process_locations().map_err(operation_error)?;
+    let pi_terminal_ids: BTreeSet<_> = pi_processes
+        .iter()
+        .map(|(session_id, _)| session_id.as_str())
+        .collect();
+    let mut protected_pi_terminals = BTreeSet::new();
+    let mut active_agent_sessions: Vec<_> = agents
         .into_iter()
         .map(|session| ActiveWorktreeSession {
             id: session.id,
             session_type: SessionType::Agent,
             name: session.title,
         })
+        .collect();
+    for session in context.checkout.sessions.iter().filter(|session| {
+        session.status == SessionStatus::Active
+            && session.session_type == SessionType::Shell
+            && pi_terminal_ids.contains(session.id.as_str())
+    }) {
+        protected_pi_terminals.insert(session.id.clone());
+        active_agent_sessions.push(ActiveWorktreeSession {
+            id: session.id.clone(),
+            session_type: SessionType::Agent,
+            name: "Pi".into(),
+        });
+    }
+    let checkout_path = Path::new(&context.checkout.canonical_path);
+    for (session_id, working_directory) in pi_processes {
+        if pi_process_protects_checkout(working_directory.as_deref(), checkout_path)
+            && protected_pi_terminals.insert(session_id.clone())
+        {
+            active_agent_sessions.push(ActiveWorktreeSession {
+                id: session_id,
+                session_type: SessionType::Agent,
+                name: "Pi".into(),
+            });
+        }
+    }
+    let active_sessions = context
+        .checkout
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.status == SessionStatus::Active
+                && session.session_type == SessionType::Shell
+                && !protected_pi_terminals.contains(&session.id)
+        })
+        .map(ActiveWorktreeSession::from)
         .collect();
     Ok(WorktreeRemovalInfo {
         checkout_id: context.checkout.id,
@@ -399,7 +445,7 @@ fn remove_locked(
     let _removal = agents
         .reserve_worktree_removal(checkout_id)
         .map_err(crate::services::agent::map_error)?;
-    let info = removal_info_locked(database, agents, checkout_id)?;
+    let info = removal_info_locked(database, backend, agents, checkout_id)?;
     if info.is_primary {
         return Err(IpcError::new(
             IpcErrorCode::InvalidCheckout,
@@ -1024,6 +1070,28 @@ mod tests {
     };
 
     #[test]
+    fn pi_process_path_guard_includes_nested_paths_and_fails_closed_when_unknown() {
+        let temp = tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let nested = checkout.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(super::pi_process_protects_checkout(
+            Some(&nested),
+            &checkout
+        ));
+        assert!(!super::pi_process_protects_checkout(
+            Some(temp.path()),
+            &checkout
+        ));
+        assert!(super::pi_process_protects_checkout(None, &checkout));
+        assert!(super::pi_process_protects_checkout(
+            Some(&checkout.join("gone")),
+            &checkout
+        ));
+    }
+
+    #[test]
     fn worktree_git_error_keeps_stderr_when_stdout_is_empty() {
         let output = Output {
             status: ExitStatus::from_raw(1 << 8),
@@ -1358,7 +1426,13 @@ mod tests {
 
         // A fresh conversation has no turn-start event and must not look busy just because
         // OpenCode also reports no idle timestamp for it.
-        let idle_info = removal_info(&database, &agents, &checkout_id).unwrap();
+        let idle_info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &agents,
+            &checkout_id,
+        )
+        .unwrap();
         assert!(idle_info.active_agent_sessions.is_empty());
         let idle_confirmation = confirmation(&idle_info, false, vec![], vec![], false);
 
@@ -1415,10 +1489,22 @@ mod tests {
             "the active agent's checkout was removed"
         );
 
-        let active = removal_info(&database, &agents, &checkout_id).unwrap();
+        let active = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &agents,
+            &checkout_id,
+        )
+        .unwrap();
         assert_eq!(active.active_agent_sessions[0].name, "coding agent");
         agents.stop(&checkout_id);
-        let idle = removal_info(&database, &agents, &checkout_id).unwrap();
+        let idle = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &agents,
+            &checkout_id,
+        )
+        .unwrap();
         assert!(idle.active_agent_sessions.is_empty());
         remove(
             &database,
@@ -1447,7 +1533,13 @@ mod tests {
         let agents = Arc::new(AgentService::with_test_server(server.port));
         create_session_from_the_mock_agent(&agents, &checkout_id, &directory, "coding agent");
 
-        let info = removal_info(&database, &agents, &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &agents,
+            &checkout_id,
+        )
+        .unwrap();
         assert!(info.active_agent_sessions.is_empty());
         let confirmation = confirmation(&info, false, vec![], vec![], false);
         let lists_before_remove = server.session_lists.load(Ordering::SeqCst);
@@ -2332,7 +2424,13 @@ mod tests {
             "dirty",
         )
         .unwrap();
-        let info = removal_info(&database, &AgentService::without_service(), &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &checkout_id,
+        )
+        .unwrap();
         assert_eq!(info.dirty_files, ["untracked.txt"]);
 
         let backend = TerminalBackend::default();
@@ -2360,7 +2458,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(stale.message.contains("changes changed"));
-        let info = removal_info(&database, &AgentService::without_service(), &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &checkout_id,
+        )
+        .unwrap();
         let confirmed = confirmation(&info, true, info.dirty_files.clone(), vec![], false);
         let result = remove(
             &database,
@@ -2394,7 +2498,13 @@ mod tests {
         fs::write(path.join("ahead.txt"), "ahead\n").unwrap();
         git(path, &["add", "ahead.txt"]);
         git(path, &["commit", "-m", "ahead"]);
-        let info = removal_info(&database, &AgentService::without_service(), &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &checkout_id,
+        )
+        .unwrap();
         assert_eq!(info.unmerged_commits, 1);
 
         let confirmed = confirmation(&info, false, vec![], vec![], true);
@@ -2415,7 +2525,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let (database, _, primary_id) = fixture(temp.path());
         let backend = TerminalBackend::default();
-        let info = removal_info(&database, &AgentService::without_service(), &primary_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &primary_id,
+        )
+        .unwrap();
         let confirmation = confirmation(&info, true, vec![], vec![], false);
 
         assert!(remove(
@@ -2428,6 +2544,150 @@ mod tests {
         .unwrap_err()
         .message
         .contains("primary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unbridged_foreground_pi_blocks_worktree_removal() {
+        let temp = tempdir().unwrap();
+        let (database, root, _) = fixture(temp.path());
+        let checkout_id = add_worktree(&database, &root, temp.path(), "unbridged-pi");
+        let checkout_path = temp.path().join("checkout-unbridged-pi");
+        let fake_pi = temp.path().join("pi");
+        std::os::unix::fs::symlink("/bin/sleep", &fake_pi).unwrap();
+
+        let terminal_id = "terminal:unbridged-pi";
+        let backend = TerminalBackend::default();
+        backend
+            .spawn(
+                terminal_id.into(),
+                SpawnOptions {
+                    program: fake_pi,
+                    args: vec!["30".into()],
+                    cwd: checkout_path,
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                },
+                Box::new(|_| Ok(())),
+            )
+            .unwrap();
+        database
+            .add_terminal_session(&Session {
+                id: terminal_id.into(),
+                session_type: SessionType::Shell,
+                checkout_id: checkout_id.clone(),
+                name: "Pi".into(),
+                created_at: "now".into(),
+                status: SessionStatus::Active,
+            })
+            .unwrap();
+
+        let agents = AgentService::without_service();
+        let info = removal_info(&database, &backend, &agents, &checkout_id).unwrap();
+        assert!(info.active_sessions.is_empty());
+        assert_eq!(info.active_agent_sessions.len(), 1);
+        assert_eq!(info.active_agent_sessions[0].id, terminal_id);
+        assert_eq!(info.active_agent_sessions[0].name, "Pi");
+
+        let error = remove(
+            &database,
+            &backend,
+            &agents,
+            &checkout_id,
+            &confirmation(&info, false, vec![], vec![], false),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("stop the active agent session"));
+        assert_eq!(
+            backend
+                .status(terminal_id)
+                .unwrap()
+                .foreground_app
+                .as_deref(),
+            Some("pi")
+        );
+        assert_eq!(
+            database
+                .terminal_session_checkout(terminal_id)
+                .unwrap()
+                .as_deref(),
+            Some(checkout_id.as_str())
+        );
+        backend.close(terminal_id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moved_pi_keeps_its_actual_worktree_protected_until_its_process_exits() {
+        let temp = tempdir().unwrap();
+        let (database, root, _) = fixture(temp.path());
+        let source_id = add_worktree(&database, &root, temp.path(), "pi-source");
+        let target_id = add_worktree(&database, &root, temp.path(), "pi-target");
+        let source_path = temp.path().join("checkout-pi-source");
+        let fake_pi = temp.path().join("pi");
+        std::os::unix::fs::symlink("/bin/sleep", &fake_pi).unwrap();
+
+        let terminal_id = "terminal:moved-pi";
+        let backend = TerminalBackend::default();
+        backend
+            .spawn(
+                terminal_id.into(),
+                SpawnOptions {
+                    program: fake_pi,
+                    args: vec!["30".into()],
+                    cwd: source_path,
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                },
+                Box::new(|_| Ok(())),
+            )
+            .unwrap();
+        database
+            .add_terminal_session(&Session {
+                id: terminal_id.into(),
+                session_type: SessionType::Shell,
+                checkout_id: source_id.clone(),
+                name: "Pi".into(),
+                created_at: "now".into(),
+                status: SessionStatus::Active,
+            })
+            .unwrap();
+        database
+            .move_terminal_session(terminal_id, &target_id, false)
+            .unwrap();
+
+        let agents = AgentService::without_service();
+        for checkout_id in [&source_id, &target_id] {
+            let info = removal_info(&database, &backend, &agents, checkout_id).unwrap();
+            assert!(info
+                .active_agent_sessions
+                .iter()
+                .any(|session| session.id == terminal_id));
+            let error = remove(
+                &database,
+                &backend,
+                &agents,
+                checkout_id,
+                &confirmation(&info, false, vec![], vec![], false),
+            )
+            .unwrap_err();
+            assert!(error.message.contains("active agent session"));
+        }
+
+        backend.close(terminal_id).unwrap();
+        database.remove_terminal_session(terminal_id).unwrap();
+        let info = removal_info(&database, &backend, &agents, &source_id).unwrap();
+        assert!(info.active_agent_sessions.is_empty());
+        remove(
+            &database,
+            &backend,
+            &agents,
+            &source_id,
+            &confirmation(&info, false, vec![], vec![], false),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2468,7 +2728,13 @@ mod tests {
             })
             .unwrap();
 
-        let info = removal_info(&database, &AgentService::without_service(), &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &checkout_id,
+        )
+        .unwrap();
         assert_eq!(info.active_sessions[0].id, session_id);
         let no_session_confirmation = confirmation(&info, false, vec![], vec![], false);
         assert!(remove(
@@ -2513,7 +2779,13 @@ mod tests {
         git(&root, &["worktree", "prune", "--expire", "now"]);
         git(&root, &["branch", "-D", "--", "missing-feature"]);
 
-        let info = removal_info(&database, &AgentService::without_service(), &checkout_id).unwrap();
+        let info = removal_info(
+            &database,
+            &TerminalBackend::default(),
+            &AgentService::without_service(),
+            &checkout_id,
+        )
+        .unwrap();
         assert!(info.is_missing);
         assert_eq!(info.branch, None);
         let confirmed = confirmation(&info, false, vec![], vec![], false);

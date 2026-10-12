@@ -4,6 +4,7 @@ import {
   agentColor,
   agentLabel,
   defaultAgentSession,
+  defaultOpenCodeSession,
   headlineSession,
   isTurnEvent,
   matchAgentSessionTitle,
@@ -15,6 +16,7 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
   return {
     id: "ses_one",
     checkoutId: "checkout:first",
+    provider: "opencode",
     title: "review",
     running: false,
     idleAt: 1,
@@ -41,6 +43,12 @@ describe("agent session helpers", () => {
     expect(sortAgentSessions(sessions).map((item) => item.id)).toEqual(["ses_new", "ses_old"]);
     expect(defaultAgentSession(sessions)?.id).toBe("ses_new");
     expect(defaultAgentSession([])).toBeNull();
+  });
+
+  it("uses the newest OpenCode session as the review target", () => {
+    const sessions = [session({ id: "ses_old", updatedAt: 1 }), session({ id: "ses_new", updatedAt: 99 })];
+    expect(defaultAgentSession(sessions)?.id).toBe("ses_new");
+    expect(defaultOpenCodeSession(sessions)?.id).toBe("ses_new");
   });
 
   it("breaks a tie deterministically so the default target never flickers", () => {

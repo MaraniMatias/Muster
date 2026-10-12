@@ -40,8 +40,8 @@ pub struct ReviewNote {
 pub struct ReviewRound {
     pub id: String,
     pub checkout_id: String,
-    /// The OpenCode session this round targeted; retained after relocation for history.
-    pub session_id: Option<String>,
+    /// The OpenCode session this round targets; retained after relocation for history.
+    pub session_id: String,
     /// "queued", "dispatching", "dispatched", "acked" or "relocated".
     /// A relocated round is historical and is never retried against a different session.
     pub status: String,
@@ -69,6 +69,48 @@ pub fn review_round_marker(round_id: &str) -> String {
     format!("{ROUND_MARKER_PREFIX}:{round_id}")
 }
 
+/// Whether a string is a marker this build writes, and so may be taken for a round's own.
+///
+/// The grammar is the one `record_round` generates and nothing looser: a round id is
+/// `round:` and three numbers. A receipt is evidence only because this app put the string
+/// in the message, so a marker-shaped run of characters typed into a session is not one of ours
+/// and must not confirm anything.
+pub fn is_review_round_marker(value: &str) -> bool {
+    let Some(id) = value.strip_prefix(&format!("{ROUND_MARKER_PREFIX}:")) else {
+        return false;
+    };
+    // Exactly `round:` and three numbers, which is what `record_round` writes. A count of "at
+    // least" would accept a marker-shaped string that is not one of ours, which is the whole
+    // failure this refuses.
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let mut parts = id.split(':');
+    let shape = parts.next() == Some("round")
+        && parts.next().is_some_and(is_number)
+        && parts.next().is_some_and(is_number)
+        && parts.next().is_some_and(is_number);
+    shape && parts.next().is_none()
+}
+
+/// Pulls a round's marker out of a delivered message.
+///
+/// Only the bracketed token `build_round_prompt` embeds is matched, so a marker that appears
+/// anywhere else in a message — quoted, spelled out in prose, echoed by the agent — is not a
+/// receipt. This is what lets an agent's own transcript be read for the marker without a
+/// search of the raw text ever standing in for one.
+pub fn review_round_marker_in(message: &str) -> Option<&str> {
+    let mut rest = message;
+    while let Some(at) = rest.find('[') {
+        rest = &rest[at + 1..];
+        let end = rest.find(']')?;
+        let candidate = &rest[..end];
+        if is_review_round_marker(candidate) {
+            return Some(candidate);
+        }
+        rest = &rest[end + 1..];
+    }
+    None
+}
+
 /// Fingerprint of a note's anchor line, used to detect that the commented line changed.
 ///
 /// Only the first line of the captured code is hashed. A multi-line note whose block was
@@ -87,7 +129,7 @@ pub fn review_anchor_hash(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::review_anchor_hash;
+    use super::{review_anchor_hash, review_round_marker, review_round_marker_in};
 
     #[test]
     fn anchor_hash_is_stable_and_separates_different_lines() {
@@ -108,6 +150,50 @@ mod tests {
         assert_eq!(
             review_anchor_hash("first line\nsecond line"),
             review_anchor_hash("first line")
+        );
+    }
+
+    /// Only what this build writes is a marker. Everything else is a string somebody typed,
+    /// and a receipt built from one would confirm a round nobody sent.
+    #[test]
+    fn only_a_generated_marker_is_read_as_one() {
+        let marker = review_round_marker("round:1762000000:4242:7");
+        assert!(super::is_review_round_marker(&marker));
+        for impostor in [
+            "muster-review:round:1:2",
+            "muster-review:round:1:2:3:4",
+            "muster-review:round:1:2:x",
+            "muster-review::1:2:3",
+            "muster-review",
+            "please review muster-review:round:1:2:3 for me",
+            "",
+        ] {
+            assert!(!super::is_review_round_marker(impostor), "{impostor}");
+        }
+    }
+
+    /// A receipt is the bracketed token the prompt carries and nothing else, so an agent
+    /// echoing the marker, or a person quoting it, cannot stand in for having received it.
+    #[test]
+    fn a_receipt_is_the_bracketed_token_and_not_anything_around_it() {
+        let marker = review_round_marker("round:1762000000:4242:7");
+        assert_eq!(
+            review_round_marker_in(&format!("instructions\n[{marker}]\n\n## src/foo.js")),
+            Some(marker.as_str())
+        );
+        assert_eq!(
+            review_round_marker_in(&format!("[{marker}]")),
+            Some(marker.as_str())
+        );
+        assert_eq!(review_round_marker_in("no marker here"), None);
+        assert_eq!(
+            review_round_marker_in(&format!("the agent echoed {marker} back at me")),
+            None,
+            "an unbracketed marker is prose, not the token this app wrote"
+        );
+        assert_eq!(
+            review_round_marker_in("muster-review:round:1:2:3] then [muster-review:round:1:2:4"),
+            None
         );
     }
 }

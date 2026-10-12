@@ -16,6 +16,8 @@ import {
   X as XIcon,
 } from "@lucide/vue";
 import type { Checkout, Repo } from "./domain/workspace";
+import { availableReviewTargets as getAvailableReviewTargets } from "./domain/compatibility";
+import type { CompatibilitySnapshot } from "./domain/compatibility";
 import type { CheckoutFileActivity } from "./domain/git";
 import type { ReviewTarget } from "./domain/review";
 import {
@@ -46,6 +48,7 @@ import {
   closeMissingCheckout as persistMissingCheckoutClose,
   exportReviewMarkdown,
   getReviewFolder,
+  getCompatibilitySnapshot,
   getTerminalStatus,
   loadReviewTarget,
   openExternalFile as requestExternalFile,
@@ -69,7 +72,7 @@ import { useTerminalMovement } from "./presentation/terminal-movement-controller
 import { WORKDIR_ICONS } from "./presentation/workdir-icons";
 import { theme } from "./presentation/theme";
 import type { Theme } from "./presentation/theme";
-import { AGENT_APP, defaultAgentSession, matchAgentSessionTitle } from "./domain/agent";
+import { AGENT_APP, defaultOpenCodeSession, matchAgentSessionTitle } from "./domain/agent";
 import { DEFAULT_ZOOM, zoomKeyFor, zoomLabel, zoomStep } from "./domain/zoom";
 import type { Zoom, ZoomModifier } from "./domain/zoom";
 import { buildReviewMarkdown, localReviewTimestamp } from "./domain/review";
@@ -92,6 +95,7 @@ import type { AppSettings, ReviewStorageMode } from "./domain/settings";
 import type { ReviewFolder } from "./domain/files";
 import { formatBytes } from "./domain/files";
 import { loadAppLayout, loadCheckoutUiState, loadSettings, prepareAppExit, saveSettings } from "./lib/ipc";
+import type { TerminalLaunch } from "./lib/ipc";
 import { reportFrontendDiagnostic } from "./lib/diagnostics";
 import type { DiagnosticCategory } from "./lib/diagnostics";
 
@@ -204,6 +208,10 @@ const terminalMovement = useTerminalMovement({
     workspace.value.activeCheckoutId === fromCheckoutId &&
     workspace.value.activeSessionId === sessionId &&
     terminalIsOnScreen(sessionId),
+  isPiTerminal: (terminalId) => {
+    const status = sessionRuntimeStatuses.value[terminalId];
+    return Boolean(status?.foregroundProcess && status.foregroundApp === "pi");
+  },
   moveSession: async (sessionId, checkoutId, index, changeDirectory, selectTarget) =>
     await mainPane.value?.moveSession(sessionId, checkoutId, index, changeDirectory, selectTarget),
   followMovedTerminal: async (sessionId, checkoutId, isCurrent) => {
@@ -225,17 +233,59 @@ useAgentRelocations(
     () => settings.value.terminal.followWorktree === "agent" || settings.value.terminal.followWorktree === "both",
   ),
 );
+const compatibilitySnapshot = ref<CompatibilitySnapshot | null>(null);
+const compatibilityLoading = ref(false);
+const compatibilityError = ref("");
+let compatibilityRequest = 0;
+const availableReviewDestinations = computed(() => getAvailableReviewTargets(compatibilitySnapshot.value));
+
+async function refreshCompatibilitySnapshot(): Promise<boolean> {
+  const request = ++compatibilityRequest;
+  compatibilityLoading.value = true;
+  compatibilityError.value = "";
+  try {
+    const snapshot = await getCompatibilitySnapshot();
+    if (request !== compatibilityRequest) return false;
+    compatibilitySnapshot.value = snapshot;
+    return true;
+  } catch (cause) {
+    if (request === compatibilityRequest) {
+      compatibilityError.value = cause instanceof Error ? cause.message : String(cause);
+    }
+    return false;
+  } finally {
+    if (request === compatibilityRequest) compatibilityLoading.value = false;
+  }
+}
+
 const reviewTarget = ref<ReviewTarget>("markdown");
 let reviewTargetLoadGeneration = 0;
 watch(
-  () => activeCheckout.value?.id ?? null,
-  async (checkoutId) => {
+  () => [activeCheckout.value?.id ?? null, compatibilitySnapshot.value] as const,
+  async ([checkoutId, snapshot], previous) => {
+    const [previousCheckoutId, previousSnapshot] = previous ?? [null, null];
+    const checkoutChanged = checkoutId !== previousCheckoutId;
+    if (checkoutId && snapshot && !checkoutChanged && previousSnapshot) {
+      if (getAvailableReviewTargets(snapshot).includes(reviewTarget.value)) return;
+      ++reviewTargetLoadGeneration;
+      reviewTarget.value = "markdown";
+      try {
+        await saveReviewTarget(checkoutId, "markdown");
+      } catch (cause) {
+        reportCause(cause);
+      }
+      return;
+    }
+
     const request = ++reviewTargetLoadGeneration;
     reviewTarget.value = "markdown";
-    if (!checkoutId) return;
+    if (!checkoutId || !snapshot) return;
     try {
       const target = await loadReviewTarget(checkoutId);
-      if (request === reviewTargetLoadGeneration) reviewTarget.value = target === "opencode" ? target : "markdown";
+      if (request !== reviewTargetLoadGeneration) return;
+      const selected = getAvailableReviewTargets(compatibilitySnapshot.value).includes(target) ? target : "markdown";
+      reviewTarget.value = selected;
+      if (selected !== target) await saveReviewTarget(checkoutId, "markdown");
     } catch (cause) {
       if (request === reviewTargetLoadGeneration) reportCause(cause);
     }
@@ -259,19 +309,20 @@ watch(
   },
 );
 
-// v2.0.18 has no turn-completed event, so a finished turn is observed rather than announced.
-// When one is seen the round closes, which is what clears the "rounds not finished" count.
-// What the turn did to each line is judged separately, by the diff.
+// v2.0.18 has no turn-completed event, so OpenCode completions are observed by session.
+let observedCompletedTurns = 0;
 watch(
   () => agent.turnsCompleted,
-  async () => {
-    // A queued round waited for exactly this: the agent is free now, so the reviews held
-    // back while it was busy go out, oldest first.
+  async (completed) => {
+    const sessionIds = agent.completedSessionIds.slice(observedCompletedTurns, completed);
+    observedCompletedTurns = completed;
+    if (!sessionIds.length) return;
     await review.flushQueuedRounds();
-    await review.ackFinishedTurn();
+    for (const sessionId of sessionIds) await review.ackFinishedTurn(sessionId);
   },
 );
-const shellRequest = ref<{ checkoutId: string; token: number } | null>(null);
+
+const shellRequest = ref<{ checkoutId: string; token: number; launch?: TerminalLaunch } | null>(null);
 let shellRequestToken = 0;
 let pendingShellNavigation: { checkoutId: string; token: number; revision: number } | null = null;
 watch(launchCheckoutId, (checkoutId) => {
@@ -1272,7 +1323,9 @@ watch(
 
 onMounted(async () => {
   window.addEventListener("resize", onViewportResize);
+  window.addEventListener("focus", onWindowFocus);
   window.addEventListener("keydown", onAppKeydown, true);
+  void refreshCompatibilitySnapshot();
   const currentWindow = getCurrentWindow();
   try {
     unlistenCloseRequested = await currentWindow.onCloseRequested(async (event) => {
@@ -1344,6 +1397,7 @@ onUnmounted(() => {
   unlistenCloseRequested?.();
   unlistenWindowResized?.();
   window.removeEventListener("resize", onViewportResize);
+  window.removeEventListener("focus", onWindowFocus);
   // The capture flag is part of the registration: a listener removed without it is not the one
   // that was added, and this one would outlive the window it belongs to.
   window.removeEventListener("keydown", onAppKeydown, true);
@@ -1351,6 +1405,10 @@ onUnmounted(() => {
   unlistenFileActivity?.();
   if (inspectorCloseTimer !== undefined) window.clearTimeout(inspectorCloseTimer);
 });
+
+function onWindowFocus() {
+  void refreshCompatibilitySnapshot();
+}
 
 function onViewportResize() {
   viewportWidth.value = window.innerWidth / appZoom.value;
@@ -1709,18 +1767,31 @@ function restoreArchivedWorktrees(repoId: string) {
   });
 }
 
-async function requestShell(checkoutId: string) {
+async function requestShell(checkoutId: string, launch?: TerminalLaunch) {
   const selection = { activeCheckoutId: checkoutId, activeSessionId: null };
   noteTerminalNavigation(selection);
   showView(checkoutId, { kind: "terminal", sessionId: null }, { navigation: false });
   const token = ++shellRequestToken;
   const revision = terminalMovement.navigationRevision;
   pendingShellNavigation = { checkoutId, token, revision };
+  if (launch) {
+    // Launch ownership is the requested checkout, not whichever navigation finishes last. The
+    // terminal request must survive a later navigation, while its stale selection must not.
+    shellRequest.value = { checkoutId, token, launch };
+    void persistCheckoutSelection(checkoutId)
+      .then(() => {
+        if (token === shellRequestToken && revision === terminalMovement.navigationRevision) {
+          workspace.value = { ...workspace.value, ...selection };
+        }
+      })
+      .catch(reportCause);
+    return;
+  }
   try {
     await persistCheckoutSelection(checkoutId);
     if (token !== shellRequestToken || revision !== terminalMovement.navigationRevision) return;
     workspace.value = { ...workspace.value, ...selection };
-    shellRequest.value = { checkoutId, token };
+    shellRequest.value = { checkoutId, token, launch };
   } catch (cause) {
     if (token === shellRequestToken) {
       if (pendingShellNavigation?.token === token) pendingShellNavigation = null;
@@ -1730,11 +1801,9 @@ async function requestShell(checkoutId: string) {
 }
 
 /**
- * Ships the notes the caller chose to one agent session as a single message.
+ * Sends the selected notes to Markdown, an existing OpenCode session, or a new interactive Pi terminal.
  *
- * The round is recorded before the agent is called, so an interrupted send is recognizable
- * afterwards instead of being repeated. The target comes from the bridge, so a review can
- * never land in a session belonging to another checkout.
+ * Pi launch success means only that its terminal opened; OpenCode retains recorded, queued review rounds.
  */
 async function sendReviewToAgent(ids: string[], queue = false) {
   const checkout = activeCheckout.value;
@@ -1753,6 +1822,25 @@ async function sendReviewToAgent(ids: string[], queue = false) {
   });
   sendingReview.value = true;
   try {
+    if (destination !== "markdown") {
+      const checked = await refreshCompatibilitySnapshot();
+      if (!checked) {
+        const message = compatibilityError.value || "Could not verify the installed review destination.";
+        pushToast(message);
+        return;
+      }
+      if (!availableReviewDestinations.value.includes(destination)) {
+        reviewTarget.value = "markdown";
+        try {
+          await saveReviewTarget(checkout.id, "markdown");
+        } catch (cause) {
+          reportCause(cause);
+        }
+        const message = `${destination === "pi" ? "Pi" : "OpenCode"} is no longer detected. Review destination reset to Markdown.`;
+        pushToast(message);
+        return;
+      }
+    }
     if (destination === "markdown") {
       const exported = await exportReviewMarkdown(checkout.id, localTime.date, localTime.timestamp, markdown);
       showView(checkout.id, {
@@ -1763,8 +1851,19 @@ async function sendReviewToAgent(ids: string[], queue = false) {
       });
       return;
     }
+    // No queue and no target to resolve: every Pi send opens its own terminal in this checkout.
+    if (destination === "pi") {
+      await requestShell(checkout.id, {
+        kind: "pi-review",
+        request: { markdown },
+      });
+      return;
+    }
     const target = await resolveAgentTarget();
-    if (!target) return;
+    if (!target) {
+      pushToast("No connected OpenCode session. Start OpenCode and open a session before sending.");
+      return;
+    }
     // `queue` records the round and leaves the agent alone: the message it was accepted
     // with is stored with it, so the flush that runs at the end of the turn sends exactly
     // those bytes, even after a restart.
@@ -1783,7 +1882,7 @@ async function sendReviewToAgent(ids: string[], queue = false) {
 
 async function selectReviewTarget(target: ReviewTarget) {
   const checkoutId = activeCheckout.value?.id;
-  if (!checkoutId) return;
+  if (!checkoutId || !availableReviewDestinations.value.includes(target)) return;
   reviewTargetLoadGeneration += 1;
   reviewTarget.value = target;
   try {
@@ -1795,11 +1894,11 @@ async function selectReviewTarget(target: ReviewTarget) {
 
 /** The session a review goes to: the selected one, otherwise the newest live session. */
 async function resolveAgentTarget(): Promise<string | null> {
-  const target = agent.targetId ?? defaultAgentSession(agent.sessions)?.id ?? null;
-  if (target) return target;
-  // No session yet: start one so the review is not silently dropped.
-  const created = await agent.createSession(`Review ${new Date().toISOString().slice(0, 10)}`);
-  return created?.id ?? null;
+  const target =
+    agent.sessions.find((session) => session.provider === "opencode" && session.id === agent.targetId)?.id ??
+    defaultOpenCodeSession(agent.sessions)?.id ??
+    null;
+  return target;
 }
 
 /**
@@ -1813,6 +1912,9 @@ const reviewSender: ReviewSender = {
   get target() {
     return reviewTarget.value;
   },
+  get availableTargets() {
+    return availableReviewDestinations.value;
+  },
   get sessions() {
     return agent.sessions;
   },
@@ -1821,6 +1923,9 @@ const reviewSender: ReviewSender = {
   },
   get unfinishedRounds() {
     return review.rounds.filter((round) => round.status !== "acked" && round.status !== "relocated").length;
+  },
+  get error() {
+    return review.error;
   },
   selectTarget: (sessionId) => agent.selectTarget(sessionId),
   selectReviewTarget,
@@ -1874,7 +1979,7 @@ function noteTerminalNavigation(
  */
 function terminalShowsSession(checkoutId: string, terminalId: string, sessionId: string): boolean {
   const status = sessionRuntimeStatuses.value[terminalId];
-  if (status?.foregroundApp !== AGENT_APP) return false;
+  if (!status?.foregroundProcess || status.foregroundApp !== AGENT_APP) return false;
   const match = matchAgentSessionTitle(terminalAgents.row(checkoutId).sessions, agentSessionTitle(status));
   return match.kind === "one" && match.session.id === sessionId;
 }
@@ -1900,7 +2005,16 @@ function applyWorkspace(next: WorkspaceState) {
   updateWorkspace(next);
 }
 
-function onShellCreated(token: number, checkoutId: string, sessionId: string) {
+/** Reports the launch result, not whether Pi read or completed the review. */
+function onReviewLaunchOpened() {
+  pushToast("Review opened in Pi", "info");
+}
+
+function onReviewLaunchFailed(message: string) {
+  pushToast(message);
+}
+
+async function onShellCreated(token: number, checkoutId: string, sessionId: string) {
   const pending = pendingShellNavigation;
   if (
     !pending ||
@@ -2201,6 +2315,8 @@ function reportWarning(message: string) {
           @open-folder="chooseFolder"
           @workspace-updated="updatePaneWorkspace"
           @shell-created="onShellCreated"
+          @review-launch-opened="onReviewLaunchOpened"
+          @review-launch-failed="onReviewLaunchFailed"
           @session-status-changed="updateSessionStatus"
           @session-order="updateSessionOrder"
           @update-document-mode="setDocumentMode"
@@ -2293,11 +2409,15 @@ function reportWarning(message: string) {
       :saving="settingsSaving"
       :version="appVersion"
       :review-folder="reviewFolder"
+      :compatibility="compatibilitySnapshot"
+      :compatibility-loading="compatibilityLoading"
+      :compatibility-error="compatibilityError"
       @close="closeSettings"
       @apply="applyFromDialog"
       @open-external-url="openExternalUrl"
       @review-storage-changed="loadReviewFolder"
       @clear-review-folder="requestClearReviewFolder"
+      @refresh-compatibility="refreshCompatibilitySnapshot"
     />
     <!-- After the settings dialog, because it is the only question asked from inside one, and two
          surfaces at the same height are painted in the order they are written: the answer has to

@@ -1163,42 +1163,26 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
     items: orderedSessions(checkout).map((session) => {
       const status = props.sessionRuntimeStatuses[session.id];
       const app = status?.foregroundApp;
-      /**
-       * The session this terminal is showing, read from this terminal's own title.
-       *
-       * Two conditions, both about this row rather than about the worktree, and both refused rather
-       * than relaxed: the runtime has to confirm OpenCode is the program in front of this terminal
-       * right now (`agentSessionTitle`), and the title that program wrote has to name exactly one
-       * session (`matchAgentSessionTitle`). The list it is matched against is the service's whole
-       * one, because a terminal's session is not necessarily in the worktree the row is filed under
-       * — a terminal under this repository routinely has its session open in a worktree beside it.
-       * The match is inference, not a mapping the service confirms — `matchAgentSessionTitle` says
-       * what cannot be told apart here — so anything but one named session draws no state rather
-       * than a borrowed one, and the two refusals are told apart in words.
-       */
-      const agentTerminal = app === AGENT_APP;
-      const match = agentTerminal
-        ? matchAgentSessionTitle(props.agentRows[checkout.id]?.sessions ?? [], agentSessionTitle(status))
-        : null;
+      const candidates = props.agentRows[checkout.id]?.sessions ?? [];
+      const foregroundProcess = status?.foregroundProcess === true;
+      const openCodeTerminal = foregroundProcess && app === AGENT_APP;
+      const piTerminal = foregroundProcess && app === "pi";
+      const match = openCodeTerminal ? matchAgentSessionTitle(candidates, agentSessionTitle(status)) : null;
       const identified = match?.kind === "one" ? match.session : null;
+      const agentTerminal = Boolean(identified) || openCodeTerminal || piTerminal;
       const unidentified = match?.kind === "ambiguous" ? AMBIGUOUS_AGENT_SESSION : NO_AGENT_SESSION;
-      /**
-       * One attention for the whole row, and the session's own answer wins.
-       *
-       * A session the service reports as running is working whether or not it has an agent to name.
-       * Pending replies are carried independently of the agent. `attention` only exists when an
-       * agent can be named, so reading it alone drew a
-       * running turn as idle grey: the row said nothing was happening while the service said a turn
-       * was open. A session that names no agent and runs no turn is idle, which is a fact rather than
-       * a shrug.
-       */
-      const attention: AgentAttention = identified
-        ? identified.awaitingReply
-          ? "blocked"
-          : (identified.agent?.attention ?? (identified.running ? "busy" : "none"))
-        : "none";
+      const attention: AgentAttention = identified?.attention ?? "none";
       const pendingUnknown = identified?.awaitingReply === null;
-      const agent = identified && !pendingUnknown ? AGENT_STATE[attention] : undefined;
+      const piTaskState = piTerminal ? status?.piTaskState : undefined;
+      const piState =
+        piTaskState === "working"
+          ? { state: "working" as const, text: "Working" }
+          : piTaskState === "error"
+            ? { state: "failed" as const, text: "Last task failed" }
+            : piTaskState === "done"
+              ? { state: "idle" as const, text: "Task complete" }
+              : undefined;
+      const agent = identified && !pendingUnknown ? AGENT_STATE[attention] : piState;
       /**
        * OpenCode's colour for this session's agent, on every state but a failed turn.
        *
@@ -1215,35 +1199,13 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
         canMove: canMoveTo(session),
         active: session.id === props.activeSessionId,
         dimmed: session.id === props.activeSessionId && !showingTerminal.value,
-        /**
-         * The row's name, which `sessionRowTitle` writes: the session this terminal is showing when
-         * its own title names one, the program in front of the shell otherwise, and the name it was
-         * opened with — or renamed to — when nothing is. Nothing about the workdir: that is the
-         * muted half beside it, and it is there so two identical shells are not identical rows.
-         */
         title: sessionRowTitle(session, status),
-        detail: identified ? (identified.agent?.label ?? NO_AGENT_SESSION) : agentTerminal ? unidentified : undefined,
-        /**
-         * The glyph and its colour, which between them are the whole of the row's state.
-         *
-         * - An identified OpenCode session wears its own agent colour while working, idle or asking.
-         *   The spinner still moves while it works and the question mark says what a waiting turn is
-         *   doing; a failed turn keeps its danger colour, because that one is the row's own news.
-         * - A plain terminal with something in front of the shell is a process that is up, which is
-         *   green and which nothing else in the panel is.
-         * - A plain terminal whose last command failed is red. The backend cannot see that at all: the
-         *   command did not kill the shell, so it is a grandchild of the process the app spawns and no
-         *   `waitpid` reaches it. The answer arrives from the OSC 133 hook (`services/terminal.rs`) as
-         *   `lastCommandExit`, read *before* the foreground process, because a session with a failed
-         *   command behind it is exactly the row that must be red. The hook clears the field when the
-         *   next command starts, so red means "the last command you ran failed" and green means one is
-         *   in front of you now. A shell that has exited stays idle whatever code it left with: the
-         *   panel already names that state in the row's accessible name, and the colour is for the
-         *   thing nothing else can report.
-         * - Everything else is idle: an agent without its own colour and a terminal are grey. An
-         *   OpenCode whose session nobody identified lands here too, which is why it also says
-         *   `sin sesión` — a colour cannot say "nothing was observed" without lying about the state.
-         */
+        detail: identified
+          ? (identified.agent?.label ?? NO_AGENT_SESSION)
+          : openCodeTerminal
+            ? unidentified
+            : undefined,
+        /** Pi task state is read only while Pi is the foreground process. */
         icon: agentTerminal
           ? agent?.state === "working"
             ? WORKDIR_ICONS.working
@@ -1273,7 +1235,7 @@ function toWorkdir(repo: Repo, checkout: Checkout): Workdir {
           ? "Session state unavailable"
           : agent
             ? agent.text
-            : agentTerminal
+            : openCodeTerminal
               ? match?.kind === "ambiguous"
                 ? "Several sessions share this name"
                 : "Session not identified"

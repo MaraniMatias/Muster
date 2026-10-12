@@ -6,7 +6,7 @@ import {
   agentAttention,
   agentColor,
   agentLabel,
-  defaultAgentSession,
+  defaultOpenCodeSession,
   headlineSession,
   isTurnEvent,
 } from "../domain/agent";
@@ -21,7 +21,7 @@ import {
   stopAgent,
 } from "../lib/ipc";
 
-/** Name of the Tauri event the bridge emits normalized agent events on. */
+/** Name of the Tauri event emitted for normalized OpenCode events. */
 export const AGENT_EVENT = "muster://agent-event";
 
 /** What a row says about the agent: which one, in OpenCode's color, and how loudly. */
@@ -49,6 +49,8 @@ export interface ActiveAgentSessions {
    * consumers that need to re-check a finished turn watch this.
    */
   turnsCompleted: number;
+  /** OpenCode session IDs whose running-to-idle transitions were observed. */
+  completedSessionIds: string[];
   reload(): Promise<boolean>;
   createSession(title: string): Promise<AgentSession | null>;
   selectTarget(sessionId: string | null): void;
@@ -92,13 +94,13 @@ function errorText(cause: unknown): string {
  * `wasRunning` is updated in place because it is the only record of what the previous read said:
  * A pending reply is not completion, even when the service no longer reports running.
  */
-function settledTurns(sessions: AgentSession[], wasRunning: Set<string>): number {
-  let settled = 0;
+function settledTurns(sessions: AgentSession[], wasRunning: Set<string>): string[] {
+  const settled: string[] = [];
   for (const session of sessions) {
     if (session.running || session.awaitingReply) {
       wasRunning.add(session.id);
     } else if (wasRunning.delete(session.id)) {
-      settled += 1;
+      settled.push(session.id);
     }
   }
   // A session the service no longer lists cannot be running, so it cannot still be owed a turn.
@@ -159,7 +161,7 @@ export function useAgentSessions(
   let refreshAgain = false;
   /** Whether the scope that owns the event subscription is already gone. */
   let disposed = false;
-  /** The bridge's own release for the one subscription this hook holds, once it has answered. */
+  /** The listener release for the one subscription this hook holds, once it has answered. */
   let unlistenAgentEvents: (() => void) | undefined;
   /**
    * Sessions the service reported as running at the previous read.
@@ -179,6 +181,7 @@ export function useAgentSessions(
     error: "",
     events: [],
     turnsCompleted: 0,
+    completedSessionIds: [],
   });
 
   /**
@@ -236,11 +239,13 @@ export function useAgentSessions(
     try {
       const sessions = await listAgentSessions(checkoutId);
       if (disposed || state.checkoutId !== checkoutId || request !== generation) return false;
-      state.turnsCompleted += settledTurns(sessions, wasRunning);
+      const completed = settledTurns(sessions, wasRunning);
+      state.turnsCompleted += completed.length;
+      state.completedSessionIds = [...state.completedSessionIds, ...completed];
       state.sessions = sessions;
       // Keep an explicit choice only while it still exists; otherwise follow the newest.
       if (!state.targetId || !state.sessions.some((session) => session.id === state.targetId)) {
-        state.targetId = defaultAgentSession(state.sessions)?.id ?? null;
+        state.targetId = defaultOpenCodeSession(state.sessions)?.id ?? null;
       }
       state.state = "ready";
       state.error = "";
@@ -347,7 +352,7 @@ export function useAgentSessions(
         state.sessions = sessions;
         // Seeded rather than counted: there is no previous read for this checkout to differ from.
         recordRunning(sessions, wasRunning);
-        state.targetId = defaultAgentSession(sessions)?.id ?? null;
+        state.targetId = defaultOpenCodeSession(sessions)?.id ?? null;
         state.state = "ready";
         await refreshAgentsBehind(sessions);
       } catch (cause) {
@@ -437,7 +442,18 @@ export interface TerminalAgentSession {
   readonly id: string;
   /** The session's own title, which is what its TUI writes into the terminal title. */
   title: string;
-  /** The agent running it, with the color OpenCode paints it with, absent when the session has none. */
+  /**
+   * How loudly this session wants for attention, read from the session rather than from its agent.
+   *
+   * It is separate from the agent label because attention is meaningful even when a session has
+   * no agent name yet.
+   */
+  attention: AgentAttention;
+  /**
+   * The agent running it, with the color OpenCode paints it with.
+   *
+   * Absent when an OpenCode session has not run an agent yet.
+   */
   agent: AgentHeadline | null;
   /** Whether the service reports a turn running in this session right now. */
   running: boolean;
@@ -480,24 +496,25 @@ export interface TerminalAgentRows {
  * `"all"` asks about every checkout that has a terminal, which is the only right question once
  * nothing is running: a turn can have started in the person's own TUI and nothing on this stream
  * says so. `"busy"` asks only about the checkouts with a turn running in them, which is all that
- * the fast poll can have changed.
+ * the fast poll can have changed. `{ checkoutId }` asks about one checkout, which is what an event
+ * names: it carries the checkout it happened in, and asking every worktree about one terminal's
+ * turn is what this scope exists to avoid.
  */
-type RefreshScope = "all" | "busy";
+type RefreshScope = "all" | "busy" | { checkoutId: string };
 
 /**
  * A cheap description of what a row would draw, so an answer that draws the same row is not written.
  *
- * It covers everything a terminal row reads out of its entry — the id a reported move is checked
- * against, the title it matches on, the agent it names, whether it is working or awaiting a reply,
- * and the clock in its trailing slot — and nothing else, because the row is only ever read and a
- * finer comparison would settle nothing.
+ * It covers everything a terminal row reads out of its entry — the id, title, agent, attention,
+ * running and reply state, and the clock in its trailing slot —
+ * and nothing else, because the row is only ever read and a finer comparison would settle nothing.
  */
 function rowSignature(entry: TerminalAgentRow): string {
   return entry.sessions
     .map((session) => {
       const agent = session.agent;
-      const named = agent ? `${agent.label}/${agent.color}/${agent.attention}` : "";
-      return `${session.id}|${session.title}|${named}|${session.running}|${session.awaitingReply}|${session.updatedAt}`;
+      const named = agent ? `${agent.label}/${agent.color}` : "";
+      return `${session.id}|${session.title}|${named}|${session.attention}|${session.running}|${session.awaitingReply}|${session.updatedAt}`;
     })
     .join("\n");
 }
@@ -524,6 +541,8 @@ export function useTerminalAgentRows(checkoutIds: ComputedRef<string[]>): Termin
   let againAll = false;
   /** Whether the scope that owns these two polls is already gone. */
   let disposed = false;
+  /** The listener release for the one event subscription this hook holds, once it has answered. */
+  let unlistenAgentEvents: (() => void) | undefined;
   /** The callers whose ask was folded into the queued pass, told once that pass has answered. */
   const waiting: Array<() => void> = [];
   /** What each published row drew, so an answer that would draw the same row is not written. */
@@ -537,20 +556,18 @@ export function useTerminalAgentRows(checkoutIds: ComputedRef<string[]>): Termin
   async function read(checkoutId: string): Promise<TerminalAgentRow> {
     // The repository-wide list, not the worktree's own: a terminal's session is not necessarily
     // located in the worktree the terminal is filed under, and a row that cannot name its session
-    // draws no state at all. Nothing here is trusted on its own — the row matches a title and refuses
-    // an ambiguous one.
+    // draws no state at all. Title inference refuses ambiguous matches.
     const sessions = await listAgentCandidateSessions(checkoutId);
     const agents = await listAgentAgents(checkoutId).catch(() => [] as AgentAgent[]);
-    // Every session is offered, and no headline is picked: the terminal row is about one terminal,
-    // and the only thing that can say which session that terminal has open is the title the
-    // terminal's own TUI wrote into it. It matches against this list by title
-    // (`matchAgentSessionTitle`), and a terminal that names none — or several — draws no state.
+    // A terminal row matches the title its own OpenCode TUI wrote into it. A missing or ambiguous
+    // title draws no session state.
     return {
       sessions: sessions.map((session) => {
         const label = agentLabel(agents, session.agent);
         return {
           id: session.id,
           title: session.title,
+          attention: agentAttention(session),
           agent: label ? { label, color: agentColor(agents, session.agent), attention: agentAttention(session) } : null,
           running: session.running,
           awaitingReply: session.awaitingReply,
@@ -584,7 +601,12 @@ export function useTerminalAgentRows(checkoutIds: ComputedRef<string[]>): Termin
       busy.delete(checkoutId);
       published.delete(checkoutId);
     }
-    const asked = scope === "busy" ? wanted.filter((checkoutId) => busy.has(checkoutId)) : wanted;
+    const asked =
+      scope === "busy"
+        ? wanted.filter((checkoutId) => busy.has(checkoutId))
+        : scope === "all"
+          ? wanted
+          : wanted.filter((checkoutId) => checkoutId === scope.checkoutId);
     const read_ = await Promise.all(
       asked.map(async (checkoutId) => {
         try {
@@ -633,7 +655,10 @@ export function useTerminalAgentRows(checkoutIds: ComputedRef<string[]>): Termin
     if (disposed) return Promise.resolve();
     if (refreshing) {
       refreshAgain = true;
-      againAll ||= scope === "all";
+      // A queued ask that is not "busy" widens the pass behind it rather than being dropped by it,
+      // and an event names one checkout: two checkouts can each queue an event inside the same
+      // in-flight read, and keeping only the last of them would leave the other one's row stale.
+      againAll ||= scope !== "busy";
       // Answered by the pass behind the one on its way, because that is the pass that will report
       // for this ask: a read that began before it cannot. Held until the queue drains, so a caller
       // that folded two asks into one pass is not told they are done before either of them ran.
@@ -688,10 +713,41 @@ export function useTerminalAgentRows(checkoutIds: ComputedRef<string[]>): Termin
    */
   const slowTimer = setInterval(() => void reload("all"), SLOW_POLL_MS);
 
+  /**
+   * Re-reads the one checkout an event happened in, instead of waiting for the slow pass.
+   *
+   * A sidebar row is about one terminal in one worktree, and the reader of those rows covers every
+   * worktree at once rather than the selected one, so an event for a worktree nobody has open still
+   * changes something on screen. The two polls are the floor under this, not the mechanism: the fast
+   * one only asks about checkouts already known to be busy, which is exactly the set an OpenCode
+   * turn that just started is not in yet, and the slow one runs every few seconds.
+   *
+   * Turn and session lifecycle events are handled here: the read is the authority on state and the
+   * event can arrive before the service's answer catches up.
+   */
+  void listen<AgentEvent>(AGENT_EVENT, ({ payload }) => {
+    if (!checkoutIds.value.includes(payload.checkoutId)) return;
+    if (!isTurnEvent(payload.kind) && !payload.rawType.startsWith("session.")) return;
+    void reload({ checkoutId: payload.checkoutId });
+  })
+    .then((dispose) => {
+      // The scope can be gone before the bridge answers, in which case nothing is left to receive
+      // events and the subscription would outlive the rows that asked for it.
+      if (disposed) dispose();
+      else unlistenAgentEvents = dispose;
+    })
+    .catch(() => {
+      // No subscription, rather than a hook that cannot be built: both polls keep every row current
+      // on their own, so this costs live events and nothing else. The rejection is taken here
+      // because an unhandled one takes the effect scope with it.
+    });
+
   onScopeDispose(() => {
     disposed = true;
     clearInterval(pollTimer);
     clearInterval(slowTimer);
+    unlistenAgentEvents?.();
+    unlistenAgentEvents = undefined;
     // Nobody is left waiting on a pass that a released scope will never run.
     for (const resolve of waiting.splice(0)) resolve();
   });

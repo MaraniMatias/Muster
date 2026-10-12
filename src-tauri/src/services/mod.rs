@@ -6,6 +6,7 @@ pub mod folder;
 pub mod git;
 pub mod opencode;
 pub mod opener;
+pub mod pi_launch;
 pub mod review;
 pub mod review_round;
 pub mod terminal;

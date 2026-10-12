@@ -193,6 +193,65 @@ describe("useReviewNotes", () => {
     expect(mocks.dispatchReviewRound).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes ambiguous dispatch errors without retrying the claim", async () => {
+    mocks.listReviewNotes.mockClear();
+    mocks.listReviewRounds.mockClear();
+    mocks.dispatchReviewRound.mockClear();
+    const persistedRound = {
+      id: "round:uncertain",
+      checkoutId: "checkout:first",
+      sessionId: "ses_one",
+      status: "dispatching" as const,
+      marker: "muster-review:round:uncertain",
+      noteIds: ["note:1"],
+      createdAt: "1",
+      updatedAt: "2",
+    };
+    mocks.listReviewNotes
+      .mockResolvedValueOnce([note()])
+      .mockResolvedValueOnce([note({ status: "sent", roundId: persistedRound.id })]);
+    mocks.listReviewRounds.mockResolvedValueOnce([]).mockResolvedValueOnce([persistedRound]);
+    mocks.dispatchReviewRound.mockRejectedValue(new Error("prompt response was lost"));
+    const state = useReviewNotes(harness().checkout, harness().repo);
+    await settle();
+
+    expect(await state.dispatchRound("ses_one", ["note:1"], "# Code Review")).toBeNull();
+    expect(mocks.dispatchReviewRound).toHaveBeenCalledTimes(1);
+    expect(state.rounds).toEqual([persistedRound]);
+    expect(state.notes[0]).toMatchObject({ status: "sent", roundId: persistedRound.id });
+    expect(state.error).toBe("prompt response was lost");
+  });
+
+  it("does not apply an ambiguous dispatch refresh after checkout navigation", async () => {
+    let resolveRounds!: (rounds: never[]) => void;
+    let resolveNotes!: (notes: ReviewNote[]) => void;
+    mocks.listReviewNotes
+      .mockResolvedValueOnce([note()])
+      .mockReturnValueOnce(new Promise((resolve) => (resolveNotes = resolve)))
+      .mockResolvedValueOnce([note({ id: "note:second", checkoutId: "checkout:second" })]);
+    mocks.listReviewRounds
+      .mockResolvedValueOnce([])
+      .mockReturnValueOnce(new Promise((resolve) => (resolveRounds = resolve)))
+      .mockResolvedValueOnce([]);
+    mocks.dispatchReviewRound.mockRejectedValue(new Error("response lost"));
+    const refs = harness();
+    const state = useReviewNotes(refs.checkout, refs.repo);
+    await settle();
+
+    const dispatch = state.dispatchRound("ses_one", ["note:1"], "# Code Review");
+    await settle();
+    refs.checkoutRef.value = second;
+    await settle();
+    resolveRounds([]);
+    resolveNotes([note({ status: "sent", roundId: "round:old" })]);
+    await dispatch;
+    await settle();
+
+    expect(state.checkoutId).toBe("checkout:second");
+    expect(state.notes.map((item) => item.id)).toEqual(["note:second"]);
+    expect(state.rounds).toEqual([]);
+  });
+
   it("holds a round back when the user asks to wait for the agent", async () => {
     mocks.listReviewNotes.mockResolvedValueOnce([note()]).mockResolvedValueOnce([note({ status: "sent" })]);
     mocks.dispatchReviewRound.mockResolvedValue({
@@ -320,12 +379,13 @@ describe("useReviewNotes", () => {
     expect(state.notes[0].status).toBe("resolved");
   });
 
-  it("closes the newest confirmed round when the agent's turn finished", async () => {
+  it("closes the newest confirmed OpenCode round when the agent's turn finished", async () => {
     mocks.listReviewNotes.mockResolvedValue([note({ status: "sent" })]);
     mocks.listReviewRounds.mockResolvedValue([
       {
         id: "round:live",
         checkoutId: "checkout:first",
+        provider: "opencode",
         sessionId: "ses_one",
         status: "dispatched",
         marker: "muster-review:round:live",
@@ -334,8 +394,20 @@ describe("useReviewNotes", () => {
         updatedAt: "1",
       },
       {
+        id: "round:other-session",
+        checkoutId: "checkout:first",
+        provider: "opencode",
+        sessionId: "ses_still_running",
+        status: "dispatched",
+        marker: "muster-review:round:other",
+        noteIds: ["note:1"],
+        createdAt: "1",
+        updatedAt: "1",
+      },
+      {
         id: "round:done",
         checkoutId: "checkout:first",
+        provider: "opencode",
         sessionId: "ses_one",
         status: "acked",
         marker: "muster-review:round:done",
@@ -347,6 +419,7 @@ describe("useReviewNotes", () => {
     mocks.ackReviewRound.mockResolvedValue({
       id: "round:live",
       checkoutId: "checkout:first",
+      provider: "opencode",
       sessionId: "ses_one",
       status: "acked",
       marker: "muster-review:round:live",
@@ -357,12 +430,12 @@ describe("useReviewNotes", () => {
     const state = useReviewNotes(harness().checkout, harness().repo);
     await settle();
 
-    const acked = await state.ackFinishedTurn();
-    // Only the live one closes; an already acked round is not touched again.
+    const acked = await state.ackFinishedTurn("ses_one");
+    // Only the newest dispatched round for this session closes; other-session and acked rounds stay unchanged.
     expect(acked?.id).toBe("round:live");
     expect(mocks.ackReviewRound).toHaveBeenCalledTimes(1);
     expect(mocks.ackReviewRound).toHaveBeenCalledWith("checkout:first", "round:live");
-    expect(state.rounds.every((item) => item.status === "acked")).toBe(true);
+    expect(state.rounds.find((item) => item.id === "round:other-session")?.status).toBe("dispatched");
   });
 
   it("surfaces failures and keeps the notes readable", async () => {

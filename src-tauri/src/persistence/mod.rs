@@ -15,8 +15,10 @@ use crate::domain::workspace::{
     WorkspaceState,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 18;
 const REVIEW_NOTE_COLUMNS: &str = "id, checkout_id, path, side, line_start, line_end, content, code, status, code_hash, outdated, round_id, created_at, updated_at";
+const REVIEW_ROUND_COLUMNS: &str =
+    "id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at";
 const ACTIVE_CHECKOUT: &str = "active_checkout_id";
 const ACTIVE_SESSION: &str = "active_session_id";
 const WORKTREE_LOCATION: &str = "worktree_location";
@@ -1021,17 +1023,20 @@ impl Database {
         Ok(state)
     }
 
+    /// Which program a checkout's reviews are delivered to, or `markdown` when it exports.
+    ///
+    /// Each installed agent opens its own path to the same place.
     pub fn review_target(&self, checkout_id: &str) -> Result<String, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let key = format!("review_target:{checkout_id}");
         Ok(match get_preference(&connection, &key)?.as_deref() {
-            Some("opencode") => "opencode".into(),
+            Some(stored @ ("opencode" | "pi")) => stored.into(),
             _ => "markdown".into(),
         })
     }
 
     pub fn set_review_target(&self, checkout_id: &str, target: &str) -> Result<(), String> {
-        if !matches!(target, "markdown" | "opencode") {
+        if !matches!(target, "markdown" | "opencode" | "pi") {
             return Err("review target is not supported".into());
         }
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
@@ -1790,13 +1795,29 @@ impl Database {
         let updated_at = timestamp();
         let changed = connection
             .execute(
-                "UPDATE review_notes SET content = ?1, status = 'draft', updated_at = ?2
-                 WHERE id = ?3 AND checkout_id = ?4",
+                "UPDATE review_notes SET content = ?1, status = 'draft', round_id = NULL, updated_at = ?2
+                 WHERE id = ?3 AND checkout_id = ?4
+                   AND (round_id IS NULL OR EXISTS (
+                       SELECT 1 FROM review_rounds
+                       WHERE id = review_notes.round_id
+                         AND status NOT IN ('queued', 'dispatching', 'dispatched')
+                   ))",
                 params![content, updated_at, id, checkout_id],
             )
             .map_err(db_error)?;
         if changed == 0 {
-            return Err("review note does not belong to the requested checkout".into());
+            let owned: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM review_notes WHERE id = ?1 AND checkout_id = ?2)",
+                    params![id, checkout_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            return Err(if owned {
+                "review note belongs to an unfinished review round".into()
+            } else {
+                "review note does not belong to the requested checkout".into()
+            });
         }
         self.read_review_note_by_id(&connection, id)
     }
@@ -1805,12 +1826,28 @@ impl Database {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let deleted = connection
             .execute(
-                "DELETE FROM review_notes WHERE id = ?1 AND checkout_id = ?2",
+                "DELETE FROM review_notes WHERE id = ?1 AND checkout_id = ?2
+                 AND (round_id IS NULL OR EXISTS (
+                     SELECT 1 FROM review_rounds
+                     WHERE id = review_notes.round_id
+                       AND status NOT IN ('queued', 'dispatching', 'dispatched')
+                 ))",
                 params![id, checkout_id],
             )
             .map_err(db_error)?;
         if deleted == 0 {
-            return Err("review note does not belong to the requested checkout".into());
+            let owned: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM review_notes WHERE id = ?1 AND checkout_id = ?2)",
+                    params![id, checkout_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            return Err(if owned {
+                "review note belongs to an unfinished review round".into()
+            } else {
+                "review note does not belong to the requested checkout".into()
+            });
         }
         Ok(())
     }
@@ -1934,13 +1971,31 @@ impl Database {
                 .execute(
                     "UPDATE review_notes
                      SET status = 'sent', round_id = ?1, updated_at = ?2
-                     WHERE id = ?3 AND checkout_id = ?4",
+                     WHERE id = ?3 AND checkout_id = ?4 AND status != 'resolved'
+                       AND (round_id IS NULL OR EXISTS (
+                           SELECT 1 FROM review_rounds
+                           WHERE id = review_notes.round_id
+                             AND status NOT IN ('queued', 'dispatching', 'dispatched')
+                       ))",
                     params![round.id, round.updated_at, id, round.checkout_id],
                 )
                 .map_err(db_error)?;
             if linked == 0 {
+                let status = transaction
+                    .query_row(
+                        "SELECT status FROM review_notes WHERE id = ?1 AND checkout_id = ?2",
+                        params![id, round.checkout_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                let error = match status.as_deref() {
+                    None => "review note does not belong to the requested checkout",
+                    Some("resolved") => "review note is resolved",
+                    Some(_) => "review note is claimed by an unfinished review round or has an invalid round link",
+                };
                 let _ = transaction.rollback();
-                return Err("review note does not belong to the requested checkout".into());
+                return Err(error.into());
             }
         }
         transaction.commit().map_err(db_error)?;
@@ -1976,10 +2031,10 @@ impl Database {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let rounds = {
             let mut statement = connection
-                .prepare(
-                    "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                     FROM review_rounds WHERE checkout_id = ?1 ORDER BY created_at DESC, rowid DESC",
-                )
+                .prepare(&format!(
+                    "SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds
+                     WHERE checkout_id = ?1 ORDER BY created_at DESC, rowid DESC"
+                ))
                 .map_err(db_error)?;
             let collected = statement
                 .query_map([checkout_id], read_review_round)
@@ -2012,42 +2067,14 @@ impl Database {
         }
         connection
             .query_row(
-                "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                 FROM review_rounds WHERE id = ?1",
+                &format!("SELECT {REVIEW_ROUND_COLUMNS} FROM review_rounds WHERE id = ?1"),
                 [id],
                 read_review_round,
             )
             .map_err(db_error)
     }
 
-    pub fn set_review_round_session(
-        &self,
-        id: &str,
-        checkout_id: &str,
-        session_id: &str,
-    ) -> Result<ReviewRound, String> {
-        let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let changed = connection
-            .execute(
-                "UPDATE review_rounds SET session_id = ?1, updated_at = ?2
-                 WHERE id = ?3 AND checkout_id = ?4",
-                params![session_id, timestamp(), id, checkout_id],
-            )
-            .map_err(db_error)?;
-        if changed == 0 {
-            return Err("review round does not belong to the requested checkout".into());
-        }
-        connection
-            .query_row(
-                "SELECT id, checkout_id, session_id, status, marker, note_ids, created_at, updated_at
-                 FROM review_rounds WHERE id = ?1",
-                [id],
-                read_review_round,
-            )
-            .map_err(db_error)
-    }
-
-    /// Puts every still-pending round of the checkout back to `queued`.
+    /// Puts every interrupted round of the checkout back to `queued`.
     pub fn requeue_review_rounds(&self, checkout_id: &str) -> Result<usize, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         connection
@@ -2481,7 +2508,7 @@ fn create_schema(connection: &Connection) -> Result<(), String> {
             CREATE TABLE review_rounds (
                 id TEXT PRIMARY KEY NOT NULL,
                 checkout_id TEXT NOT NULL REFERENCES checkouts(id) ON DELETE CASCADE,
-                session_id TEXT,
+                session_id TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (
                     status IN ('queued', 'dispatching', 'dispatched', 'acked', 'relocated')
                 ),
@@ -2966,7 +2993,7 @@ mod tests {
         let round = ReviewRound {
             id: id.into(),
             checkout_id: checkout_id.into(),
-            session_id: Some("session:historic".into()),
+            session_id: "session:historic".into(),
             status: status.into(),
             marker: format!("muster-review:{id}"),
             note_ids: vec![note_id],
@@ -2993,7 +3020,7 @@ mod tests {
         let note_id = format!("note:{id}");
         assert_eq!(round.checkout_id, checkout_id);
         assert_eq!(round.status, status);
-        assert_eq!(round.session_id.as_deref(), Some("session:historic"));
+        assert_eq!(round.session_id, "session:historic");
         assert_eq!(round.note_ids.as_slice(), std::slice::from_ref(&note_id));
         assert_eq!(round.marker, format!("muster-review:{id}"));
         assert_eq!(
@@ -3090,11 +3117,11 @@ mod tests {
     /// A file with no stamp gets the whole schema, a file already stamped with this build's
     /// version is left alone, and a file from any other version is refused by name.
     #[test]
-    fn a_fresh_file_gets_schema_15_and_a_foreign_one_is_refused() {
+    fn a_fresh_file_gets_schema_18_and_a_foreign_one_is_refused() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("workspace.sqlite3");
         let database = Database::open(&path).expect("fresh database");
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 18);
         let checkout_path = temp.path().join("checkout");
         fs::create_dir(&checkout_path).unwrap();
         let repo = plain_repo(&checkout_path, "now");
@@ -3143,15 +3170,15 @@ mod tests {
                 .execute_batch(
                     "CREATE TABLE preserved (value TEXT NOT NULL);
                      INSERT INTO preserved VALUES ('keep');
-                     PRAGMA user_version = 14;",
+                     PRAGMA user_version = 15;",
                 )
                 .unwrap();
         }
         let error = Database::open(&foreign_path)
             .err()
             .expect("a file from another schema version is refused");
-        assert!(error.contains("schema version 14"), "{error}");
-        assert!(error.contains("this build speaks version 15"), "{error}");
+        assert!(error.contains("schema version 15"), "{error}");
+        assert!(error.contains("this build speaks version 18"), "{error}");
         assert!(error.contains("deleting"), "{error}");
         assert!(error.contains("empty workspace"), "{error}");
 
@@ -3160,7 +3187,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            14
+            15
         );
         assert_eq!(
             connection
@@ -3484,6 +3511,13 @@ mod tests {
             .set_review_target("checkout:one", "opencode")
             .unwrap();
         assert_eq!(database.review_target("checkout:one").unwrap(), "opencode");
+        // Pi remains an independent review destination even though it has no agent session list.
+        database.set_review_target("checkout:one", "pi").unwrap();
+        assert_eq!(database.review_target("checkout:one").unwrap(), "pi");
+        database
+            .set_review_target("checkout:one", "markdown")
+            .unwrap();
+        assert_eq!(database.review_target("checkout:one").unwrap(), "markdown");
         assert_eq!(database.review_target("checkout:two").unwrap(), "markdown");
         assert!(database.set_review_target("checkout:one", "codex").is_err());
         database
@@ -3498,6 +3532,33 @@ mod tests {
         assert_eq!(
             database.review_target("checkout:three").unwrap(),
             "markdown"
+        );
+    }
+
+    #[test]
+    fn a_review_round_and_its_prompt_survive_a_restart() {
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("checkout");
+        fs::create_dir(&folder).unwrap();
+        let path = temp.path().join("workspace.sqlite3");
+        let repo = plain_repo(&folder, "now");
+        let checkout_id = repo.checkouts[0].id.clone();
+        let database = Database::open(&path).unwrap();
+        database.register_plain_repo(repo).unwrap();
+        let expected = add_round(&database, &checkout_id, "round:one", "dispatched");
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.review_rounds(&checkout_id).unwrap(),
+            vec![expected]
+        );
+        assert_eq!(
+            reopened
+                .review_round_prompt("round:one", &checkout_id)
+                .unwrap()
+                .as_deref(),
+            Some("saved review prompt")
         );
     }
 

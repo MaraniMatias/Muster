@@ -20,6 +20,7 @@ import type { AppLayoutState, CheckoutUiState } from "../domain/ui-state";
 import type { AppSettings, ReviewStorageMode } from "../domain/settings";
 import type { AgentAgent, AgentRelocation, AgentSession } from "../domain/agent";
 import type { DocumentOrigin } from "../domain/main-document";
+import type { CompatibilitySnapshot } from "../domain/compatibility";
 
 export interface CreatedTerminal {
   session: Session;
@@ -271,6 +272,37 @@ export function dispatchReviewRound(request: {
   return invoke<ReviewRound>("review_round_dispatch", { request });
 }
 
+/**
+ * What a terminal has to be opened with when it is a Pi receiving a review.
+ *
+ * Travels with the terminal view rather than being sent from the diff: the Pi's output belongs to
+ * the terminal that runs it, so the terminal is what has to exist before there is anything to read.
+ */
+export interface ReviewLaunch {
+  markdown: string;
+}
+
+export type TerminalLaunch = { kind: "pi-review"; request: ReviewLaunch };
+
+/**
+ * Opens an interactive Pi in a terminal of this checkout with the review already in front of it.
+ *
+ * No session and no queue: each send opens a new interactive Pi terminal with a private `@file` prompt.
+ * Success means that terminal was opened, not that Pi confirmed reading the review.
+ */
+export function launchPiReviewTerminal(
+  request: ReviewLaunch,
+  checkoutId: string,
+  cols: number,
+  rows: number,
+  onOutput: Channel<ArrayBuffer>,
+): Promise<CreatedTerminal> {
+  return invoke("review_launch_pi", {
+    request: { checkoutId, ...request, cols, rows },
+    onOutput,
+  });
+}
+
 /** Sends the rounds held back while the agent was busy. Returns how many went out. */
 export function flushReviewRounds(checkoutId: string): Promise<number> {
   return invoke<number>("review_round_flush", { checkoutId });
@@ -392,6 +424,10 @@ export function selectCheckout(checkoutId: string | null): Promise<WorkspaceStat
 
 export function selectSession(sessionId: string | null): Promise<WorkspaceState> {
   return invoke<WorkspaceState>("select_session", { sessionId });
+}
+
+export function getCompatibilitySnapshot(): Promise<CompatibilitySnapshot> {
+  return invoke<CompatibilitySnapshot>("compatibility_snapshot");
 }
 
 export function createTerminal(

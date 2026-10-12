@@ -86,26 +86,15 @@ pub fn create_with_settings(
     output: OutputSink,
 ) -> Result<CreatedTerminal, String> {
     let TerminalOptions { cols, rows, prompt } = options;
-    let cwd = database.terminal_checkout_path(checkout_id)?;
+    // Refused before anything is written for this terminal, so a checkout that is not there cannot
+    // leave a shell-integration script behind on the way to being told so.
+    database.terminal_checkout_path(checkout_id)?;
     reject_prompt(prompt.as_deref())?;
     let mut program = inherited_shell();
     let name = program
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "shell".into());
-    let session = Session {
-        id: format!(
-            "session:terminal:{}-{}-{}",
-            timestamp(),
-            std::process::id(),
-            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-        ),
-        session_type: SessionType::Shell,
-        checkout_id: checkout_id.to_string(),
-        name,
-        created_at: timestamp(),
-        status: SessionStatus::Active,
-    };
 
     let mut args = inherited_shell_args(&program);
     // Resolved before the spawn because `program` is moved into it below, and the hook text is a
@@ -122,21 +111,86 @@ pub fn create_with_settings(
     } else {
         None
     };
-    let mut child_env = Vec::new();
+    let mut env = Vec::new();
     if let Some(integration) = integration {
         program = integration.program;
         args = integration.args;
-        child_env = integration.env;
+        env = integration.env;
     }
+    create_program(
+        database,
+        backend,
+        checkout_id,
+        TerminalSize { cols, rows },
+        TerminalProgram {
+            program,
+            args,
+            env,
+            name,
+        },
+        output,
+    )
+}
+
+/// The size a terminal is opened at, which the window resizes from as soon as it has measured
+/// itself against its own font and zoom.
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Everything a terminal is, once what runs in it has been decided.
+///
+/// Separate from what this module knows about shells because not every terminal runs one: a Pi
+/// started to receive a review is handed the program itself, with no shell anywhere in the chain,
+/// so there is nothing for a review note to be interpreted by. That is the only property the two
+/// kinds of terminal have to share, and it is why they share this one spawn.
+pub struct TerminalProgram {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// The name the session row carries, read by a person and never used as a path or a command.
+    pub name: String,
+}
+
+/// Mints a session for a decided program, spawns it in the checkout's directory, and records it.
+pub fn create_program(
+    database: &Database,
+    backend: &TerminalBackend,
+    checkout_id: &str,
+    size: TerminalSize,
+    decided: TerminalProgram,
+    output: OutputSink,
+) -> Result<CreatedTerminal, String> {
+    let TerminalProgram {
+        program,
+        args,
+        env,
+        name,
+    } = decided;
+    let cwd = database.terminal_checkout_path(checkout_id)?;
+    let session = Session {
+        id: format!(
+            "session:terminal:{}-{}-{}",
+            timestamp(),
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ),
+        session_type: SessionType::Shell,
+        checkout_id: checkout_id.to_string(),
+        name,
+        created_at: timestamp(),
+        status: SessionStatus::Active,
+    };
     backend.spawn(
         session.id.clone(),
         SpawnOptions {
             program,
             args,
             cwd,
-            cols,
-            rows,
-            env: child_env,
+            cols: size.cols,
+            rows: size.rows,
+            env,
         },
         output,
     )?;
@@ -525,9 +579,77 @@ mod tests {
     };
 
     use super::{
-        create_with_options, create_with_settings, inherited_shell_args, install_shell_integration,
-        rename, shell_integration_script, shell_quote, ShellIntegration, TerminalOptions,
+        create_program, create_with_options, create_with_settings, inherited_shell_args,
+        install_shell_integration, rename, shell_integration_script, shell_quote, ShellIntegration,
+        TerminalOptions, TerminalProgram, TerminalSize,
     };
+
+    /// A terminal can be opened on something other than a shell, and what runs in it receives
+    /// its arguments as arguments.
+    ///
+    /// Nothing in this path interprets a string, which is the whole reason the Pi launch goes
+    /// through it: a review is the contents of a file, and those contents never become a command.
+    /// The argument list below is spelled exactly as the launcher builds one, so what the program
+    /// prints is what Pi would have been handed.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_runs_the_program_it_is_given_with_its_arguments_untouched() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let database = Database::open(directory.path().join("workspace.sqlite3")).unwrap();
+        let repo = plain_repo(&checkout);
+        database.register_plain_repo(repo.clone()).unwrap();
+        let backend = TerminalBackend::default();
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&collected);
+        let output: OutputSink = Box::new(move |bytes| {
+            kept.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(())
+        });
+
+        // Exercise the exact no-extension argv the Pi launcher builds, through the native PTY spawn.
+        // `echo` is the mocked executable; the prompt body is tested as a private file by pi_launch.
+        let prompt =
+            crate::services::pi_launch::write_prompt(directory.path(), "review body").unwrap();
+        let args = crate::services::pi_launch::arguments(&prompt);
+        let created = create_program(
+            &database,
+            &backend,
+            &repo.checkouts[0].id,
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalProgram {
+                program: PathBuf::from("/bin/echo"),
+                args: args.clone(),
+                env: Vec::new(),
+                name: "pi".into(),
+            },
+            output,
+        )
+        .unwrap();
+
+        assert_eq!(created.session.name, "pi");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let printed = loop {
+            let text = String::from_utf8_lossy(
+                &collected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned();
+            if text.contains(&args.join(" ")) || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            printed.contains(&args.join(" ")),
+            "the program was not handed the Pi launcher's argv untouched: {printed}"
+        );
+        backend.close(&created.session.id).unwrap();
+    }
 
     fn plain_repo(path: &Path) -> Repo {
         Repo::plain(path, "now").unwrap()
@@ -1671,7 +1793,7 @@ user_prompt_three() { printf '[THREE:%s]' \"$?\"; }
     }
 
     #[test]
-    fn terminals_reject_a_prompt_because_the_review_goes_to_the_agent_bridge() {
+    fn ordinary_shells_reject_prompts() {
         let directory = tempdir().unwrap();
         let checkout = directory.path().join("checkout");
         fs::create_dir(&checkout).unwrap();

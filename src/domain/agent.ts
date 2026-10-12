@@ -1,10 +1,16 @@
 export type AgentEventKind =
   "unknown" | "turnStarted" | "turnFinished" | "turnFailed" | "toolCalled" | "permissionAsked" | "questionAsked";
 
-/** One OpenCode session in a checkout. `id` is only valid inside that checkout's server. */
+/** The provider of the sessions listed in the agent panel. */
+export type AgentProvider = "opencode";
+
+/** One agent session Muster knows about, scoped to the checkout that owns it. */
 export interface AgentSession {
+  /** The program's own session id, only ever valid inside its checkout's provider. */
   id: string;
   checkoutId: string;
+  /** The program this session belongs to; everything else here is read through it. */
+  provider: AgentProvider;
   title: string;
   /**
    * True while the service is draining a turn for this session.
@@ -22,7 +28,7 @@ export interface AgentSession {
   agent: string | null;
   /** The model behind it, as `provider/id#variant`. */
   model: string | null;
-  /** The session a subagent was spawned from. */
+  /** The session this one was spawned from. */
   parentId: string | null;
   /** How the last turn ended: `succeeded`, `failed` or `interrupted`. */
   outcome: string | null;
@@ -30,7 +36,11 @@ export interface AgentSession {
   updatedAt: number;
 }
 
-/** One agent a checkout's server offers, as OpenCode describes it. */
+/**
+ * One agent a checkout's server offers, as OpenCode describes it.
+ *
+ * The catalog includes names and colors for this checkout's OpenCode agents.
+ */
 export interface AgentAgent {
   id: string;
   name: string;
@@ -67,11 +77,13 @@ export interface AgentEvent {
 }
 
 /**
- * The one program in front of a shell that is also an agent, and so owns the row's agent line.
+ * The program in front of a shell that is also an agent, and so owns the row's agent line.
  *
- * A terminal's `foregroundApp` is its process name as the OS reports it, so this is that name
- * and nothing else: it is what makes a row an agent row, and what makes a terminal the one an
- * OpenCode session moved along with it.
+ * A terminal's `foregroundApp` is its process name as the OS reports it, so these are those
+ * names and nothing else: they are what makes a row an agent row, and what makes a terminal the
+ * one a session moved along with it.
+ *
+ * The OpenCode TUI writes `OC | <session title>` into the terminal title.
  */
 export const AGENT_APP = "opencode";
 
@@ -116,7 +128,12 @@ export function sortAgentSessions(sessions: AgentSession[]): AgentSession[] {
   return [...sessions].sort((first, second) => second.updatedAt - first.updatedAt || first.id.localeCompare(second.id));
 }
 
-/** The session a review round should go to: the most recent live one, else the newest. */
+/** The newest OpenCode session a review round can target. */
+export function defaultOpenCodeSession(sessions: AgentSession[]): AgentSession | null {
+  return sortAgentSessions(sessions.filter((session) => session.provider === "opencode"))[0] ?? null;
+}
+
+/** The newest session for display. */
 export function defaultAgentSession(sessions: AgentSession[]): AgentSession | null {
   const sorted = sortAgentSessions(sessions);
   return sorted[0] ?? null;
@@ -182,6 +199,8 @@ export type AgentTitleMatch<Session> = { kind: "one"; session: Session } | { kin
  * - Only a title carrying the TUI's own ellipsis is read as a prefix, and only when exactly one
  *   session starts with what is left of it. The ellipsis is the signal that the title was cut; how
  *   many characters the cut was is the TUI's business, changes between releases, and is not checked.
+ *
+ * Only OpenCode sessions are listed here.
  */
 export function matchAgentSessionTitle<Session extends { title: string }>(
   sessions: Session[],

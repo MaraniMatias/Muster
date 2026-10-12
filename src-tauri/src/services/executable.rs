@@ -6,9 +6,19 @@ use std::{
 /// The first executable named `name` on PATH, with the usual install locations a GUI app misses
 /// because it never inherited a login shell's environment.
 pub fn find_executable(name: &str) -> Option<PathBuf> {
-    let mut candidates = env::var_os("PATH")
+    let path = env::var_os("PATH");
+    let home = env::var_os("HOME");
+    find_executable_in(name, path.as_deref(), home.as_deref())
+}
+
+fn find_executable_in(
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let mut candidates = path
         .map(|paths| {
-            env::split_paths(&paths)
+            env::split_paths(paths)
                 .map(|path| path.join(name))
                 .collect::<Vec<_>>()
         })
@@ -18,11 +28,11 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
             .into_iter()
             .map(|directory| Path::new(directory).join(name)),
     );
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = home {
         candidates.extend(
             [".opencode/bin", ".local/bin"]
                 .into_iter()
-                .map(|directory| Path::new(&home).join(directory).join(name)),
+                .map(|directory| Path::new(home).join(directory).join(name)),
         );
     }
     candidates.into_iter().find(|path| is_executable(path))
@@ -52,7 +62,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{find_executable, is_executable};
+    use super::{find_executable, find_executable_in, is_executable};
 
     #[test]
     fn only_a_searchable_program_file_counts_as_executable() {
@@ -72,5 +82,24 @@ mod tests {
             &temp.path().join("muster-test-missing-91af")
         ));
         assert!(find_executable("muster-test-missing-91af").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_gui_installs_outside_path_for_pi_and_opencode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        for (directory, name) in [(".local/bin", "pi"), (".opencode/bin", "opencode")] {
+            let directory = home.path().join(directory);
+            fs::create_dir_all(&directory).unwrap();
+            let program = directory.join(name);
+            fs::write(&program, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                find_executable_in(name, None, Some(home.path().as_os_str())),
+                Some(program)
+            );
+        }
     }
 }

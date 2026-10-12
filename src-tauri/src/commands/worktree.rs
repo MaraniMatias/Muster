@@ -46,12 +46,14 @@ pub async fn worktree_create(
 pub async fn worktree_removal_info(
     checkout_id: String,
     database: State<'_, Database>,
+    backend: State<'_, std::sync::Arc<TerminalBackend>>,
     agents: State<'_, std::sync::Arc<AgentService>>,
 ) -> Result<WorktreeRemovalInfo, IpcError> {
     let database = database.inner().clone();
+    let backend = backend.inner().clone();
     let agents = agents.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        worktree::removal_info(&database, &agents, &checkout_id)
+        worktree::removal_info(&database, &backend, &agents, &checkout_id)
     })
     .await
     .map_err(operation_error)?
