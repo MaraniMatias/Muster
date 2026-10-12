@@ -40,7 +40,10 @@ pub enum PasteError {
 /// result smaller.
 pub fn encode_paste(text: &str, modes: &TerminalModes) -> Result<Vec<u8>, PasteError> {
     if text.len() > MAX_PASTE_BYTES {
-        return Err(PasteError::TooLarge { bytes: text.len(), limit: MAX_PASTE_BYTES });
+        return Err(PasteError::TooLarge {
+            bytes: text.len(),
+            limit: MAX_PASTE_BYTES,
+        });
     }
 
     // A clipboard on macOS or Windows carries CRLF, and a terminal in raw mode
@@ -72,25 +75,40 @@ mod tests {
     }
 
     fn bracketed() -> TerminalModes {
-        TerminalModes { bracketed_paste: true, ..TerminalModes::default() }
+        TerminalModes {
+            bracketed_paste: true,
+            ..TerminalModes::default()
+        }
     }
 
     #[test]
     fn a_paste_is_wrapped_only_when_the_child_asked() {
         let text = "git status\n";
 
-        assert_eq!(encode_paste(text, &bracketed()).expect("a paste under the limit"), b"\x1b[200~git status\n\x1b[201~");
+        assert_eq!(
+            encode_paste(text, &bracketed()).expect("a paste under the limit"),
+            b"\x1b[200~git status\n\x1b[201~"
+        );
 
         // Markers sent to a child that never asked are six and six characters
         // of escape sequence sitting in its input line, which is exactly what
         // the markers exist to prevent in the other direction.
-        assert_eq!(encode_paste(text, &plain()).expect("a paste under the limit"), b"git status\n");
+        assert_eq!(
+            encode_paste(text, &plain()).expect("a paste under the limit"),
+            b"git status\n"
+        );
 
         // Bracketing is the child's mode and nothing else: the two modes agree
         // on the payload, so a paste that crosses a `DECSET 2004` mid-flight is
         // only ever the payload that changes shape.
-        let wrapping = TerminalModes { bracketed_paste: true, ..bracketed() };
-        assert_eq!(encode_paste(text, &wrapping).expect("a paste under the limit"), b"\x1b[200~git status\n\x1b[201~");
+        let wrapping = TerminalModes {
+            bracketed_paste: true,
+            ..bracketed()
+        };
+        assert_eq!(
+            encode_paste(text, &wrapping).expect("a paste under the limit"),
+            b"\x1b[200~git status\n\x1b[201~"
+        );
     }
 
     #[test]
@@ -99,14 +117,25 @@ mod tests {
         // produces on its own but a terminal, a paste from a pipe and some
         // remote clipboard tools all do.
         for (input, expected) in [("a\r\nb", "a\nb"), ("a\rb", "a\nb"), ("a\nb", "a\nb")] {
-            assert_eq!(encode_paste(input, &bracketed()).expect("a paste under the limit"), format!("\x1b[200~{expected}\x1b[201~").into_bytes(), "{input:?}");
-            assert_eq!(encode_paste(input, &plain()).expect("a paste under the limit"), expected.as_bytes(), "{input:?}");
+            assert_eq!(
+                encode_paste(input, &bracketed()).expect("a paste under the limit"),
+                format!("\x1b[200~{expected}\x1b[201~").into_bytes(),
+                "{input:?}"
+            );
+            assert_eq!(
+                encode_paste(input, &plain()).expect("a paste under the limit"),
+                expected.as_bytes(),
+                "{input:?}"
+            );
         }
 
         // The two-character sequence is one line ending, not two: folding `\r`
         // on its own first would turn a CR into a LF and leave the LF that
         // followed it as a blank line of its own.
-        assert_eq!(encode_paste("a\r\nb", &plain()).expect("a paste under the limit"), b"a\nb");
+        assert_eq!(
+            encode_paste("a\r\nb", &plain()).expect("a paste under the limit"),
+            b"a\nb"
+        );
     }
 
     #[test]
@@ -117,17 +146,26 @@ mod tests {
 
         assert_eq!(
             encode_paste(&oversized, &plain()),
-            Err(PasteError::TooLarge { bytes: MAX_PASTE_BYTES + 1, limit: MAX_PASTE_BYTES })
+            Err(PasteError::TooLarge {
+                bytes: MAX_PASTE_BYTES + 1,
+                limit: MAX_PASTE_BYTES
+            })
         );
         assert_eq!(
             encode_paste(&oversized, &bracketed()),
-            Err(PasteError::TooLarge { bytes: MAX_PASTE_BYTES + 1, limit: MAX_PASTE_BYTES })
+            Err(PasteError::TooLarge {
+                bytes: MAX_PASTE_BYTES + 1,
+                limit: MAX_PASTE_BYTES
+            })
         );
 
         // Exactly at the limit is not over it. Without this the refusal above
         // would also pass against a limit one byte too tight, and a paste of
         // precisely the documented size would be the thing nobody tested.
-        assert_eq!(encode_paste(&"x".repeat(MAX_PASTE_BYTES), &plain()), Ok(vec![b'x'; MAX_PASTE_BYTES]));
+        assert_eq!(
+            encode_paste(&"x".repeat(MAX_PASTE_BYTES), &plain()),
+            Ok(vec![b'x'; MAX_PASTE_BYTES])
+        );
 
         // Nothing comes back that a caller could mistake for the payload. Half
         // a paste is worse than none, because it looks like the paste worked.
@@ -148,7 +186,10 @@ mod tests {
         // One character past the limit is still over it.
         assert_eq!(
             encode_paste(&format!("{under}{emoji}"), &plain()),
-            Err(PasteError::TooLarge { bytes: MAX_PASTE_BYTES + 4, limit: MAX_PASTE_BYTES })
+            Err(PasteError::TooLarge {
+                bytes: MAX_PASTE_BYTES + 4,
+                limit: MAX_PASTE_BYTES
+            })
         );
     }
 
@@ -156,7 +197,10 @@ mod tests {
     fn an_empty_paste_encodes_to_nothing_rather_than_to_just_the_markers() {
         // There is nothing to tell the child about, and a child in bracketed
         // paste mode treats the two markers as an empty paste it should run.
-        assert_eq!(encode_paste("", &bracketed()), Ok(b"\x1b[200~\x1b[201~".to_vec()));
+        assert_eq!(
+            encode_paste("", &bracketed()),
+            Ok(b"\x1b[200~\x1b[201~".to_vec())
+        );
         assert_eq!(encode_paste("", &plain()), Ok(Vec::new()));
     }
 }

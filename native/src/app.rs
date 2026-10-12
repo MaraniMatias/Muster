@@ -21,19 +21,19 @@
 //! Nothing else is read from the machine: no database is opened, nothing under
 //! `~/.muster` is touched, and no shell startup file is parsed by this file.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use gpui_kit::{
-    AnyElement, App, AppContext, Bounds, Context, Entity, Focusable, IntoElement, ParentElement,
-    Render, Styled, TextAlign, Window, WindowBounds, WindowOptions, div, px, size,
+    div, px, size, AnyElement, App, AppContext, Bounds, Context, Entity, Focusable, IntoElement,
+    ParentElement, Render, Styled, TextAlign, Window, WindowBounds, WindowOptions,
 };
 
 use crate::pty::TerminalBackend;
 use crate::terminal::{
-    CellMetrics, CloseReport, ColorSnapshot, Palette, SessionError, ShellState, TerminalHost,
-    TerminalSession, TerminalSessionConfig, TerminalView, shutdown, xterm_256,
+    shutdown, xterm_256, CellMetrics, CloseReport, ColorSnapshot, Palette, SessionError,
+    ShellState, TerminalHost, TerminalSession, TerminalSessionConfig, TerminalView,
 };
 
 /// The shell this process owns, taken by whichever path ends it first.
@@ -130,13 +130,8 @@ impl TerminalWindow {
 
     /// Mount the grid over `shell` and register how this window ends.
     fn over(shell: Arc<OwnedShell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let view = cx.new(|cx| {
-            TerminalView::new(
-                shell.session.clone(),
-                Arc::clone(&shell.metrics),
-                cx,
-            )
-        });
+        let view =
+            cx.new(|cx| TerminalView::new(shell.session.clone(), Arc::clone(&shell.metrics), cx));
         refuse_close_while_busy(&shell, window, cx);
 
         Self {
@@ -181,7 +176,9 @@ impl TerminalWindow {
             // allowed to be phrased like the others.
             failure: status.poll_error.map_or_else(
                 || match status.shell {
-                    ShellState::Exited { code: Some(code) } => Some(format!("shell exited ({code})")),
+                    ShellState::Exited { code: Some(code) } => {
+                        Some(format!("shell exited ({code})"))
+                    }
                     ShellState::Exited { code: None } => Some("shell exited".to_owned()),
                     ShellState::Unknown | ShellState::Running => None,
                 },
@@ -392,9 +389,7 @@ fn spawn_and_claim(
 /// fonts, palettes or clipboards, and a headless test can answer all three.
 fn host(metrics: Arc<Mutex<CellMetrics>>) -> TerminalHost {
     TerminalHost {
-        cell_metrics: Box::new(move || {
-            metrics.lock().map(|cell| *cell).unwrap_or(UNMEASURED_CELL)
-        }),
+        cell_metrics: Box::new(move || metrics.lock().map(|cell| *cell).unwrap_or(UNMEASURED_CELL)),
         // The view's own palette: a child that indexed 231 asked for the
         // brightest cube corner and gets it whether or not this window is open.
         resolve_color: Box::new(xterm_256),
@@ -511,6 +506,7 @@ const UNMEASURED_CELL: CellMetrics = CellMetrics {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -531,7 +527,10 @@ mod tests {
     static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
     fn next_id() -> String {
-        format!("muster-native-test-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "muster-native-test-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// A session running `script` under `/bin/sh`.
@@ -630,7 +629,12 @@ mod tests {
         let session = session(&backend, "sleep 30");
         let big = size(px(1200.), px(800.));
 
-        for size in [big, size(px(640.), px(480.)), size(px(120.), px(60.)), size(px(1.), px(1.))] {
+        for size in [
+            big,
+            size(px(640.), px(480.)),
+            size(px(120.), px(60.)),
+            size(px(1.), px(1.)),
+        ] {
             let (handle, window) = open(cx, size, &backend, &session);
             settle(cx, handle);
 

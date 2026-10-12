@@ -7,7 +7,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const PATCHED_ALACRITTY_DIR = join(ROOT, "native/vendor/alacritty_terminal-0.26.0");
 const PATCHED_ALACRITTY_VERSION = "0.26.0";
 // Original crates.io archive checksum for alacritty_terminal 0.26.0, the latest published release.
-// `native/Cargo.lock` cannot supply it: a `[patch.crates-io]` path replacement drops the registry
+// `Cargo.lock` cannot supply it: a `[patch.crates-io]` path replacement drops the registry
 // `source` and `checksum` lines from the entry. This is the `cksum` field of the 0.26.0 entry in
 // the crates.io sparse index, confirmed by hashing the archive downloaded from static.crates.io.
 // Upstream has published no advisory for the panic this patch fixes; see

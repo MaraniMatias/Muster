@@ -41,7 +41,11 @@ pub const MAX_QUEUED_REQUESTS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueError {
     /// The request would push the queue past [`MAX_QUEUED_BYTES`].
-    TooManyBytes { queued: usize, incoming: usize, limit: usize },
+    TooManyBytes {
+        queued: usize,
+        incoming: usize,
+        limit: usize,
+    },
     /// The queue already holds [`MAX_QUEUED_REQUESTS`] requests.
     TooManyRequests { queued: usize, limit: usize },
     /// The queue has been stopped, so a request taken now could never be
@@ -90,8 +94,10 @@ impl WriteQueue {
     where
         S: FnMut(&[u8]) -> Result<(), String> + Send + 'static,
     {
-        let shared =
-            Arc::new(Shared { state: Mutex::new(QueueState::default()), ready: Condvar::new() });
+        let shared = Arc::new(Shared {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        });
         let writer = Arc::clone(&shared);
 
         let handle = thread::Builder::new()
@@ -99,7 +105,10 @@ impl WriteQueue {
             .spawn(move || writer_loop(&mut sink, &writer))
             .expect("the terminal write queue thread could not be spawned");
 
-        Self { shared, writer: Mutex::new(Some(handle)) }
+        Self {
+            shared,
+            writer: Mutex::new(Some(handle)),
+        }
     }
 
     /// Queue one request, or refuse it whole.
@@ -109,7 +118,11 @@ impl WriteQueue {
     /// it is still delivered, which is the whole point of refusing rather than
     /// dropping.
     pub fn push(&self, request: Vec<u8>) -> Result<(), EnqueueError> {
-        let mut state = self.shared.state.lock().expect("terminal write queue poisoned");
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("terminal write queue poisoned");
 
         if state.stopping {
             return Err(EnqueueError::Stopped);
@@ -142,12 +155,21 @@ impl WriteQueue {
 
     /// Queued bytes not yet handed to the sink.
     pub fn queued_bytes(&self) -> usize {
-        self.shared.state.lock().expect("terminal write queue poisoned").queued_bytes
+        self.shared
+            .state
+            .lock()
+            .expect("terminal write queue poisoned")
+            .queued_bytes
     }
 
     /// Queued requests not yet handed to the sink.
     pub fn queued_requests(&self) -> usize {
-        self.shared.state.lock().expect("terminal write queue poisoned").requests.len()
+        self.shared
+            .state
+            .lock()
+            .expect("terminal write queue poisoned")
+            .requests
+            .len()
     }
 
     /// Stop the writer thread and wait for it.
@@ -157,11 +179,19 @@ impl WriteQueue {
     /// behind a child that has stopped reading. Safe to call more than once,
     /// and called for you on drop.
     pub fn stop(&self) {
-        let handle = self.writer.lock().expect("terminal write queue poisoned").take();
+        let handle = self
+            .writer
+            .lock()
+            .expect("terminal write queue poisoned")
+            .take();
         let Some(handle) = handle else { return };
 
         {
-            let mut state = self.shared.state.lock().expect("terminal write queue poisoned");
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("terminal write queue poisoned");
             state.stopping = true;
             self.shared.ready.notify_all();
         }
@@ -206,7 +236,10 @@ where
                     state.queued_bytes -= request.len();
                     break request;
                 }
-                state = shared.ready.wait(state).expect("terminal write queue poisoned");
+                state = shared
+                    .ready
+                    .wait(state)
+                    .expect("terminal write queue poisoned");
             }
         };
 
@@ -276,7 +309,10 @@ mod tests {
         let recorder = Arc::clone(&seen);
 
         let sink = move |request: &[u8]| {
-            recorder.lock().expect("sink recorder poisoned").push(request.to_vec());
+            recorder
+                .lock()
+                .expect("sink recorder poisoned")
+                .push(request.to_vec());
             // Recorded first, then announced: one token is one request the
             // writer has taken off the queue and handed over, not one it has
             // promised to write.
@@ -287,7 +323,12 @@ mod tests {
             Ok(())
         };
 
-        GatedSink { sink: Some(Box::new(sink)), entered, release: Some(release), delivered: seen }
+        GatedSink {
+            sink: Some(Box::new(sink)),
+            entered,
+            release: Some(release),
+            delivered: seen,
+        }
     }
 
     impl GatedSink {
@@ -307,15 +348,19 @@ mod tests {
     }
 
     fn what_the_sink_saw(gated: &GatedSink) -> Vec<Vec<u8>> {
-        gated.delivered.lock().expect("sink recorder poisoned").clone()
+        gated
+            .delivered
+            .lock()
+            .expect("sink recorder poisoned")
+            .clone()
     }
 
     /// Wait for `count` requests to have reached the sink.
     fn expect_delivered(entered: &Receiver<()>, count: usize) {
         for request in 0..count {
-            entered
-                .recv_timeout(PATIENCE)
-                .unwrap_or_else(|error| panic!("request {request} never reached the sink: {error}"));
+            entered.recv_timeout(PATIENCE).unwrap_or_else(|error| {
+                panic!("request {request} never reached the sink: {error}")
+            });
         }
     }
 
@@ -330,8 +375,13 @@ mod tests {
             // Held inside the sink for the rest of the block, so everything
             // measured below is measured against a queue that cannot drain
             // itself out from under the measurement.
-            queue.push(b"first".to_vec()).expect("a small request is queued");
-            gated.entered.recv_timeout(PATIENCE).expect("the writer takes the first request");
+            queue
+                .push(b"first".to_vec())
+                .expect("a small request is queued");
+            gated
+                .entered
+                .recv_timeout(PATIENCE)
+                .expect("the writer takes the first request");
 
             let oversized = vec![b'x'; MAX_QUEUED_BYTES + 1];
             assert_eq!(
@@ -353,7 +403,9 @@ mod tests {
             // as hard to reach.
             let at_budget = "\u{1f600}".repeat(MAX_QUEUED_BYTES / 4);
             assert_eq!(at_budget.len(), MAX_QUEUED_BYTES);
-            queue.push(at_budget.clone().into_bytes()).expect("exactly the budget is within it");
+            queue
+                .push(at_budget.clone().into_bytes())
+                .expect("exactly the budget is within it");
             assert_eq!(queue.queued_bytes(), MAX_QUEUED_BYTES);
 
             assert_eq!(
@@ -371,10 +423,17 @@ mod tests {
             assert_eq!(queue.queued_requests(), 1);
             gated.release();
             expect_delivered(&gated.entered, 1);
-            assert_eq!(what_the_sink_saw(&gated), vec![b"first".to_vec(), at_budget.into_bytes()]);
+            assert_eq!(
+                what_the_sink_saw(&gated),
+                vec![b"first".to_vec(), at_budget.into_bytes()]
+            );
 
             queue.stop();
-            assert_eq!(queue.queued_bytes(), 0, "everything handed over is off the books");
+            assert_eq!(
+                queue.queued_bytes(),
+                0,
+                "everything handed over is off the books"
+            );
         }
 
         // Requests, counted separately, on a queue whose bytes are not already
@@ -383,19 +442,29 @@ mod tests {
             let mut gated = gated_sink();
             let queue = gated.spawn();
 
-            queue.push(b"first".to_vec()).expect("a small request is queued");
-            gated.entered.recv_timeout(PATIENCE).expect("the writer takes the first request");
+            queue
+                .push(b"first".to_vec())
+                .expect("a small request is queued");
+            gated
+                .entered
+                .recv_timeout(PATIENCE)
+                .expect("the writer takes the first request");
 
             for request in 0..MAX_QUEUED_REQUESTS {
                 queue
                     .push(vec![b'x'; request % 251 + 1])
-                    .unwrap_or_else(|error| panic!("request {request} of the budget should be queued: {error:?}"));
+                    .unwrap_or_else(|error| {
+                        panic!("request {request} of the budget should be queued: {error:?}")
+                    });
             }
             assert_eq!(queue.queued_requests(), MAX_QUEUED_REQUESTS);
 
             assert_eq!(
                 queue.push(b"one too many".to_vec()),
-                Err(EnqueueError::TooManyRequests { queued: MAX_QUEUED_REQUESTS, limit: MAX_QUEUED_REQUESTS })
+                Err(EnqueueError::TooManyRequests {
+                    queued: MAX_QUEUED_REQUESTS,
+                    limit: MAX_QUEUED_REQUESTS
+                })
             );
 
             // The refusal moved nothing: every request that was queued is still
@@ -408,13 +477,21 @@ mod tests {
 
             let delivered = what_the_sink_saw(&gated);
             assert_eq!(delivered.len(), MAX_QUEUED_REQUESTS + 1);
-            assert_eq!(delivered.first().expect("the held request came first"), b"first");
+            assert_eq!(
+                delivered.first().expect("the held request came first"),
+                b"first"
+            );
 
             // Still accepting once it has room: a refusal is not the queue
             // giving up, and the request taken now is delivered like any other.
-            queue.push(b"after the refusal".to_vec()).expect("the queue still accepts input");
+            queue
+                .push(b"after the refusal".to_vec())
+                .expect("the queue still accepts input");
             expect_delivered(&gated.entered, 1);
-            assert_eq!(what_the_sink_saw(&gated).last().expect("the last request"), b"after the refusal");
+            assert_eq!(
+                what_the_sink_saw(&gated).last().expect("the last request"),
+                b"after the refusal"
+            );
 
             queue.stop();
         }
@@ -427,7 +504,10 @@ mod tests {
 
         // Pushed while the writer is held, so nothing can overtake anything.
         queue.push(b"first".to_vec()).expect("queued");
-        gated.entered.recv_timeout(PATIENCE).expect("the writer takes the first request");
+        gated
+            .entered
+            .recv_timeout(PATIENCE)
+            .expect("the writer takes the first request");
         for request in [&b"second"[..], b"third", b"fourth"] {
             queue.push(request.to_vec()).expect("queued");
         }
@@ -437,7 +517,15 @@ mod tests {
 
         // The child reads this as one stream: a reordering here is a paste that
         // runs its own first line last.
-        assert_eq!(what_the_sink_saw(&gated), vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec(), b"fourth".to_vec()]);
+        assert_eq!(
+            what_the_sink_saw(&gated),
+            vec![
+                b"first".to_vec(),
+                b"second".to_vec(),
+                b"third".to_vec(),
+                b"fourth".to_vec()
+            ]
+        );
     }
 
     #[test]
@@ -447,7 +535,9 @@ mod tests {
 
         // An empty paste encodes to no bytes at all, and a zero-length write to
         // the PTY is a syscall that cannot do anything anybody wanted.
-        queue.push(Vec::new()).expect("an empty request is not a refusal");
+        queue
+            .push(Vec::new())
+            .expect("an empty request is not a refusal");
         queue.push(b"real".to_vec()).expect("queued");
 
         gated.release();
@@ -462,7 +552,10 @@ mod tests {
         let queue = gated.spawn();
 
         queue.push(b"first".to_vec()).expect("queued");
-        gated.entered.recv_timeout(PATIENCE).expect("the writer takes the first request");
+        gated
+            .entered
+            .recv_timeout(PATIENCE)
+            .expect("the writer takes the first request");
         queue.push(b"still queued".to_vec()).expect("queued");
 
         // Released before the stop, because the writer is inside the sink and
@@ -479,11 +572,17 @@ mod tests {
 
         // A request taken now cannot be written by anything, so it is refused
         // rather than accepted and lost.
-        assert_eq!(queue.push(b"after the stop".to_vec()), Err(EnqueueError::Stopped));
+        assert_eq!(
+            queue.push(b"after the stop".to_vec()),
+            Err(EnqueueError::Stopped)
+        );
 
         // Stopping twice is what dropping the queue does, and it is not a panic.
         queue.stop();
 
-        assert_eq!(what_the_sink_saw(&gated).first().map(Vec::as_slice), Some(b"first".as_slice()));
+        assert_eq!(
+            what_the_sink_saw(&gated).first().map(Vec::as_slice),
+            Some(b"first".as_slice())
+        );
     }
 }

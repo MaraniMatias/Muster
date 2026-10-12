@@ -12,9 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::domain::workspace::{TerminalProcessState, TerminalSessionStatus};
+use crate::workspace::{TerminalProcessState, TerminalSessionStatus};
 
-pub(crate) mod process;
+pub mod process;
 
 pub type OutputSink = Box<dyn FnMut(&[u8]) -> Result<(), String> + Send + 'static>;
 
@@ -1211,10 +1211,35 @@ fn write_to_session(session: &Session, id: &str, bytes: &[u8]) -> Result<(), Str
     }
 }
 
-#[cfg(test)]
-pub(crate) use tests::wait_for_output;
+/// Helpers that exist for tests, in a build that is not a test.
+///
+/// Not `#[cfg(test)]`, and that is the whole reason this module exists rather
+/// than a re-export out of the test module below: the gate applies to the crate
+/// being tested, never to a crate that depends on it, so a caller whose tests
+/// call `wait_for_output` would find nothing there. Public because that caller
+/// is a different crate. Hidden from the docs because it is not an API.
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    pub fn wait_for_output(receiver: &mpsc::Receiver<Vec<u8>>, marker: &[u8], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut actual = Vec::new();
+        while !actual.windows(marker.len()).any(|window| window == marker) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "terminal output marker timed out");
+            match receiver.recv_timeout(remaining) {
+                Ok(bytes) => actual.extend(bytes),
+                Err(error) => panic!("terminal output marker timed out: {error}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::wait_for_output;
     use std::{
         io,
         path::PathBuf,
@@ -1237,14 +1262,19 @@ mod tests {
     use super::{process_group_exists, signal_group_with, GroupSignal, REAP_POLL_INTERVAL};
     use super::{
         start_child_reaper, ChildState, OutputGate, OutputSink, ReaderEnd, SpawnOptions,
-        TerminalBackend, MAX_TERMINAL_INPUT_BYTES, OUTPUT_HIGH_WATER_BYTES,
-        OUTPUT_LOW_WATER_BYTES, OUTPUT_RESUME_TIMEOUT,
+        TerminalBackend, MAX_TERMINAL_INPUT_BYTES, OUTPUT_HIGH_WATER_BYTES, OUTPUT_LOW_WATER_BYTES,
+        OUTPUT_RESUME_TIMEOUT,
     };
 
     /// A reader end that reports once, so a test can tell "told me" from "told me twice".
     fn reader_end_sink() -> (super::ReaderEndSink, mpsc::Receiver<ReaderEnd>) {
         let (sender, receiver) = mpsc::channel();
-        (Box::new(move |end| { let _ = sender.send(end); }), receiver)
+        (
+            Box::new(move |end| {
+                let _ = sender.send(end);
+            }),
+            receiver,
+        )
     }
 
     fn spawn(
@@ -1290,23 +1320,6 @@ mod tests {
             .write(id, b"printf '\\036MUSTER_READY\\037\\n'\n")
             .unwrap();
         wait_for_output(receiver, b"\x1eMUSTER_READY\x1f", Duration::from_secs(5));
-    }
-
-    pub(crate) fn wait_for_output(
-        receiver: &mpsc::Receiver<Vec<u8>>,
-        marker: &[u8],
-        timeout: Duration,
-    ) {
-        let deadline = Instant::now() + timeout;
-        let mut actual = Vec::new();
-        while !actual.windows(marker.len()).any(|window| window == marker) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "terminal output marker timed out");
-            match receiver.recv_timeout(remaining) {
-                Ok(bytes) => actual.extend(bytes),
-                Err(error) => panic!("terminal output marker timed out: {error}"),
-            }
-        }
     }
 
     /// Waits until the write of a session is in flight, which is the state the caller closes in.
@@ -2443,7 +2456,7 @@ mod tests {
         close.join().unwrap();
     }
 
-    use crate::domain::workspace::TerminalProcessState;
+    use crate::workspace::TerminalProcessState;
 
     #[test]
     fn a_reader_that_reaches_the_end_of_the_pty_says_so_exactly_once() {
@@ -2467,7 +2480,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ends.recv_timeout(Duration::from_secs(5)).expect("no reader end was reported"),
+            ends.recv_timeout(Duration::from_secs(5))
+                .expect("no reader end was reported"),
             ReaderEnd::EndOfStream,
             "a shell that exits cleanly ends the stream, which is not a read failure",
         );
@@ -2502,7 +2516,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ends.recv_timeout(Duration::from_secs(5)).expect("an unwinding reader stayed quiet"),
+            ends.recv_timeout(Duration::from_secs(5))
+                .expect("an unwinding reader stayed quiet"),
             ReaderEnd::ReaderStopped,
         );
         backend.shutdown();

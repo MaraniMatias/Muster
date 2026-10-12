@@ -162,7 +162,10 @@ struct ParkedEvents {
 
 impl EventListener for ParkedEvents {
     fn send_event(&self, event: Event) {
-        self.events.lock().expect("terminal event buffer poisoned").push(event);
+        self.events
+            .lock()
+            .expect("terminal event buffer poisoned")
+            .push(event);
     }
 }
 
@@ -212,7 +215,9 @@ impl TerminalCore {
 
         let size = TermSize::new(cols as usize, rows as usize);
         let events = Arc::new(Mutex::new(Vec::new()));
-        let listener = ParkedEvents { events: Arc::clone(&events) };
+        let listener = ParkedEvents {
+            events: Arc::clone(&events),
+        };
 
         Self {
             term: Term::new(config, &size, listener),
@@ -239,8 +244,10 @@ impl TerminalCore {
         // events themselves still wait in `pending` until it does.
         let parked =
             std::mem::take(&mut *self.events.lock().expect("terminal event buffer poisoned"));
-        let translated: Vec<TerminalEvent> =
-            parked.into_iter().filter_map(|event| self.translate(event)).collect();
+        let translated: Vec<TerminalEvent> = parked
+            .into_iter()
+            .filter_map(|event| self.translate(event))
+            .collect();
 
         self.pending.extend(translated);
     }
@@ -248,7 +255,8 @@ impl TerminalCore {
     /// Resize the grid. The scrollback survives; the scroll offset does too,
     /// clamped by the grid to whatever the shorter history can still show.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.resize(TermSize::new(cols as usize, rows as usize));
+        self.term
+            .resize(TermSize::new(cols as usize, rows as usize));
     }
 
     /// Everything the parser reported since the last call.
@@ -284,9 +292,8 @@ impl TerminalCore {
             // Refused above the cap rather than truncated: a clipboard write is
             // all-or-nothing, and half a program payload is worse than none,
             // because it looks like the write succeeded.
-            Event::ClipboardStore(_, payload) => {
-                (payload.len() <= MAX_CLIPBOARD_PAYLOAD_BYTES).then_some(TerminalEvent::ClipboardStore(payload))
-            }
+            Event::ClipboardStore(_, payload) => (payload.len() <= MAX_CLIPBOARD_PAYLOAD_BYTES)
+                .then_some(TerminalEvent::ClipboardStore(payload)),
 
             // The formatter that would answer this read goes with the event. The
             // child is not answered here and must not be: whether this program's
@@ -310,7 +317,12 @@ impl TerminalCore {
             }),
             Event::TextAreaSizeRequest(format) => Some(TerminalEvent::TextAreaSizeRequested {
                 respond: Box::new(move |cols, rows, cell_width, cell_height| {
-                    format(WindowSize { num_lines: rows, num_cols: cols, cell_width, cell_height })
+                    format(WindowSize {
+                        num_lines: rows,
+                        num_cols: cols,
+                        cell_width,
+                        cell_height,
+                    })
                 }),
             }),
 
@@ -461,7 +473,11 @@ fn sanitise_title(raw: &str) -> Option<String> {
     // Capped before trimming rather than after: the parser's OSC buffer is not
     // bounded, so this is also the point where the copy out of it is bounded. A
     // title that is nothing but whitespace is no title at all.
-    let capped: String = raw.chars().filter(|c| !c.is_control()).take(MAX_TITLE_CHARS).collect();
+    let capped: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TITLE_CHARS)
+        .collect();
     let title = capped.trim();
 
     (!title.is_empty()).then(|| title.to_owned())
@@ -517,7 +533,7 @@ fn color_snapshot(color: Color) -> ColorSnapshot {
             };
 
             ColorSnapshot::Indexed(index as u8)
-        },
+        }
     }
 }
 
@@ -541,7 +557,13 @@ mod tests {
 
     /// The first visible row of a core, as plain chars.
     fn first_row(core: &TerminalCore) -> Vec<char> {
-        core.visible_rows().first().expect("a 24 row core has a first row").cells.iter().map(|cell| cell.c).collect()
+        core.visible_rows()
+            .first()
+            .expect("a 24 row core has a first row")
+            .cells
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
     }
 
     #[test]
@@ -551,7 +573,10 @@ mod tests {
         for (c, split_at) in [('é', 1_usize), ('😀', 2)] {
             let mut encoded = [0u8; 4];
             let bytes = c.encode_utf8(&mut encoded).as_bytes();
-            assert!(split_at < bytes.len(), "the split has to land inside the sequence");
+            assert!(
+                split_at < bytes.len(),
+                "the split has to land inside the sequence"
+            );
 
             let mut whole = core();
             whole.feed(bytes);
@@ -560,10 +585,17 @@ mod tests {
             split.feed(&bytes[..split_at]);
             split.feed(&bytes[split_at..]);
 
-            assert_eq!(whole.visible_rows(), split.visible_rows(), "`{c}` fed whole and in two chunks");
+            assert_eq!(
+                whole.visible_rows(),
+                split.visible_rows(),
+                "`{c}` fed whole and in two chunks"
+            );
 
             let row = first_row(&whole);
-            assert!(row.contains(&c), "`{c}` should have landed in one cell, got {row:?}");
+            assert!(
+                row.contains(&c),
+                "`{c}` should have landed in one cell, got {row:?}"
+            );
         }
     }
 
@@ -594,11 +626,18 @@ mod tests {
     fn a_title_split_across_feeds_still_sets_the_title() {
         // BEL is one payload byte; ST is two, and the split can land between them,
         // which leaves the parser mid-way through the terminator it is holding.
-        for sequence in [b"\x1b]0;split title\x07".as_slice(), b"\x1b]0;split title\x1b\\".as_slice()] {
+        for sequence in [
+            b"\x1b]0;split title\x07".as_slice(),
+            b"\x1b]0;split title\x1b\\".as_slice(),
+        ] {
             let mut whole = core();
             whole.feed(sequence);
 
-            assert_eq!(whole.title(), Some("split title"), "the title fed in one call");
+            assert_eq!(
+                whole.title(),
+                Some("split title"),
+                "the title fed in one call"
+            );
 
             for at in [7, sequence.len() - 1] {
                 let mut split = core();
@@ -627,13 +666,23 @@ mod tests {
 
         let title = core.title().expect("a non-empty title should survive");
 
-        assert!(!title.chars().any(char::is_control), "no control character should survive: {title:?}");
-        assert_eq!(title, title.trim(), "the title should be trimmed: {title:?}");
+        assert!(
+            !title.chars().any(char::is_control),
+            "no control character should survive: {title:?}"
+        );
+        assert_eq!(
+            title,
+            title.trim(),
+            "the title should be trimmed: {title:?}"
+        );
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
         // A cap taken by byte index would leave half an emoji here. Every character
         // being a whole emoji is the same fact stated about the code points rather
         // than about the UTF-8 they happen to encode to.
-        assert!(title.chars().all(|c| c == '😀'), "truncation should land on a code point boundary: {title:?}");
+        assert!(
+            title.chars().all(|c| c == '😀'),
+            "truncation should land on a code point boundary: {title:?}"
+        );
     }
 
     #[test]
@@ -647,7 +696,10 @@ mod tests {
         // ASCII bytes out, and the result decodes to valid UTF-8.
         let encoded = "QUFB".repeat(MAX_CLIPBOARD_PAYLOAD_BYTES / 3 + 2);
         let decoded_len = encoded.len() / 4 * 3;
-        assert!(decoded_len > MAX_CLIPBOARD_PAYLOAD_BYTES, "the test payload has to exceed the limit");
+        assert!(
+            decoded_len > MAX_CLIPBOARD_PAYLOAD_BYTES,
+            "the test payload has to exceed the limit"
+        );
 
         // A payload this size is kept, so the refusal below is about the size and
         // not about OSC 52 having stopped working: without this the whole case
@@ -679,10 +731,17 @@ mod tests {
         let events = core.take_events();
 
         assert!(
-            events.iter().any(|event| matches!(event, TerminalEvent::ClipboardRequested)),
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::ClipboardRequested)),
             "the request should reach the host: {events:?}",
         );
-        assert!(!events.iter().any(|event| matches!(event, TerminalEvent::PtyWrite(_))), "nothing may be written back: {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PtyWrite(_))),
+            "nothing may be written back: {events:?}"
+        );
     }
 
     #[test]
@@ -699,7 +758,9 @@ mod tests {
         let events = core.take_events();
 
         assert!(
-            events.iter().any(|event| matches!(event, TerminalEvent::PtyWrite(_))),
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PtyWrite(_))),
             "the query has to have been answered, or this test proves nothing about it: {events:?}"
         );
         assert!(
@@ -712,7 +773,11 @@ mod tests {
         // is the one thing that turns them on.
         core.feed(b"\x1b[>1u");
 
-        assert!(core.modes().disambiguate_esc_codes, "after the push: {:?}", core.modes());
+        assert!(
+            core.modes().disambiguate_esc_codes,
+            "after the push: {:?}",
+            core.modes()
+        );
 
         // `CSI > 2 u` replaces the mode rather than adding to it
         // (`push_keyboard_mode`, `src/term/mod.rs:1288`), so the snapshot a
@@ -720,7 +785,10 @@ mod tests {
         core.feed(b"\x1b[>2u");
         let modes = core.modes();
         assert!(modes.report_event_types, "after the second push: {modes:?}");
-        assert!(!modes.disambiguate_esc_codes, "the first push was replaced, not extended: {modes:?}");
+        assert!(
+            !modes.disambiguate_esc_codes,
+            "the first push was replaced, not extended: {modes:?}"
+        );
 
         // The other modes a snapshot carries come from the same place, so a
         // snapshot that read the wrong bit would read all of them wrong.

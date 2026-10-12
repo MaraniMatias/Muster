@@ -43,16 +43,24 @@ struct EventCollector {
 
 impl EventListener for EventCollector {
     fn send_event(&self, event: Event) {
-        self.events.lock().expect("event collector mutex poisoned").push(event);
+        self.events
+            .lock()
+            .expect("event collector mutex poisoned")
+            .push(event);
     }
 }
 
 /// A kitty-keyboard-enabled terminal plus a handle on the events it emitted.
 fn terminal() -> (Term<EventCollector>, Arc<Mutex<Vec<Event>>>) {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let config = Config { kitty_keyboard: true, ..Config::default() };
+    let config = Config {
+        kitty_keyboard: true,
+        ..Config::default()
+    };
     let size = TermSize::new(COLUMNS, SCREEN_LINES);
-    let collector = EventCollector { events: Arc::clone(&events) };
+    let collector = EventCollector {
+        events: Arc::clone(&events),
+    };
 
     (Term::new(config, &size, collector), events)
 }
@@ -96,19 +104,20 @@ fn the_terminal_still_renders_after_a_keyboard_mode_flood() {
         .flat_map(|line| (0..COLUMNS).map(move |column| (line, column)))
         .find(|&(line, column)| {
             column + RED.len() <= COLUMNS
-                && RED
-                    .iter()
-                    .enumerate()
-                    .all(|(offset, &expected)| {
-                        grid[Line::from(line)][Column(column + offset)].c == expected
-                    })
+                && RED.iter().enumerate().all(|(offset, &expected)| {
+                    grid[Line::from(line)][Column(column + offset)].c == expected
+                })
         })
         .expect("`red` should be rendered in three consecutive cells of a visible row");
 
     for (offset, &expected) in RED.iter().enumerate() {
         let cell = &grid[Line::from(line)][Column(column + offset)];
         assert_eq!(cell.c, expected, "cell {offset} of `red`");
-        assert_eq!(cell.fg, Color::Named(NamedColor::Red), "foreground of cell {offset} of `red`");
+        assert_eq!(
+            cell.fg,
+            Color::Named(NamedColor::Red),
+            "foreground of cell {offset} of `red`"
+        );
     }
 
     // `CSI > 1 u` asks for disambiguated escape codes and nothing else was pushed, so a
@@ -164,9 +173,14 @@ fn kitty_keyboard_negotiation_still_replies_after_the_fix() {
         })
         .collect();
 
-    assert!(!replies.is_empty(), "the keyboard-protocol query should be answered");
     assert!(
-        replies.last().is_some_and(|reply| reply.starts_with("\x1b[?") && reply.ends_with('u')),
+        !replies.is_empty(),
+        "the keyboard-protocol query should be answered"
+    );
+    assert!(
+        replies
+            .last()
+            .is_some_and(|reply| reply.starts_with("\x1b[?") && reply.ends_with('u')),
         "the reply should report a keyboard mode, got {replies:?}"
     );
 }

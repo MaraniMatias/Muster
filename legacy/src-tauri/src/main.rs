@@ -10,7 +10,12 @@ pub mod git;
 mod menus;
 mod persistence;
 pub mod services;
-mod terminal;
+
+// The PTY backend and the workspace shapes it returns live in `muster-core`,
+// shared with the native host. Re-exported under its old name so every
+// `crate::terminal::` path in this crate keeps resolving to the one
+// implementation.
+pub use muster_core::pty as terminal;
 
 /// The level every log statement is kept at, in every build.
 ///

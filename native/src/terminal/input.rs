@@ -233,7 +233,10 @@ mod tests {
         let Input::Press(press) = press(&interrupt) else {
             panic!("Ctrl+C was taken by the application");
         };
-        assert!(press.ctrl, "Ctrl has to reach the PTY to interrupt the child");
+        assert!(
+            press.ctrl,
+            "Ctrl has to reach the PTY to interrupt the child"
+        );
         assert_eq!(press.key, Key::Char('c'));
     }
 
@@ -282,7 +285,10 @@ mod tests {
             focused: true,
             window_active: false,
         };
-        assert!(!inactive.accepts_input(), "an inactive window keeps nothing");
+        assert!(
+            !inactive.accepts_input(),
+            "an inactive window keeps nothing"
+        );
         assert!(inactive.draws_unfocused_cursor());
     }
 }

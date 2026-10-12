@@ -12,6 +12,9 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The PTY backend and the workspace shapes, shared with the native host. One
+# implementation of process lifetime, bounded writes and group-safe shutdown.
+muster-core = { path = "../../core" }
 base64 = "0.22"
 roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }

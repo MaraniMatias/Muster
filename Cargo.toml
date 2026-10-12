@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["core", "native"]
+
+# Declared here rather than in `native/Cargo.toml` because only the workspace
+# root's patch table is read. `native/vendor/alacritty_terminal-0.26.0` carries
+# a one-line fix over the published crate: crates.io 0.26.0 is the latest release
+# and panics on a remotely triggerable input. `native/vendor/.../PATCHES.md`
+# records what changed and why, and `scripts/patched-alacritty.mjs` hash-pins the
+# whole tree.
+[patch.crates-io]
+alacritty_terminal = { path = "native/vendor/alacritty_terminal-0.26.0" }
+
+# The VT parser and the GPUI text stack are hot enough that an unoptimized debug
+# build is not worth waiting for, and every third-party crate is worse.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

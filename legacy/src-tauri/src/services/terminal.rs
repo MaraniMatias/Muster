@@ -522,7 +522,7 @@ mod tests {
     use crate::{
         domain::workspace::Repo,
         persistence::Database,
-        terminal::{wait_for_output, OutputSink, SpawnOptions, TerminalBackend},
+        terminal::{test_support::wait_for_output, OutputSink, SpawnOptions, TerminalBackend},
     };
 
     use super::{

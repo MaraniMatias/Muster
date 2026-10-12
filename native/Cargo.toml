@@ -18,30 +18,16 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-kit = { version = "0.7.3", features = ["component"] }
-# The PTY layer is not reimplemented here: these are the same crates the Tauri
-# backend already uses, reached through the reused `terminal` module below.
+# The PTY layer is not reimplemented here: the same backend the Tauri app used,
+# as a dependency. Process lifetime, bounded writes and group-safe shutdown have
+# exactly one implementation.
+muster-core = { path = "../core" }
 portable-pty = "0.9"
 libc = "0.2"
 log = "0.4"
-# `src-tauri/src/domain/workspace.rs` derives both halves; this build only reads.
-serde = { version = "1", features = ["derive"] }
 alacritty_terminal = "0.26.0"
 
 [dev-dependencies]
 # Same crate, test-support on: unit tests build the same type universe as the app.
 gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
-# `src-tauri/src/domain/workspace.rs` has inline tests that serialize its shapes.
-serde_json = "1"
 tempfile = "3"
-
-# crates.io `alacritty_terminal` 0.26.0 is the latest published release and carries a remotely
-# triggerable panic with no corrected release to move to. The vendored copy carries a one-line
-# fix; `native/vendor/alacritty_terminal-0.26.0/PATCHES.md` records what changed and why.
-[patch.crates-io]
-alacritty_terminal = { path = "vendor/alacritty_terminal-0.26.0" }
-
-[profile.dev]
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 2

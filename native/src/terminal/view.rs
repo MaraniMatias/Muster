@@ -25,15 +25,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::{
-    App, Bounds, Context, FontId, FontStyle, FontWeight, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, Render, Rgba,
-    SharedString, Size, StrikethroughStyle, Styled, Task, TextAlign, TextStyle, UnderlineStyle,
-    Window, WindowTextSystem, canvas, div, px, point, quad,
+    canvas, div, point, px, quad, App, Bounds, Context, FocusHandle, FontId, FontStyle, FontWeight,
+    Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
+    Render, Rgba, SharedString, StrikethroughStyle, Styled, Task, TextAlign, TextStyle,
+    UnderlineStyle, Window, WindowTextSystem,
 };
 
 use super::input::{self, FocusState};
 use super::{
-    CellMetrics, CellSnapshot, ColorSnapshot, CursorShapeSnapshot, TerminalSession, TerminalSnapshot,
+    CellMetrics, CellSnapshot, ColorSnapshot, CursorShapeSnapshot, TerminalSession,
+    TerminalSnapshot,
 };
 
 /// The terminal's font size, in pixels.
@@ -448,12 +449,7 @@ impl TerminalView {
     }
 
     /// One keystroke, sent or refused.
-    fn on_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Only one source of printable text exists here, which is what keeps a
         // press from being sent twice. See `input` for why it is this one.
         let input::FocusState {
@@ -515,7 +511,13 @@ impl Frame {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let FrameInput { snapshot, cell, columns, rows, focus } = input;
+        let FrameInput {
+            snapshot,
+            cell,
+            columns,
+            rows,
+            focus,
+        } = input;
         let text_system = window.text_system().clone();
         let font_id = self.font_id;
         let font_size = self.style.font_size.to_pixels(window.rem_size());
@@ -549,21 +551,11 @@ impl Frame {
                 let x = bounds.origin.x + placement.column as f32 * cell.width;
                 let span = Bounds {
                     origin: point(x, y),
-                    size: gpui_kit::size(
-                        placement.columns as f32 * cell.width,
-                        cell.height,
-                    ),
+                    size: gpui_kit::size(placement.columns as f32 * cell.width, cell.height),
                 };
                 let at_cursor = cursor == Some((row_index, placement.column));
 
-                self.paint_cell(
-                    span,
-                    source,
-                    at_cursor,
-                    snapshot.cursor.shape,
-                    window,
-                    cx,
-                );
+                self.paint_cell(span, source, at_cursor, snapshot.cursor.shape, window, cx);
 
                 if at_cursor {
                     paint_cursor(span, snapshot.cursor.shape, focus, &self.palette, window);
@@ -642,15 +634,20 @@ impl Frame {
         });
 
         let text = SharedString::from(cell.c.to_string());
-        let shaped = window
-            .text_system()
-            .shape_line(
-                text.clone(),
-                style.font_size.to_pixels(window.rem_size()),
-                &[style.to_run(text.len())],
-                None,
-            );
-        if let Err(error) = shaped.paint(bounds.origin, bounds.size.height, TextAlign::Left, None, window, cx) {
+        let shaped = window.text_system().shape_line(
+            text.clone(),
+            style.font_size.to_pixels(window.rem_size()),
+            &[style.to_run(text.len())],
+            None,
+        );
+        if let Err(error) = shaped.paint(
+            bounds.origin,
+            bounds.size.height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        ) {
             log::warn!("muster-native: a cell was not painted: {error}");
         }
     }
@@ -760,10 +757,7 @@ fn outline(bounds: Bounds<Pixels>, color: &Hsla, window: &mut Window) {
             size: gpui_kit::size(bounds.size.width, edge),
         },
         Bounds {
-            origin: point(
-                bounds.origin.x,
-                bounds.origin.y + bounds.size.height - edge,
-            ),
+            origin: point(bounds.origin.x, bounds.origin.y + bounds.size.height - edge),
             size: gpui_kit::size(bounds.size.width, edge),
         },
         Bounds {
@@ -868,27 +862,36 @@ impl Render for TerminalView {
                         let view = Arc::clone(&self.session);
                         move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
                             let cell = cell?;
-                        let size = (cell.columns_in(bounds.size.width), cell.rows_in(bounds.size.height));
-                        // A window measuring nothing is invisible or minimised.
-                        // `resize` refuses zero already; asking only when the
-                        // answer changed is what keeps a hidden window from
-                        // asking sixty times a second.
-                        if size.0 > 0 && size.1 > 0 && applied.get() != size {
-                            applied.set(size);
-                            if let Err(error) = view.resize(size.0, size.1) {
-                                log::warn!("muster-native: the grid was not resized: {error}");
+                            let size = (
+                                cell.columns_in(bounds.size.width),
+                                cell.rows_in(bounds.size.height),
+                            );
+                            // A window measuring nothing is invisible or minimised.
+                            // `resize` refuses zero already; asking only when the
+                            // answer changed is what keeps a hidden window from
+                            // asking sixty times a second.
+                            if size.0 > 0 && size.1 > 0 && applied.get() != size {
+                                applied.set(size);
+                                if let Err(error) = view.resize(size.0, size.1) {
+                                    log::warn!("muster-native: the grid was not resized: {error}");
+                                }
                             }
+                            Some((cell, size))
                         }
-                        Some((cell, size))
-                    }
-                },
-                move |bounds, state, window, cx| {
-                    let Some((cell, (columns, rows))) = state else {
-                        return;
-                    };
-                    frame.paint(
+                    },
+                    move |bounds, state, window, cx| {
+                        let Some((cell, (columns, rows))) = state else {
+                            return;
+                        };
+                        frame.paint(
                             bounds,
-                            FrameInput { snapshot: &snapshot, cell, columns, rows, focus },
+                            FrameInput {
+                                snapshot: &snapshot,
+                                cell,
+                                columns,
+                                rows,
+                                focus,
+                            },
                             window,
                             cx,
                         );
@@ -1006,7 +1009,9 @@ mod tests {
             "every column of the row is claimed by exactly one glyph"
         );
         assert!(
-            placements.windows(2).all(|pair| pair[0].column + pair[0].columns <= pair[1].column),
+            placements
+                .windows(2)
+                .all(|pair| pair[0].column + pair[0].columns <= pair[1].column),
             "two placements claim the same column"
         );
     }
@@ -1043,9 +1048,21 @@ mod tests {
             height: px(16.0),
         };
         assert_eq!(cell.columns_in(px(80.0)), 10);
-        assert_eq!(cell.columns_in(px(87.0)), 10, "7 pixels cannot hold a column");
+        assert_eq!(
+            cell.columns_in(px(87.0)),
+            10,
+            "7 pixels cannot hold a column"
+        );
         assert_eq!(cell.rows_in(px(400.0)), 25);
-        assert_eq!(cell.columns_in(px(4.0)), 0, "a window under one cell is not a size");
-        assert_eq!(cell.rows_in(px(0.0)), 0, "neither is a window measuring nothing");
+        assert_eq!(
+            cell.columns_in(px(4.0)),
+            0,
+            "a window under one cell is not a size"
+        );
+        assert_eq!(
+            cell.rows_in(px(0.0)),
+            0,
+            "neither is a window measuring nothing"
+        );
     }
 }

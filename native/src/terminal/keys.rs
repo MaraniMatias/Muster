@@ -106,7 +106,14 @@ fn encode_press(press: &KeyPress, modes: &TerminalModes) -> Option<Vec<u8>> {
         // LNM: those are the same key and the mode is the only thing telling
         // them apart.
         Key::Enter => match modifier {
-            None => Some(if modes.newline_is_return { b"\n" } else { b"\r" }.to_vec()),
+            None => Some(
+                if modes.newline_is_return {
+                    b"\n"
+                } else {
+                    b"\r"
+                }
+                .to_vec(),
+            ),
             // The agent's newline. Only a child that pushed `CSI > 1 u` can tell
             // this from Enter at all, and this is the only form such a child
             // reads as anything but Enter.
@@ -165,7 +172,7 @@ fn encode_press(press: &KeyPress, modes: &TerminalModes) -> Option<Vec<u8>> {
         // turns `CSI 11 ~`.. into `SS3 P`.., and the negotiated form is neither.
         Key::F(number) => match number {
             1..=4 => {
-                let final_byte = [ 'P', 'Q', 'R', 'S' ][(number - 1) as usize];
+                let final_byte = ['P', 'Q', 'R', 'S'][(number - 1) as usize];
                 if modes.disambiguate_esc_codes {
                     if let Some(modifier) = modifier {
                         return Some(csi(&negotiated_parameters(Some(modifier)), final_byte));
@@ -177,7 +184,11 @@ fn encode_press(press: &KeyPress, modes: &TerminalModes) -> Option<Vec<u8>> {
                     tilde_key(number + 10, modes, None)
                 })
             }
-            5..=12 => Some(tilde_key(FUNCTION_KEY_NUMBERS[(number - 5) as usize], modes, modifier)),
+            5..=12 => Some(tilde_key(
+                FUNCTION_KEY_NUMBERS[(number - 5) as usize],
+                modes,
+                modifier,
+            )),
             // See `Key::F`.
             _ => None,
         },
@@ -321,7 +332,14 @@ mod tests {
     /// A press with nothing held. Most of what follows is about what one key
     /// sends on its own.
     fn press(key: Key) -> KeyPress {
-        KeyPress { key, shift: false, ctrl: false, alt: false, meta: false, text: None }
+        KeyPress {
+            key,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+            text: None,
+        }
     }
 
     fn with_shift(mut press: KeyPress) -> KeyPress {
@@ -358,7 +376,10 @@ mod tests {
 
     /// The child that pushed `CSI > 1 u`.
     fn negotiated() -> TerminalModes {
-        TerminalModes { disambiguate_esc_codes: true, ..TerminalModes::default() }
+        TerminalModes {
+            disambiguate_esc_codes: true,
+            ..TerminalModes::default()
+        }
     }
 
     fn encoded(press: &KeyPress, modes: &TerminalModes) -> Vec<u8> {
@@ -384,19 +405,40 @@ mod tests {
         // is 8. Answering 3 and 7 instead would name Alt+Enter and
         // Alt+Ctrl+Enter to the child, which is the one thing this whole case
         // exists to avoid.
-        assert_eq!(encoded(&with_alt(with_shift(press(Key::Enter))), &negotiated()), b"\x1b[13;4u");
-        assert_eq!(encoded(&with_ctrl(with_shift(press(Key::Enter))), &negotiated()), b"\x1b[13;6u");
         assert_eq!(
-            encoded(&with_ctrl(with_alt(with_shift(press(Key::Enter)))), &negotiated()),
+            encoded(&with_alt(with_shift(press(Key::Enter))), &negotiated()),
+            b"\x1b[13;4u"
+        );
+        assert_eq!(
+            encoded(&with_ctrl(with_shift(press(Key::Enter))), &negotiated()),
+            b"\x1b[13;6u"
+        );
+        assert_eq!(
+            encoded(
+                &with_ctrl(with_alt(with_shift(press(Key::Enter)))),
+                &negotiated()
+            ),
             b"\x1b[13;8u"
         );
-        assert_eq!(encoded(&with_alt(press(Key::Enter)), &negotiated()), b"\x1b[13;3u");
-        assert_eq!(encoded(&with_ctrl(press(Key::Enter)), &negotiated()), b"\x1b[13;5u");
+        assert_eq!(
+            encoded(&with_alt(press(Key::Enter)), &negotiated()),
+            b"\x1b[13;3u"
+        );
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Enter)), &negotiated()),
+            b"\x1b[13;5u"
+        );
 
         // Enter still answers Enter when the child asked for line feeds instead
         // of carriage returns, because LNM is about the unmodified key.
         assert_eq!(
-            encode_key(&plain_enter, &TerminalModes { newline_is_return: true, ..negotiated() }),
+            encode_key(
+                &plain_enter,
+                &TerminalModes {
+                    newline_is_return: true,
+                    ..negotiated()
+                }
+            ),
             Some(b"\n".to_vec())
         );
     }
@@ -414,10 +456,22 @@ mod tests {
         let asked_and_declined = unnegotiated();
 
         assert!(!asked_and_declined.disambiguate_esc_codes);
-        assert_eq!(encoded(&with_shift(press(Key::Enter)), &asked_and_declined), b"\n");
-        assert_eq!(encoded(&with_ctrl(with_shift(press(Key::Enter))), &asked_and_declined), b"\n");
+        assert_eq!(
+            encoded(&with_shift(press(Key::Enter)), &asked_and_declined),
+            b"\n"
+        );
+        assert_eq!(
+            encoded(
+                &with_ctrl(with_shift(press(Key::Enter))),
+                &asked_and_declined
+            ),
+            b"\n"
+        );
         assert_eq!(encoded(&press(Key::Up), &asked_and_declined), b"\x1b[A");
-        assert_eq!(encoded(&with_text(press(Key::Char('c')), "c"), &asked_and_declined), b"c");
+        assert_eq!(
+            encoded(&with_text(press(Key::Char('c')), "c"), &asked_and_declined),
+            b"c"
+        );
     }
 
     #[test]
@@ -433,9 +487,28 @@ mod tests {
         ] {
             let table = [
                 (TerminalModes::default(), csi_form),
-                (TerminalModes { app_cursor: true, ..TerminalModes::default() }, ss3_form),
-                (TerminalModes { disambiguate_esc_codes: true, ..TerminalModes::default() }, csi_form),
-                (TerminalModes { app_cursor: true, disambiguate_esc_codes: true, ..TerminalModes::default() }, csi_form),
+                (
+                    TerminalModes {
+                        app_cursor: true,
+                        ..TerminalModes::default()
+                    },
+                    ss3_form,
+                ),
+                (
+                    TerminalModes {
+                        disambiguate_esc_codes: true,
+                        ..TerminalModes::default()
+                    },
+                    csi_form,
+                ),
+                (
+                    TerminalModes {
+                        app_cursor: true,
+                        disambiguate_esc_codes: true,
+                        ..TerminalModes::default()
+                    },
+                    csi_form,
+                ),
             ];
 
             for (modes, expected) in table {
@@ -450,27 +523,48 @@ mod tests {
         // An unmodified arrow under the negotiation is `CSI A` still, not
         // `CSI 1 ; 1 A`: the parameter belongs to a modifier that is not there.
         assert_eq!(encoded(&press(Key::Up), &negotiated()), b"\x1b[A");
-        assert_eq!(encoded(&with_ctrl(press(Key::Up)), &negotiated()), b"\x1b[1;5A");
-        assert_eq!(encoded(&with_ctrl(with_alt(press(Key::Right))), &negotiated()), b"\x1b[1;7C");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Up)), &negotiated()),
+            b"\x1b[1;5A"
+        );
+        assert_eq!(
+            encoded(&with_ctrl(with_alt(press(Key::Right))), &negotiated()),
+            b"\x1b[1;7C"
+        );
         // A legacy child has no modified arrow at all, so it gets the
         // unmodified one rather than a parameter it will not read.
-        assert_eq!(encoded(&with_ctrl(press(Key::Left)), &unnegotiated()), b"\x1b[D");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Left)), &unnegotiated()),
+            b"\x1b[D"
+        );
     }
 
     #[test]
     fn ctrl_letters_become_control_bytes_and_meta_prefixes_with_escape() {
         for (letter, byte) in [('a', 0x01_u8), ('c', 0x03), ('z', 0x1a)] {
-            assert_eq!(encode_key(&with_ctrl(press(Key::Char(letter))), &unnegotiated()), Some(vec![byte]));
+            assert_eq!(
+                encode_key(&with_ctrl(press(Key::Char(letter))), &unnegotiated()),
+                Some(vec![byte])
+            );
         }
 
         // Ctrl+Shift+C is Ctrl+C: the shift is in the character the view
         // reported, not in a separate request for a different byte.
-        assert_eq!(encode_key(&with_ctrl(with_shift(press(Key::Char('C')))), &unnegotiated()), Some(vec![0x03]));
+        assert_eq!(
+            encode_key(
+                &with_ctrl(with_shift(press(Key::Char('C')))),
+                &unnegotiated()
+            ),
+            Some(vec![0x03])
+        );
 
         // A control byte beats the text the press carries, because the text a
         // view reports alongside Ctrl is the letter it is the control *of*.
         assert_eq!(
-            encode_key(&with_text(with_ctrl(press(Key::Char('c'))), "c"), &unnegotiated()),
+            encode_key(
+                &with_text(with_ctrl(press(Key::Char('c'))), "c"),
+                &unnegotiated()
+            ),
             Some(vec![0x03])
         );
 
@@ -478,74 +572,143 @@ mod tests {
         // character instead would put a `€` in a Ctrl press, and answering with
         // nothing at all would look like a dropped key, so the caller is told
         // instead.
-        assert_eq!(encode_key(&with_ctrl(press(Key::Char('€'))), &unnegotiated()), None);
+        assert_eq!(
+            encode_key(&with_ctrl(press(Key::Char('€'))), &unnegotiated()),
+            None
+        );
         // A key with an encoding of its own is not that case: Ctrl+Up is still
         // Up to a child that negotiated nothing, and has somewhere to go once
         // it did.
-        assert_eq!(encoded(&with_ctrl(press(Key::Up)), &unnegotiated()), b"\x1b[A");
-        assert_eq!(encoded(&with_ctrl(press(Key::Up)), &negotiated()), b"\x1b[1;5A");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Up)), &unnegotiated()),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Up)), &negotiated()),
+            b"\x1b[1;5A"
+        );
 
         // Meta prefixes whatever the press had on its own, text and keys alike.
-        assert_eq!(encoded(&with_meta(press(Key::Char('b'))), &unnegotiated()), b"\x1bb");
-        assert_eq!(encoded(&with_meta(press(Key::Up)), &unnegotiated()), b"\x1b\x1b[A");
-        assert_eq!(encoded(&with_meta(press(Key::Backspace)), &unnegotiated()), b"\x1b\x7f");
-        assert_eq!(encoded(&with_meta(with_shift(press(Key::Enter))), &negotiated()), b"\x1b\x1b[13;2u");
+        assert_eq!(
+            encoded(&with_meta(press(Key::Char('b'))), &unnegotiated()),
+            b"\x1bb"
+        );
+        assert_eq!(
+            encoded(&with_meta(press(Key::Up)), &unnegotiated()),
+            b"\x1b\x1b[A"
+        );
+        assert_eq!(
+            encoded(&with_meta(press(Key::Backspace)), &unnegotiated()),
+            b"\x1b\x7f"
+        );
+        assert_eq!(
+            encoded(&with_meta(with_shift(press(Key::Enter))), &negotiated()),
+            b"\x1b\x1b[13;2u"
+        );
         // ... and a press that had no meaning of its own still has none.
-        assert_eq!(encode_key(&with_meta(with_ctrl(press(Key::Char('€')))), &unnegotiated()), None);
+        assert_eq!(
+            encode_key(
+                &with_meta(with_ctrl(press(Key::Char('€')))),
+                &unnegotiated()
+            ),
+            None
+        );
     }
 
     #[test]
     fn committed_text_is_sent_whole_and_ctrl_only_applies_to_a_single_letter() {
         // An IME commit is several characters on one key event, and it is the
         // text rather than the `Key::Char` it arrived on that is the input.
-        assert_eq!(encoded(&with_text(press(Key::Char('あ')), "こんにちは"), &unnegotiated()), "こんにちは".as_bytes());
+        assert_eq!(
+            encoded(
+                &with_text(press(Key::Char('あ')), "こんにちは"),
+                &unnegotiated()
+            ),
+            "こんにちは".as_bytes()
+        );
         assert_eq!(encoded(&press(Key::Char('a')), &unnegotiated()), b"a");
         // Empty text is a view with nothing to report, so the character stands.
-        assert_eq!(encoded(&with_text(press(Key::Char('a')), ""), &unnegotiated()), b"a");
+        assert_eq!(
+            encoded(&with_text(press(Key::Char('a')), ""), &unnegotiated()),
+            b"a"
+        );
 
         // A commit longer than one letter under Ctrl has no control encoding in
         // any terminal, so it is refused rather than sent as if Ctrl were not
         // held.
-        assert_eq!(encode_key(&with_text(with_ctrl(press(Key::Char('こ'))), "こ"), &unnegotiated()), None);
+        assert_eq!(
+            encode_key(
+                &with_text(with_ctrl(press(Key::Char('こ'))), "こ"),
+                &unnegotiated()
+            ),
+            None
+        );
     }
 
     #[test]
     fn tab_keeps_its_legacy_shift_form_and_the_negotiated_one_carries_the_modifier() {
         assert_eq!(encoded(&press(Key::Tab), &unnegotiated()), b"\t");
-        assert_eq!(encoded(&with_shift(press(Key::Tab)), &unnegotiated()), b"\x1b[Z");
+        assert_eq!(
+            encoded(&with_shift(press(Key::Tab)), &unnegotiated()),
+            b"\x1b[Z"
+        );
         // Ctrl+Tab has no legacy form, so it collapses onto the unmodified one.
         assert_eq!(encoded(&with_ctrl(press(Key::Tab)), &unnegotiated()), b"\t");
 
         assert_eq!(encoded(&press(Key::Tab), &negotiated()), b"\t");
-        assert_eq!(encoded(&with_shift(press(Key::Tab)), &negotiated()), b"\x1b[9;2u");
-        assert_eq!(encoded(&with_ctrl(press(Key::Tab)), &negotiated()), b"\x1b[9;5u");
+        assert_eq!(
+            encoded(&with_shift(press(Key::Tab)), &negotiated()),
+            b"\x1b[9;2u"
+        );
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Tab)), &negotiated()),
+            b"\x1b[9;5u"
+        );
     }
 
     #[test]
     fn home_and_end_gain_a_modifier_only_under_the_negotiation() {
-        for (key, legacy, negotiated_modifiers) in
-            [(Key::Home, b"\x1b[H".as_slice(), b"\x1b[1;4H".as_slice()), (Key::End, b"\x1b[F".as_slice(), b"\x1b[1;4F".as_slice())]
-        {
+        for (key, legacy, negotiated_modifiers) in [
+            (Key::Home, b"\x1b[H".as_slice(), b"\x1b[1;4H".as_slice()),
+            (Key::End, b"\x1b[F".as_slice(), b"\x1b[1;4F".as_slice()),
+        ] {
             assert_eq!(encoded(&press(key), &unnegotiated()), legacy);
             assert_eq!(encoded(&press(key), &negotiated()), legacy);
-            assert_eq!(encoded(&with_alt(with_shift(press(key))), &negotiated()), negotiated_modifiers);
+            assert_eq!(
+                encoded(&with_alt(with_shift(press(key))), &negotiated()),
+                negotiated_modifiers
+            );
             // The legacy pair is two fixed bytes in every terminal that has it.
-            assert_eq!(encoded(&with_alt(with_shift(press(key))), &unnegotiated()), legacy);
+            assert_eq!(
+                encoded(&with_alt(with_shift(press(key))), &unnegotiated()),
+                legacy
+            );
         }
 
         assert_eq!(encoded(&press(Key::PageUp), &unnegotiated()), b"\x1b[5~");
         assert_eq!(encoded(&press(Key::PageDown), &unnegotiated()), b"\x1b[6~");
         assert_eq!(encoded(&press(Key::Insert), &unnegotiated()), b"\x1b[2~");
         assert_eq!(encoded(&press(Key::Delete), &unnegotiated()), b"\x1b[3~");
-        assert_eq!(encoded(&with_ctrl(press(Key::Delete)), &negotiated()), b"\x1b[3;5~");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Delete)), &negotiated()),
+            b"\x1b[3;5~"
+        );
     }
 
     #[test]
     fn function_keys_pick_between_three_encodings_and_refuse_a_thirteenth() {
-        let app_keypad = TerminalModes { app_keypad: true, ..TerminalModes::default() };
+        let app_keypad = TerminalModes {
+            app_keypad: true,
+            ..TerminalModes::default()
+        };
 
         for (number, legacy, ss3, disambiguated) in [
-            (1_u8, b"\x1b[11~".as_slice(), b"\x1bOP".as_slice(), b"\x1b[1;2P".as_slice()),
+            (
+                1_u8,
+                b"\x1b[11~".as_slice(),
+                b"\x1bOP".as_slice(),
+                b"\x1b[1;2P".as_slice(),
+            ),
             (2, b"\x1b[12~", b"\x1bOQ", b"\x1b[1;2Q"),
             (3, b"\x1b[13~", b"\x1bOR", b"\x1b[1;2R"),
             (4, b"\x1b[14~", b"\x1bOS", b"\x1b[1;2S"),
@@ -555,19 +718,32 @@ mod tests {
             // Negotiated, the four answer as `CSI 1 ; modifier P`.. whatever the
             // keypad mode says, and the final byte is the one F1 already had.
             assert_eq!(encoded(&press(Key::F(number)), &negotiated()), legacy);
-            assert_eq!(encoded(&with_shift(press(Key::F(number))), &negotiated()), disambiguated);
-            assert_eq!(encoded(&with_shift(press(Key::F(number))), &app_keypad), ss3);
+            assert_eq!(
+                encoded(&with_shift(press(Key::F(number))), &negotiated()),
+                disambiguated
+            );
+            assert_eq!(
+                encoded(&with_shift(press(Key::F(number))), &app_keypad),
+                ss3
+            );
         }
 
         // F5 and up have one encoding and application keypad does not touch it.
         assert_eq!(encoded(&press(Key::F(5)), &unnegotiated()), b"\x1b[15~");
         assert_eq!(encoded(&press(Key::F(5)), &app_keypad), b"\x1b[15~");
         assert_eq!(encoded(&press(Key::F(12)), &unnegotiated()), b"\x1b[24~");
-        assert_eq!(encoded(&with_ctrl(press(Key::F(12))), &negotiated()), b"\x1b[24;5~");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::F(12))), &negotiated()),
+            b"\x1b[24;5~"
+        );
 
         // A key no terminal can be sent is refused, not rounded to a neighbour.
         for number in [0_u8, 13, 255] {
-            assert_eq!(encode_key(&press(Key::F(number)), &negotiated()), None, "F{number}");
+            assert_eq!(
+                encode_key(&press(Key::F(number)), &negotiated()),
+                None,
+                "F{number}"
+            );
         }
     }
 
@@ -577,6 +753,9 @@ mod tests {
         assert_eq!(encoded(&press(Key::Escape), &negotiated()), b"\x1b");
         // Their encoding has no parameter to put a modifier in, so a modified
         // one is the unmodified one rather than a shape that does not exist.
-        assert_eq!(encoded(&with_ctrl(press(Key::Backspace)), &negotiated()), b"\x7f");
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Backspace)), &negotiated()),
+            b"\x7f"
+        );
     }
 }

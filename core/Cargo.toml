@@ -1,0 +1,28 @@
+[package]
+name = "muster-core"
+version = "0.0.0"
+# 2021, matching the sources this crate took over from `src-tauri`. Those files
+# are edition 2021 and `muster-native` -- the only consumer -- does not have to
+# cross editions to depend on them.
+edition = "2021"
+publish = false
+description = "Muster's host-independent core: the PTY backend and the workspace shapes its callers exchange. No window, no Tauri, no GPUI."
+
+[lib]
+name = "muster_core"
+path = "src/lib.rs"
+
+[dependencies]
+# The PTY layer is not reimplemented here: these are the same crates the Tauri
+# backend already used, and the code below is the code it used.
+portable-pty = "0.9"
+libc = "0.2"
+log = "0.4"
+# `workspace.rs` derives both halves; the terminal backend returns these types.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Same crate, so a unit test here builds the same type universe the callers build.
+serde_json = "1"
+# `pty/mod.rs` and `workspace.rs` carry inline tests that need a scratch path.
+tempfile = "3"

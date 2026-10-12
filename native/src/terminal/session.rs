@@ -46,8 +46,8 @@ use super::keys::{encode_key, KeyPress};
 use super::modes::TerminalModes;
 use super::paste::{encode_paste, PasteError};
 use super::write_queue::{EnqueueError, WriteQueue};
-use crate::domain::workspace::TerminalProcessState;
 use crate::pty::{OutputSink, ReaderEnd, ReaderEndSink, SpawnOptions, TerminalBackend};
+use crate::workspace::TerminalProcessState;
 
 /// The argument that makes a shell a *login* shell on every shell this app can
 /// spawn: `zsh`, `bash`, `sh` and `fish` all take it and none of them treats it
