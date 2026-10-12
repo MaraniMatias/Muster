@@ -18,6 +18,26 @@ pub(crate) mod process;
 
 pub type OutputSink = Box<dyn FnMut(&[u8]) -> Result<(), String> + Send + 'static>;
 
+/// How a session's reader thread stopped taking bytes.
+///
+/// A child exiting is not this: the shell can be gone while its last output is
+/// still being drained, and the reverse is possible too. A consumer that cannot
+/// tell the three apart has no way to tell a quiet terminal from a dead reader,
+/// and will keep showing a frozen grid as though it were healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReaderEnd {
+    /// The PTY was closed cleanly. Every byte the child wrote has been delivered.
+    EndOfStream,
+    /// The PTY could not be read any further. Bytes already delivered stand, but
+    /// the reason is a failure and not the end of the session.
+    ReadFailed(String),
+    /// The reader itself stopped, which means output stopped being delivered while
+    /// the child may well still be running.
+    ReaderStopped,
+}
+
+pub type ReaderEndSink = Box<dyn FnOnce(ReaderEnd) + Send + 'static>;
+
 pub struct SpawnOptions {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -26,6 +46,33 @@ pub struct SpawnOptions {
     pub rows: u16,
     /// Environment overrides for this child only.
     pub env: Vec<(OsString, OsString)>,
+    /// Told exactly once, from the reader thread, when that thread stops: end of
+    /// stream, a read failure, or an unwinding reader. `None` — what a consumer
+    /// that only wants bytes passes — leaves the reader as silent as it was.
+    pub reader_end: Option<ReaderEndSink>,
+}
+
+/// Reports the reader's fate exactly once, whichever way the thread ends.
+///
+/// The normal paths take the callback and call it with the real reason. What is
+/// left behind runs while the thread unwinds, which is how a panic inside the
+/// reader still reaches the owner instead of being indistinguishable from a
+/// quiet PTY. Catching the unwind is deliberately not done: the report says the
+/// reader stopped, and the cause of a panic stays where it happened.
+struct ReaderCompletion(Option<ReaderEndSink>);
+
+impl ReaderCompletion {
+    fn finish(&mut self, end: ReaderEnd) {
+        if let Some(sink) = self.0.take() {
+            sink(end);
+        }
+    }
+}
+
+impl Drop for ReaderCompletion {
+    fn drop(&mut self) {
+        self.finish(ReaderEnd::ReaderStopped);
+    }
 }
 
 struct Session {
@@ -146,11 +193,13 @@ impl TerminalBackend {
         });
         let reader_session = Arc::clone(&session);
         let reader_fd = session.master_fd;
+        let reader_end = options.reader_end;
         if let Err(error) = thread::Builder::new()
             .name("muster-pty-reader".into())
             .spawn(move || {
                 let _session = reader_session;
-                read_output(reader, reader_fd, &mut output)
+                let mut completion = ReaderCompletion(reader_end);
+                read_output(reader, reader_fd, &mut output, &mut completion)
             })
         {
             let _ = terminate_session(&session, &id);
@@ -917,7 +966,12 @@ fn wait_pty_readable(fd: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn read_output(mut reader: Box<dyn Read + Send>, master_fd: libc::c_int, output: &mut OutputSink) {
+fn read_output(
+    mut reader: Box<dyn Read + Send>,
+    master_fd: libc::c_int,
+    output: &mut OutputSink,
+    completion: &mut ReaderCompletion,
+) {
     let mut buffer = [0_u8; 64 * 1024];
     // Said once. A window that is gone refuses every chunk from here to the end of the session,
     // and a line per chunk would bury everything else the log is for.
@@ -926,16 +980,23 @@ fn read_output(mut reader: Box<dyn Read + Send>, master_fd: libc::c_int, output:
         #[cfg(unix)]
         if let Err(error) = wait_pty_readable(master_fd) {
             log::warn!("terminal PTY reader poll failed: {error}");
+            completion.finish(ReaderEnd::ReadFailed(error.to_string()));
             break;
         }
         #[cfg(not(unix))]
         let _ = master_fd;
 
         match reader.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                completion.finish(ReaderEnd::EndOfStream);
+                break;
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
+            Err(error) => {
+                completion.finish(ReaderEnd::ReadFailed(error.to_string()));
+                break;
+            }
             Ok(count) => {
                 // A disconnected renderer must not stop draining the PTY and deadlock its child.
                 if let Err(error) = output(&buffer[..count]) {
@@ -1175,10 +1236,16 @@ mod tests {
     #[cfg(unix)]
     use super::{process_group_exists, signal_group_with, GroupSignal, REAP_POLL_INTERVAL};
     use super::{
-        start_child_reaper, ChildState, OutputGate, OutputSink, SpawnOptions, TerminalBackend,
-        MAX_TERMINAL_INPUT_BYTES, OUTPUT_HIGH_WATER_BYTES, OUTPUT_LOW_WATER_BYTES,
-        OUTPUT_RESUME_TIMEOUT,
+        start_child_reaper, ChildState, OutputGate, OutputSink, ReaderEnd, SpawnOptions,
+        TerminalBackend, MAX_TERMINAL_INPUT_BYTES, OUTPUT_HIGH_WATER_BYTES,
+        OUTPUT_LOW_WATER_BYTES, OUTPUT_RESUME_TIMEOUT,
     };
+
+    /// A reader end that reports once, so a test can tell "told me" from "told me twice".
+    fn reader_end_sink() -> (super::ReaderEndSink, mpsc::Receiver<ReaderEnd>) {
+        let (sender, receiver) = mpsc::channel();
+        (Box::new(move |end| { let _ = sender.send(end); }), receiver)
+    }
 
     fn spawn(
         backend: &TerminalBackend,
@@ -1196,6 +1263,7 @@ mod tests {
                     cwd: std::env::current_dir().unwrap(),
                     cols: 80,
                     rows: 24,
+                    reader_end: None,
                     env: vec![],
                 },
                 output,
@@ -1362,6 +1430,7 @@ mod tests {
                     cwd: directory.path().to_path_buf(),
                     cols: 80,
                     rows: 24,
+                    reader_end: None,
                     env: vec![],
                 },
                 output,
@@ -2375,4 +2444,67 @@ mod tests {
     }
 
     use crate::domain::workspace::TerminalProcessState;
+
+    #[test]
+    fn a_reader_that_reaches_the_end_of_the_pty_says_so_exactly_once() {
+        let backend = TerminalBackend::default();
+        let (sink, receiver) = sink();
+        let (end_sink, ends) = reader_end_sink();
+        backend
+            .spawn(
+                "ends:stream".into(),
+                SpawnOptions {
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".into(), "exit 0".into()],
+                    cwd: std::env::current_dir().unwrap(),
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                    reader_end: Some(end_sink),
+                },
+                sink,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ends.recv_timeout(Duration::from_secs(5)).expect("no reader end was reported"),
+            ReaderEnd::EndOfStream,
+            "a shell that exits cleanly ends the stream, which is not a read failure",
+        );
+        assert!(
+            ends.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the reader reported its end more than once",
+        );
+        drop(receiver);
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_reader_that_unwinds_says_the_reader_stopped_rather_than_going_quiet() {
+        let backend = TerminalBackend::default();
+        let (end_sink, ends) = reader_end_sink();
+        // A child that outlives the unwind, so a silent reader here would leave a live
+        // process with no reader and nothing to say so.
+        backend
+            .spawn(
+                "ends:panic".into(),
+                SpawnOptions {
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".into(), "printf x; sleep 30".into()],
+                    cwd: std::env::current_dir().unwrap(),
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                    reader_end: Some(end_sink),
+                },
+                Box::new(|_| panic!("the renderer went away mid-chunk")),
+            )
+            .unwrap();
+
+        assert_eq!(
+            ends.recv_timeout(Duration::from_secs(5)).expect("an unwinding reader stayed quiet"),
+            ReaderEnd::ReaderStopped,
+        );
+        backend.shutdown();
+    }
 }

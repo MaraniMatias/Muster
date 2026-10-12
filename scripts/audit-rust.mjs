@@ -1,10 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { auditedPatchedAlacritty } from "./patched-alacritty.mjs";
 import { auditedPatchedGlib, isAuditedPatchedGlib, PATCHED_GLIB_ADVISORY_IDS } from "./patched-glib.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const MANIFEST = resolve(ROOT, "src-tauri/Cargo.toml");
+// Every manifest whose locked dependency graph is audited: the Tauri app and the native GPUI shell.
+export const AUDITED_MANIFESTS = Object.freeze([
+  resolve(ROOT, "src-tauri/Cargo.toml"),
+  resolve(ROOT, "native/Cargo.toml"),
+]);
 export const CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index";
 const OSV_ENDPOINT = "https://api.osv.dev/v1/querybatch";
 const OSV_VULN_ENDPOINT = "https://api.osv.dev/v1/vulns/";
@@ -12,7 +17,7 @@ const BATCH_SIZE = 100;
 const DETAIL_CONCURRENCY = 8;
 const REQUEST_TIMEOUT_MS = 20_000;
 
-export function cargoMetadataArgs(manifestPath = MANIFEST) {
+export function cargoMetadataArgs(manifestPath) {
   return ["metadata", "--locked", "--format-version", "1", "--all-features", "--manifest-path", manifestPath];
 }
 
@@ -48,10 +53,10 @@ export function parseCargoMetadata(json) {
     } else if (pkg.source !== null) {
       throw new Error(`unsupported external dependency source for ${label}`);
     } else {
-      const patchedGlib = auditedPatchedGlib(pkg);
-      if (patchedGlib) {
+      const audited = auditedPatchedGlib(pkg) ?? auditedPatchedAlacritty(pkg);
+      if (audited) {
         const key = `patched\0${pkg.name}@${pkg.version}`;
-        packages.set(key, patchedGlib);
+        packages.set(key, audited);
       } else if (!workspaceMembers.has(pkg.id)) {
         throw new Error(`unsupported external path dependency for ${label}`);
       }
@@ -60,23 +65,31 @@ export function parseCargoMetadata(json) {
   return [...packages.values()].sort((a, b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`));
 }
 
-export function loadLockedPackages({ manifestPath = MANIFEST, run = spawnSync } = {}) {
-  const result = run("cargo", cargoMetadataArgs(manifestPath), {
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-    timeout: 120_000,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error("cargo metadata could not validate Cargo.lock");
-  }
+export function loadLockedPackages({ manifestPaths = AUDITED_MANIFESTS, run = spawnSync } = {}) {
+  const packages = new Map();
+  for (const manifestPath of manifestPaths) {
+    const result = run("cargo", cargoMetadataArgs(manifestPath), {
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: 120_000,
+    });
+    if (result.error || result.status !== 0) {
+      throw new Error("cargo metadata could not validate Cargo.lock");
+    }
 
-  let metadata;
-  try {
-    metadata = JSON.parse(result.stdout);
-  } catch {
-    throw new Error("cargo metadata returned invalid JSON");
+    let metadata;
+    try {
+      metadata = JSON.parse(result.stdout);
+    } catch {
+      throw new Error("cargo metadata returned invalid JSON");
+    }
+    // Both manifests resolve their own share of the dependency graph, so a package reachable from
+    // more than one of them is audited once.
+    for (const pkg of parseCargoMetadata(metadata)) {
+      packages.set(`${pkg.source ?? "patched"}\0${pkg.name}@${pkg.version}`, pkg);
+    }
   }
-  return parseCargoMetadata(metadata);
+  return [...packages.values()].sort((a, b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`));
 }
 
 export function classifySeverity(vulnerability) {
@@ -98,7 +111,10 @@ export function classifySeverity(vulnerability) {
     return "UNKNOWN";
   }
   if (vulnerability.database_specific?.informational) return "INFO";
-  if (/\bunmaintained\b/i.test(vulnerability.summary ?? "")) return "INFO";
+  // RustSec writes maintenance status two ways: "foo is unmaintained" and "foo - no longer
+  // maintained". Both are the same advisory class, and both used to be classified UNKNOWN when
+  // only the first phrasing was recognised, which blocks the build on a non-vulnerability.
+  if (/\b(?:unmaintained|no longer maintained)\b/i.test(vulnerability.summary ?? "")) return "INFO";
   return "UNKNOWN";
 }
 
