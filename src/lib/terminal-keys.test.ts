@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { watchKeyboardProtocol } from "./terminal-keys";
+import { csiUChord, watchKeyboardProtocol } from "./terminal-keys";
 
 /** The escape every one of these sequences opens with, as the code it is. */
 const ESC = String.fromCharCode(0x1b);
@@ -102,5 +102,36 @@ describe("watchKeyboardProtocol", () => {
     protocol.read(output(`${ESC}[?0u`));
     expect(protocol.csiU).toBe(false);
     expect(answer).not.toHaveBeenCalled();
+  });
+});
+
+describe("csiUChord", () => {
+  const chord = (over: Partial<Parameters<typeof csiUChord>[0]>) =>
+    csiUChord({ key: "", code: "", ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, ...over });
+
+  it("sends the chord a reader asked to be told about", () => {
+    // The key is the one its position spells with nothing held down, and the shift rides in the
+    // modifier byte: 1 is the base, 1 the shift and 4 the control.
+    expect(chord({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true })).toBe(`${ESC}[97;6u`);
+    expect(chord({ key: "P", code: "KeyP", ctrlKey: true, shiftKey: true })).toBe(`${ESC}[112;6u`);
+    // A digit is the same chord as a letter, and the character the shift produced is not the key.
+    expect(chord({ key: "!", code: "Digit1", ctrlKey: true, shiftKey: true })).toBe(`${ESC}[49;6u`);
+  });
+
+  it("carries the other modifiers it is handed", () => {
+    expect(chord({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true, altKey: true })).toBe(`${ESC}[97;8u`);
+    expect(chord({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true, metaKey: true })).toBe(`${ESC}[97;14u`);
+  });
+
+  it("leaves every chord xterm.js already spells to xterm.js", () => {
+    // Without the control, the shift is a character and xterm sends it as one; without the shift,
+    // the chord is a control character xterm knows how to make.
+    expect(chord({ key: "A", code: "KeyA", shiftKey: true })).toBeUndefined();
+    expect(chord({ key: "a", code: "KeyA", ctrlKey: true })).toBeUndefined();
+    // xterm's mapping has an escape for the keys it names and sends those itself.
+    expect(chord({ key: "F5", code: "F5", ctrlKey: true, shiftKey: true })).toBeUndefined();
+    expect(chord({ key: "Enter", code: "Enter", ctrlKey: true, shiftKey: true })).toBeUndefined();
+    // A position that is neither a letter nor a digit is not a key this build can spell.
+    expect(chord({ key: "?", code: "Slash", ctrlKey: true, shiftKey: true })).toBeUndefined();
   });
 });

@@ -42,6 +42,12 @@ const ANNOUNCEMENT = new RegExp(`${ESCAPE}\\[([<>?=])(\\d*)(?:[;: ](\\d+))*u`, "
 const ADD = 2;
 const REMOVE = 3;
 
+/** What each modifier adds to the byte the protocol carries it in, one bit above the base value. */
+const SHIFT = 1;
+const ALT = 2;
+const CTRL = 4;
+const META = 8;
+
 export interface KeyboardProtocol {
   /** Whether a modified key can be sent as a key of its own rather than as the bare one it looks like. */
   readonly csiU: boolean;
@@ -93,4 +99,51 @@ export function watchKeyboardProtocol(answer: (data: string) => void): KeyboardP
         carried > ANNOUNCEMENT_TAIL ? chunk.slice(lastRead + (carried - ANNOUNCEMENT_TAIL)) : chunk.slice(lastRead);
     },
   };
+}
+
+/** The part of a key event the encoding below is decided from. */
+export interface ChordKey {
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+}
+
+/**
+ * The key a chord names, or nothing at all for a position this build does not spell.
+ *
+ * The position is the key and not the character, which is the same rule the flags are read by: a
+ * key is sent as the key it types with nothing held down, so `Ctrl+Shift+A` is the `97` its
+ * position spells and the shift rides in the modifier byte beside it. Reading `key` instead would
+ * send the `65` of the character the shift produced and ask a reader for a shifted `a` with the
+ * shift already in the modifiers.
+ */
+function baseKey(event: ChordKey): number | undefined {
+  const letter = /^Key([A-Z])$/.exec(event.code);
+  if (letter) return letter[1]!.charCodeAt(0) + 32;
+  const digit = /^Digit(\d)$/.exec(event.code);
+  return digit ? digit[1]!.charCodeAt(0) : undefined;
+}
+
+/**
+ * The `ESC [ key ; modifiers u` form of a chord xterm.js cannot spell, or nothing for one it can.
+ *
+ * xterm.js answers the keys it has an escape for and drops the rest: `Ctrl+Shift+A` sends no bytes
+ * at all, where `Ctrl+Shift+F5` goes out as `ESC [ 15 ; 6 ~` with the shift in it. The letter is
+ * what is missing — it is the one key xterm turns into a control character, and the shift it
+ * cannot put on a control character is dropped with it, so a reader that asked for the whole chord
+ * is handed nothing and the shortcut it is bound to never fires.
+ *
+ * Ctrl and Shift is the only chord decided here, because it is the only one that gets here: every
+ * other modifier xterm either sends or drops the same way whatever the shift is, and a chord the
+ * reader never distinguished was never a shortcut anybody is holding down.
+ */
+export function csiUChord(event: ChordKey): string | undefined {
+  if (!event.ctrlKey || !event.shiftKey) return undefined;
+  const key = baseKey(event);
+  if (key === undefined) return undefined;
+  const modifiers = 1 + SHIFT + CTRL + (event.altKey ? ALT : 0) + (event.metaKey ? META : 0);
+  return `${ESCAPE}[${key};${modifiers}u`;
 }

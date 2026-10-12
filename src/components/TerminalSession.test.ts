@@ -447,6 +447,35 @@ describe("TerminalSession UI", () => {
     wrapper.unmount();
   });
 
+  it("answers Ctrl+Shift+<key> in the encoding the program announced, which xterm drops", async () => {
+    const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
+    await flushPromises();
+
+    const handler = terminalMock.customKeyHandlers[0]!;
+    const chord = (init: KeyboardEventInit) => handler(new KeyboardEvent("keydown", init));
+
+    // A program that never asked to be told about keys is xterm's to answer, and a chord it can
+    // spell is left alone: the release and the character event must both reach it as well.
+    expect(chord({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(handler(new KeyboardEvent("keyup", { key: "A", code: "KeyA", ctrlKey: true, shiftKey: true }))).toBe(true);
+    expect(writeTerminal).not.toHaveBeenCalled();
+
+    terminalMock.channel?.onmessage(new TextEncoder().encode("\u001b[>1u").buffer as ArrayBuffer);
+    expect(chord({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true })).toBe(false);
+    await flushPromises();
+    expect(writeTerminal).toHaveBeenLastCalledWith(
+      "checkout:repo",
+      "session:new",
+      new TextEncoder().encode("\u001b[97;6u"),
+    );
+
+    // A chord without the shift is a control character xterm makes itself, and Shift+Enter is the
+    // one the handler above already answers.
+    expect(chord({ key: "a", code: "KeyA", ctrlKey: true })).toBe(true);
+    expect(chord({ key: "Enter", ctrlKey: true, shiftKey: true })).toBe(true);
+    wrapper.unmount();
+  });
+
   it("rejects terminal input above the byte budget with a visible error", async () => {
     const wrapper = mount(TerminalSession, { props: { checkoutId: "checkout:repo", active: true } });
     await flushPromises();

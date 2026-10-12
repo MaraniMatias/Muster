@@ -36,7 +36,7 @@ import {
 import { registerFilePathLinks } from "../lib/terminal-file-links";
 import { enableClickToMoveCursor } from "../lib/terminal-click-cursor";
 import type { ClickToMoveCursor } from "../lib/terminal-click-cursor";
-import { watchKeyboardProtocol } from "../lib/terminal-keys";
+import { csiUChord, watchKeyboardProtocol } from "../lib/terminal-keys";
 import { createPtyOutputWriter } from "../lib/terminal-renderer";
 import type { PtyOutputWriter } from "../lib/terminal-renderer";
 import { registerShellIntegration } from "../lib/terminal-shell-integration";
@@ -1112,7 +1112,24 @@ function forwardShiftEnter(event: KeyboardEvent): boolean {
   if (event.type === "keydown") void queueInput(keyboardProtocol.csiU ? "\u001b[13;2u" : "\n");
   return false;
 }
-terminal.attachCustomKeyEventHandler(forwardShiftEnter);
+/**
+ * Ctrl+Shift+<key> is a key of its own to a reader that asked for the keyboard protocol, and
+ * xterm.js 6 sends nothing at all for it: the letter is the one key its mapping turns into a
+ * control character, and the shift it cannot put on a control character is dropped with it, so a
+ * program bound to that chord never hears it pressed. The encoding it is sent in is the reader's
+ * to have chosen, the same as Shift+Enter's: a program that pushed the flags reads keys in the
+ * CSI-u form and gets the chord whole, and one that never said anything is left with xterm's own
+ * answer rather than one invented here.
+ */
+function forwardCtrlShift(event: KeyboardEvent): boolean {
+  if (event.type !== "keydown" || !keyboardProtocol.csiU) return true;
+  const chord = csiUChord(event);
+  if (chord === undefined) return true;
+  void queueInput(chord);
+  return false;
+}
+
+terminal.attachCustomKeyEventHandler((event) => forwardCtrlShift(event) && forwardShiftEnter(event));
 
 terminal.onTitleChange((title) => {
   // PTY titles are untrusted text: keep them short and strip control characters before exposing them to UI.

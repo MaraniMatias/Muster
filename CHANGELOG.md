@@ -8,6 +8,18 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **Ctrl+Shift+<key> now reaches the program in the terminal.** xterm.js 6 answers the keys it has an
+  escape for and drops the rest: `Ctrl+Shift+A` sent no bytes at all, where `Ctrl+Shift+F5` went out
+  as `ESC [ 15 ; 6 ~` with the shift in it. The letter is what went missing, because it is the one
+  key xterm turns into a control character and the shift it cannot put on a control character is
+  dropped with it — so a program bound to `Ctrl+Shift+<key>` never heard it pressed and the shortcut
+  did nothing. The terminal now answers that chord itself, in the encoding the program chose: one
+  that pushed the keyboard protocol gets `ESC [ 97 ; 6 u` and the whole chord, and one that never
+  announced anything is left with xterm's own answer rather than one invented here. This is the
+  same path `Shift+Enter` already took, and it means the shortcut only exists behind a reader that
+  asked to be told about keys at all — no terminal can send a chord no program has agreed to
+  distinguish.
+
 - **Where an exported review round lands is a preference.** Settings has a "Review notes" section
   with a selector for it: `Default` keeps them in `~/.muster/tmp/reviews`, and `Work directory`
   keeps them in `.muster/reviews` inside the checkout the review was made in — the repository or
