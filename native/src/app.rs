@@ -1,228 +1,2085 @@
-//! The window, and the two ways this app ends.
-//!
-//! One grid, one status line, one shell. Everything with a lifetime in it lives
-//! here: the shell is spawned and claimed *before* the view that draws it, so a
-//! window that never mounts still has a shell somebody is responsible for
-//! ending, and the quit path is registered before the window opens, so a quit
-//! that arrives in the first frame still ends it.
-//!
-//! Two endings, and they differ on purpose:
-//!
-//! * A **window close** can be refused. A `vim` in front of the shell is the
-//!   person's work, and only they decide whether it is worth closing.
-//! * An **app quit** cannot. GPUI runs [`install_quit_path`]'s handler from
-//!   `App::shutdown`, and the platform hands the process to `exit` rather than
-//!   unwinding, so a window's `Drop` is not somewhere a shell can be relied on
-//!   to end from. That path is also where the free [`shutdown`] lives: the
-//!   session's close sequence respects the drain deadline and the process
-//!   group, and `shutdown` is the only thing that reaches a child the sequence
-//!   never got to.
-//!
-//! Nothing else is read from the machine: no database is opened, nothing under
-//! `~/.muster` is touched, and no shell startup file is parsed by this file.
+//! Native workspace window. Terminal entities are retained by session identity;
+//! navigation and folding never own (or restart) a PTY.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc, Arc, Mutex, Weak,
+};
 use std::thread;
+use std::time::Duration;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    button::{Button, ButtonVariants},
+    dialog::{Dialog, DialogContent, DialogFooter},
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+    resizable::{h_resizable, resizable_panel, ResizableState},
+    scroll::ScrollableElement,
+    Disableable, Icon, Sizable,
+};
 use gpui_kit::{
-    div, px, size, AnyElement, App, AppContext, Bounds, Context, Entity, Focusable, IntoElement,
-    ParentElement, Render, Styled, TextAlign, Window, WindowBounds, WindowOptions,
+    div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, PathPromptOptions,
+    PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, WindowBounds, WindowOptions,
+};
+use muster_core::navigation::{self, DiffTotals, NavigationState};
+use muster_core::workspace::{
+    Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
 };
 
+use crate::navigation::{checkout_title, session_title, Navigation};
 use crate::pty::TerminalBackend;
 use crate::terminal::{
-    shutdown, xterm_256, CellMetrics, CloseReport, ColorSnapshot, Palette, SessionError,
-    ShellState, TerminalHost, TerminalSession, TerminalSessionConfig, TerminalView,
+    shutdown, xterm_256, CellMetrics, ColorSnapshot, Palette, ShellState, TerminalHost,
+    TerminalSession, TerminalSessionConfig, TerminalView,
 };
 
-/// The shell this process owns, taken by whichever path ends it first.
-///
-/// A `static` rather than a field because the quit callback has no window to
-/// borrow from, and `shutdown` wants a `&TerminalBackend` that outlives every
-/// entity in the process. Taking the value is what makes ending idempotent: the
-/// second caller finds nothing and does nothing, whichever order a window close
-/// and an app quit arrive in.
-static OWNED: Mutex<Option<Arc<OwnedShell>>> = Mutex::new(None);
+#[cfg(test)]
+use crate::terminal::{CloseReport, SessionError};
 
-/// One shell, and everything needed to end it deliberately.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+static OWNERS: Mutex<Vec<Weak<SessionOwner>>> = Mutex::new(Vec::new());
+const INITIAL_COLUMNS: u16 = 80;
+const INITIAL_ROWS: u16 = 24;
+/// How many maintenance ticks pass between two line-count passes.
 ///
-/// Cloned into the view rather than moved into it, because the quit path has to
-/// own the shell before the view exists: a shell only the view owns outlives the
-/// app whenever the view is never mounted.
+/// Every tick re-reads Git's worktree list; a line count is a full read of
+/// every changed file on top of that, so it runs once every ten seconds rather
+/// than once every two.
+const COUNT_EVERY_TICKS: u64 = 5;
+const UNMEASURED_CELL: CellMetrics = CellMetrics {
+    width: 8,
+    height: 16,
+};
+
 struct OwnedShell {
-    backend: Arc<TerminalBackend>,
     session: TerminalSession,
-    /// Where the view publishes its measured cell. Built here rather than in the
-    /// view because the session's host callbacks are made before the view that
-    /// answers them exists.
     metrics: Arc<Mutex<CellMetrics>>,
 }
+#[derive(Default)]
+struct Ownership {
+    closing: bool,
+    shells: HashMap<String, Arc<OwnedShell>>,
+}
 
-/// What the person is looking at.
+/// Spawn and shutdown share a gate. A worker cannot publish a late PTY after
+/// quit has drained the registry; ownership starts before any UI entity exists.
+struct SessionOwner {
+    backend: Arc<TerminalBackend>,
+    owns_backend: bool,
+    state: Mutex<Ownership>,
+    stop_gate: Mutex<()>,
+    writer: Mutex<Option<StateWriter>>,
+}
+impl SessionOwner {
+    fn new(backend: Arc<TerminalBackend>, owns_backend: bool) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            owns_backend,
+            state: Mutex::new(Ownership::default()),
+            stop_gate: Mutex::new(()),
+            writer: Mutex::new(None),
+        })
+    }
+    fn spawn(&self, mut config: TerminalSessionConfig) -> Result<Arc<OwnedShell>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.closing {
+            return Err("The workspace is closing.".into());
+        }
+        let metrics = Arc::new(Mutex::new(UNMEASURED_CELL));
+        config.host = host(Arc::clone(&metrics));
+        let session = TerminalSession::spawn(Arc::clone(&self.backend), config)
+            .map_err(|error| error.to_string())?;
+        let shell = Arc::new(OwnedShell { session, metrics });
+        state
+            .shells
+            .insert(shell.session.id().into(), shell.clone());
+        Ok(shell)
+    }
+    fn close_one(&self, id: &str) -> Result<(), String> {
+        let shell = self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .shells
+            .get(id)
+            .cloned();
+        if let Some(shell) = shell {
+            shell
+                .session
+                .close()
+                .wait()
+                .map_err(|error| error.to_string())?;
+            self.state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .shells
+                .remove(id);
+        }
+        Ok(())
+    }
+    fn stop(&self) {
+        let _gate = self
+            .stop_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shells = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.closing {
+                return;
+            }
+            state.closing = true;
+            state.shells.values().cloned().collect::<Vec<_>>()
+        };
+        // This is synchronous deliberately: GPUI exits the process after its
+        // quit hook. A detached close thread would lose that race.
+        if self.owns_backend {
+            shutdown(&self.backend);
+        }
+        for shell in shells {
+            if let Err(error) = shell.session.close().wait() {
+                log::warn!("terminal cleanup failed: {error}");
+            }
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shells
+            .clear();
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+impl Drop for SessionOwner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// One serial writer for this window. UI sends snapshots in order; shutdown
+/// joins it so the last accepted snapshot isn't lost on process exit.
+struct StateWriter {
+    sender: Option<mpsc::Sender<NavigationState>>,
+    thread: Option<thread::JoinHandle<()>>,
+    error: Arc<Mutex<Option<String>>>,
+}
+impl StateWriter {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let (sender, receiver) = mpsc::channel::<NavigationState>();
+        let error = Arc::new(Mutex::new(None));
+        let failures = error.clone();
+        let thread = thread::Builder::new()
+            .name("muster-navigation-save".into())
+            .spawn(move || {
+                while let Ok(state) = receiver.recv() {
+                    if let Err(cause) = navigation::save(&path, &state) {
+                        *failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+            error,
+        })
+    }
+    fn send(&self, state: NavigationState) {
+        if let Some(sender) = &self.sender {
+            if let Err(error) = sender.send(state) {
+                *self
+                    .error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+            }
+        }
+    }
+}
+impl Drop for StateWriter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+// Kit Button already has a stable ID, but only exposes the generic interactive
+// trait. Use GPUI's native stateful setters on that same interactivity, so fold
+// and selection metadata describe the real focused control, not a second node.
+struct StatefulButton(Button);
+impl InteractiveElement for StatefulButton {
+    fn interactivity(&mut self) -> &mut gpui_kit::Interactivity {
+        self.0.interactivity()
+    }
+}
+impl StatefulInteractiveElement for StatefulButton {}
+trait ButtonA11y {
+    fn aria_expanded(self, expanded: bool) -> Self;
+    fn aria_selected(self, selected: bool) -> Self;
+}
+impl ButtonA11y for Button {
+    fn aria_expanded(self, expanded: bool) -> Self {
+        StatefulButton(self).aria_expanded(expanded).0
+    }
+    fn aria_selected(self, selected: bool) -> Self {
+        StatefulButton(self).aria_selected(selected).0
+    }
+}
+
+struct LiveTerminal {
+    view: Entity<TerminalView>,
+    shell: Arc<OwnedShell>,
+}
+struct Rename {
+    id: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// The one worktree this window is creating, if it is creating one.
 ///
-/// One grid and one line of chrome. Everything below the line belongs to the
-/// child, and the line itself is the only thing in this window that is not
-/// either this file or the parser.
-pub struct TerminalWindow {
-    /// The grid. `None` only when no shell could be spawned, which is the one
-    /// state in which this window has something of its own to draw.
-    terminal: Option<Entity<TerminalView>>,
-    /// Why there is no grid, in the window's own words.
-    failure: Option<String>,
-    /// The shell, for a window that was disposed of before the quit path ran.
-    shell: Option<Arc<OwnedShell>>,
-    /// Whether this window has taken focus for its terminal yet.
+/// Its own struct rather than a field soup because the dialog is a modal
+/// conversation: the three inputs, whether the branch is still the suggestion,
+/// what Git answered about the starting point, and the failure that keeps the
+/// dialog open. The mutation runs on a worker and cannot be rolled back, so
+/// `busy` also refuses the dialog's own Cancel.
+struct WorktreeDraft {
+    repo_id: String,
+    task: Entity<InputState>,
+    branch: Entity<InputState>,
+    /// The branch this worktree starts from, prefilled when Git named one.
     ///
-    /// A field rather than a call on every frame because focusing is a window
-    /// mutation, and doing it on each paint fights whatever else in the window
-    /// is asking for focus.
-    focused: bool,
-    /// The name to show until the child sets a title of its own.
-    fallback: String,
+    /// Not optional because a repository whose default branch Git will not
+    /// guess is ordinary enough to meet on the first run, and the answer to
+    /// that is a field to fill rather than a dead dialog. It is also the only
+    /// answer creation uses: a field the person cleared is a starting point
+    /// they refused, and a second, remembered answer would quietly override it.
+    base: Entity<InputState>,
+    /// Where worktrees of this repository go, once Git has answered.
+    location: Option<PathBuf>,
+    branch_edited: bool,
+    /// Set while the task name is rewriting the branch, so a programmatic
+    /// value is not read back as the person having taken the branch over.
+    syncing_branch: bool,
+    busy: bool,
+    error: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub struct TerminalWindow {
+    navigation: Navigation,
+    terminals: HashMap<String, LiveTerminal>,
+    /// Line counts per checkout, absent when nothing was counted yet.
+    ///
+    /// Absent means "not counted", never "no changes": a checkout Git could
+    /// not be asked about draws nothing rather than a confident zero.
+    diff_totals: HashMap<String, DiffTotals>,
+    worktree: Option<WorktreeDraft>,
+    owner: Arc<SessionOwner>,
+    failure: Option<String>,
+    notice: Option<String>,
+    opening: bool,
+    closing: bool,
+    closing_sessions: std::collections::HashSet<String>,
+    membership_revision: u64,
+    latest_terminal_request: Option<String>,
+    editing: Option<Rename>,
+    resize: Entity<ResizableState>,
+    scroll: ScrollHandle,
+    focus_pending: bool,
     palette: Palette,
+    /// Injected-session tests exercise the same view/focus path without touching
+    /// the person's state file, directory picker or session ownership.
+    injected: bool,
+    _maintenance: Option<Task<()>>,
 }
 
 impl TerminalWindow {
-    /// Open the terminal: one login shell, in the directory this process was
-    /// pointed at.
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        match start_shell() {
-            Ok(shell) => Self::over(shell, window, cx),
-            Err(error) => Self::refused(error.to_string()),
+    fn empty(backend: Arc<TerminalBackend>, owns_backend: bool, cx: &mut Context<Self>) -> Self {
+        Self {
+            navigation: Navigation::new(),
+            terminals: HashMap::new(),
+            diff_totals: HashMap::new(),
+            worktree: None,
+            owner: SessionOwner::new(backend, owns_backend),
+            failure: None,
+            notice: None,
+            opening: false,
+            closing: false,
+            closing_sessions: Default::default(),
+            membership_revision: 0,
+            latest_terminal_request: None,
+            editing: None,
+            resize: cx.new(|_| ResizableState::default()),
+            scroll: ScrollHandle::new(),
+            focus_pending: true,
+            palette: Palette::default(),
+            injected: false,
+            _maintenance: None,
         }
     }
 
-    /// The same window over a session somebody else built.
-    ///
-    /// A test needs this because [`Self::new`] picks the shell out of the
-    /// running person's environment, and a suite must not depend on which shell
-    /// that is. The caller keeps ownership: the quit path ends exactly one
-    /// shell, and a test opens more than one.
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut app = Self::empty(Arc::new(TerminalBackend::default()), true, cx);
+        OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(&app.owner));
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let _ = weak.update(cx, |app, cx| app.request_window_close(window, cx));
+            false
+        });
+        app.opening = true;
+        let cwd = working_directory();
+        let worker = cx
+            .background_executor()
+            .spawn(async move { restore_navigation(&cwd) });
+        cx.spawn_in(window, async move |view, cx| {
+            let loaded = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.opening = false;
+                app.failure = loaded.errors.first().cloned();
+                app.navigation = loaded.navigation;
+                match loaded.state_path.map(StateWriter::new).transpose() {
+                    Ok(writer) => {
+                        *app.owner
+                            .writer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer
+                    }
+                    Err(error) => app.failure = Some(error),
+                }
+                app.persist();
+                if let Some(id) = app.navigation.active_checkout.clone() {
+                    app.request_terminal(&id, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        app.start_maintenance(cx);
+        app
+    }
+
     pub fn with_session(
         session: TerminalSession,
         backend: Arc<TerminalBackend>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut app = Self::empty(backend, false, cx);
+        app.injected = true;
         let shell = Arc::new(OwnedShell {
-            backend,
-            session,
+            session: session.clone(),
             metrics: Arc::new(Mutex::new(UNMEASURED_CELL)),
         });
-        Self::over(shell, window, cx)
+        let id = session.id().to_owned();
+        let view = cx.new(|cx| TerminalView::new(session, shell.metrics.clone(), cx));
+        app.terminals.insert(
+            id.clone(),
+            LiveTerminal {
+                view,
+                shell: shell.clone(),
+            },
+        );
+        app.navigation.active_session = Some(id);
+        window.on_window_should_close(cx, move |_, _| {
+            let status = shell.session.status();
+            if status.foreground.running || status.poll_error.is_some() {
+                return false;
+            }
+            shell.session.close();
+            true
+        });
+        app
     }
 
-    /// The window with no shell behind it.
-    ///
-    /// A terminal that refused to spawn is not a terminal that closed: somebody
-    /// has to be told, and this is the only surface that can tell them.
-    pub fn refused(failure: String) -> Self {
-        Self {
-            terminal: None,
-            failure: Some(failure),
-            shell: None,
-            focused: false,
-            fallback: default_title(),
-            palette: Palette::default(),
-        }
-    }
-
-    /// Mount the grid over `shell` and register how this window ends.
-    fn over(shell: Arc<OwnedShell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let view =
-            cx.new(|cx| TerminalView::new(shell.session.clone(), Arc::clone(&shell.metrics), cx));
-        refuse_close_while_busy(&shell, window, cx);
-
-        Self {
-            terminal: Some(view),
-            failure: None,
-            shell: Some(shell),
-            focused: false,
-            fallback: default_title(),
-            palette: Palette::default(),
-        }
-    }
-
-    /// The grid this window draws, when it has one.
     pub fn terminal(&self) -> Option<&Entity<TerminalView>> {
-        self.terminal.as_ref()
+        self.navigation
+            .active_session
+            .as_ref()
+            .and_then(|id| self.terminals.get(id))
+            .map(|terminal| &terminal.view)
     }
 
-    /// What the status line shows right now.
-    ///
-    /// The title is whatever the child last set, already sanitised and bounded
-    /// by the parser: untrusted text with a fixed-size destination.
-    fn line(&self, cx: &App) -> Line {
-        let Some(terminal) = &self.terminal else {
-            return Line {
-                title: self.fallback.clone(),
-                busy: false,
-                failure: self.failure.clone(),
-            };
-        };
-
-        let session = terminal.read(cx).session();
-        let snapshot = session.snapshot();
-        let status = session.status();
-
-        Line {
-            title: snapshot
-                .title
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| self.fallback.clone()),
-            busy: status.foreground.running,
-            // Three failures with three different fixes, so none of them is
-            // allowed to be phrased like the others.
-            failure: status.poll_error.map_or_else(
-                || match status.shell {
-                    ShellState::Exited { code: Some(code) } => {
-                        Some(format!("shell exited ({code})"))
-                    }
-                    ShellState::Exited { code: None } => Some("shell exited".to_owned()),
-                    ShellState::Unknown | ShellState::Running => None,
-                },
-                |error| Some(format!("the shell's status could not be read: {error}")),
-            ),
+    fn persist(&self) {
+        if let Some(writer) = self
+            .owner
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            writer.send(self.navigation.persistent_state());
         }
+    }
+
+    fn request_terminal(&mut self, checkout_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let Some(checkout) = self.navigation.checkout(checkout_id) else {
+            return;
+        };
+        if checkout.is_missing || self.navigation.archived.contains(checkout_id) {
+            self.failure = Some("This directory is unavailable.".into());
+            cx.notify();
+            return;
+        }
+        let cwd = PathBuf::from(&checkout.path);
+        let checkout_id = checkout_id.to_owned();
+        let id = format!(
+            "native-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let revision = self.navigation.revision;
+        self.latest_terminal_request = Some(id.clone());
+        self.navigation
+            .pending
+            .insert(id.clone(), checkout_id.clone());
+        let config =
+            TerminalSessionConfig::new(id.clone(), cwd, INITIAL_COLUMNS, INITIAL_ROWS, None);
+        let name = crate::terminal::login_shell()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shell".into());
+        let owner = self.owner.clone();
+        let worker = cx
+            .background_executor()
+            .spawn(async move { owner.spawn(config) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.navigation.pending.remove(&id);
+                match result {
+                    Ok(shell) => {
+                        let accepted = !app.closing
+                            && app.navigation.add_session(
+                                Session {
+                                    id: id.clone(),
+                                    checkout_id,
+                                    name,
+                                    created_at: String::new(),
+                                    session_type: SessionType::Shell,
+                                    status: SavedSessionStatus::Active,
+                                },
+                                (app.latest_terminal_request.as_deref() == Some(&id))
+                                    .then_some(revision),
+                            );
+                        if accepted {
+                            let terminal = cx.new(|cx| {
+                                TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
+                            });
+                            app.terminals.insert(
+                                id.clone(),
+                                LiveTerminal {
+                                    view: terminal,
+                                    shell,
+                                },
+                            );
+                            if app.navigation.active_session.as_deref() == Some(&id) {
+                                app.focus_terminal(window, cx);
+                            }
+                            app.persist();
+                        } else {
+                            let owner = app.owner.clone();
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = owner.close_one(&id);
+                                })
+                                .detach();
+                        }
+                    }
+                    Err(error) => app.failure = Some(error),
+                }
+                cx.notify();
+            });
+            // If the entity disappeared, its owner stops every registered shell,
+            // including this worker's result; no UI callback is needed for cleanup.
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.terminal() {
+            terminal.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        self.focus_pending = false;
+    }
+
+    fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.opening || self.closing {
+            return;
+        }
+        self.opening = true;
+        let revision = self.navigation.revision;
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open directory".into()),
+        });
+        let background = cx.background_executor().clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = match prompt.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                    let path = paths[0].clone();
+                    background.spawn(async move { navigation::open_directory(&path).map(Some) }).await
+                }
+                Ok(Ok(_)) => Ok(None),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.opening = false;
+                if !app.closing {
+                    match result {
+                        Ok(Some(opened)) => {
+                            if app.navigation.archived.contains(&opened.checkout_id) {
+                                app.failure = Some("This worktree is archived. Restore it from its repository menu first.".into());
+                            } else {
+                                let select = app.navigation.revision == revision;
+                                app.navigation.merge(opened, select);
+                                app.membership_revision += 1;
+                                app.persist();
+                                if select { app.focus_terminal(window, cx); }
+                            }
+                        }
+                        Ok(None) => (),
+                        Err(error) => app.failure = Some(error),
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn start_maintenance(&mut self, cx: &mut Context<Self>) {
+        let background = cx.background_executor().clone();
+        self._maintenance = Some(cx.spawn(async move |view, cx| {
+            let mut ticks: u64 = 0;
+            loop {
+                background.timer(Duration::from_secs(2)).await;
+                ticks += 1;
+                let Ok((epoch, repos, closing, counts)) = view.update(cx, |app, cx| {
+                    if let Some(error) = app
+                        .owner
+                        .writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .and_then(|writer| writer.error.lock().ok()?.take())
+                    {
+                        app.failure = Some(error);
+                        cx.notify();
+                    }
+                    // Status changes repaint inactive terminal rows too.
+                    cx.notify();
+                    // Counted far less often than membership is refreshed: a
+                    // line total is a full Git read of every changed file, and
+                    // this is a background refresh, not a Git watcher.
+                    let counts = if ticks.is_multiple_of(COUNT_EVERY_TICKS) {
+                        app.navigation
+                            .repos
+                            .iter()
+                            .flat_map(|repo| repo.checkouts.iter())
+                            .filter(|checkout| {
+                                !checkout.is_missing
+                                    && !app.navigation.archived.contains(&checkout.id)
+                            })
+                            .map(|checkout| (checkout.id.clone(), checkout.path.clone()))
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        app.membership_revision,
+                        app.navigation
+                            .repos
+                            .iter()
+                            .filter(|repo| repo.kind == RepoKind::Git)
+                            .map(|repo| (repo.id.clone(), repo.root.clone()))
+                            .collect::<Vec<_>>(),
+                        app.closing,
+                        counts,
+                    )
+                }) else {
+                    return;
+                };
+                if closing {
+                    return;
+                }
+                let results = background
+                    .spawn(async move {
+                        repos
+                            .into_iter()
+                            .map(|(id, root)| (id, navigation::open_directory(Path::new(&root))))
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                if view
+                    .update(cx, |app, cx| {
+                        if app.closing || app.membership_revision != epoch {
+                            return;
+                        }
+                        for (id, result) in results {
+                            if !app.navigation.repos.iter().any(|repo| repo.id == id) {
+                                continue;
+                            }
+                            match result {
+                                Ok(opened) => app.navigation.merge(opened, false),
+                                Err(error) => {
+                                    if let Some(repo) =
+                                        app.navigation.repos.iter_mut().find(|repo| repo.id == id)
+                                    {
+                                        for checkout in &mut repo.checkouts {
+                                            checkout.is_missing =
+                                                !Path::new(&checkout.path).is_dir();
+                                        }
+                                    }
+                                    app.failure = Some(error);
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // A checkout Git cannot be counted drops its total rather than
+                // showing a zero it did not measure. The message goes to the log
+                // because the row itself is honest by drawing nothing, and the
+                // dialog that does need the answer asks Git for itself.
+                if counts.is_empty() {
+                    continue;
+                }
+                let totals = background
+                    .spawn(async move {
+                        counts
+                            .into_iter()
+                            .map(|(id, path)| {
+                                let total = navigation::diff_totals(Path::new(&path))
+                                    .map_err(|error| log::debug!("muster-native: {path}: {error}"));
+                                (id, total)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                if view
+                    .update(cx, |app, cx| {
+                        for (id, total) in totals {
+                            match total {
+                                Ok(total) => {
+                                    app.diff_totals.insert(id, total);
+                                }
+                                Err(()) => {
+                                    app.diff_totals.remove(&id);
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn request_close_terminal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_sessions.contains(id) || self.closing {
+            return;
+        }
+        let Some(terminal) = self.terminals.get(id) else {
+            return;
+        };
+        let status = terminal.shell.session.status();
+        if status.foreground.running
+            || status.poll_error.is_some()
+            || matches!(status.shell, ShellState::Unknown)
+        {
+            let prompt = window.prompt(PromptLevel::Warning, "Close this terminal?",
+                Some("A running process may be stopped. If its state is unavailable, closing may still interrupt work."), &["Cancel", "Close terminal"], cx);
+            let id = id.to_owned();
+            cx.spawn_in(window, async move |view, cx| {
+                if prompt.await == Ok(1) {
+                    let _ =
+                        view.update_in(cx, |app, window, cx| app.close_terminal(&id, window, cx));
+                }
+            })
+            .detach();
+        } else {
+            self.close_terminal(id, window, cx);
+        }
+    }
+
+    fn close_terminal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.closing_sessions.insert(id.into()) {
+            return;
+        }
+        let owner = self.owner.clone();
+        let id = id.to_owned();
+        let closing_id = id.clone();
+        let worker = cx
+            .background_executor()
+            .spawn(async move { owner.close_one(&closing_id) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.closing_sessions.remove(&id);
+                match result {
+                    Ok(()) => {
+                        app.terminals.remove(&id);
+                        app.navigation.remove_session(&id);
+                        app.persist();
+                        app.focus_terminal(window, cx);
+                    }
+                    Err(error) => app.failure = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let busy = self.terminals.values().any(|terminal| {
+            let status = terminal.shell.session.status();
+            status.foreground.running
+                || status.poll_error.is_some()
+                || matches!(status.shell, ShellState::Unknown)
+        }) || !self.navigation.pending.is_empty();
+        if busy {
+            let prompt = window.prompt(PromptLevel::Warning, "Close Muster and stop its terminals?",
+                Some("All terminals in this window will be stopped, including terminals in other directories."), &["Cancel", "Stop and close"], cx);
+            cx.spawn_in(window, async move |view, cx| {
+                if prompt.await == Ok(1) {
+                    let _ =
+                        view.update_in(cx, |app, window, cx| app.finish_window_close(window, cx));
+                }
+            })
+            .detach();
+        } else {
+            self.finish_window_close(window, cx);
+        }
+    }
+
+    fn finish_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.persist();
+        let owner = self.owner.clone();
+        let worker = cx.background_executor().spawn(async move {
+            owner.stop();
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            worker.await;
+            let _ = view.update_in(cx, |_, window, _| window.remove_window());
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.navigation.session(id) else {
+            return;
+        };
+        let name = session.name.clone();
+        let id = id.to_owned();
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(name, window, cx);
+            input.select_all(window, cx);
+            input
+        });
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        let subscription = cx.subscribe_in(&input, window, |app, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                app.commit_rename(window, cx);
+            }
+        });
+        self.editing = Some(Rename {
+            id,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.editing.take() else {
+            return;
+        };
+        let name = edit.input.read(cx).value();
+        if !name.trim().is_empty() {
+            if let Err(error) = self.navigation.rename(&edit.id, &name) {
+                self.failure = Some(error);
+            }
+        }
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+
+    /// Ask Git what a worktree of `repo_id` would be created from.
+    ///
+    /// The dialog opens first with the branch it suggests, so the answer is a
+    /// line inside it rather than a spinner over the whole window. A repository
+    /// with no resolvable default branch keeps the dialog open and says so: the
+    /// starting point is the one thing that cannot be guessed.
+    fn open_worktree_dialog(&mut self, repo_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || self.worktree.is_some() {
+            return;
+        }
+        let Some(repo) = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .cloned()
+        else {
+            return;
+        };
+        if repo.kind != RepoKind::Git || repo.checkouts.iter().any(|item| item.is_missing) {
+            self.failure = Some("Worktrees need an available Git repository.".into());
+            cx.notify();
+            return;
+        }
+        let mut field = |value: &str, cx: &mut App| {
+            cx.new(|cx| {
+                let mut input = InputState::new(window, cx);
+                input.set_value(value.to_owned(), window, cx);
+                input.select_all(window, cx);
+                input
+            })
+        };
+        let task = field("new-task", cx);
+        let branch = field("feature/new-task", cx);
+        let base = field("", cx);
+        let subscriptions = vec![
+            cx.subscribe_in(&task, window, |app, _, event, window, cx| match event {
+                InputEvent::Change => app.sync_worktree_branch(window, cx),
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => app.submit_worktree(window, cx),
+                _ => {}
+            }),
+            cx.subscribe_in(&branch, window, |app, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    if let Some(draft) = app.worktree.as_mut() {
+                        if !draft.syncing_branch {
+                            draft.branch_edited = true;
+                        }
+                        cx.notify();
+                    }
+                }
+            }),
+        ];
+        task.read(cx).focus_handle(cx).focus(window, cx);
+        let repo_id = repo_id.to_owned();
+        self.worktree = Some(WorktreeDraft {
+            repo_id: repo_id.clone(),
+            task,
+            branch,
+            base,
+            location: None,
+            branch_edited: false,
+            syncing_branch: false,
+            busy: false,
+            error: None,
+            _subscriptions: subscriptions,
+        });
+        let worker = cx
+            .background_executor()
+            .spawn(async move { navigation::worktree_defaults(&repo) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                // A closed dialog answers nothing; a reopened one is a different
+                // conversation with its own repository.
+                let Some(draft) = app.worktree.as_mut().filter(|d| d.repo_id == repo_id) else {
+                    return;
+                };
+                match result {
+                    Ok(defaults) => {
+                        let entity = draft.base.clone();
+                        let name = defaults.default_branch.clone();
+                        entity.update(cx, |input, cx| input.set_value(name, window, cx));
+                        draft.location = Some(defaults.location);
+                    }
+                    Err(_) => {
+                        // Git would not name a default branch. That is a question
+                        // for the person, not a failure: the dialog keeps the
+                        // field and waits for it.
+                        draft.error = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Follow the task name into the branch, until the person takes the branch
+    /// over by typing in it. Editing it is not reversible here: a rename would
+    /// silently move a branch the person had already chosen.
+    fn sync_worktree_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.worktree.as_ref() else {
+            return;
+        };
+        if draft.branch_edited || draft.busy {
+            return;
+        }
+        let suggested = format!("feature/{}", Self::slug_for(&draft.task.read(cx).value()));
+        let entity = draft.branch.clone();
+        if let Some(draft) = self.worktree.as_mut() {
+            draft.syncing_branch = true;
+        }
+        entity.update(cx, |input, cx| input.set_value(suggested, window, cx));
+        if let Some(draft) = self.worktree.as_mut() {
+            draft.syncing_branch = false;
+        }
+    }
+
+    /// Create the worktree on a worker and open a shell in it.
+    ///
+    /// Git's mutation has no deadline and no rollback: a failure that arrives
+    /// after the branch and the directory exist says so and leaves them, because
+    /// deleting a branch that now holds someone's commits is worse than a row
+    /// the person has to reopen.
+    fn submit_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.worktree.as_ref() else {
+            return;
+        };
+        if draft.busy {
+            return;
+        }
+        let Some(repo) = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == draft.repo_id)
+            .cloned()
+        else {
+            return;
+        };
+        let task = draft.task.read(cx).value().trim().to_owned();
+        let branch = draft.branch.read(cx).value().trim().to_owned();
+        let typed_base = draft.base.read(cx).value().trim().to_owned();
+        let base = typed_base;
+        if task.is_empty() || branch.is_empty() || base.is_empty() {
+            if let Some(draft) = self.worktree.as_mut() {
+                draft.error =
+                    Some("Enter a task name, a new branch, and the branch it starts from.".into());
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(draft) = self.worktree.as_mut() {
+            draft.busy = true;
+            draft.error = None;
+        }
+        let worker = cx
+            .background_executor()
+            .spawn(async move { navigation::create_worktree(&repo, &task, &branch, &base) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                let mut created = None;
+                if let Some(draft) = app.worktree.as_mut() {
+                    draft.busy = false;
+                    match result {
+                        Ok(opened) => created = Some(opened),
+                        Err(error) => draft.error = Some(error),
+                    }
+                }
+                if let Some(opened) = created {
+                    let checkout = opened.checkout_id.clone();
+                    app.worktree = None;
+                    app.membership_revision += 1;
+                    app.navigation.merge(opened, true);
+                    app.persist();
+                    app.request_terminal(&checkout, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The worktree dialog, drawn over the window it belongs to.
+    fn worktree_dialog(&self, draft: &WorktreeDraft, cx: &mut Context<Self>) -> AnyElement {
+        let ready = draft.location.is_some() && !draft.busy;
+        // The content builder is called again on every repaint, so it holds the
+        // three input entities and builds the fields itself rather than closing
+        // over elements it would have to hand out twice.
+        let task = draft.task.clone();
+        let branch = draft.branch.clone();
+        let base = draft.base.clone();
+        let origin = draft
+            .location
+            .as_ref()
+            .map(|location| format!("Worktrees are created under {}", location.display()));
+        let error = draft.error.clone();
+        let cancel_button = cx.weak_entity();
+        let cancel_dialog = cx.weak_entity();
+        let submit_button = cx.weak_entity();
+        Dialog::new(cx)
+            .width(px(440.))
+            .title("Create worktree")
+            .content(move |content: DialogContent, _, _| {
+                let mut content = content
+                    .child(div().text_size(px(12.)).child("Task name"))
+                    .child(Input::new(&task).aria_label("Task name").w_full())
+                    // Legacy says this under the field, and the native dialog
+                    // had dropped it: the task name is the directory on disk,
+                    // and a person who does not know that will not predict the
+                    // path their worktree lands in.
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child("Used as directory name; unsafe characters are cleaned by Git."),
+                    )
+                    .child(div().mt_3().text_size(px(12.)).child("New branch"))
+                    .child(Input::new(&branch).aria_label("New branch").w_full())
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_size(px(12.))
+                            .child("Starting from branch"),
+                    )
+                    .child(
+                        Input::new(&base)
+                            .aria_label("Starting from branch")
+                            .w_full(),
+                    );
+                if let Some(origin) = origin.clone() {
+                    content = content.child(
+                        div()
+                            .mt_2()
+                            .text_size(px(11.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child(origin),
+                    );
+                }
+                if let Some(error) = error.clone() {
+                    content = content.child(
+                        div()
+                            .mt_2()
+                            .text_size(px(12.))
+                            .text_color(gpui_kit::rgb(0xd97f84))
+                            .child(error),
+                    );
+                }
+                content
+            })
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("worktree-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .on_click(move |_, _window, cx| {
+                                let _ = cancel_button.update(cx, |app, cx| {
+                                    close_worktree_dialog(app, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("worktree-create")
+                            .primary()
+                            .label(if draft.busy {
+                                "Creating…"
+                            } else {
+                                "Create and open shell"
+                            })
+                            .disabled(!ready)
+                            .on_click(move |_, _window, cx| {
+                                let _ = submit_button.update_in(cx, |app, window, cx| {
+                                    app.submit_worktree(window, cx)
+                                });
+                            }),
+                    ),
+            )
+            .on_cancel(move |_, _, cx| {
+                let _ = cancel_dialog.update(cx, |app, cx| {
+                    close_worktree_dialog(app, cx);
+                    cx.notify();
+                });
+                false
+            })
+            .into_any_element()
+    }
+
+    fn move_terminal(
+        &mut self,
+        id: &str,
+        target: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cross_checkout = self
+            .navigation
+            .session(id)
+            .is_some_and(|session| session.checkout_id != target);
+        if let Err(error) = self.navigation.move_session(id, target, index) {
+            self.failure = Some(error);
+        } else {
+            if cross_checkout {
+                self.notice = Some("Terminal moved. Its process and working directory were preserved; no cd was sent.".into());
+            }
+            self.persist();
+            self.focus_terminal(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn archive(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Err(error) = self.navigation.archive(id) {
+            self.failure = Some(error);
+        } else {
+            self.membership_revision += 1;
+            self.persist();
+        }
+        cx.notify();
+    }
+
+    fn restore_archived(&mut self, repo_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.navigation.repos.iter().find(|repo| repo.id == repo_id) else {
+            return;
+        };
+        let ids = repo
+            .checkouts
+            .iter()
+            .filter(|checkout| self.navigation.archived.contains(&checkout.id))
+            .map(|checkout| checkout.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let message = format!("Restore {} archived worktree(s)?", ids.len());
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            &message,
+            Some("Their rows return to the sidebar. Nothing on disk changes."),
+            &["Cancel", "Restore"],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            if prompt.await == Ok(1) {
+                let _ = view.update(cx, |app, cx| {
+                    for id in ids {
+                        app.navigation.archived.remove(&id);
+                    }
+                    app.membership_revision += 1;
+                    app.persist();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn remove_repo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.navigation.repos.iter().find(|repo| repo.id == id) else {
+            return;
+        };
+        if repo
+            .checkouts
+            .iter()
+            .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id))
+        {
+            return;
+        }
+        if repo.checkouts.iter().any(|checkout| {
+            !checkout.sessions.is_empty()
+                || self
+                    .navigation
+                    .pending
+                    .values()
+                    .any(|pending| pending == &checkout.id)
+        }) {
+            self.failure = Some("Close this repository's terminal sessions before removing it from the panel. No files have been deleted.".into());
+            cx.notify();
+            return;
+        }
+        let message = format!("Remove “{}” from the panel?", repo.root);
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("No files will be deleted. Opening the directory again brings it back."),
+            &["Cancel", "Remove from panel"],
+            cx,
+        );
+        let id = id.to_owned();
+        cx.spawn_in(window, async move |view, cx| {
+            if prompt.await == Ok(1) {
+                let _ = view.update(cx, |app, cx| {
+                    // Revalidate after the prompt: a terminal may have opened while
+                    // this confirmation was outstanding.
+                    let safe = app.navigation.repos.iter().find(|repo| repo.id == id).is_some_and(|repo|
+                        repo.checkouts.iter().all(|checkout| checkout.sessions.is_empty() && !app.navigation.pending.values().any(|pending| pending == &checkout.id)));
+                    if safe {
+                        let removed = app.navigation.repos.iter().find(|repo| repo.id == id).map(|repo| repo.checkouts.iter().map(|checkout| checkout.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                        app.navigation.repos.retain(|repo| repo.id != id);
+                        for checkout in &removed { app.navigation.archived.remove(checkout); }
+                        if app.navigation.active_checkout.as_ref().is_some_and(|checkout| removed.contains(checkout)) {
+                            app.navigation.active_checkout = None; app.navigation.active_session = None;
+                        }
+                        app.navigation.revision += 1;
+                        app.membership_revision += 1; app.persist();
+                    } else { app.failure = Some("The repository now has a terminal session. Close it before removing the directory.".into()); }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && (self.editing.is_some() || self.worktree.is_some()) {
+            if let Some(draft) = self.worktree.as_ref() {
+                // Escape is not a way to make a half-made worktree disappear.
+                if draft.busy {
+                    self.failure =
+                        Some("This worktree is still being created. Wait for it to finish.".into());
+                    cx.notify();
+                    return;
+                }
+            }
+            self.editing = None;
+            self.worktree = None;
+            cx.stop_propagation();
+            self.focus_terminal(window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(shortcut) = shortcut(&event.keystroke) else {
+            return;
+        };
+        if self.opening || self.closing || self.injected {
+            return;
+        }
+        cx.stop_propagation();
+        match shortcut {
+            Shortcut::Panels => {
+                self.navigation.panels_visible = !self.navigation.panels_visible;
+                self.focus_terminal(window, cx);
+            }
+            Shortcut::Terminal => {
+                if let Some(id) = self
+                    .navigation
+                    .active_checkout
+                    .clone()
+                    .or_else(|| self.navigation.home.clone())
+                {
+                    self.request_terminal(&id, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// What a checkout's trailing slot says, or nothing at all.
+    ///
+    /// `None` both for a checkout nobody counted and for one counted clean,
+    /// because the two say different things and the row can only stay silent
+    /// about both: a `+0`/`−0` would claim a measurement nobody made, and the
+    /// row is where a person looks to learn whether Git was asked at all.
+    fn line_slot(counts: Option<&DiffTotals>) -> Option<(u64, u64)> {
+        let totals = counts?;
+        (totals.additions + totals.deletions > 0).then_some((totals.additions, totals.deletions))
+    }
+
+    /// A task name as the directory and branch it suggests.
+    ///
+    /// Legacy's rule, kept rather than invented: letters, digits, `_`, `.` and
+    /// `-` survive, everything else collapses to one `-`, and a name that
+    /// reduces to nothing falls back to `new-task` rather than creating a
+    /// worktree called `.worktrees/`.
+    fn slug_for(value: &str) -> String {
+        let mut slug = String::new();
+        let mut separator = false;
+        for character in value.trim().chars() {
+            if character.is_alphanumeric() || matches!(character, '_' | '.' | '-') {
+                slug.push(character);
+                separator = false;
+            } else if !separator {
+                slug.push('-');
+                separator = true;
+            }
+        }
+        let slug = slug.trim_matches('-').trim_start_matches('.');
+        if slug.is_empty() {
+            "new-task".into()
+        } else {
+            slug.to_owned()
+        }
+    }
+
+    fn repo_menu(
+        &self,
+        id: String,
+        view: gpui_kit::WeakEntity<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
+        let repo = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == id)
+            .expect("drawn repository");
+        let archived = repo
+            .checkouts
+            .iter()
+            .filter(|checkout| self.navigation.archived.contains(&checkout.id))
+            .count();
+        // A missing directory has no repository to ask about, and adding a
+        // worktree is the one action that has to be a click away rather than a
+        // click and a dialog further.
+        let can_add =
+            repo.kind == RepoKind::Git && !repo.checkouts.iter().any(|item| item.is_missing);
+        let can_close = !repo
+            .checkouts
+            .iter()
+            .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
+        move |mut menu, _, _| {
+            if can_add {
+                let id = id.clone();
+                let view = view.clone();
+                menu = menu.item(PopupMenuItem::new("New worktree").on_click(
+                    move |_, _window, cx| {
+                        let _ = view.update_in(cx, |app, window, cx| {
+                            app.open_worktree_dialog(&id, window, cx)
+                        });
+                    },
+                ));
+            }
+            if archived > 0 {
+                let id = id.clone();
+                let view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("Restore {archived} archived worktree(s)"))
+                        .on_click(move |_, window, cx| {
+                            let _ =
+                                view.update(cx, |app, cx| app.restore_archived(&id, window, cx));
+                        }),
+                );
+            }
+            if can_close {
+                let id = id.clone();
+                let view = view.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .text_color(gpui_kit::rgb(0xf07178))
+                            .child("Remove from panel")
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |app, cx| app.remove_repo(&id, window, cx));
+                    }),
+                );
+            }
+            menu
+        }
+    }
+
+    fn terminal_menu(
+        &self,
+        id: String,
+        view: gpui_kit::WeakEntity<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
+        let session = self.navigation.session(&id).expect("drawn session");
+        let source = session.checkout_id.clone();
+        let sessions = &self
+            .navigation
+            .checkout(&source)
+            .expect("session checkout")
+            .sessions;
+        let index = sessions
+            .iter()
+            .position(|session| session.id == id)
+            .unwrap_or(0);
+        let count = sessions.len();
+        let destinations = self
+            .navigation
+            .repos
+            .iter()
+            .flat_map(|repo| repo.checkouts.iter().map(move |checkout| (repo, checkout)))
+            .filter(|(_, checkout)| {
+                !checkout.is_missing
+                    && !self.navigation.archived.contains(&checkout.id)
+                    && checkout.id != source
+            })
+            .map(|(repo, checkout)| {
+                (
+                    checkout.id.clone(),
+                    format!("Move to {} / {}", repo.name, checkout_title(repo, checkout)),
+                    checkout.sessions.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        move |mut menu, _, _| {
+            let rename_id = id.clone();
+            let rename_view = view.clone();
+            menu = menu.item(PopupMenuItem::new("Rename terminal").on_click(
+                move |_, window, cx| {
+                    let _ =
+                        rename_view.update(cx, |app, cx| app.start_rename(&rename_id, window, cx));
+                },
+            ));
+            for (label, target_index, available) in [
+                ("Move up", index.saturating_sub(1), index > 0),
+                ("Move down", index + 1, index + 1 < count),
+            ] {
+                let id = id.clone();
+                let source = source.clone();
+                let view = view.clone();
+                menu = menu.item(PopupMenuItem::new(label).disabled(!available).on_click(
+                    move |_, window, cx| {
+                        let _ = view.update(cx, |app, cx| {
+                            app.move_terminal(&id, &source, target_index, window, cx)
+                        });
+                    },
+                ));
+            }
+            for (target, label, index) in &destinations {
+                let id = id.clone();
+                let target = target.clone();
+                let index = *index;
+                let view = view.clone();
+                menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
+                    move |_, window, cx| {
+                        let _ = view.update(cx, |app, cx| {
+                            app.move_terminal(&id, &target, index, window, cx)
+                        });
+                    },
+                ));
+            }
+            let id = id.clone();
+            let view = view.clone();
+            menu.separator()
+                .item(
+                    PopupMenuItem::new("Close terminal").on_click(move |_, window, cx| {
+                        let _ =
+                            view.update(cx, |app, cx| app.request_close_terminal(&id, window, cx));
+                    }),
+                )
+        }
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        let mut rows = Vec::<AnyElement>::new();
+        for repo in &self.navigation.repos {
+            let id = repo.id.clone();
+            let folded = self.navigation.folded_repos.contains(&id);
+            let toggle_id = id.clone();
+            let has_menu = repo.kind == RepoKind::Git
+                && !repo.checkouts.iter().any(|checkout| checkout.is_missing)
+                || repo
+                    .checkouts
+                    .iter()
+                    .any(|checkout| self.navigation.archived.contains(&checkout.id))
+                || !repo
+                    .checkouts
+                    .iter()
+                    .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
+            let heading = div()
+                .id(SharedString::from(format!("heading-{id}")))
+                .group(SharedString::from(format!("repo-heading-{id}")))
+                .flex()
+                .items_baseline()
+                .w_full()
+                .pl(px(10.))
+                .pr(px(8.))
+                .pt(px(8.))
+                .pb(px(4.))
+                .child(
+                    Button::new(SharedString::from(format!("fold-repo-{id}")))
+                        .ghost()
+                        .small()
+                        .compact()
+                        .rounded(px(0.))
+                        .flex_1()
+                        .min_w_0()
+                        .justify_start()
+                        .h(px(22.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_baseline()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(14.))
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .child(repo.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_size(px(11.))
+                                        .text_color(gpui_kit::rgb(0x8b909c))
+                                        .child(repo.root.clone()),
+                                ),
+                        )
+                        .aria_expanded(!folded)
+                        .tooltip(repo.root.clone())
+                        .accessibility_label(format!(
+                            "{} repository {}",
+                            if folded { "Expand" } else { "Collapse" },
+                            repo.name
+                        ))
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            toggle(&mut app.navigation.folded_repos, &toggle_id);
+                            cx.notify();
+                        })),
+                )
+                .when(has_menu, |heading| {
+                    heading.child(
+                        Button::new(SharedString::from(format!("actions-{id}")))
+                            .opacity(0.)
+                            .group_hover(
+                                SharedString::from(format!("repo-heading-{id}")),
+                                |style| style.opacity(1.),
+                            )
+                            .focus(|style| style.opacity(1.))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(IconName::Ellipsis)
+                            .accessibility_label(format!("Actions for {}", repo.name))
+                            .dropdown_menu(self.repo_menu(id.clone(), weak.clone())),
+                    )
+                });
+            rows.push(
+                heading
+                    .context_menu(self.repo_menu(id, weak.clone()))
+                    .into_any_element(),
+            );
+            if folded {
+                rows.push(div().h(px(8.)).into_any_element());
+                continue;
+            }
+            for checkout in &repo.checkouts {
+                if self.navigation.archived.contains(&checkout.id) {
+                    continue;
+                }
+                let title = checkout_title(repo, checkout);
+                let folded = self.navigation.folded_checkouts.contains(&checkout.id);
+                let id = checkout.id.clone();
+                let fold_id = id.clone();
+                let select_id = id.clone();
+                let selected = self.navigation.active_checkout.as_deref() == Some(&id)
+                    && self.navigation.active_session.is_none();
+                let icon = if checkout.is_missing {
+                    IconName::TriangleAlert
+                } else if self.navigation.home.as_deref() == Some(&id) {
+                    IconName::House
+                } else if repo.kind == RepoKind::Plain {
+                    IconName::Folder
+                } else {
+                    IconName::GitBranch
+                };
+                let row = div()
+                    .id(SharedString::from(format!("checkout-row-{id}")))
+                    .flex()
+                    .items_center()
+                    .h(px(26.))
+                    .gap(px(7.))
+                    .px(px(8.))
+                    .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
+                    .when(selected, |row| {
+                        row.bg(gpui_kit::rgb(0x2c3b57))
+                            .border_l_2()
+                            .border_color(gpui_kit::rgb(0x5b97ff))
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!("fold-checkout-{id}")))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .rounded(px(0.))
+                            .h(px(26.))
+                            .w(px(20.))
+                            .icon(if folded {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .aria_expanded(!folded)
+                            .accessibility_label(format!(
+                                "{} {title}",
+                                if folded { "Expand" } else { "Collapse" }
+                            ))
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                toggle(&mut app.navigation.folded_checkouts, &fold_id);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("select-checkout-{id}")))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .rounded(px(0.))
+                            .h(px(26.))
+                            .flex_1()
+                            .min_w_0()
+                            .icon(Icon::new(icon).size(px(14.)))
+                            .justify_start()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(title.clone()),
+                            )
+                            .tooltip(format!("{title} — {}", checkout.path))
+                            .aria_selected(selected)
+                            .disabled(checkout.is_missing)
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                if app.navigation.select_checkout(&select_id) {
+                                    app.persist();
+                                    app.focus_terminal(window, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .when(repo.kind == RepoKind::Git && !checkout.is_missing, |row| {
+                        match Self::line_slot(self.diff_totals.get(&id)) {
+                            Some((added, removed)) => row.child(
+                                div()
+                                    .id(SharedString::from(format!("diff-{id}")))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(11.))
+                                    .when(added > 0, |slot| {
+                                        slot.child(
+                                            div()
+                                                .text_color(gpui_kit::rgb(0xa1c181))
+                                                .child(format!("+{added}")),
+                                        )
+                                    })
+                                    .when(removed > 0, |slot| {
+                                        slot.child(
+                                            div()
+                                                .text_color(gpui_kit::rgb(0xd97f84))
+                                                .child(format!("\u{2212}{removed}")),
+                                        )
+                                    }),
+                            ),
+                            None => row,
+                        }
+                    })
+                    .when(checkout.is_missing, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(gpui_kit::rgb(0xd97f84))
+                                .child("Directory missing"),
+                        )
+                    })
+                    .when(repo.kind == RepoKind::Git && !checkout.is_primary, |row| {
+                        let archive_id = id.clone();
+                        row.child(
+                            Button::new(SharedString::from(format!("archive-{id}")))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .icon(IconName::Archive)
+                                .accessibility_label(format!("Archive worktree {title}"))
+                                .tooltip("Archive worktree; keep every file")
+                                .on_click(
+                                    cx.listener(move |app, _, _, cx| app.archive(&archive_id, cx)),
+                                ),
+                        )
+                    });
+                rows.push(row.into_any_element());
+                if folded || checkout.is_missing {
+                    continue;
+                }
+                for session in &checkout.sessions {
+                    let Some(terminal) = self.terminals.get(&session.id) else {
+                        continue;
+                    };
+                    let status = terminal.shell.session.status();
+                    let snapshot = terminal.shell.session.snapshot();
+                    let title = session_title(
+                        &session.name,
+                        status.foreground.app.as_deref(),
+                        snapshot.title.as_deref(),
+                    );
+                    let selected = self.navigation.active_session.as_deref() == Some(&session.id);
+                    let busy = status.foreground.running;
+                    let unknown =
+                        status.poll_error.is_some() || status.shell == ShellState::Unknown;
+                    let agent = status.foreground.app.as_deref() == Some("opencode");
+                    let id = session.id.clone();
+                    let click_id = id.clone();
+                    let close_id = id.clone();
+                    let content =
+                        if let Some(editing) = self.editing.as_ref().filter(|edit| edit.id == id) {
+                            Input::new(&editing.input)
+                                .aria_label("Terminal session name")
+                                .h(px(26.))
+                                .into_any_element()
+                        } else {
+                            Button::new(SharedString::from(format!("select-session-{id}")))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .rounded(px(0.))
+                                .h(px(26.))
+                                .w_full()
+                                .min_w_0()
+                                .icon(
+                                    Icon::new(if agent {
+                                        IconName::Sparkles
+                                    } else {
+                                        IconName::SquareTerminal
+                                    })
+                                    .size(px(14.))
+                                    .text_color(
+                                        gpui_kit::rgb(if unknown {
+                                            0xe3b341
+                                        } else if busy && !agent {
+                                            0xa1c181
+                                        } else {
+                                            0xabb2bf
+                                        }),
+                                    ),
+                                )
+                                .justify_start()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(title.clone()),
+                                )
+                                .aria_selected(selected)
+                                .accessibility_label(format!(
+                                    "Terminal session: {title}{}",
+                                    if unknown {
+                                        ", state unavailable"
+                                    } else if matches!(status.shell, ShellState::Exited { .. }) {
+                                        ", shell exited"
+                                    } else if agent {
+                                        ", agent session state not identified"
+                                    } else if busy {
+                                        ", process running"
+                                    } else {
+                                        ", idle"
+                                    }
+                                ))
+                                .tooltip(title.clone())
+                                .disabled(self.closing_sessions.contains(&id))
+                                .on_click(cx.listener(
+                                    move |app, event: &gpui_kit::ClickEvent, window, cx| {
+                                        if event.click_count() == 2 {
+                                            app.start_rename(&click_id, window, cx);
+                                        } else if app.navigation.select_session(&click_id) {
+                                            app.persist();
+                                            app.focus_terminal(window, cx);
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .into_any_element()
+                        };
+                    let row = div()
+                        .id(SharedString::from(format!("session-row-{id}")))
+                        .flex()
+                        .items_center()
+                        .ml(px(20.))
+                        .pl(px(6.))
+                        .pr(px(8.))
+                        .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
+                        .h(px(26.))
+                        .when(selected, |row| {
+                            row.bg(gpui_kit::rgb(0x2c3b57))
+                                .border_l_2()
+                                .border_color(gpui_kit::rgb(0x5b97ff))
+                        })
+                        .child(div().flex_1().min_w_0().child(content))
+                        .child(
+                            Button::new(SharedString::from(format!("session-menu-{id}")))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .icon(IconName::Ellipsis)
+                                .accessibility_label(format!("Actions for terminal {title}"))
+                                .dropdown_menu(self.terminal_menu(id.clone(), weak.clone())),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("close-session-{id}")))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .icon(IconName::X)
+                                .accessibility_label(format!("Close terminal session: {title}"))
+                                .disabled(self.closing_sessions.contains(&id))
+                                .on_click(cx.listener(move |app, _, window, cx| {
+                                    app.request_close_terminal(&close_id, window, cx)
+                                })),
+                        );
+                    rows.push(
+                        row.context_menu(self.terminal_menu(id, weak.clone()))
+                            .into_any_element(),
+                    );
+                }
+                for (_, pending) in self
+                    .navigation
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| *pending == &checkout.id)
+                {
+                    rows.push(
+                        div()
+                            .ml(px(26.))
+                            .h(px(26.))
+                            .child(format!(
+                                "Starting terminal in {}…",
+                                pending.strip_prefix("checkout:").unwrap_or(pending)
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                let create_id = checkout.id.clone();
+                rows.push(
+                    div()
+                        .ml(px(26.))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "new-terminal-{}",
+                                checkout.id
+                            )))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .rounded(px(0.))
+                            .h(px(26.))
+                            .w_full()
+                            .icon(IconName::Plus)
+                            .label("New terminal")
+                            .accessibility_label(format!("New terminal for {title}"))
+                            .on_click(cx.listener(
+                                move |app, _, window, cx| {
+                                    app.request_terminal(&create_id, window, cx)
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+            rows.push(div().h(px(8.)).into_any_element());
+        }
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .p_3()
+                    .child("Your opened folders will appear here.")
+                    .into_any_element(),
+            );
+        }
+        div()
+            .id("navigation-panel")
+            .h_full()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .text_size(px(13.))
+            .bg(gpui_kit::rgb(0x1c1f26))
+            .child(
+                div()
+                    .id("navigation-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(rows)
+                    .vertical_scrollbar(&self.scroll),
+            )
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(gpui_kit::rgb(0x2c313b))
+                    .p_1()
+                    .child(
+                        Button::new("open-directory")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .rounded(px(0.))
+                            .w_full()
+                            .h(px(26.))
+                            .icon(IconName::FolderPlus)
+                            .label("Open directory")
+                            .accessibility_label("Open directory")
+                            .disabled(self.opening || self.closing)
+                            .on_click(
+                                cx.listener(|app, _, window, cx| app.choose_directory(window, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Focus once, on the first frame. Nothing else in this window takes
-        // keys, so a terminal nobody focused is a terminal nobody can type into.
-        if !self.focused {
-            self.focused = true;
-            if let Some(terminal) = &self.terminal {
-                terminal.read(cx).focus_handle(cx).focus(window, cx);
-            }
+        if self.focus_pending {
+            self.focus_terminal(window, cx);
         }
-
-        let line = self.line(cx);
         let background = self.palette.background(ColorSnapshot::Default);
         let text = self.palette.foreground(ColorSnapshot::Default);
-        let alarm = self.palette.foreground(ColorSnapshot::Indexed(1));
-
-        // A shell that never started has no grid to draw, and a half-drawn
-        // grid under an error reads as a shell that opened and then stopped.
-        let body: AnyElement = match &self.terminal {
-            Some(terminal) => terminal.clone().into_any_element(),
-            None => div()
+        let title = self
+            .terminal()
+            .map(|terminal| {
+                terminal
+                    .read(cx)
+                    .session()
+                    .snapshot()
+                    .title
+                    .unwrap_or_else(|| "Terminal".into())
+            })
+            .or_else(|| {
+                self.navigation
+                    .active_checkout
+                    .as_deref()
+                    .and_then(|id| self.navigation.checkout(id))
+                    .map(|checkout| checkout.path.clone())
+            })
+            .unwrap_or_else(|| "Muster".into());
+        let body: AnyElement = if let Some(terminal) = self.terminal() {
+            terminal.clone().into_any_element()
+        } else {
+            let available = self
+                .navigation
+                .active_checkout
+                .as_deref()
+                .and_then(|id| self.navigation.checkout(id))
+                .is_some_and(|checkout| !checkout.is_missing);
+            div()
                 .flex_1()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .px_6()
-                .child(line.failure.clone().unwrap_or_default())
-                .into_any_element(),
+                .gap_3()
+                .child(if self.opening {
+                    "Opening workspace…"
+                } else if available {
+                    "No terminal is open in this directory."
+                } else {
+                    "Open a directory to get started."
+                })
+                .child(
+                    Button::new("empty-action")
+                        .label(if available {
+                            "New terminal"
+                        } else {
+                            "Open directory"
+                        })
+                        .disabled(self.opening || self.closing)
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            if available {
+                                if let Some(id) = app.navigation.active_checkout.clone() {
+                                    app.request_terminal(&id, window, cx);
+                                }
+                            } else {
+                                app.choose_directory(window, cx);
+                            }
+                        })),
+                )
+                .into_any_element()
         };
-
+        let body = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(body)
+            .into_any_element();
+        let content = if !self.injected && self.navigation.panels_visible {
+            let sidebar = self.sidebar(cx);
+            h_resizable("workspace-panels")
+                .with_state(&self.resize)
+                .child(
+                    resizable_panel()
+                        .flex_none()
+                        .size(px(self.navigation.sidebar_width))
+                        .size_range(px(240.)..px(500.))
+                        .child(sidebar),
+                )
+                .child(resizable_panel().child(body))
+                .on_resize(cx.listener(|app, state: &Entity<ResizableState>, _, cx| {
+                    if let Some(width) = state.read(cx).sizes().first() {
+                        app.navigation.sidebar_width = width.as_f32().clamp(240., 500.);
+                        app.persist();
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+        } else {
+            body
+        };
+        let dialog = self
+            .worktree
+            .as_ref()
+            .map(|draft| self.worktree_dialog(draft, cx));
         div()
+            .id("workspace-root")
             .size_full()
             .flex()
             .flex_col()
             .bg(background)
+            .text_color(text)
+            .capture_key_down(cx.listener(Self::on_key))
             .child(
                 div()
                     .flex()
@@ -232,546 +2089,266 @@ impl Render for TerminalWindow {
                     .px_2()
                     .overflow_hidden()
                     .text_xs()
-                    .text_color(text)
-                    .child(line.title.clone())
-                    .child(div().ml_2().child(line.detail()))
-                    // One fixed trailing slot rather than a conditional child:
-                    // a line that grows and shrinks its children is a line that
-                    // relayouts every time the shell's state changes. `flex_1`
-                    // rather than `ml_auto` so the message takes the space the
-                    // title did not and the two cannot overlap when narrow.
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_align(TextAlign::Right)
-                            .text_color(alarm)
-                            .child(line.failure.clone().unwrap_or_default()),
-                    ),
+                    .child(title)
+                    .when(!self.injected, |row| {
+                        row.child(
+                            Button::new("toggle-panels")
+                                .ghost()
+                                .small()
+                                .compact()
+                                .h(px(20.))
+                                .icon(IconName::PanelLeftClose)
+                                .accessibility_label("Toggle side panels")
+                                .tooltip("Toggle side panels — Cmd/Ctrl+/")
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.navigation.panels_visible = !app.navigation.panels_visible;
+                                    app.focus_terminal(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
-            .child(body)
+            .when_some(
+                self.failure.clone().or_else(|| self.notice.clone()),
+                |root, message| {
+                    root.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_2()
+                            .text_size(px(12.))
+                            .text_color(gpui_kit::rgb(0xe3b341))
+                            .child(div().flex_1().child(message))
+                            .child(
+                                Button::new("dismiss-message")
+                                    .ghost()
+                                    .small()
+                                    .compact()
+                                    .icon(IconName::X)
+                                    .accessibility_label("Dismiss message")
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.failure = None;
+                                        app.notice = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                },
+            )
+            .child(content)
+            .when_some(dialog, |root, dialog| root.child(dialog))
     }
 }
-
 impl Drop for TerminalWindow {
     fn drop(&mut self) {
-        // Not every exit runs the quit path: a window closed through the
-        // platform never reaches `on_app_quit`, and an injected session is not
-        // this process's to end. `Drop for Inner` stops a session's threads and
-        // deliberately leaves the PTY, so skipping this is the difference
-        // between a closed terminal and an invisible one.
-        let _ = self.shell;
-        let _ = end_shell();
+        if !self.injected {
+            self.owner.stop();
+        }
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Ending the shell
-// ---------------------------------------------------------------------------------------------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shortcut {
+    Panels,
+    Terminal,
+}
+fn shortcut(key: &gpui_kit::Keystroke) -> Option<Shortcut> {
+    let app_modifier = if cfg!(target_os = "macos") {
+        key.modifiers.platform && !key.modifiers.control
+    } else {
+        key.modifiers.control && !key.modifiers.platform
+    };
+    if !app_modifier || key.modifiers.alt {
+        return None;
+    }
+    match key.key.to_lowercase().as_str() {
+        "/" | "slash" => Some(Shortcut::Panels),
+        "7" if key.modifiers.shift => Some(Shortcut::Panels),
+        "n" => Some(Shortcut::Terminal),
+        _ => None,
+    }
+}
+fn toggle(set: &mut std::collections::HashSet<String>, id: &str) {
+    if !set.remove(id) {
+        set.insert(id.into());
+    }
+}
 
-/// Register the process-wide path that ends the shell when the app quits.
+/// Give up on the worktree dialog, unless Git is already making one.
 ///
-/// `App::on_app_quit` is the hook GPUI runs from `App::shutdown`, which is what
-/// the platform's quit reaches instead of an unwind. Registered before the
-/// window is built so a quit in the first frame still ends the shell.
+/// A creation that has reached Git owns a branch and a directory; cancelling
+/// the form cannot undo either, and pretending it did is how a person loses a
+/// worktree they were told had not been made.
+fn close_worktree_dialog(app: &mut TerminalWindow, cx: &mut Context<TerminalWindow>) {
+    match app.worktree.as_mut() {
+        Some(draft) if draft.busy => {
+            draft.error =
+                Some("This worktree is still being created. Wait for it to finish.".into());
+        }
+        Some(_) => app.worktree = None,
+        None => {}
+    }
+    cx.notify();
+}
+
+struct RestoredNavigation {
+    navigation: Navigation,
+    state_path: Option<PathBuf>,
+    errors: Vec<String>,
+}
+fn restore_navigation(cwd: &Path) -> RestoredNavigation {
+    let mut errors = Vec::new();
+    let state_path = navigation::state_path()
+        .map_err(|error| errors.push(error))
+        .ok();
+    let state = state_path
+        .as_ref()
+        .and_then(|path| {
+            navigation::load(path)
+                .map_err(|error| errors.push(error))
+                .ok()
+        })
+        .unwrap_or_default();
+    let mut nav = Navigation::new();
+    nav.sidebar_width = state.sidebar_width;
+    nav.archived = state.archived_checkout_ids.into_iter().collect();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        match Repo::plain(&home, "startup") {
+            Ok(mut repo) => {
+                repo.name = "Home".into();
+                nav.home = Some(repo.checkouts[0].id.clone());
+                nav.repos.push(repo);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    for root in &state.roots {
+        if nav.repos.iter().any(|repo| &repo.root == root) {
+            continue;
+        }
+        match navigation::open_directory(Path::new(root)) {
+            Ok(opened) => nav.merge(opened, false),
+            Err(error) => {
+                errors.push(error);
+                // Keep a missing registration available for removal instead of
+                // silently erasing the saved directory on the next save.
+                let id = muster_core::workspace::repo_id_for_path(root);
+                let checkout_id = muster_core::workspace::checkout_id_for_path(root);
+                nav.repos.push(Repo {
+                    id: id.clone(),
+                    kind: RepoKind::Plain,
+                    name: Path::new(root)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.clone()),
+                    root: root.clone(),
+                    default_branch: None,
+                    created_at: "startup".into(),
+                    last_opened_at: "startup".into(),
+                    checkouts: vec![muster_core::workspace::Checkout {
+                        id: checkout_id,
+                        repo_id: id,
+                        path: root.clone(),
+                        canonical_path: root.clone(),
+                        is_primary: true,
+                        branch: None,
+                        head: None,
+                        ahead_of_default: None,
+                        changed_files: 0,
+                        is_missing: true,
+                        sessions: Vec::new(),
+                    }],
+                });
+            }
+        }
+    }
+    // The explicitly launched directory remains the first shell's cwd, as in
+    // the terminal MVP. A restored selection is used when it is that directory.
+    match navigation::open_directory(cwd) {
+        Ok(opened) => nav.merge(opened, true),
+        Err(error) => {
+            errors.push(error);
+            if let Some(home) = nav.home.clone() {
+                nav.select_checkout(&home);
+            }
+        }
+    }
+    RestoredNavigation {
+        navigation: nav,
+        state_path,
+        errors,
+    }
+}
+
 pub fn install_quit_path(cx: &mut App) {
-    cx.on_app_quit(|_| async move {
-        let Some(shell) = claim() else { return };
-        // On its own thread, because the quit callback has `SHUTDOWN_TIMEOUT`
-        // (200ms) and a close is allowed a grace period before it kills. The
-        // close thread is detached either way, so this is explicit rather than
-        // fire-and-forget only to keep the handle alive.
-        thread::Builder::new()
-            .name("muster-native-quit".to_owned())
-            .spawn(move || {
-                let _ = end(shell);
-            })
-            .expect("muster-native: the quit thread could not be spawned");
+    cx.on_app_quit(|_| {
+        let owners = OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .filter_map(|owner| owner.upgrade())
+            .collect::<Vec<_>>();
+        for owner in owners {
+            owner.stop();
+        }
+        async {}
     })
     .detach();
 }
-
-/// End this process's shell, on the caller's thread.
-///
-/// The test seam: [`install_quit_path`] runs exactly this body on a thread of
-/// its own. Here it is synchronous, so a test can wait for the answer instead
-/// of asserting that a thread it cannot see finished.
-pub fn end_shell() -> Option<Result<CloseReport, SessionError>> {
-    claim().map(end)
-}
-
-/// Take the process's shell, if it still has one.
-fn claim() -> Option<Arc<OwnedShell>> {
-    OWNED.lock().ok()?.take()
-}
-
-/// End `shell`: the session's own close sequence, waited for, and then the free
-/// [`shutdown`] for any child that sequence never reached.
-fn end(shell: Arc<OwnedShell>) -> Result<CloseReport, SessionError> {
-    let report = shell.session.close().wait();
-    shutdown(&shell.backend);
-    report
-}
-
-/// Refuse a window close while something is in front of the shell.
-///
-/// The gate is the last status poll rather than the fresh read inside
-/// `begin_close`, and the difference is the whole point: `begin_close` sets the
-/// session's closing flag and nothing sets it back, so asking it in order to
-/// answer "no" answers a close with a terminal that no longer accepts keys. A
-/// poll is at most one status interval old, which is exactly how old the answer
-/// already displayed above the grid is.
-fn refuse_close_while_busy(shell: &Arc<OwnedShell>, window: &mut Window, cx: &App) {
-    let shell = Arc::clone(shell);
-    window.on_window_should_close(cx, move |_window, _cx| {
-        let status = shell.session.status();
-
-        if let Some(error) = status.poll_error {
-            log::warn!("muster-native: close refused, the shell's state is unknown: {error}");
-            return false;
-        }
-        if status.foreground.running {
-            let app = status.foreground.app.as_deref().unwrap_or("a program");
-            log::warn!("muster-native: close refused, {app} is still running");
-            return false;
-        }
-
-        // Nothing is killed here: the close only starts once the window is on
-        // its way out and the refusal can no longer be taken back.
-        shell.session.close();
-        true
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Starting the shell
-// ---------------------------------------------------------------------------------------------
-
-/// The shell this milestone opens.
-///
-/// The person's login shell in the directory this process was pointed at, with
-/// no database, no `~/.muster`, and no startup file of its own.
-fn start_shell() -> Result<Arc<OwnedShell>, SessionError> {
-    let config = TerminalSessionConfig::new(
-        SESSION_ID.to_owned(),
-        working_directory(),
-        INITIAL_COLUMNS,
-        INITIAL_ROWS,
-        None,
-    );
-    spawn_and_claim(Arc::new(TerminalBackend::default()), config)
-}
-
-/// Spawn `config`'s shell and take ownership of it before returning.
-///
-/// Separate from the window on purpose: a session only the view owns leaks a
-/// shell whenever the view is never mounted, and the mount happens after the
-/// spawn.
-fn spawn_and_claim(
-    backend: Arc<TerminalBackend>,
-    mut config: TerminalSessionConfig,
-) -> Result<Arc<OwnedShell>, SessionError> {
-    let metrics = Arc::new(Mutex::new(UNMEASURED_CELL));
-    config.host = host(Arc::clone(&metrics));
-    let session = TerminalSession::spawn(Arc::clone(&backend), config)?;
-
-    let shell = Arc::new(OwnedShell {
-        backend,
-        session,
-        metrics,
-    });
-    *OWNED.lock().expect("owned shell slot poisoned") = Some(Arc::clone(&shell));
-    Ok(shell)
-}
-
-/// The three things only this window can answer.
-///
-/// Injected rather than reached for, so `TerminalSession` keeps no opinion about
-/// fonts, palettes or clipboards, and a headless test can answer all three.
 fn host(metrics: Arc<Mutex<CellMetrics>>) -> TerminalHost {
     TerminalHost {
         cell_metrics: Box::new(move || metrics.lock().map(|cell| *cell).unwrap_or(UNMEASURED_CELL)),
-        // The view's own palette: a child that indexed 231 asked for the
-        // brightest cube corner and gets it whether or not this window is open.
         resolve_color: Box::new(xterm_256),
-        // No clipboard this milestone. Nothing here owns one, so an OSC 52
-        // write is dropped rather than put anywhere a shell could read it back
-        // out of.
         store_clipboard: Box::new(|_| {}),
     }
 }
-
-/// Where the shell starts.
-///
-/// The directory this process was pointed at, or the one it was launched from.
-/// Never the home directory: an app that does not know where it was opened from
-/// should say so rather than guess, and `$HOME` is a guess that looks exactly
-/// like working.
 pub fn working_directory() -> PathBuf {
-    directory_from(std::env::args_os()).unwrap_or_else(|| {
-        std::env::current_dir().ok().unwrap_or_else(|| {
-            log::warn!("muster-native: no working directory is known, the shell starts in `.`");
-            PathBuf::from(".")
-        })
-    })
+    directory_from(std::env::args_os())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
-
-/// The first argument that names a directory, if there is one.
-///
-/// Split out of [`working_directory`] because `std::env::args` cannot be handed
-/// a value in a test, and this is the half that decides.
 fn directory_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
     args.into_iter()
         .skip(1)
         .map(PathBuf::from)
         .find(|path| path.is_dir())
 }
-
-/// The size the window opens at.
-///
-/// Chosen rather than left to the platform so the first grid is a real one:
-/// `open_window` with no bounds opens whatever the desktop last remembered, and
-/// a remembered postage stamp is not a terminal anybody can use.
 pub fn window_bounds(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(960.), px(640.)),
+            size(px(1280.), px(800.)),
             cx,
         ))),
         ..Default::default()
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// The status line
-// ---------------------------------------------------------------------------------------------
-
-/// The line above the grid.
-struct Line {
-    title: String,
-    /// Whether something is in front of the shell, which is what a close asks
-    /// about and what a person needs to see before they close it themselves.
-    busy: bool,
-    failure: Option<String>,
+// The original ownership regression test remains isolated from production
+// window ownership. Injected views never claim or terminate somebody else's PTY.
+#[cfg(test)]
+static TEST_OWNER: Mutex<Option<Arc<SessionOwner>>> = Mutex::new(None);
+#[cfg(test)]
+fn spawn_and_claim(
+    backend: Arc<TerminalBackend>,
+    config: TerminalSessionConfig,
+) -> Result<Arc<OwnedShell>, String> {
+    let owner = SessionOwner::new(backend, true);
+    let shell = owner.spawn(config)?;
+    *TEST_OWNER.lock().unwrap() = Some(owner);
+    Ok(shell)
 }
-
-impl Line {
-    /// The middle of the line, shown only when there is something to say.
-    ///
-    /// A `String` rather than an `Option` so the element tree has the same
-    /// shape whatever the shell is doing: a line that grows and shrinks its
-    /// children is a line that relayouts on every frame the title changes.
-    fn detail(&self) -> String {
-        if self.busy {
-            "a program is running".to_owned()
-        } else {
-            String::new()
-        }
-    }
+#[cfg(test)]
+fn end_shell() -> Option<Result<CloseReport, SessionError>> {
+    let owner = TEST_OWNER.lock().ok()?.take()?;
+    let shell = owner.state.lock().ok()?.shells.values().next()?.clone();
+    let report = shell.session.close().wait();
+    owner.stop();
+    Some(report)
 }
-
-/// The directory's own name: what a shell calls itself before a program renames
-/// it. Computed once per window because it reads the filesystem.
-fn default_title() -> String {
-    working_directory()
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| DEFAULT_TITLE.to_owned())
-}
-
-/// The backend key for this milestone's one session.
-const SESSION_ID: &str = "muster-native";
-
-/// The grid the PTY starts at, before anything has been measured.
-///
-/// Eighty by twenty-four is what every terminal has opened at since 1971; the
-/// first prepaint replaces it with whatever the window really is.
-const INITIAL_COLUMNS: u16 = 80;
-const INITIAL_ROWS: u16 = 24;
-
-/// What the line shows when no program has set a title and the directory has no
-/// name to lend.
-const DEFAULT_TITLE: &str = "muster-native";
-
-/// The cell a child is told about before anything has been measured.
-///
-/// Eight by sixteen, which is what `TerminalHost::default` claims and what every
-/// non-GPUI caller of this crate gets. A child that asks within its first
-/// millisecond deserves the conventional answer rather than a zero.
-const UNMEASURED_CELL: CellMetrics = CellMetrics {
-    width: 8,
-    height: 16,
-};
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{Duration, Instant};
-
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AnyWindowHandle, AppContext, Pixels, Size, TestAppContext};
-
-    use super::*;
-
-    /// How long a test waits for a child before deciding it is not coming.
-    ///
-    /// Generous, because a test that fails on a busy machine is a test about
-    /// scheduling, and finite, because every test in this file is bounded.
-    const PATIENCE: Duration = Duration::from_secs(10);
-
-    /// How often a waiting test looks.
-    const POLL: Duration = Duration::from_millis(10);
-
-    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-
-    fn next_id() -> String {
-        format!(
-            "muster-native-test-{}",
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-
-    /// A session running `script` under `/bin/sh`.
-    ///
-    /// Not the login shell: a suite must not depend on which shell the person
-    /// running it has, nor on what their startup files do to a PTY.
-    fn session(backend: &Arc<TerminalBackend>, script: &str) -> TerminalSession {
-        let mut config = TerminalSessionConfig::new(
-            next_id(),
-            std::env::temp_dir(),
-            INITIAL_COLUMNS,
-            INITIAL_ROWS,
-            Some(PathBuf::from("/bin/sh")),
-        );
-        config.args = Some(vec!["-c".to_owned(), script.to_owned()]);
-        config.status_interval = Duration::from_millis(20);
-        config.drain_deadline = Duration::from_millis(500);
-        TerminalSession::spawn(Arc::clone(backend), config).expect("the test session spawns")
-    }
-
-    /// Open a window over an existing session, at a size.
-    fn open(
-        cx: &mut TestAppContext,
-        size: Size<Pixels>,
-        backend: &Arc<TerminalBackend>,
-        session: &TerminalSession,
-    ) -> (AnyWindowHandle, Entity<TerminalWindow>) {
-        cx.update(gpui_kit::init);
-        cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        gpui_kit::point(px(0.), px(0.)),
-                        size,
-                    ))),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    cx.new(|cx| {
-                        TerminalWindow::with_session(
-                            session.clone(),
-                            Arc::clone(backend),
-                            window,
-                            cx,
-                        )
-                    })
-                },
-            )
-            .expect("the test window opens")
-        })
-    }
-
-    /// Wait, bounded, for the grid to hold `wanted`.
-    ///
-    /// Polls the session rather than the window on purpose: the snapshot is one
-    /// short lock and is readable from this thread, where a rendered frame
-    /// would need the event loop this test is deliberately not running.
-    fn wait_for_grid(session: &TerminalSession, wanted: char) -> bool {
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            if session
-                .snapshot()
-                .rows
-                .iter()
-                .any(|row| row.cells.iter().any(|cell| cell.c == wanted))
-            {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-
-    /// Draw a few frames of `handle`.
-    ///
-    /// More than one because the view measures its cell while it is painted and
-    /// the canvas that publishes the measurement is laid out in the next frame's
-    /// prepaint. A single frame therefore measures nothing, which is a property
-    /// of the frame order and not of the window.
-    fn settle(cx: &mut TestAppContext, handle: AnyWindowHandle) {
-        for _ in 0..3 {
-            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
-                .expect("the window renders a frame");
-            cx.run_until_parked();
-        }
-    }
-
-    #[gpui_kit::test]
-    fn the_terminal_renders_at_every_window_size(cx: &mut TestAppContext) {
-        let backend = Arc::new(TerminalBackend::default());
-        // One session behind several windows: this is about drawing, and a
-        // shell per size would be a handful of orphans nobody asked for.
-        let session = session(&backend, "sleep 30");
-        let big = size(px(1200.), px(800.));
-
-        for size in [
-            big,
-            size(px(640.), px(480.)),
-            size(px(120.), px(60.)),
-            size(px(1.), px(1.)),
-        ] {
-            let (handle, window) = open(cx, size, &backend, &session);
-            settle(cx, handle);
-
-            let grid = window.read_with(cx, |window, cx| {
-                window
-                    .terminal()
-                    .expect("a spawned shell has a grid")
-                    .read(cx)
-                    .applied_size()
-            });
-            if size == big {
-                assert!(
-                    grid.0 > 80 && grid.1 > 24,
-                    "a 1200x800 window measured {grid:?}"
-                );
-            } else if size.width < px(8.) || size.height < px(22.) {
-                // Too small for even one cell under the line: a background and
-                // nothing else. Painting half a glyph here is how a terminal
-                // ends up with a column of clipped characters at its edge.
-                assert_eq!(grid, (0, 0), "{size:?} measured a grid anyway");
-            }
-
-            cx.update_window(handle, |_, window, _| window.remove_window())
-                .expect("the window closes");
-            cx.run_until_parked();
-        }
-
-        session.close().wait().expect("the test session closes");
-    }
-
-    #[gpui_kit::test]
-    fn a_focused_terminal_sends_a_keystroke_to_the_shell(cx: &mut TestAppContext) {
-        // `cat` echoes exactly what it is sent, so what lands back in the grid
-        // is the child's answer rather than a copy of what the test wrote.
-        let backend = Arc::new(TerminalBackend::default());
-        let session = session(&backend, "cat");
-        let (handle, _window) = open(cx, size(px(800.), px(600.)), &backend, &session);
-
-        // Active as well as focused: `FocusState` asks both, and a press is
-        // refused when either half is missing.
-        cx.update_window(handle, |_, window, _| window.activate_window())
-            .expect("the window activates");
-        cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window.render_frame(cx);
-            window.press("q", cx);
-        })
-        .expect("the window takes a key press");
-        cx.run_until_parked();
-
-        let typed = wait_for_grid(&session, 'q');
-        let _ = session.close().wait();
-
-        assert!(typed, "the keystroke never reached the child's write path");
-    }
-
-    #[test]
-    fn an_app_quit_ends_the_shell_and_leaves_nothing_to_end_twice() {
-        let backend = Arc::new(TerminalBackend::default());
-        let mut config = TerminalSessionConfig::new(
-            next_id(),
-            std::env::temp_dir(),
-            INITIAL_COLUMNS,
-            INITIAL_ROWS,
-            Some(PathBuf::from("/bin/sh")),
-        );
-        config.args = Some(vec!["-c".to_owned(), "sleep 30".to_owned()]);
-        config.drain_deadline = Duration::from_millis(500);
-        let id = config.id.clone();
-
-        spawn_and_claim(Arc::clone(&backend), config).expect("the shell spawns");
-
-        // `end_shell` is the whole body of the quit handler, so asserting on it
-        // asserts that a quit ends the shell, without quitting the test process
-        // to find out.
-        let report = end_shell()
-            .expect("the quit path found a shell")
-            .expect("the close sequence reported an error");
-        assert_eq!(report.id, id, "the close reported about another shell");
-
-        assert!(
-            end_shell().is_none(),
-            "a second quit must find nothing left to end"
-        );
-    }
-
-    #[test]
-    fn the_host_answers_from_the_measured_cell_and_the_views_palette() {
-        let metrics = Arc::new(Mutex::new(UNMEASURED_CELL));
-        let host = host(Arc::clone(&metrics));
-
-        assert_eq!(
-            (host.cell_metrics)(),
-            UNMEASURED_CELL,
-            "a child that asks before the first frame gets the conventional cell"
-        );
-
-        *metrics.lock().expect("the measured cell") = CellMetrics {
-            width: 8,
-            height: 17,
-        };
-        assert_eq!(
-            (host.cell_metrics)(),
-            CellMetrics {
-                width: 8,
-                height: 17
-            },
-            "the view publishes into the cell the host reads"
-        );
-        assert_eq!((host.resolve_color)(196), (255, 0, 0));
-        (host.store_clipboard)("ignored");
-    }
-
-    #[test]
-    fn the_working_directory_is_the_first_argument_that_is_one() {
-        let dir = std::env::temp_dir();
-        let args = vec![
-            OsString::from("muster-native"),
-            OsString::from("not-a-directory"),
-            dir.clone().into_os_string(),
-            std::env::temp_dir().join("also-not-here").into_os_string(),
-        ];
-        assert_eq!(directory_from(args), Some(dir));
-    }
-
-    #[test]
-    fn no_argument_at_all_leaves_the_directory_undecided() {
-        assert_eq!(
-            directory_from([OsString::from("muster-native")]),
-            None,
-            "the program's own name is not a working directory"
-        );
-        let working = working_directory();
-        assert!(
-            working.is_absolute() || working == Path::new("."),
-            "the shell must start somewhere real, not in a guess"
-        );
-    }
-}
+#[path = "sidebar_tests.rs"]
+mod sidebar_tests;

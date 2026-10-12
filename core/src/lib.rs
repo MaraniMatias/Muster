@@ -28,3 +28,6 @@ pub mod pty;
 /// shapes the terminal backend returns are declared, and it depends on nothing
 /// else in the old tree.
 pub mod workspace;
+
+/// Read-only folder/worktree discovery and the native host's isolated navigation state.
+pub mod navigation;

@@ -11,18 +11,21 @@ use gpui_kit::{App, AppContext, Window};
 use muster_native::app::{self, TerminalWindow};
 
 fn main() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
-        gpui_kit::open_window(
-            app::window_bounds(cx),
-            cx,
-            |window: &mut Window, cx: &mut App| {
-                // Before the window exists: a quit that arrives while the shell
-                // is spawning has to find somebody already holding it.
-                app::install_quit_path(cx);
-                cx.new(|cx| TerminalWindow::new(window, cx))
-            },
-        )
-        .expect("muster-native: failed to open window");
-    });
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            gpui_kit::open_window(
+                app::window_bounds(cx),
+                cx,
+                |window: &mut Window, cx: &mut App| {
+                    // Before the window exists: a quit that arrives while the shell
+                    // is spawning has to find somebody already holding it.
+                    app::install_quit_path(cx);
+                    cx.new(|cx| TerminalWindow::new(window, cx))
+                },
+            )
+            .expect("muster-native: failed to open window");
+        });
 }

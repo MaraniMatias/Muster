@@ -7,8 +7,8 @@ workspace of two crates; the Tauri + Vue app it replaces is parked in `legacy/`.
 
 ```text
 Cargo.toml        workspace: core + native, and the [patch.crates-io] table
-core/             muster-core   PTY + workspace shapes. No window, no toolkit.
-native/           muster-native the app: GPUI Kit, VT grid, keyboard, lifecycle
+core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
+native/           muster-native the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
 legacy/           the Tauri 2 + Vue 3 app, frozen at v0.21.1. Not built here.
 scripts/          the RustSec audit and the vendored-crate hash pins
 docs/             the migration plan, and what the port has to satisfy
@@ -21,13 +21,19 @@ docs/             the migration plan, and what the port has to satisfy
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 34 tests and `native` holds 56. The PTY tests are `core`'s: they
+- `core` holds 66 tests and `native` holds 84. The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
 - A focused test: `cargo test --locked -p muster-core pty::`.
 - The native app has no headless UI test suite yet. GPUI's `test-support` feature
   is on in dev-dependencies; `native/src/app.rs` uses it for the window, focus
-  and close-path cases.
+  and close-path cases, and `native/src/sidebar_tests.rs` for the sidebar rows,
+  the worktree dialog and the directory picker.
+- The native workspace lives in `~/.muster/native-workspace.json`, written by
+  `core::navigation`. It is **not** the Legacy SQLite database and nothing reads
+  the old one. It holds roots, archived checkout ids, the active checkout and
+  the sidebar width. Live sessions and terminal layouts are never written, so a
+  restart begins with no terminals rather than reviving processes that are gone.
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
   `linux-build` job in `.github/workflows/ci.yml` for the current list.
 

@@ -5,8 +5,11 @@
 //! used, reached as a dependency instead of a path into its tree, so there is
 //! exactly one implementation of bounded writes and group-safe shutdown.
 
-/// The window: one shell, the line above it, and the two ways this app ends.
+/// The workspace window, retained terminal registry, and native sidebar.
 pub mod app;
+
+/// Navigation projection and selection/merge rules for the native sidebar.
+mod navigation;
 
 /// `muster_core::workspace`, re-exported so a host-side module can reach the
 /// status shapes through one path.
