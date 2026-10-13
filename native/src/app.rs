@@ -14,6 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     checkbox::Checkbox,
@@ -3777,19 +3778,24 @@ impl TerminalWindow {
                             ))
                         })
                         .child(
-                            Button::new(SharedString::from(format!(
+                            // The component's Button builds its content in a
+                            // full-size box that centres whatever it holds, and
+                            // `justify_start` on the builder only reaches the
+                            // root. A row is read as a column, so its own label
+                            // has to start on the terminals' glyph axis, which
+                            // is what the base button does: it lays children
+                            // out from the leading edge. Still a button, so it
+                            // is still focusable and still a click.
+                            BaseButton::new(SharedString::from(format!(
                                 "new-terminal-{}",
                                 checkout.id
                             )))
-                            .text()
-                            .text_color(sidebar_faint_ink())
-                            .rounded(px(0.))
                             .h(px(26.))
                             .w_full()
-                            .p_0()
                             .gap(px(7.))
-                            .justify_start()
-                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .cursor_pointer()
+                            .text_color(sidebar_faint_ink())
+                            .hover(|style| style.text_color(gpui_kit::rgb(0xd7dae0)))
                             .child(Icon::new(IconName::Plus).size(px(14.)))
                             .child("New terminal")
                             .accessibility_label(format!("New terminal for {title}"))
@@ -3806,13 +3812,16 @@ impl TerminalWindow {
                     .border_l_1()
                     .border_color(gpui_kit::rgb(0x1c1f26))
                     .group_hover(
-                        SharedString::from(format!("checkout-row-{}", checkout.id)),
+                        SharedString::from(format!("checkout-children-{}", checkout.id)),
                         |style| style.border_color(gpui_kit::rgb(0x2c313b)),
                     )
                     .children(checkout_children);
                 rows.push(
                     div()
-                        .group(SharedString::from(format!("checkout-row-{}", checkout.id)))
+                        .group(SharedString::from(format!(
+                            "checkout-children-{}",
+                            checkout.id
+                        )))
                         .flex()
                         .flex_col()
                         .child(checkout_row)

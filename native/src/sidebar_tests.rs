@@ -528,6 +528,30 @@ fn figures_right_of(window: &mut Window, checkout: &str) -> f32 {
 }
 
 #[gpui_kit::test]
+fn a_rows_own_action_starts_on_the_glyph_axis_it_is_read_on(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = &fixture.sessions[0];
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // The click target spans the whole row; the terminals' glyphs start 12px
+        // into that row's own padding, and the row that adds one has to start
+        // there too. A centred control drifts right by its own width instead.
+        let row = window.find(format!("select-session-{id}")).bounds().left();
+        let action = window
+            .find(format!("new-terminal-{}", fixture.checkout))
+            .bounds();
+        let glyph_axis = row.as_f32() + 12.;
+        assert!(
+            (action.left().as_f32() - glyph_axis).abs() <= 1.,
+            "New terminal starts {}px off the terminals' own glyph axis",
+            action.left().as_f32() - glyph_axis
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
 fn worktree_creation_cannot_submit_while_defaults_are_loading(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     cx.update_window(fixture.handle, |_, window, cx| {
