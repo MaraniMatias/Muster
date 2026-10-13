@@ -528,29 +528,20 @@ fn figures_right_of(window: &mut Window, checkout: &str) -> f32 {
 }
 
 #[gpui_kit::test]
-fn the_row_that_adds_a_terminal_is_centred_across_the_sidebar(cx: &mut TestAppContext) {
+fn the_row_that_adds_a_terminal_shares_the_terminal_glyph_axis(cx: &mut TestAppContext) {
     let fixture = open(cx);
-    let width = fixture
-        .view
-        .read_with(cx, |app, _| app.navigation.sidebar_width as f32);
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         let action = window
-            .find(format!("new-terminal-{}", fixture.checkout))
+            .find(format!("new-terminal-content-{}", fixture.checkout))
             .bounds();
-        assert!(
-            (action.center().x.as_f32() - width / 2.).abs() <= 1.,
-            "New terminal is centred {}px off the sidebar's own middle",
-            action.center().x.as_f32() - width / 2.
-        );
-        // And it is the group's last line, not one more terminal: it starts
-        // left of the terminals it follows.
         let terminal = window
             .find(format!("select-session-{}", fixture.sessions[0]))
             .bounds();
         assert!(
-            action.left() < terminal.left(),
-            "New terminal is indented like a terminal rather than centred"
+            (action.left().as_f32() - terminal.left().as_f32() - 12.).abs() <= 1.,
+            "New terminal content starts {}px from the terminal glyph axis",
+            action.left().as_f32() - terminal.left().as_f32() - 12.
         );
     })
     .unwrap();

@@ -1331,7 +1331,24 @@ impl TerminalSession {
             queue: Arc::new(WriteQueue::spawn({
                 let backend = Arc::clone(&backend);
                 let id = id.clone();
-                move |bytes| backend.write(&id, bytes)
+                let shared = Arc::clone(&shared);
+                let wake = Arc::clone(&wake);
+                move |bytes| {
+                    let result = backend.write(&id, bytes);
+                    if let Err(error) = &result {
+                        if !shared.closing.load(Ordering::Acquire) {
+                            shared
+                                .protocol_error
+                                .lock()
+                                .expect("terminal protocol error poisoned")
+                                .get_or_insert_with(|| {
+                                    format!("terminal PTY write failed: {error}")
+                                });
+                            wake.signal();
+                        }
+                    }
+                    result
+                }
             })),
             host,
             wake,
@@ -2148,6 +2165,27 @@ mod tests {
         assert!(parser_available, "reply wait held the parser lock");
         assert!(result.is_err());
         assert!(side_protocol_error(&side).is_some_and(|error| error.contains("queue timed out")));
+    }
+
+    #[test]
+    fn a_queued_reply_write_failure_is_sticky_and_wakes_the_view() {
+        let dir = TempDir::new().unwrap();
+        let (backend, session, wake) = start(config(dir.path(), "printf ready; sleep 30"));
+        wait_for("the child to print", || grid(&session).contains("ready"));
+        // Remove the PTY without closing the session: enqueue still succeeds,
+        // but the asynchronous backend write must fail.
+        assert!(backend.close(&session.inner.id).unwrap());
+        wake.take();
+        push_reply(&session.inner.side, b"\x1b[0n".to_vec()).unwrap();
+        wait_for("the writer to record its failure and wake the view", || {
+            side_protocol_error(&session.inner.side).is_some() && wake.take()
+        });
+        let error = session.status().poll_error.unwrap();
+        assert!(error.starts_with("terminal PTY write failed:"));
+        // A later successful status poll must not erase a lost reply.
+        session.inner.shared().status.lock().unwrap().poll_error = None;
+        assert_eq!(session.status().poll_error.as_deref(), Some(error.as_str()));
+        let _ = session.close().wait();
     }
 
     #[test]

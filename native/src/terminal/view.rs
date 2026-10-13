@@ -156,7 +156,7 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             foreground: (0xdc, 0xe0, 0xe5),
-            background: (0x22, 0x24, 0x36),
+            background: (0x16, 0x18, 0x1c),
             cursor: CURSOR_COLOR,
         }
     }
@@ -395,10 +395,7 @@ pub struct TerminalView {
     gesture_tracking: bool,
     gesture_size: (u16, u16),
     scroll_remainder: f32,
-    scrollbar_drag: bool,
-    drag_edge: i32,
     drag_point: (usize, usize),
-    next_drag_scroll: std::time::Instant,
     blink_visible: bool,
     blink_enabled: bool,
     blink_deadline: std::time::Instant,
@@ -466,10 +463,7 @@ impl TerminalView {
             gesture_tracking: false,
             gesture_size: (0, 0),
             scroll_remainder: 0.0,
-            scrollbar_drag: false,
-            drag_edge: 0,
             drag_point: (0, 0),
-            next_drag_scroll: std::time::Instant::now(),
             blink_visible: true,
             blink_enabled: false,
             blink_deadline: std::time::Instant::now() + Duration::from_millis(500),
@@ -778,21 +772,6 @@ impl TerminalView {
         }
     }
 
-    fn scroll_thumb_to(&self, position: gpui_kit::Point<Pixels>) {
-        let snapshot = self.session.snapshot();
-        let Some(cell) = self.cell else {
-            return;
-        };
-        let height = cell.height.as_f32() * f32::from(self.applied.get().1);
-        if height > 0.0 {
-            let fraction =
-                ((position.y - self.canvas_origin.get().y).as_f32() / height).clamp(0.0, 1.0);
-            self.session.set_display_offset(
-                ((1.0 - fraction) * snapshot.history_size as f32).round() as usize,
-            );
-        }
-    }
-
     fn on_mouse_down(
         &mut self,
         event: &gpui_kit::MouseDownEvent,
@@ -813,17 +792,7 @@ impl TerminalView {
         self.gesture_screen = snapshot.alt_screen;
         self.gesture_tracking = snapshot.mouse_tracking;
         self.gesture_size = self.applied.get();
-        if event.button == MouseButton::Left
-            && !snapshot.alt_screen
-            && snapshot.history_size > 0
-            && self.cell.is_some_and(|cell| {
-                event.position.x
-                    >= self.canvas_origin.get().x + cell.width * f32::from(cols) - px(8.0)
-            })
-        {
-            self.scrollbar_drag = true;
-            self.scroll_thumb_to(event.position);
-        } else if snapshot.mouse_tracking && !event.modifiers.shift {
+        if snapshot.mouse_tracking && !event.modifiers.shift {
             if let Some(button) = mouse_button(event.button) {
                 self.mouse_buttons[button as usize] = true;
                 self.report_mouse(event.position, button, false, false, event.modifiers);
@@ -840,6 +809,7 @@ impl TerminalView {
             self.last_click = Some((now, point, self.click_count));
             self.left_mouse = Some((event.position.x.as_f32(), event.position.y.as_f32()));
             self.click_origin = Some(point);
+            self.drag_point = point;
             self.dragged = false;
             self.dragging = false;
             self.modified_click = event.modifiers.shift
@@ -867,12 +837,6 @@ impl TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.scrollbar_drag {
-            self.scroll_thumb_to(event.position);
-            cx.notify();
-            cx.stop_propagation();
-            return;
-        }
         if let Some(origin) = self
             .click_origin
             .filter(|_| event.pressed_button == Some(MouseButton::Left))
@@ -883,16 +847,6 @@ impl TerminalView {
             });
             self.dragging |= point != origin;
             self.drag_point = point;
-            self.drag_edge = self.cell.map_or(0, |cell| {
-                let top = self.canvas_origin.get().y;
-                if event.position.y < top {
-                    1
-                } else if event.position.y >= top + cell.height * f32::from(self.applied.get().1) {
-                    -1
-                } else {
-                    0
-                }
-            });
             if self.dragging || self.click_count > 1 || self.dragged {
                 self.session.update_selection(point);
                 self.selection_range.set(self.snapshot_range());
@@ -943,11 +897,9 @@ impl TerminalView {
             }
             cx.stop_propagation();
         }
-        self.scrollbar_drag = false;
         self.left_mouse = None;
         self.dragged = false;
         self.dragging = false;
-        self.drag_edge = 0;
         self.modified_click = false;
         self.reset_blink();
         cx.notify();
@@ -1193,28 +1145,6 @@ impl Frame {
                     );
                 }
             }
-        }
-        if snapshot.history_size > 0 && !snapshot.alt_screen {
-            let total = snapshot.history_size as f32 + f32::from(rows);
-            let height = (bounds.size.height * (f32::from(rows) / total))
-                .max(px(12.0))
-                .min(bounds.size.height);
-            let fraction = 1.0 - snapshot.display_offset as f32 / snapshot.history_size as f32;
-            let thumb = Bounds {
-                origin: point(
-                    bounds.right() - px(6.0),
-                    bounds.top() + (bounds.size.height - height) * fraction,
-                ),
-                size: gpui_kit::size(px(5.0), height),
-            };
-            window.paint_quad(quad(
-                thumb,
-                px(2.0),
-                opaque((0x62, 0x68, 0x83)),
-                px(0.0),
-                gpui_kit::transparent_black(),
-                Default::default(),
-            ));
         }
     }
 
@@ -1503,14 +1433,7 @@ fn start_wake_task(
                         view.blink_visible = !view.blink_visible;
                         view.blink_deadline = now + Duration::from_millis(500);
                     }
-                    let scroll =
-                        view.dragged && view.drag_edge != 0 && now >= view.next_drag_scroll;
-                    if scroll {
-                        view.session.scroll_by(view.drag_edge);
-                        view.session.update_selection(view.drag_point);
-                        view.next_drag_scroll = now + Duration::from_millis(80);
-                    }
-                    if dirty || blink || scroll {
+                    if dirty || blink {
                         cx.notify();
                     }
                 })
@@ -1545,7 +1468,6 @@ impl Render for TerminalView {
         {
             self.click_origin = None;
             self.left_mouse = None;
-            self.drag_edge = 0;
             self.mouse_buttons = [false; 3];
             self.mouse_cell = None;
             self.last_click = None;
@@ -2427,6 +2349,32 @@ mod tests {
         });
         assert_eq!(session.snapshot().display_offset, 3);
         cx.update(|window, cx| window.render_frame(cx));
+        // The right edge is terminal content, not a scrollbar hit target.
+        let cols = view.read_with(cx, |v, _| v.applied.get().0);
+        cx.simulate_click(
+            point(
+                origin.x + cell.width * f32::from(cols) - px(1.0),
+                position.y,
+            ),
+            Default::default(),
+        );
+        assert_eq!(session.snapshot().display_offset, 3);
+        // Two half-cell trackpad deltas must accumulate into one history line.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    gpui_kit::ScrollWheelEvent {
+                        position,
+                        delta: gpui_kit::ScrollDelta::Pixels(point(px(0.0), cell.height / 2.0)),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+        }
+        assert_eq!(session.snapshot().display_offset, 4);
+        cx.update(|window, cx| window.render_frame(cx));
         cx.simulate_keystrokes("q");
         assert_eq!(session.snapshot().display_offset, 0);
         assert!(wait_for_char(&session, 'q'));
@@ -2514,8 +2462,8 @@ mod tests {
         );
         assert_eq!(
             palette.background,
-            (0x22, 0x24, 0x36),
-            "legacy content background"
+            (0x16, 0x18, 0x1c),
+            "legacy default content background"
         );
 
         // The cube: 16 is its black corner and 231 its white one.

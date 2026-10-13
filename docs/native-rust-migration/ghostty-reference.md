@@ -118,7 +118,8 @@ That default is not appropriate to copy into Muster.
   drag remains word-granular and a triple-click drag line-granular. Ghostty does this
   explicitly and resets gestures on screen-generation changes [G3].
 - `core.rs:674-682` already subtracts the viewport offset. The missing pieces are
-  wheel/navigation wiring and drag auto-scroll, not a new history coordinate system.
+  wheel/navigation wiring, not a new history coordinate system. Drag auto-scroll
+  and a scrollbar are explicitly out of scope at the user's request.
 - The view currently retains a viewport-coordinate drag origin. If the viewport
   scrolls during a drag, reinterpreting that origin against a new offset moves the
   anchor to different content. Keep the original grid anchor; update only the head.
@@ -218,7 +219,7 @@ existing tests of `compatible_run_end` do not establish the cursor split itself.
 
 | Area | Observed state in Muster | Consequence / recommendation |
 | --- | --- | --- |
-| Scrollback | Core supports scrolling; snapshot carries offset; view/session have no navigation path | Add wheel/trackpad with fractional accumulation, platform-appropriate shortcuts, a correctly measured thumb and drag auto-scroll; history navigation must not go to the PTY |
+| Scrollback | Core supports scrolling; snapshot carries offset; view/session have no navigation path | Add wheel/trackpad with fractional accumulation and platform-appropriate shortcuts; no scrollbar or drag auto-scroll; history navigation must not go to the PTY |
 | Mouse reporting | `mouse_tracking` only suppresses local selection; no mouse-event encoder/path is installed | A TUI can request clicks, movement and releases, yet receive none. Implement negotiated formats/modes and the selection override before claiming Neovim/agent mouse parity |
 | Alternate scroll and focus | Modes exist in the parser but are not exposed in the six-boolean input snapshot (`modes.rs`) | Wheel handling must distinguish history, mouse reporting and alternate-scroll arrows. Send focus-in/out only when requested; do not report sidebar focus as terminal input |
 | Wide characters | Snapshot drops width/spacer flags; view guesses width from font advance (`view.rs:720-725`) | Parser grid is authoritative. Carry width/spacer metadata so fallback fonts cannot consume a neighbor or duplicate a wide glyph |
@@ -348,8 +349,8 @@ commit order.
 
 | Stage | Implemented as |
 | --- | --- |
-| 2 | Events are drained under the parser lock and dispatched after it is released; a reply that cannot be delivered becomes a sticky `poll_error`. Paste strips C0/C1 controls and embedded bracketed-paste markers, and a non-bracketed multiline paste needs an explicit warning dialog before `paste_confirmed`. `CellSnapshot` carries the parser's width, spacer and combining codepoints. |
-| 3 | `SelectionKind::{Simple,Word,Line}` is expanded by the parser's own selection; the drag anchor is a grid point that survives viewport scrolling; copy happens on release; TUI mouse reporting is encoded per negotiated mode and Shift overrides it locally; wheel, keyboard and scrollbar drive history scrolling with edge-drag auto-scroll. |
+| 2 | Events are drained under the parser lock and dispatched after it is released; both reply enqueue failures and asynchronous PTY write failures become a sticky `poll_error` and wake the view. Paste strips C0/C1 controls and embedded bracketed-paste markers, and a non-bracketed multiline paste needs an explicit warning dialog before `paste_confirmed`. `CellSnapshot` carries the parser's width, spacer and combining codepoints. |
+| 3 | `SelectionKind::{Simple,Word,Line}` is expanded by the parser's own selection; the drag anchor is a grid point that survives viewport scrolling; copy happens on release; TUI mouse reporting is encoded per negotiated mode and Shift overrides it locally; wheel/trackpad and keyboard drive history scrolling. There is no scrollbar or drag auto-scroll, as requested. |
 | 4 | `prompt_caret_move` returns an ordered arrow count and direction from one authoritative read, follows soft-wrapped rows, refuses tabs, combining clusters, wide spacers, alternate screens, mouse-tracking apps and hard multiline input. |
 | 5 | The block cursor uses the program's color or the theme cursor color on an empty cell, stays visible when the sidebar holds focus, follows `DECSCUSR`/blink state, and the grid paints the program's dynamic background. `ElementInputHandler` owns only the uncommitted composition buffer. |
 
@@ -389,6 +390,15 @@ rustup run 1.97.1 cargo clippy --locked --workspace --all-targets -- -D warnings
 rustup run 1.97.1 cargo fmt --all --check
 # clean
 ```
+
+The follow-up removed the scrollbar and drag auto-scroll, retained wheel/trackpad
+navigation, and tested a reply whose enqueue succeeds but whose backend write fails.
+All **93 terminal tests** pass with `RUSTC` explicitly set to the result of
+`rustup which --toolchain 1.97.1 rustc`; formatting and `muster-native` library
+Clippy (`-D warnings`) also pass. The build uses a
+separate target directory so it does not contend with other contributors. In this
+environment, invoking pinned Cargo alone still resolves Homebrew's rustc, so Cargo's
+version is not sufficient evidence of the compiler used.
 
 The terminal tests are real processes under a real PTY: the prompt-click cases drive
 `/bin/sh` with an OSC 133 marker and read what the child answered, and the
