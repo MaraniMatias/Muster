@@ -11,6 +11,7 @@
 1. This report: feasibility, dependency decisions, architecture, delivery sequence, risks and evidence.
 2. [Terminal-first implementation specification](terminal-first.md): PTY reuse, parser/rendering decisions, concurrency, input, lifecycle, and acceptance checks for the first milestone.
 3. [Interface and workflow parity specification](interface-parity.md): the current layout and behavior that a complete port must preserve, with component mappings and verification scenarios.
+4. [Ghostty reference and terminal gap analysis](ghostty-reference.md): what the native terminal already provides, what it is missing against Legacy parity, and the ranked behaviors worth taking from Ghostty.
 
 These documents distinguish **observed facts**, **proposed decisions**, and **unverified questions**. A source-level assessment is not a successful build, and a terminal library's feature list is not proof that Muster's actual agent TUI works with it.
 
