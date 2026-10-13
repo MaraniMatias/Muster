@@ -2940,43 +2940,64 @@ impl TerminalWindow {
             return;
         }
         if repo.checkouts.iter().any(|checkout| {
-            !checkout.sessions.is_empty()
-                || self
-                    .navigation
-                    .pending
-                    .values()
-                    .any(|pending| pending == &checkout.id)
+            self.navigation
+                .pending
+                .values()
+                .any(|pending| pending == &checkout.id)
         }) {
-            self.failure = Some("Close this repository's terminal sessions before removing it from the panel. No files have been deleted.".into());
+            self.failure = Some("A worktree is still being created here. Wait for Git to finish before removing the directory.".into());
             cx.notify();
             return;
         }
+        // The terminals come with the group. Asking for them to be closed first is
+        // a detour that never ends: a launch opens one in the active workdir, and
+        // this is that workdir, so the directory the person just opened is the one
+        // they can never take back off the panel.
+        let terminals = repo
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.sessions.len())
+            .sum::<usize>();
         let message = format!("Remove “{}” from the panel?", repo.root);
+        let detail = match terminals {
+            0 => "No files will be deleted. Opening the directory again brings it back.".to_owned(),
+            1 => "No files will be deleted. Its 1 running terminal will be closed. Opening the directory again brings it back.".into(),
+            n => format!("No files will be deleted. Its {n} running terminals will be closed. Opening the directory again brings it back."),
+        };
         let prompt = window.prompt(
             PromptLevel::Warning,
             &message,
-            Some("No files will be deleted. Opening the directory again brings it back."),
+            Some(&detail),
             &["Cancel", "Remove from panel"],
             cx,
         );
         let id = id.to_owned();
         cx.spawn_in(window, async move |view, cx| {
             if prompt.await == Ok(1) {
-                let _ = view.update(cx, |app, cx| {
-                    // Revalidate after the prompt: a terminal may have opened while
-                    // this confirmation was outstanding.
-                    let safe = app.navigation.repos.iter().find(|repo| repo.id == id).is_some_and(|repo|
-                        repo.checkouts.iter().all(|checkout| checkout.sessions.is_empty() && !app.navigation.pending.values().any(|pending| pending == &checkout.id)));
-                    if safe {
-                        let removed = app.navigation.repos.iter().find(|repo| repo.id == id).map(|repo| repo.checkouts.iter().map(|checkout| checkout.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
-                        app.navigation.repos.retain(|repo| repo.id != id);
-                        for checkout in &removed { app.navigation.archived.remove(checkout); }
-                        if app.navigation.active_checkout.as_ref().is_some_and(|checkout| removed.contains(checkout)) {
-                            app.navigation.active_checkout = None; app.navigation.active_session = None;
+                let _ = view.update_in(cx, |app, window, cx| {
+                    // Revalidate after the prompt: the group can be gone, or a
+                    // worktree can be on its way into it, while it was open.
+                    let (removed, sessions) = {
+                        let Some(repo) = app.navigation.repos.iter().find(|repo| repo.id == id) else {
+                            return;
+                        };
+                        if app.navigation.pending.values().any(|pending| repo.checkouts.iter().any(|checkout| checkout.id == *pending)) {
+                            app.failure = Some("A worktree is still being created here. Wait for Git to finish before removing the directory.".into());
+                            return;
                         }
-                        app.navigation.revision += 1;
-                        app.membership_revision += 1; app.persist(); app.refresh_diff_totals(cx);
-                    } else { app.failure = Some("The repository now has a terminal session. Close it before removing the directory.".into()); }
+                        (
+                            repo.checkouts.iter().map(|checkout| checkout.id.clone()).collect::<Vec<_>>(),
+                            repo.checkouts.iter().flat_map(|checkout| checkout.sessions.iter().map(|session| session.id.clone())).collect::<Vec<_>>(),
+                        )
+                    };
+                    for session in &sessions { app.close_terminal(session, window, cx); }
+                    app.navigation.repos.retain(|repo| repo.id != id);
+                    for checkout in &removed { app.navigation.archived.remove(checkout); }
+                    if app.navigation.active_checkout.as_ref().is_some_and(|checkout| removed.contains(checkout)) {
+                        app.navigation.active_checkout = None; app.navigation.active_session = None;
+                    }
+                    app.navigation.revision += 1;
+                    app.membership_revision += 1; app.persist(); app.refresh_diff_totals(cx);
                     cx.notify();
                 });
             }

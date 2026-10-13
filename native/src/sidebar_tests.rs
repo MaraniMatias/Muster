@@ -2425,6 +2425,95 @@ async fn native_directory_picker_adds_a_checkout_without_spawning_a_shell(cx: &m
     dispose(&fixture, cx);
 }
 
+#[gpui_kit::test]
+async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    fixture.view.update(cx, |app, _| {
+        app.navigation.home = Some(app.navigation.repos[0].checkouts[0].id.clone());
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    let checkout = muster_core::workspace::checkout_id_for_path(canonical.to_str().unwrap());
+    let repo_id = muster_core::workspace::repo_id_for_path(canonical.to_str().unwrap());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("open-directory", cx)
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec![canonical.clone()]));
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .navigation
+            .checkout(&checkout)
+            .is_some()
+    })
+    .await;
+    // What TerminalWindow::new does on every launch: the active workdir, which is
+    // the directory just opened, gets a shell.
+    fixture.view.update(cx, |app, _| {
+        assert!(app.navigation.add_session(
+            Session {
+                id: "plain-folder-terminal".into(),
+                checkout_id: checkout.clone(),
+                name: "sh".into(),
+                created_at: "now".into(),
+                session_type: SessionType::Shell,
+                status: SavedSessionStatus::Active,
+            },
+            None,
+        ));
+    });
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(format!("fold-repo-{repo_id}")), cx);
+        window.click(SharedString::from(format!("actions-{repo_id}")), cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // A plain folder's menu is the separator-less single item at index 0.
+        window.within("items").click(0usize, cx);
+    })
+    .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Remove from panel");
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .navigation
+            .checkout(&checkout)
+            .is_none()
+    })
+    .await;
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        !fixture
+            .view
+            .read(cx)
+            .terminals
+            .contains_key("plain-folder-terminal")
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.navigation.active_checkout.is_none());
+        assert!(app.navigation.active_session.is_none());
+        // The rest of the panel is untouched, and nothing complained.
+        assert_eq!(app.navigation.repos.len(), 1);
+        assert!(app.failure.is_none());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .try_find(format!("select-checkout-{checkout}"))
+            .is_none());
+        assert!(window.try_find(format!("actions-{repo_id}")).is_none());
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
 #[test]
 fn serial_writer_flushes_the_last_snapshot_before_shutdown() {
     let directory = tempfile::tempdir().unwrap();

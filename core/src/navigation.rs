@@ -266,9 +266,30 @@ fn is_plain_directory(path: &Path, output: &Output) -> Result<bool, String> {
         return Ok(false);
     }
     for ancestor in path.ancestors() {
-        match fs::symlink_metadata(ancestor.join(".git")) {
-            Ok(_) => return Ok(false),
+        let marker = ancestor.join(".git");
+        match fs::symlink_metadata(&marker) {
+            // A `.git` file is a worktree or submodule link, and a broken one
+            // still fails closed. A `.git` directory only counts when Git would
+            // have called it a checkout: a stub holding nothing but `info/`,
+            // which some tool leaves in a home directory, is not a repository
+            // Git refused, and reading it as one would refuse every plain
+            // folder underneath it.
+            Ok(metadata) if !metadata.is_dir() || is_git_directory(&marker)? => return Ok(false),
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not inspect Git metadata: {error}")),
+        }
+    }
+    Ok(true)
+}
+
+/// `HEAD` with `objects` and `refs` is what makes a `.git` directory a
+/// repository to Git; without them there was never one to break.
+fn is_git_directory(marker: &Path) -> Result<bool, String> {
+    for entry in ["HEAD", "objects", "refs"] {
+        match fs::symlink_metadata(marker.join(entry)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(format!("could not inspect Git metadata: {error}")),
         }
     }
@@ -1783,6 +1804,25 @@ mod tests {
         let root = repository(temp.path());
         fs::write(root.join(".git/config"), "[broken\n").unwrap();
         assert!(open_directory(&root).is_err());
+    }
+
+    #[test]
+    fn a_git_stub_above_a_plain_folder_is_not_a_checkout_marker() {
+        let temp = tempdir().unwrap();
+        // A home directory holding nothing but a global excludes file: Git
+        // never called it a repository, so neither does the folder under it.
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".git/info")).unwrap();
+        fs::write(home.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        let folder = home.join("notes");
+        fs::create_dir(&folder).unwrap();
+
+        let opened = open_directory(&folder).unwrap();
+        assert_eq!(opened.repo.kind, RepoKind::Plain);
+        assert_eq!(
+            opened.repo.root,
+            folder.canonicalize().unwrap().display().to_string()
+        );
     }
 
     #[test]
