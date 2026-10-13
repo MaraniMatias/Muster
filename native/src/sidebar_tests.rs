@@ -341,6 +341,193 @@ async fn diff_refresh_is_immediate_coalesced_and_skips_plain_folders(cx: &mut Te
 }
 
 #[gpui_kit::test]
+async fn hovering_a_checkout_opens_its_line_counts(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("changed"), "one\ntwo\n").unwrap();
+    fixture
+        .view
+        .update(cx, |app, cx| app.refresh_diff_totals(cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_totals
+            .get(&fixture.checkout)
+            .is_some_and(|counts| counts.additions == 2)
+    })
+    .await;
+
+    let width = |cx: &mut TestAppContext, id: &str| {
+        let mut found = None;
+        cx.update_window(fixture.handle, |_, window, _| {
+            found = window
+                .try_find(SharedString::from(id.to_owned()))
+                .map(|snapshot| snapshot.bounds().size.width.as_f32());
+        })
+        .unwrap();
+        found
+    };
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    // At rest the row says `+2` in the width it has always reserved.
+    assert_eq!(
+        width(cx, &format!("diff-figures-{}", fixture.checkout)),
+        Some(0.),
+        "the figures were open before the pointer arrived"
+    );
+    assert!(width(cx, &format!("diff-mark-add-{}", fixture.checkout)).unwrap_or(0.) > 0.);
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(format!("select-checkout-{}", fixture.checkout), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let figures = width(cx, &format!("diff-figures-{}", fixture.checkout)).unwrap();
+    assert!(figures > 0., "hover left the line counts closed: {figures}");
+    assert_eq!(
+        width(cx, &format!("diff-mark-add-{}", fixture.checkout)),
+        Some(0.),
+        "the mark did not give way to the figures"
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn the_pointer_over_a_row_reveals_its_own_controls(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (worktree, _) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // The real pointer, not an element flag: hover has to survive hit-testing
+    // through the overlays the row draws on top of itself.
+    let cross = format!("worktree-actions-{worktree}");
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let row = window.find(format!("select-checkout-{worktree}")).bounds();
+        pointer_move(window, row.center(), None, cx);
+        window.render_frame(cx);
+        assert!(
+            window.find(cross.clone()).visible(),
+            "the row's own action stayed hidden under the pointer"
+        );
+    })
+    .unwrap();
+
+    // Moving away takes the affordance back, so the panel is not left lit.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        pointer_move(window, gpui_kit::point(px(900.), px(600.)), None, cx);
+        window.render_frame(cx);
+        assert!(!window.find(cross).visible());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn the_background_sweep_finds_counts_with_only_the_pointer_over_a_row(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, cx| app.start_maintenance(cx));
+    std::fs::write(fixture.root.join("changed"), "one\ntwo\n").unwrap();
+
+    // Nothing asks for these counts: the sweep does, the way it does in the app.
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_totals
+            .get(&fixture.checkout)
+            .is_some_and(|counts| counts.additions == 2)
+    })
+    .await;
+
+    let figures = format!("diff-figures-{}", fixture.checkout);
+    let mark = format!("diff-mark-add-{}", fixture.checkout);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        pointer_move(
+            window,
+            window
+                .find(format!("select-checkout-{}", fixture.checkout))
+                .bounds()
+                .center(),
+            None,
+            cx,
+        );
+        window.render_frame(cx);
+        let open = window.find(figures.clone()).bounds().size.width.as_f32();
+        assert!(
+            open > 0.,
+            "the sweep counted the file but hover left the figures closed"
+        );
+        assert_eq!(window.find(mark).bounds().size.width.as_f32(), 0.);
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn hover_opens_counts_wide_enough_to_need_the_strip(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // The shape a real worktree produces: five digits on each side, which is
+    // wider than the strip a bare mark reserves and has to open into.
+    let (worktree, _) = add_worktree(&fixture, cx);
+    fixture.view.update(cx, |app, cx| {
+        app.diff_totals.insert(
+            worktree.clone(),
+            DiffTotals {
+                additions: 43_084,
+                deletions: 354,
+            },
+        );
+        cx.notify();
+    });
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window
+                .try_find(format!("diff-figures-{worktree}"))
+                .map(|snapshot| snapshot.bounds().size.width.as_f32()),
+            Some(0.),
+            "wide figures were open before the pointer arrived"
+        );
+        let row = window.find(format!("select-checkout-{worktree}")).bounds();
+        pointer_move(window, row.center(), None, cx);
+        window.render_frame(cx);
+        let open = window
+            .find(format!("diff-figures-{worktree}"))
+            .bounds()
+            .size
+            .width
+            .as_f32();
+        assert!(open > 40., "the figures did not open wide enough: {open}");
+        // And the cross keeps its own strip, so the figures never run under it.
+        let cross = window.find(format!("worktree-actions-{worktree}")).bounds();
+        assert!(
+            figures_right_of(window, &worktree) <= cross.left().as_f32() + 0.5,
+            "the figures reached into the cross's slot"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+fn figures_right_of(window: &mut Window, checkout: &str) -> f32 {
+    window
+        .find(format!("diff-figures-{checkout}"))
+        .bounds()
+        .right()
+        .as_f32()
+}
+
+#[gpui_kit::test]
 fn worktree_creation_cannot_submit_while_defaults_are_loading(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     cx.update_window(fixture.handle, |_, window, cx| {

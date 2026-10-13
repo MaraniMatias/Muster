@@ -29,7 +29,7 @@ use gpui_kit::{
     Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Length, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
     Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, WindowBounds, WindowOptions,
+    Styled, Subscription, Task, TestSupportExt, Window, WindowBounds, WindowOptions,
 };
 use muster_core::navigation::{self, DiffTotals, NavigationState};
 use muster_core::workspace::{
@@ -124,6 +124,13 @@ fn sidebar_row_focus(window: &mut Window, cx: &mut App, id: &str) -> (gpui_kit::
     (handle, focused)
 }
 
+/// The chrome a sidebar control wears.
+///
+/// A custom variant keeps its own hover surface — the reference draws a
+/// neutral `#2d323c` behind a row action, not the accent wash a ghost button
+/// paints — but it is neither text nor link, so Kit hands it the default arrow.
+/// The row and the control inside it are one target, and the hand is how that
+/// says so.
 fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
         .foreground(gpui_kit::rgb(0x8b909c).into())
@@ -3026,6 +3033,7 @@ impl TerminalWindow {
                             .child(
                                 Button::new(SharedString::from(format!("actions-{id}")))
                                     .custom(sidebar_action_style(cx))
+                                    .cursor_pointer()
                                     .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
                                         1.
                                     } else {
@@ -3152,6 +3160,7 @@ impl TerminalWindow {
                     .child(
                         Button::new(SharedString::from(format!("fold-checkout-{id}")))
                             .custom(sidebar_action_style(cx))
+                            .cursor_pointer()
                             .small()
                             .compact()
                             .rounded(px(0.))
@@ -3243,29 +3252,37 @@ impl TerminalWindow {
                                     .when(added > 0, |slot| {
                                         slot.child(
                                             div()
+                                                .id(SharedString::from(format!("diff-mark-add-{id}")))
+                                                .test_support()
                                                 .text_color(gpui_kit::rgb(0xa1c181))
                                                 .when(row_focused, |mark| mark.w(px(0.)))
                                                 .overflow_hidden()
                                                 .group_hover(row_group.clone(), |style| {
-                                                    style.w(px(0.))
-                                                })
+                                                style.w(px(0.))
+                                            })
+                                                .cursor_pointer()
                                                 .child("+"),
                                         )
                                     })
                                     .when(removed > 0, |slot| {
                                         slot.child(
                                             div()
+                                                .id(SharedString::from(format!("diff-mark-del-{id}")))
+                                                .test_support()
                                                 .text_color(gpui_kit::rgb(0xd97f84))
                                                 .when(row_focused, |mark| mark.w(px(0.)))
                                                 .overflow_hidden()
                                                 .group_hover(row_group.clone(), |style| {
                                                     style.w(px(0.))
                                                 })
+                                                .cursor_pointer()
                                                 .child("\u{2212}"),
                                         )
                                     })
                                     .child(
                                         div()
+                                            .id(SharedString::from(format!("diff-figures-{id}")))
+                                            .test_support()
                                             .flex()
                                             .items_center()
                                             .gap(px(5.))
@@ -3273,7 +3290,7 @@ impl TerminalWindow {
                                             .overflow_hidden()
                                             .w(if row_focused { Length::Auto } else { px(0.).into() })
                                             .group_hover(row_group.clone(), |style| {
-                                                style.w(Length::Auto)
+                                                style.w(Length::Auto).ml(px(5.))
                                             })
                                             .when(added > 0, |figures| {
                                                 figures.child(
@@ -3309,6 +3326,7 @@ impl TerminalWindow {
                         row.child(
                             Button::new(SharedString::from(format!("dismiss-missing-{id}")))
                                 .custom(sidebar_action_style(cx))
+                                .cursor_pointer()
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -3342,6 +3360,7 @@ impl TerminalWindow {
                             row.child(
                                 Button::new(SharedString::from(format!("worktree-actions-{id}")))
                                     .custom(sidebar_action_style(cx))
+                                    .cursor_pointer()
                                     .rounded(px(0.))
                                     .absolute()
                                     .right(px(8.))
@@ -3633,6 +3652,7 @@ impl TerminalWindow {
                         .child(
                             Button::new(SharedString::from(format!("close-session-{id}")))
                                 .custom(sidebar_action_style(cx))
+                                .cursor_pointer()
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -3748,6 +3768,7 @@ impl TerminalWindow {
                                 ButtonCustomVariant::new(cx)
                                     .foreground(gpui_kit::rgb(0x8b909c).into()),
                             )
+                            .cursor_pointer()
                             .rounded(px(0.))
                             .h(px(26.))
                             .w_full()
@@ -3866,6 +3887,7 @@ impl TerminalWindow {
                                 ButtonCustomVariant::new(cx)
                                     .foreground(gpui_kit::rgb(0x8b909c).into()),
                             )
+                            .cursor_pointer()
                             .small()
                             .compact()
                             .rounded(px(0.))
