@@ -2967,7 +2967,7 @@ impl TerminalWindow {
                 .group(SharedString::from(format!("repo-heading-{id}")))
                 .relative()
                 .flex()
-                .items_baseline()
+                .items_end()
                 .w_full()
                 .cursor_pointer()
                 .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
@@ -3003,7 +3003,14 @@ impl TerminalWindow {
                         .flex_1()
                         .min_w_0()
                         .flex()
-                        .items_baseline()
+                        // Bottom, not baseline: the flex engine is handed no
+                        // baseline to align, so `items_baseline` degrades to the
+                        // top, and a 14px name and an 11px path each sit half
+                        // their own leading below the line they share. Measured
+                        // against the reference, the path hung about 2.5px low;
+                        // aligning their boxes at the foot puts the two
+                        // baselines within a fifth of a pixel.
+                        .items_end()
                         .gap(px(8.))
                         .child(
                             div()
@@ -4311,7 +4318,12 @@ pub fn install_quit_path(cx: &mut App) {
 fn host(metrics: Arc<Mutex<CellMetrics>>) -> TerminalHost {
     TerminalHost {
         cell_metrics: Box::new(move || metrics.lock().map(|cell| *cell).unwrap_or(UNMEASURED_CELL)),
-        resolve_color: Box::new(xterm_256),
+        resolve_color: Box::new(|index| match index {
+            0..=255 => xterm_256(index as u8),
+            257 => Palette::default().background,
+            258 => Palette::default().cursor,
+            _ => Palette::default().foreground,
+        }),
         store_clipboard: Box::new(|_| {}),
     }
 }
