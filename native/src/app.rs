@@ -3771,49 +3771,50 @@ impl TerminalWindow {
                         drag_rows.clone(),
                     ));
                 }
-                checkout_children.push(
-                    div()
-                        .relative()
-                        .pl(px(12.))
-                        .when(self.sidebar_drag.is_some(), |row| {
-                            row.child(sidebar_drag_geometry(
-                                SidebarDropRegion::Append {
-                                    checkout_id: checkout.id.clone(),
-                                    index: checkout.sessions.len(),
-                                },
-                                drag_rows.clone(),
-                            ))
-                        })
-                        .child(
-                            // The component's Button builds its content in a
-                            // full-size box that centres whatever it holds, and
-                            // `justify_start` on the builder only reaches the
-                            // root. A row is read as a column, so its own label
-                            // has to start on the terminals' glyph axis, which
-                            // is what the base button does: it lays children
-                            // out from the leading edge. Still a button, so it
-                            // is still focusable and still a click.
-                            BaseButton::new(SharedString::from(format!(
-                                "new-terminal-{}",
-                                checkout.id
-                            )))
-                            .h(px(26.))
-                            .w_full()
-                            .gap(px(7.))
-                            .cursor_pointer()
-                            .text_color(sidebar_faint_ink())
-                            .hover(|style| style.text_color(gpui_kit::rgb(0xd7dae0)))
-                            .child(Icon::new(IconName::Plus).size(px(14.)))
-                            .child("New terminal")
-                            .accessibility_label(format!("New terminal for {title}"))
-                            .on_click(cx.listener(
-                                move |app, _, window, cx| {
-                                    app.request_terminal(&create_id, window, cx)
-                                },
-                            )),
-                        )
-                        .into_any_element(),
-                );
+                // The row that adds a terminal is centred across the panel's
+                // own width rather than sitting on the terminals' glyph axis: it
+                // is the one row in a group that is not about one terminal, so
+                // it reads as the group's last line instead of as another
+                // terminal. It therefore spans the wrapper rather than the
+                // indented column the terminals are drawn in.
+                let new_terminal_row = div()
+                    .relative()
+                    .w_full()
+                    .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
+                    .when(self.sidebar_drag.is_some(), |row| {
+                        row.child(sidebar_drag_geometry(
+                            SidebarDropRegion::Append {
+                                checkout_id: checkout.id.clone(),
+                                index: checkout.sessions.len(),
+                            },
+                            drag_rows.clone(),
+                        ))
+                    })
+                    .child(
+                        // The component's Button centres its content in a
+                        // full-size box, which is what this row wants. The base
+                        // button lays children out from the leading edge, so it
+                        // carries the centring itself; still a button, so it is
+                        // still focusable and still a click.
+                        BaseButton::new(SharedString::from(format!(
+                            "new-terminal-{}",
+                            checkout.id
+                        )))
+                        .h(px(26.))
+                        .w_full()
+                        .gap(px(7.))
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_color(sidebar_faint_ink())
+                        .hover(|style| style.text_color(gpui_kit::rgb(0xd7dae0)))
+                        .child(Icon::new(IconName::Plus).size(px(14.)))
+                        .child("New terminal")
+                        .accessibility_label(format!("New terminal for {title}"))
+                        .on_click(cx.listener(
+                            move |app, _, window, cx| app.request_terminal(&create_id, window, cx),
+                        )),
+                    )
+                    .into_any_element();
                 let guide = div()
                     .ml(px(14.))
                     .border_l_1()
@@ -3831,8 +3832,10 @@ impl TerminalWindow {
                         )))
                         .flex()
                         .flex_col()
+                        .w_full()
                         .child(checkout_row)
                         .child(guide)
+                        .child(new_terminal_row)
                         .into_any_element(),
                 );
             }

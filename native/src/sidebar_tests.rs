@@ -528,23 +528,29 @@ fn figures_right_of(window: &mut Window, checkout: &str) -> f32 {
 }
 
 #[gpui_kit::test]
-fn a_rows_own_action_starts_on_the_glyph_axis_it_is_read_on(cx: &mut TestAppContext) {
+fn the_row_that_adds_a_terminal_is_centred_across_the_sidebar(cx: &mut TestAppContext) {
     let fixture = open(cx);
-    let id = &fixture.sessions[0];
+    let width = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.sidebar_width as f32);
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        // The click target spans the whole row; the terminals' glyphs start 12px
-        // into that row's own padding, and the row that adds one has to start
-        // there too. A centred control drifts right by its own width instead.
-        let row = window.find(format!("select-session-{id}")).bounds().left();
         let action = window
             .find(format!("new-terminal-{}", fixture.checkout))
             .bounds();
-        let glyph_axis = row.as_f32() + 12.;
         assert!(
-            (action.left().as_f32() - glyph_axis).abs() <= 1.,
-            "New terminal starts {}px off the terminals' own glyph axis",
-            action.left().as_f32() - glyph_axis
+            (action.center().x.as_f32() - width / 2.).abs() <= 1.,
+            "New terminal is centred {}px off the sidebar's own middle",
+            action.center().x.as_f32() - width / 2.
+        );
+        // And it is the group's last line, not one more terminal: it starts
+        // left of the terminals it follows.
+        let terminal = window
+            .find(format!("select-session-{}", fixture.sessions[0]))
+            .bounds();
+        assert!(
+            action.left() < terminal.left(),
+            "New terminal is indented like a terminal rather than centred"
         );
     })
     .unwrap();
