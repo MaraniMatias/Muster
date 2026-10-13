@@ -35,7 +35,9 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -145,6 +147,145 @@ impl Default for TerminalHost {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+const OSC_STARTED: &str = r"\e]133;C\a";
+const OSC_EXIT_BASH: &str = r"\033]133;D;%s\007";
+const OSC_STARTED_BASH: &str = r"\033]133;C\007";
+const OSC_INPUT_STARTED_ZSH: &str = r"\e]133;B\a";
+const OSC_INPUT_STARTED_BASH: &str = r"\\[\033]133;B\007\\]";
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+type ShellSpawn = (PathBuf, Vec<String>, Vec<(OsString, OsString)>);
+
+fn shell_integration(
+    program: &Path,
+    config: &TerminalSessionConfig,
+) -> Option<(ShellSpawn, tempfile::TempDir)> {
+    if config.args.is_some() {
+        return None;
+    }
+    let shell = program.file_name()?.to_str()?;
+    if shell == "bash" && std::env::var_os("POSIXLY_CORRECT").is_some() {
+        return None;
+    }
+    let (filename, script) = match shell {
+        "zsh" => ("hook.zsh", format!("if [[ -z ${{__muster_integrated-}} ]]; then\ntypeset -g __muster_integrated=1 __muster_pending=0\nmuster_pc() {{ local __muster_status=$?; (( __muster_pending )) || __muster_status=0; __muster_pending=0; printf '{OSC_EXIT_BASH}' \"$__muster_status\"; local input=$'{OSC_INPUT_STARTED_ZSH}'; [[ $PS1 == *\"$input\"* ]] || PS1=\"$PS1%{{$input%}}\"; }}\nmuster_px() {{ __muster_pending=1; print -Pn \"{OSC_STARTED}\"; }}\nprecmd_functions=(${{precmd_functions:#muster_pc}} muster_pc)\npreexec_functions+=(muster_px)\nfi\n")),
+        "bash" if std::env::var_os("POSIXLY_CORRECT").is_none() => ("hook.bash", format!("if [[ -z ${{__muster_integrated-}} ]]; then\n__muster_integrated=1; __muster_first_prompt=1\n__muster_prompt_begin() {{ local status=$?; if [[ $__muster_first_prompt == 1 ]]; then [[ ${{__muster_restore_posix-}} != on ]] || set -o posix; unset __muster_restore_posix; status=0; __muster_first_prompt=0; fi; __muster_command_status=$status; return \"$status\"; }}\n__muster_prompt_end() {{ printf '{OSC_EXIT_BASH}' \"$__muster_command_status\"; local input=$'{OSC_INPUT_STARTED_BASH}'; [[ ${{PS1-}} == *\"$input\"* ]] || PS1=\"${{PS1-}}$input\"; }}\nif [[ ${{BASH_VERSINFO[0]}} -gt 5 || ${{BASH_VERSINFO[0]}} -eq 5 && ${{BASH_VERSINFO[1]}} -ge 1 ]] && [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then PROMPT_COMMAND=(__muster_prompt_begin \"${{PROMPT_COMMAND[@]}}\" __muster_prompt_end); else PROMPT_COMMAND=\"__muster_prompt_begin${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}; __muster_prompt_end\"; fi\nprintf -v PS0 '%s' '{OSC_STARTED_BASH}'\"${{PS0-}}\"\nfi\n")),
+        _ => return None,
+    };
+    let temp_dir = tempfile::TempDir::new().ok()?;
+    let dir = temp_dir.path();
+    let script_path = dir.join(filename);
+    fs::write(&script_path, script).ok()?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o600)).ok()?;
+    let mut args = vec![LOGIN_FLAG.into()];
+    let mut env = config.env.clone();
+    if shell == "zsh" {
+        let bootstrap = dir.join("zsh");
+        for file in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+            let mut text = String::new();
+            if file == ".zshenv" {
+                text.push_str(
+                    "typeset -g __muster_bootstrap=$ZDOTDIR __muster_zdotdir=$__MUSTER_ZDOTDIR\n",
+                );
+            }
+            text.push_str("if [[ $__MUSTER_ZDOTDIR_SET == 1 ]]; then export ZDOTDIR=$__MUSTER_ZDOTDIR; else unset ZDOTDIR; fi\n");
+            text.push_str(&format!(
+                "[[ ! -r ${{ZDOTDIR-$HOME}}/{file} ]] || source \"${{ZDOTDIR-$HOME}}/{file}\"\n"
+            ));
+            text.push_str("__MUSTER_ZDOTDIR_SET=${+ZDOTDIR}\n__MUSTER_ZDOTDIR=${ZDOTDIR-}\n");
+            if file == ".zlogin" {
+                text.push_str(&format!(
+                    "unset __MUSTER_ZDOTDIR_SET __MUSTER_ZDOTDIR\nsource {}\n",
+                    shell_quote(&script_path)
+                ));
+            } else if file == ".zshrc" {
+                text.push_str(&format!("if [[ -o login && -o rcs ]]; then export ZDOTDIR=$__muster_bootstrap; else unset __MUSTER_ZDOTDIR_SET __MUSTER_ZDOTDIR; source {}; fi\n", shell_quote(&script_path)));
+            } else {
+                text.push_str("if [[ -o rcs ]]; then export ZDOTDIR=$__muster_bootstrap; else unset __MUSTER_ZDOTDIR_SET __MUSTER_ZDOTDIR __muster_bootstrap; fi\n");
+            }
+            let path = bootstrap.join(file);
+            if file == ".zshenv" {
+                fs::create_dir(&bootstrap).ok()?;
+            }
+            fs::write(&path, text).ok()?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok()?;
+        }
+        let zdotdir = config
+            .env
+            .iter()
+            .find(|(key, _)| key == "ZDOTDIR")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os("ZDOTDIR"));
+        let mut zdotdir_env = vec![
+            (
+                OsString::from("__MUSTER_ZDOTDIR_SET"),
+                if zdotdir.is_some() { "1" } else { "0" }.into(),
+            ),
+            (
+                OsString::from("__MUSTER_ZDOTDIR"),
+                zdotdir.unwrap_or_default(),
+            ),
+            (OsString::from("ZDOTDIR"), bootstrap.into_os_string()),
+        ];
+        env.append(&mut zdotdir_env);
+        Some(((program.to_path_buf(), args, env), temp_dir))
+    } else {
+        #[cfg(unix)]
+        {
+            let link = dir.join("bash-sh");
+            let target = fs::canonicalize(program).ok()?;
+            if fs::read_link(&link).as_ref().ok() != Some(&target)
+                && symlink(&target, &link).is_err()
+                && fs::read_link(&link).ok() != Some(target)
+            {
+                return None;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return None;
+        }
+        let bootstrap = dir.join("bootstrap.bash");
+        let text = format!("# Private Bash startup bridge.\nset +o posix\nBASH=$__MUSTER_BASH\nif (( BASH_VERSINFO[0] >= 5 )); then BASH_ARGV0=$BASH; fi\nunset __MUSTER_BASH\nif [[ $__MUSTER_ENV_SET == 1 ]]; then export ENV=$__MUSTER_ENV; else unset ENV; fi\nunset __MUSTER_ENV_SET __MUSTER_ENV\n[[ ! -r /etc/profile ]] || . /etc/profile\nif [[ -r $HOME/.bash_profile ]]; then . $HOME/.bash_profile; elif [[ -r $HOME/.bash_login ]]; then . $HOME/.bash_login; elif [[ -r $HOME/.profile ]]; then . $HOME/.profile; fi\nif shopt -qo posix; then __muster_restore_posix=on; else __muster_restore_posix=off; fi\n. {}\n", shell_quote(&script_path));
+        if fs::write(&bootstrap, text).is_err()
+            || fs::set_permissions(&bootstrap, fs::Permissions::from_mode(0o600)).is_err()
+        {
+            return None;
+        }
+        let environment = config
+            .env
+            .iter()
+            .find(|(key, _)| key == "ENV")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os("ENV"));
+        env.extend([
+            (
+                OsString::from("__MUSTER_ENV_SET"),
+                if environment.is_some() { "1" } else { "0" }.into(),
+            ),
+            (
+                OsString::from("__MUSTER_ENV"),
+                environment.unwrap_or_default(),
+            ),
+            (
+                OsString::from("__MUSTER_BASH"),
+                program.as_os_str().to_owned(),
+            ),
+            (OsString::from("ENV"), bootstrap.clone().into_os_string()),
+        ]);
+        args.clear();
+        args.extend([
+            "--noprofile".into(),
+            "--rcfile".into(),
+            bootstrap.to_string_lossy().into_owned(),
+        ]);
+        Some(((dir.join("bash-sh"), args, env), temp_dir))
+    }
+}
 // Configuration
 // ---------------------------------------------------------------------------------------------
 
@@ -733,6 +874,7 @@ struct ReaderSide {
 
 struct Inner {
     backend: Arc<TerminalBackend>,
+    _integration_dir: Option<tempfile::TempDir>,
     id: String,
     side: ReaderSide,
     control: Arc<Control>,
@@ -1141,7 +1283,10 @@ impl TerminalSession {
             .args
             .clone()
             .unwrap_or_else(|| vec![LOGIN_FLAG.to_owned()]);
-        let env = config.env.clone();
+        let (spawn, integration_dir) = shell_integration(&program, &config)
+            .map(|(spawn, dir)| (spawn, Some(dir)))
+            .unwrap_or(((program, args, config.env.clone()), None));
+        let (program, args, env) = spawn;
 
         let shared = Arc::new(Shared::new(
             config.cols,
@@ -1169,6 +1314,7 @@ impl TerminalSession {
 
         let inner = Arc::new(Inner {
             backend: Arc::clone(&backend),
+            _integration_dir: integration_dir,
             id,
             side,
             control: Arc::clone(&control),
@@ -1299,6 +1445,19 @@ impl TerminalSession {
         self.inner.shared().core().invalidate_prompt_anchor();
     }
 
+    /// The exit status the last finished command reported, as OSC 133 `D`.
+    ///
+    /// Display data, and only that: it is what a child printed, so it is a claim
+    /// about a terminal's contents and never an input to a decision about the
+    /// agent, a permission, or anything else that acts on a person's behalf.
+    ///
+    /// `None` is one honest answer for "nothing has finished", "a new command
+    /// started" and "this shell reports nothing at all" -- three states the
+    /// parser cannot tell apart, so a sidebar must not pick one of them.
+    pub fn last_command_exit(&self) -> Option<i32> {
+        self.inner.shared().core().command_exit()
+    }
+
     /// Everything known about the child. The last poll's answers, never a fresh
     /// read: this is a view thread's question and asking the OS blocks.
     pub fn status(&self) -> SessionStatus {
@@ -1370,6 +1529,11 @@ impl TerminalSession {
         let Some(bytes) = encode_key(press, &modes) else {
             return Ok(());
         };
+        // Retire the editable prompt before submitting it, including on older
+        // Bash versions that do not support the pre-execution PS0 marker.
+        if press.key == super::keys::Key::Enter {
+            self.invalidate_prompt_anchor();
+        }
         self.inner.push_input(bytes)
     }
 
@@ -1428,8 +1592,9 @@ impl Drop for Inner {
         self.side.queue.stop();
         // The PTY itself is not closed here, and deliberately: `backend.close`
         // is a decision a host makes with the person in front of it, and
-        // `shutdown` is the one that ends everything at once. A dropped session
-        // leaves its shell to whichever of those happens next.
+        // `shutdown` is the one that ends everything at once. The private
+        // integration files remain until this point, after the session workers
+        // have stopped.
     }
 }
 
@@ -1508,6 +1673,7 @@ mod tests {
             Some(PathBuf::from("/bin/sh")),
         );
         config.args = Some(vec!["-c".to_owned(), script.to_owned()]);
+        assert!(shell_integration(&PathBuf::from("/bin/bash"), &config).is_none());
         config.scrollback_lines = TEST_SCROLLBACK;
         config.status_interval = Duration::from_millis(20);
         config.drain_deadline = Duration::from_millis(500);
@@ -1529,6 +1695,127 @@ mod tests {
         config.status_interval = Duration::from_millis(20);
         config.drain_deadline = Duration::from_millis(500);
         config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_zsh_and_bash_startup_markers_and_caret_movement_edit_command() {
+        use std::os::unix::fs::PermissionsExt;
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let home = TempDir::new().expect("isolated home");
+            let scripts = TempDir::new().expect("private integration directory");
+            let marker_file = home.path().join("startup-sourced");
+            let startup = format!(
+                "printf sourced > '{}'\nPS1='test> '\n",
+                marker_file.display()
+            );
+            if shell.ends_with("zsh") {
+                std::fs::write(home.path().join(".zshenv"), "export ZDOTDIR=$HOME\n").unwrap();
+                std::fs::write(home.path().join(".zshrc"), &startup).unwrap();
+            } else {
+                std::fs::write(home.path().join(".bash_profile"), &startup).unwrap();
+            }
+            let mut config = TerminalSessionConfig::new(
+                next_id(),
+                home.path().to_path_buf(),
+                80,
+                24,
+                Some(PathBuf::from(shell)),
+            );
+            config.env.extend([
+                (OsString::from("HOME"), home.path().as_os_str().to_owned()),
+                (
+                    OsString::from("ZDOTDIR"),
+                    home.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    scripts.path().as_os_str().to_owned(),
+                ),
+            ]);
+            config.status_interval = Duration::from_millis(20);
+            let (backend, session, _) = start(config);
+            let deadline = Instant::now() + PATIENCE;
+            while Instant::now() < deadline
+                && !(marker_file.exists() && session.snapshot().prompt_anchor.is_some())
+            {
+                thread::sleep(POLL);
+            }
+            assert!(
+                marker_file.exists(),
+                "startup not sourced for {shell}: {}",
+                grid(&session)
+            );
+            assert!(
+                session.snapshot().prompt_anchor.is_some(),
+                "no OSC 133 B for {shell}: {}",
+                grid(&session)
+            );
+            let initial = session.snapshot();
+            assert_eq!(
+                initial.cursor.col,
+                "test> ".len(),
+                "prompt width for {shell}"
+            );
+            assert_eq!(
+                initial
+                    .prompt_anchor
+                    .expect("OSC 133 B anchors prompt")
+                    .column,
+                "test> ".len()
+            );
+            assert!(
+                grid(&session).contains("test> "),
+                "user PS1 preserved for {shell}: {}",
+                grid(&session)
+            );
+            let script_dir = session
+                .inner
+                ._integration_dir
+                .as_ref()
+                .expect("default shell has private integration directory")
+                .path();
+            assert_eq!(
+                std::fs::metadata(script_dir.join(if shell.ends_with("zsh") {
+                    "hook.zsh"
+                } else {
+                    "hook.bash"
+                }))
+                .unwrap()
+                .permissions()
+                .mode()
+                    & 0o077,
+                0
+            );
+            let probe = home.path().join("executed-command");
+            let command = "printf '%s' 'beforeafter' > executed-command";
+            session.paste(command).unwrap();
+            wait_for("command echo", || grid(&session).contains(command));
+            let current = session.snapshot();
+            let anchor = current.prompt_anchor.expect("editable prompt");
+            let column = anchor.column + "printf '%s' 'before".len();
+            let count = session
+                .move_prompt_caret(current.cursor.row, column)
+                .expect("click inside editable input");
+            for _ in 0..count {
+                session.send_key(&press(Key::Left)).unwrap();
+            }
+            session.paste("-inserted-").unwrap();
+            session.send_key(&press(Key::Enter)).unwrap();
+            wait_for("edited command execution", || probe.exists());
+            assert_eq!(
+                std::fs::read_to_string(&probe).unwrap(),
+                "before-inserted-after"
+            );
+            wait_for("next prompt reacquires anchor", || {
+                session.snapshot().prompt_anchor.is_some()
+            });
+            session.close().wait().unwrap();
+            backend.shutdown();
+        }
     }
 
     fn start(
@@ -1870,6 +2157,33 @@ mod tests {
             session.status().stream == StreamState::Ended(ReaderEnd::EndOfStream)
         });
         assert!(session.status().poll_error.is_none());
+
+        session.close().wait().expect("the session closes");
+    }
+
+    /// A command's exit status and the shell's own are two different facts, and
+    /// only the first one is something a sidebar may show. Here the shell exits
+    /// 3 while the last command it ran reported 1, and neither overwrites the
+    /// other: nothing is read off the child's wait status, and nothing is
+    /// inferred from a foreground process.
+    #[test]
+    fn a_shell_exit_status_is_never_read_as_a_command_exit_status() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let (_backend, session, _wake) =
+            start(config(dir.path(), "printf '\\033]133;D;1\\a'; exit 3"));
+        wait_for("the shell to exit", || {
+            matches!(session.status().shell, ShellState::Exited { .. })
+        });
+        wait_for("its output to drain", || {
+            session.status().stream == StreamState::Ended(ReaderEnd::EndOfStream)
+        });
+
+        assert_eq!(session.status().shell, ShellState::Exited { code: Some(3) });
+        assert_eq!(
+            session.last_command_exit(),
+            Some(1),
+            "the marker the shell printed, not the status it died with"
+        );
 
         session.close().wait().expect("the session closes");
     }

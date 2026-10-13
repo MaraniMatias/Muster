@@ -2,6 +2,8 @@
 //! Discovery merges membership without replacing newer selection or live session order.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::path::Path;
 
 use muster_core::navigation::{NavigationState, OpenedDirectory};
 use muster_core::workspace::{Checkout, Repo, RepoKind, Session};
@@ -70,6 +72,10 @@ impl Navigation {
         if select && !self.archived.contains(&opened.checkout_id) {
             self.select_checkout(&opened.checkout_id);
         }
+    }
+
+    pub fn restore_active_checkout(&mut self, checkout_id: Option<&str>) -> bool {
+        checkout_id.is_some_and(|id| self.select_checkout(id))
     }
 
     pub fn select_checkout(&mut self, id: &str) -> bool {
@@ -217,6 +223,94 @@ impl Navigation {
         Ok(())
     }
 
+    /// Forget a worktree after Core has confirmed that Git removed its selected path.
+    pub fn forget_removed_worktree(&mut self, id: &str) -> Result<(), String> {
+        let repo_index = self
+            .repos
+            .iter()
+            .position(|repo| {
+                repo.kind == RepoKind::Git
+                    && repo.checkouts.iter().any(|checkout| checkout.id == id)
+            })
+            .ok_or("This Git worktree no longer exists.")?;
+        let repo = &self.repos[repo_index];
+        let checkout = repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == id)
+            .expect("located checkout");
+        if checkout.is_primary
+            || self.home.as_deref() == Some(id)
+            || !checkout.sessions.is_empty()
+            || self.pending.values().any(|pending| pending == id)
+        {
+            return Err(
+                "Only a non-primary worktree without terminal activity can be deleted.".into(),
+            );
+        }
+        let fallback = repo
+            .checkouts
+            .iter()
+            .find(|item| item.is_primary && !self.archived.contains(&item.id))
+            .map(|item| item.id.clone());
+        let was_active = self.active_checkout.as_deref() == Some(id);
+        self.repos[repo_index]
+            .checkouts
+            .retain(|checkout| checkout.id != id);
+        self.archived.remove(id);
+        self.selected_by_checkout.remove(id);
+        if was_active {
+            self.active_checkout = None;
+            self.active_session = None;
+        }
+        self.revision += 1;
+        if was_active {
+            if let Some(fallback) = fallback {
+                self.select_checkout(&fallback);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn dismiss_missing_checkout(&mut self, id: &str) -> Result<(), String> {
+        let Some(repo_index) = self.repos.iter().position(|repo| {
+            repo.kind == RepoKind::Git && repo.checkouts.iter().any(|checkout| checkout.id == id)
+        }) else {
+            return Err("This missing Git worktree no longer exists.".into());
+        };
+        let repo = &self.repos[repo_index];
+        let checkout = repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == id)
+            .expect("located checkout");
+        if checkout.is_primary || !checkout.is_missing || self.home.as_deref() == Some(id) {
+            return Err("Only a non-primary missing worktree can be hidden.".into());
+        }
+        if !checkout.sessions.is_empty() || self.pending.values().any(|pending| pending == id) {
+            return Err("Close this worktree's terminal sessions before hiding it.".into());
+        }
+        let fallback = repo
+            .checkouts
+            .iter()
+            .find(|item| item.is_primary && !item.is_missing && !self.archived.contains(&item.id))
+            .map(|item| item.id.clone());
+        let was_active = self.active_checkout.as_deref() == Some(id);
+        self.archived.insert(id.into());
+        self.selected_by_checkout.remove(id);
+        if was_active {
+            self.active_checkout = None;
+            self.active_session = None;
+        }
+        self.revision += 1;
+        if was_active {
+            if let Some(fallback) = fallback {
+                self.select_checkout(&fallback);
+            }
+        }
+        Ok(())
+    }
+
     pub fn persistent_state(&self) -> NavigationState {
         let mut archived_checkout_ids: Vec<_> = self.archived.iter().cloned().collect();
         archived_checkout_ids.sort();
@@ -255,6 +349,27 @@ pub(crate) fn session_title(name: &str, app: Option<&str>, title: Option<&str>) 
     app.map(str::to_owned).unwrap_or_else(|| name.into())
 }
 
+/// Where a repository lives, in the form the panel has room for.
+///
+/// A path of one or two segments is drawn whole; a longer one gives up whole
+/// segments from the front rather than characters from the end. A path cut at
+/// its tail loses the part that says which repository this is — `…/Tra…` names
+/// nothing at all where `…/Marvis` still does — so the ellipsis in front only
+/// ever appears where a segment really was dropped.
+#[cfg(test)]
+pub(crate) fn path_head_tail(root: &Path) -> String {
+    let path = root.to_string_lossy();
+    let segments = path
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() > 2 {
+        format!("\u{2026}/{}", segments[segments.len() - 2..].join("/"))
+    } else {
+        path.into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +400,156 @@ mod tests {
             status: SessionStatus::Active,
         }
     }
+    #[test]
+    fn restored_checkout_overrides_launch_selection_only_when_available() {
+        let (_dir, mut nav, launch) = fixture();
+        let mut saved = nav.repos[0].checkouts[0].clone();
+        saved.id = "checkout:/saved".into();
+        saved.path = "/saved".into();
+        saved.canonical_path = saved.path.clone();
+        saved.is_primary = false;
+        nav.repos[0].checkouts.push(saved.clone());
+
+        assert!(nav.select_checkout(&launch));
+        assert!(nav.restore_active_checkout(Some(&saved.id)));
+        assert_eq!(nav.active_checkout.as_deref(), Some(saved.id.as_str()));
+
+        nav.repos[0].checkouts[1].is_missing = true;
+        assert!(nav.select_checkout(&launch));
+        assert!(!nav.restore_active_checkout(Some(&saved.id)));
+        assert_eq!(nav.active_checkout.as_deref(), Some(launch.as_str()));
+
+        nav.repos[0].checkouts[1].is_missing = false;
+        nav.archived.insert(saved.id.clone());
+        assert!(nav.select_checkout(&launch));
+        assert!(!nav.restore_active_checkout(Some(&saved.id)));
+        assert_eq!(nav.active_checkout.as_deref(), Some(launch.as_str()));
+    }
+
+    #[test]
+    fn dismissing_one_missing_checkout_hides_only_it_and_selects_primary() {
+        let (_dir, mut nav, primary) = fixture();
+        nav.repos[0].kind = RepoKind::Git;
+        let mut stale = nav.repos[0].checkouts[0].clone();
+        stale.id = "checkout:/stale".into();
+        stale.path = "/stale".into();
+        stale.canonical_path = stale.path.clone();
+        stale.branch = Some("stale".into());
+        stale.is_primary = false;
+        stale.is_missing = true;
+        let mut sibling = stale.clone();
+        sibling.id = "checkout:/sibling".into();
+        sibling.path = "/sibling".into();
+        sibling.canonical_path = sibling.path.clone();
+        sibling.branch = Some("sibling".into());
+        nav.repos[0]
+            .checkouts
+            .extend([stale.clone(), sibling.clone()]);
+        nav.active_checkout = Some(stale.id.clone());
+
+        nav.dismiss_missing_checkout(&stale.id).unwrap();
+        assert!(nav.archived.contains(&stale.id));
+        assert_eq!(
+            nav.checkout(&stale.id).unwrap().branch.as_deref(),
+            Some("stale")
+        );
+        assert!(!nav.archived.contains(&sibling.id));
+        assert_eq!(
+            nav.checkout(&sibling.id).unwrap().branch.as_deref(),
+            Some("sibling")
+        );
+        assert_eq!(nav.active_checkout.as_deref(), Some(primary.as_str()));
+        assert_eq!(
+            nav.persistent_state().archived_checkout_ids,
+            vec![stale.id.clone()]
+        );
+    }
+
+    #[test]
+    fn a_missing_checkout_cannot_be_hidden_if_home_primary_or_has_terminal_activity() {
+        let (_dir, mut nav, primary) = fixture();
+        nav.repos[0].kind = RepoKind::Git;
+        let mut checkout = nav.repos[0].checkouts[0].clone();
+        checkout.id = "checkout:/missing".into();
+        checkout.path = "/missing".into();
+        checkout.canonical_path = checkout.path.clone();
+        checkout.branch = Some("missing".into());
+        checkout.is_primary = false;
+        checkout.is_missing = true;
+        nav.repos[0].checkouts.push(checkout.clone());
+
+        nav.home = Some(checkout.id.clone());
+        assert!(nav.dismiss_missing_checkout(&checkout.id).is_err());
+        nav.home = None;
+        nav.repos[0].checkouts[1]
+            .sessions
+            .push(session("session", &checkout.id));
+        assert!(nav.dismiss_missing_checkout(&checkout.id).is_err());
+        nav.repos[0].checkouts[1].sessions.clear();
+        nav.pending.insert("pending".into(), checkout.id.clone());
+        assert!(nav.dismiss_missing_checkout(&checkout.id).is_err());
+        nav.pending.clear();
+        nav.repos[0].checkouts[1].is_primary = true;
+        assert!(nav.dismiss_missing_checkout(&checkout.id).is_err());
+
+        assert_eq!(nav.active_checkout.as_deref(), Some(primary.as_str()));
+        assert!(!nav.archived.contains(&checkout.id));
+        assert!(nav.checkout(&checkout.id).is_some());
+    }
+
+    #[test]
+    fn removing_a_git_worktree_forgets_only_its_row_and_selects_primary() {
+        let (_dir, mut nav, primary) = fixture();
+        nav.repos[0].kind = RepoKind::Git;
+        let mut removed = nav.checkout(&primary).unwrap().clone();
+        removed.id = "checkout:/removed".into();
+        removed.path = "/removed".into();
+        removed.canonical_path = removed.path.clone();
+        removed.is_primary = false;
+        let mut sibling = removed.clone();
+        sibling.id = "checkout:/sibling".into();
+        sibling.path = "/sibling".into();
+        sibling.canonical_path = sibling.path.clone();
+        nav.repos[0]
+            .checkouts
+            .extend([removed.clone(), sibling.clone()]);
+        nav.active_checkout = Some(removed.id.clone());
+        nav.archived.insert(removed.id.clone());
+
+        nav.forget_removed_worktree(&removed.id).unwrap();
+
+        assert!(nav.checkout(&removed.id).is_none());
+        assert!(nav.checkout(&sibling.id).is_some());
+        assert!(!nav.archived.contains(&removed.id));
+        assert_eq!(nav.active_checkout.as_deref(), Some(primary.as_str()));
+    }
+
+    #[test]
+    fn a_worktree_cannot_be_forgotten_if_it_is_home_or_owns_terminal_activity() {
+        let (_dir, mut nav, primary) = fixture();
+        nav.repos[0].kind = RepoKind::Git;
+        let mut checkout = nav.checkout(&primary).unwrap().clone();
+        checkout.id = "checkout:/worktree".into();
+        checkout.path = "/worktree".into();
+        checkout.canonical_path = checkout.path.clone();
+        checkout.is_primary = false;
+        nav.repos[0].checkouts.push(checkout.clone());
+
+        nav.home = Some(checkout.id.clone());
+        assert!(nav.forget_removed_worktree(&checkout.id).is_err());
+        nav.home = None;
+        nav.repos[0].checkouts[1]
+            .sessions
+            .push(session("session", &checkout.id));
+        assert!(nav.forget_removed_worktree(&checkout.id).is_err());
+        nav.repos[0].checkouts[1].sessions.clear();
+        nav.pending.insert("pending".into(), checkout.id.clone());
+        assert!(nav.forget_removed_worktree(&checkout.id).is_err());
+        nav.pending.clear();
+        assert!(nav.forget_removed_worktree(&primary).is_err());
+        assert!(nav.checkout(&checkout.id).is_some());
+    }
+
     #[test]
     fn checkout_selection_does_not_create_terminals() {
         let (_dir, mut nav, id) = fixture();
@@ -361,6 +626,26 @@ mod tests {
             session_title("sh", Some("opencode"), Some("OC | OpenCode")),
             "opencode"
         );
+    }
+    #[test]
+    fn a_header_path_gives_up_segments_and_not_its_tail() {
+        // A short path is drawn whole: an ellipsis in front of a path that was
+        // not elided is a claim the row cannot back up.
+        assert_eq!(
+            path_head_tail(Path::new("/Users/matiasmarani")),
+            "/Users/matiasmarani"
+        );
+        // A longer one keeps the end, because the end is what says which
+        // repository this is.
+        assert_eq!(
+            path_head_tail(Path::new("/Users/matiasmarani/Trabajo")),
+            "\u{2026}/matiasmarani/Trabajo"
+        );
+        assert_eq!(
+            path_head_tail(Path::new("/Users/matiasmarani/Trabajo/Marvis")),
+            "\u{2026}/Trabajo/Marvis"
+        );
+        assert_eq!(path_head_tail(Path::new("/")), "/");
     }
     #[test]
     fn folds_and_hidden_panels_do_not_change_navigation_or_sessions() {

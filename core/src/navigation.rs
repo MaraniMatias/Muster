@@ -461,6 +461,40 @@ pub struct WorktreeDefaults {
     pub start_ref: String,
 }
 
+/// Fresh Git state shown before removing one selected linked worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRemovalInfo {
+    pub checkout_id: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub dirty_files: Vec<String>,
+    pub default_branch: Option<String>,
+    pub default_ref: Option<String>,
+    pub unmerged_commits: u32,
+}
+
+/// The exact preview the person acknowledged before a destructive worktree removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRemovalConfirmation {
+    pub checkout_id: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub dirty_files: Vec<String>,
+    pub default_ref: Option<String>,
+    pub unmerged_commits: u32,
+    pub confirm_dirty: bool,
+    pub confirm_unmerged: bool,
+    pub delete_branch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedWorktree {
+    /// Git may remove the worktree but fail to delete the optional branch.
+    pub warning: Option<String>,
+}
+
 /// Revalidate the repository identity before resolving any mutation inputs.
 pub fn worktree_defaults(repo: &Repo) -> Result<WorktreeDefaults, String> {
     let root = primary_root(repo)?;
@@ -523,6 +557,252 @@ fn primary_root(repo: &Repo) -> Result<PathBuf, String> {
         return Err("repository identity changed; refresh before creating a worktree".into());
     }
     Ok(root.to_path_buf())
+}
+
+fn checked_worktree(repo: &Repo, checkout: &Checkout) -> Result<(PathBuf, Worktree), String> {
+    let root = primary_root(repo)?;
+    if checkout.repo_id != repo.id
+        || checkout.is_primary
+        || checkout.is_missing
+        || checkout.id != checkout_id_for_path(&checkout.path)
+        || checkout.path != checkout.canonical_path
+    {
+        return Err("worktree identity changed; refresh before removing it".into());
+    }
+    validate_path(&checkout.path)?;
+    let path = Path::new(&checkout.path);
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not verify selected worktree: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("selected worktree is not a real directory".into());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve selected worktree: {error}"))?;
+    if canonical == root || canonical.to_str() != Some(checkout.canonical_path.as_str()) {
+        return Err("selected path is not this non-primary worktree; refresh and retry".into());
+    }
+
+    let listed = git_success(
+        &root,
+        &["worktree", "list", "--porcelain", "-z"],
+        GIT_READ_TIMEOUT,
+    )?;
+    let mut selected = None;
+    for entry in parse_worktrees(&listed.stdout)? {
+        if canonical_or_original(&entry.path)? == canonical {
+            if selected.is_some() {
+                return Err(
+                    "Git listed this worktree more than once; refresh before removing it".into(),
+                );
+            }
+            let metadata = fs::symlink_metadata(&entry.path)
+                .map_err(|error| format!("could not verify Git's worktree path: {error}"))?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err("Git's selected worktree path is not a real directory".into());
+            }
+            selected = Some(entry);
+        }
+    }
+    let selected = selected.ok_or_else(|| {
+        "Git no longer lists this selected worktree; refresh before removing it".to_owned()
+    })?;
+    Ok((root, selected))
+}
+
+fn porcelain_path(record: &[u8], spaces: usize) -> Result<String, String> {
+    let mut found = 0;
+    for (index, byte) in record.iter().enumerate() {
+        if *byte == b' ' {
+            found += 1;
+            if found == spaces {
+                let path = &record[index + 1..];
+                if path.is_empty() {
+                    break;
+                }
+                return String::from_utf8(path.to_vec())
+                    .map_err(|_| "Git returned a non-UTF-8 changed filename".into());
+            }
+        }
+    }
+    Err("Git returned an invalid worktree status record".into())
+}
+
+fn parse_worktree_dirty_files(bytes: &[u8]) -> Result<Vec<String>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.last() != Some(&0) {
+        return Err("Git returned an incomplete worktree status".into());
+    }
+    let records = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index + 1 < records.len() {
+        let record = records[index];
+        let (path, renamed) = if record.starts_with(b"? ") {
+            (porcelain_path(record, 1)?, false)
+        } else if record.starts_with(b"1 ") {
+            (porcelain_path(record, 8)?, false)
+        } else if record.starts_with(b"2 ") {
+            (porcelain_path(record, 9)?, true)
+        } else if record.starts_with(b"u ") {
+            (porcelain_path(record, 10)?, false)
+        } else {
+            return Err("Git returned an unknown worktree status record".into());
+        };
+        files.push(path);
+        index += 1;
+        if renamed {
+            let old_path = records
+                .get(index)
+                .filter(|path| !path.is_empty())
+                .ok_or("Git returned an incomplete rename status")?;
+            files.push(
+                String::from_utf8(old_path.to_vec())
+                    .map_err(|_| "Git returned a non-UTF-8 changed filename")?,
+            );
+            index += 1;
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Read a fresh Git preview for this exact, selected linked worktree.
+pub fn worktree_removal_info(
+    repo: &Repo,
+    checkout: &Checkout,
+) -> Result<WorktreeRemovalInfo, String> {
+    let (root, worktree) = checked_worktree(repo, checkout)?;
+    let status = git_success(
+        &worktree.path,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+        GIT_READ_TIMEOUT,
+    )?;
+    let dirty_files = parse_worktree_dirty_files(&status.stdout)?;
+    let (default_branch, default_ref, unmerged_commits) =
+        if let Some(branch) = worktree.branch.as_deref() {
+            let (default_branch, default_ref) = default_ref(&root, repo.default_branch.as_deref())?;
+            let branch_ref = format!("refs/heads/{branch}");
+            let valid = git_output(&root, &["check-ref-format", &branch_ref], GIT_READ_TIMEOUT)?;
+            if !valid.status.success() {
+                return Err(git_error("could not validate worktree branch", &valid));
+            }
+            let output = git_success(
+                &root,
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("{default_ref}..{branch_ref}"),
+                ],
+                GIT_READ_TIMEOUT,
+            )?;
+            let count = output_text(&output)?.parse::<u32>().map_err(|error| {
+                format!("Git returned an invalid unmerged commit count: {error}")
+            })?;
+            (Some(default_branch), Some(default_ref), count)
+        } else {
+            // `--all` includes detached worktree HEADs, so count against durable branch, remote, and tag refs.
+            let output = git_success(
+                Path::new(&worktree.path),
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                    "--tags",
+                ],
+                GIT_READ_TIMEOUT,
+            )?;
+            let count = output_text(&output)?.parse::<u32>().map_err(|error| {
+                format!("Git returned an invalid detached commit count: {error}")
+            })?;
+            (None, None, count)
+        };
+    Ok(WorktreeRemovalInfo {
+        checkout_id: checkout.id.clone(),
+        path: checkout.canonical_path.clone(),
+        branch: worktree.branch,
+        head: worktree.head,
+        dirty_files,
+        default_branch,
+        default_ref,
+        unmerged_commits,
+    })
+}
+
+/// Remove only the worktree represented by a fresh preview and its explicit confirmation.
+pub fn remove_worktree(
+    repo: &Repo,
+    checkout: &Checkout,
+    confirmation: &WorktreeRemovalConfirmation,
+) -> Result<RemovedWorktree, String> {
+    let info = worktree_removal_info(repo, checkout)?;
+    if confirmation.checkout_id != info.checkout_id
+        || confirmation.path != info.path
+        || confirmation.branch != info.branch
+        || confirmation.head != info.head
+        || confirmation.dirty_files != info.dirty_files
+        || confirmation.default_ref != info.default_ref
+        || confirmation.unmerged_commits != info.unmerged_commits
+    {
+        return Err(
+            "the worktree changed since the preview; review the safeguards and retry".into(),
+        );
+    }
+    if !info.dirty_files.is_empty() && !confirmation.confirm_dirty {
+        return Err(
+            "uncommitted files are present; explicitly confirm their loss before deleting".into(),
+        );
+    }
+    if info.branch.is_none() && info.unmerged_commits > 0 && !confirmation.confirm_unmerged {
+        return Err(
+            "detached HEAD has commits unreachable from branches, remotes, or tags; explicitly confirm their loss before deleting".into(),
+        );
+    }
+    if confirmation.delete_branch && info.branch.is_none() {
+        return Err("this worktree has no local branch to delete".into());
+    }
+
+    // Recheck membership and the registered path immediately before the destructive Git call.
+    let (root, worktree) = checked_worktree(repo, checkout)?;
+    if worktree.branch != info.branch || worktree.head != info.head {
+        return Err("the worktree branch changed; refresh the preview and retry".into());
+    }
+    let path = worktree
+        .path
+        .to_str()
+        .ok_or("non-UTF-8 worktree paths are not supported")?;
+    let mut args = vec!["worktree", "remove"];
+    if !info.dirty_files.is_empty() {
+        args.push("--force");
+    }
+    args.push(path);
+    let output = git_write(&root, &args)?;
+    if !output.status.success() {
+        return Err(git_error("could not remove worktree", &output));
+    }
+
+    let warning = if confirmation.delete_branch {
+        let branch = info.branch.as_deref().expect("validated branch");
+        match git_write(&root, &["branch", "-D", "--", branch]) {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(git_error(
+                "worktree was removed, but branch deletion failed",
+                &output,
+            )),
+            Err(error) => Some(format!(
+                "worktree was removed, but branch deletion failed; inspect the repository: {error}"
+            )),
+        }
+    } else {
+        None
+    };
+    Ok(RemovedWorktree { warning })
 }
 
 // From Legacy's resolve_default_ref/resolve_branch_ref: remote refs remain
@@ -1978,6 +2258,199 @@ mod tests {
         repo.root = linked.canonicalize().unwrap().to_str().unwrap().into();
         repo.id = repo_id_for_path(&repo.root);
         assert!(worktree_defaults(&repo).is_err());
+    }
+
+    fn removal_confirmation(
+        info: &WorktreeRemovalInfo,
+        confirm_dirty: bool,
+        delete_branch: bool,
+    ) -> WorktreeRemovalConfirmation {
+        WorktreeRemovalConfirmation {
+            checkout_id: info.checkout_id.clone(),
+            path: info.path.clone(),
+            branch: info.branch.clone(),
+            head: info.head.clone(),
+            dirty_files: info.dirty_files.clone(),
+            default_ref: info.default_ref.clone(),
+            unmerged_commits: info.unmerged_commits,
+            confirm_dirty,
+            confirm_unmerged: false,
+            delete_branch,
+        }
+    }
+
+    #[test]
+    fn detached_worktree_commits_require_explicit_confirmation_before_removal() {
+        let temp = tempdir().unwrap();
+        let repo = main_repo(temp.path());
+        let path = temp.path().join("detached");
+        git(
+            Path::new(&repo.root),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        fs::write(path.join("detached.txt"), "unique detached commit\n").unwrap();
+        git(&path, &["add", "detached.txt"]);
+        commit(&path, "detached-only commit");
+
+        let opened = open_directory(&path).unwrap();
+        let checkout = opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == opened.checkout_id)
+            .unwrap()
+            .clone();
+        let info = worktree_removal_info(&opened.repo, &checkout).unwrap();
+        assert_eq!(info.branch, None);
+        assert_eq!(info.unmerged_commits, 1);
+
+        let mut confirmation = removal_confirmation(&info, false, false);
+        assert!(remove_worktree(&opened.repo, &checkout, &confirmation)
+            .unwrap_err()
+            .contains("explicitly confirm"));
+        assert!(path.is_dir());
+
+        confirmation.confirm_unmerged = true;
+        remove_worktree(&opened.repo, &checkout, &confirmation).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn removal_previews_dirty_files_and_unmerged_commits_and_keeps_branch_by_default() {
+        let temp = tempdir().unwrap();
+        let repo = main_repo(temp.path());
+        let opened = create_worktree(&repo, "task", "feature/task", "").unwrap();
+        let checkout = opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == opened.checkout_id)
+            .unwrap()
+            .clone();
+        let path = Path::new(&checkout.path);
+        fs::write(path.join("committed.txt"), "branch commit\n").unwrap();
+        git(path, &["add", "committed.txt"]);
+        commit(path, "unmerged commit");
+        fs::write(path.join("uncommitted file.txt"), "keep or lose\n").unwrap();
+
+        let info = worktree_removal_info(&opened.repo, &checkout).unwrap();
+        assert_eq!(info.branch.as_deref(), Some("feature/task"));
+        assert_eq!(info.unmerged_commits, 1);
+        assert_eq!(info.default_branch.as_deref(), Some("main"));
+        assert!(info
+            .dirty_files
+            .iter()
+            .any(|file| file == "uncommitted file.txt"));
+
+        let mut confirmation = removal_confirmation(&info, false, false);
+        assert!(remove_worktree(&opened.repo, &checkout, &confirmation)
+            .unwrap_err()
+            .contains("explicitly confirm"));
+        assert!(path.is_dir());
+        confirmation.confirm_dirty = true;
+        let removed = remove_worktree(&opened.repo, &checkout, &confirmation).unwrap();
+        assert!(removed.warning.is_none());
+        assert!(!path.exists());
+        assert!(git_output(
+            Path::new(&repo.root),
+            &["show-ref", "--verify", "--quiet", "refs/heads/feature/task"],
+            GIT_READ_TIMEOUT,
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(Path::new(&repo.root).join(".git").exists());
+    }
+
+    #[test]
+    fn removal_deletes_a_branch_only_when_the_confirmation_asks_for_it() {
+        let temp = tempdir().unwrap();
+        let repo = main_repo(temp.path());
+        let opened = create_worktree(&repo, "task", "feature/task", "").unwrap();
+        let checkout = opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == opened.checkout_id)
+            .unwrap()
+            .clone();
+        let info = worktree_removal_info(&opened.repo, &checkout).unwrap();
+        let confirmation = removal_confirmation(&info, false, true);
+
+        let removed = remove_worktree(&opened.repo, &checkout, &confirmation).unwrap();
+        assert!(removed.warning.is_none());
+        assert!(!Path::new(&checkout.path).exists());
+        assert!(!git_output(
+            Path::new(&repo.root),
+            &["show-ref", "--verify", "--quiet", "refs/heads/feature/task"],
+            GIT_READ_TIMEOUT,
+        )
+        .unwrap()
+        .status
+        .success());
+    }
+
+    #[test]
+    fn removal_refuses_primary_missing_and_unregistered_paths_without_deleting_them() {
+        let temp = tempdir().unwrap();
+        let repo = main_repo(temp.path());
+        let opened = create_worktree(&repo, "task", "feature/task", "").unwrap();
+        let checkout = opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == opened.checkout_id)
+            .unwrap()
+            .clone();
+        let primary = opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.is_primary)
+            .unwrap();
+        assert!(worktree_removal_info(&opened.repo, primary).is_err());
+
+        let info = worktree_removal_info(&opened.repo, &checkout).unwrap();
+        let confirmation = removal_confirmation(&info, false, false);
+        git(
+            Path::new(&repo.root),
+            &["worktree", "remove", "--force", &checkout.path],
+        );
+        fs::create_dir(&checkout.path).unwrap();
+        let sentinel = Path::new(&checkout.path).join("not-a-worktree.txt");
+        fs::write(&sentinel, "leave me").unwrap();
+        assert!(remove_worktree(&opened.repo, &checkout, &confirmation).is_err());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "leave me");
+
+        fs::remove_dir_all(&checkout.path).unwrap();
+        git(
+            Path::new(&repo.root),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/missing",
+                &checkout.path,
+            ],
+        );
+        fs::remove_dir_all(&checkout.path).unwrap();
+        let refreshed = open_directory(Path::new(&repo.root)).unwrap();
+        let missing = refreshed
+            .repo
+            .checkouts
+            .iter()
+            .find(|item| item.id == checkout.id)
+            .unwrap();
+        assert!(missing.is_missing);
+        assert!(worktree_removal_info(&refreshed.repo, missing).is_err());
     }
 
     #[cfg(unix)]

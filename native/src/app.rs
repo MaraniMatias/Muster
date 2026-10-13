@@ -1,8 +1,11 @@
 //! Native workspace window. Terminal entities are retained by session identity;
 //! navigation and folding never own (or restart) a PTY.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc, Mutex, Weak,
@@ -13,6 +16,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     dialog::{Dialog, DialogContent, DialogFooter},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
@@ -21,10 +25,11 @@ use gpui_kit::component::{
     Disableable, Icon, Sizable,
 };
 use gpui_kit::{
-    div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
-    Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, PathPromptOptions,
-    PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, WindowBounds, WindowOptions,
+    canvas, div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context,
+    Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Length, MouseButton,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
+    Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, WindowBounds, WindowOptions,
 };
 use muster_core::navigation::{self, DiffTotals, NavigationState};
 use muster_core::workspace::{
@@ -42,6 +47,70 @@ use crate::terminal::{
 use crate::terminal::{CloseReport, SessionError};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// The family the sidebar draws with, and the one its labels are measured in.
+///
+/// One name in both places on purpose: a path elided against a different face
+/// than the one that draws it is a fit that is a guess. This is the family the
+/// bundled faces declare in their own `name` table, not a browser alias.
+pub(crate) const SIDEBAR_FONT_FAMILY: &str = "Fira Code";
+
+/// Register the bundled faces on the application's text system.
+///
+/// Called before the first window opens, because a family that is missing when
+/// the first frame is laid out is one GPUI quietly answers with a fallback.
+/// The regular face and the bold face both go in: the rows set a weight.
+pub fn load_fonts(cx: &App) {
+    if let Err(error) = cx.text_system().add_fonts(vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Bold.ttf").as_slice()),
+    ]) {
+        log::error!("muster-native: bundled sidebar fonts could not load: {error}");
+    }
+}
+
+fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixels {
+    let style = gpui_kit::TextStyle {
+        font_family: SIDEBAR_FONT_FAMILY.into(),
+        font_size: px(size).into(),
+        ..Default::default()
+    };
+    let run = style.to_run(text.len());
+    window
+        .text_system()
+        .shape_line(text.into(), px(size), &[run], None)
+        .width()
+}
+
+fn sidebar_repo_path(
+    window: &Window,
+    root: &str,
+    name: &str,
+    width: f32,
+    has_menu: bool,
+) -> String {
+    let segments = root
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return root.to_owned();
+    }
+    let fixed =
+        18. + sidebar_text_width(window, name, 14.).as_f32() + 8. + if has_menu { 28. } else { 0. };
+    let available = px((width - fixed).max(0.));
+    for count in (1..=segments.len()).rev() {
+        let candidate = if count == segments.len() {
+            root.to_owned()
+        } else {
+            format!("…/{}", segments[segments.len() - count..].join("/"))
+        };
+        if sidebar_text_width(window, &candidate, 11.) <= available {
+            return candidate;
+        }
+    }
+    String::new()
+}
 static OWNERS: Mutex<Vec<Weak<SessionOwner>>> = Mutex::new(Vec::new());
 const INITIAL_COLUMNS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
@@ -217,7 +286,7 @@ impl Drop for StateWriter {
 
 // Kit Button already has a stable ID, but only exposes the generic interactive
 // trait. Use GPUI's native stateful setters on that same interactivity, so fold
-// and selection metadata describe the real focused control, not a second node.
+// expansion metadata describes the real focused control, not a second node.
 struct StatefulButton(Button);
 impl InteractiveElement for StatefulButton {
     fn interactivity(&mut self) -> &mut gpui_kit::Interactivity {
@@ -239,6 +308,7 @@ impl ButtonA11y for Button {
 }
 
 struct LiveTerminal {
+    checkout_id: String,
     view: Entity<TerminalView>,
     shell: Arc<OwnedShell>,
 }
@@ -255,7 +325,21 @@ struct Rename {
 /// what Git answered about the starting point, and the failure that keeps the
 /// dialog open. The mutation runs on a worker and cannot be rolled back, so
 /// `busy` also refuses the dialog's own Cancel.
+struct WorktreeRemovalDraft {
+    request_id: u64,
+    repo_id: String,
+    checkout_id: String,
+    info: Option<muster_core::navigation::WorktreeRemovalInfo>,
+    loading: bool,
+    busy: bool,
+    dirty_confirmed: bool,
+    unmerged_confirmed: bool,
+    delete_branch: bool,
+    error: Option<String>,
+}
+
 struct WorktreeDraft {
+    request_id: u64,
     repo_id: String,
     task: Entity<InputState>,
     branch: Entity<InputState>,
@@ -278,6 +362,75 @@ struct WorktreeDraft {
     _subscriptions: Vec<Subscription>,
 }
 
+const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
+const SIDEBAR_SCROLL_EDGE: f32 = 28.0;
+const SIDEBAR_SCROLL_STEP: f32 = 4.0;
+
+#[derive(Clone, PartialEq, Eq)]
+struct SidebarDropTarget {
+    checkout_id: String,
+    index: usize,
+}
+
+struct SidebarDrag {
+    session_id: String,
+    source_checkout: String,
+    origin: (f32, f32),
+    position: (f32, f32),
+    started: bool,
+    target: Option<SidebarDropTarget>,
+}
+
+#[derive(Clone)]
+enum SidebarDropRegion {
+    Session { checkout_id: String, index: usize },
+    Append { checkout_id: String, index: usize },
+}
+
+struct SidebarRowBounds {
+    region: SidebarDropRegion,
+    bounds: Bounds<Pixels>,
+}
+
+// Record laid-out, window-local bounds so insertion targets stay correct while scrolling.
+fn sidebar_drag_geometry(
+    region: SidebarDropRegion,
+    rows: Rc<RefCell<Vec<SidebarRowBounds>>>,
+) -> AnyElement {
+    canvas(
+        move |bounds, _, _| rows.borrow_mut().push(SidebarRowBounds { region, bounds }),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .left(px(0.))
+    .right(px(0.))
+    .top(px(0.))
+    .bottom(px(0.))
+    .into_any_element()
+}
+
+fn sidebar_drop_marker() -> AnyElement {
+    div()
+        .absolute()
+        .left(px(8.))
+        .right(px(8.))
+        .top(px(0.))
+        .h(px(2.))
+        .bg(gpui_kit::rgb(0x5b97ff))
+        .into_any_element()
+}
+
+// Window events track movement past row boundaries; MouseExitEvent cancels an abandoned gesture.
+fn sidebar_drag_dispatcher(register: impl FnOnce(&mut Window, &mut App) + 'static) -> AnyElement {
+    canvas(|_, _, _| (), move |_, _, window, cx| register(window, cx))
+        .absolute()
+        .left(px(0.))
+        .right(px(0.))
+        .top(px(0.))
+        .bottom(px(0.))
+        .into_any_element()
+}
+
 pub struct TerminalWindow {
     navigation: Navigation,
     terminals: HashMap<String, LiveTerminal>,
@@ -287,15 +440,19 @@ pub struct TerminalWindow {
     /// not be asked about draws nothing rather than a confident zero.
     diff_totals: HashMap<String, DiffTotals>,
     worktree: Option<WorktreeDraft>,
+    worktree_removal: Option<WorktreeRemovalDraft>,
     owner: Arc<SessionOwner>,
     failure: Option<String>,
     notice: Option<String>,
     opening: bool,
     closing: bool,
     closing_sessions: std::collections::HashSet<String>,
+    removing_checkouts: HashSet<String>,
     membership_revision: u64,
     latest_terminal_request: Option<String>,
     editing: Option<Rename>,
+    sidebar_drag: Option<SidebarDrag>,
+    suppress_sidebar_click: bool,
     resize: Entity<ResizableState>,
     scroll: ScrollHandle,
     focus_pending: bool,
@@ -313,15 +470,19 @@ impl TerminalWindow {
             terminals: HashMap::new(),
             diff_totals: HashMap::new(),
             worktree: None,
+            worktree_removal: None,
             owner: SessionOwner::new(backend, owns_backend),
             failure: None,
             notice: None,
             opening: false,
             closing: false,
             closing_sessions: Default::default(),
+            removing_checkouts: Default::default(),
             membership_revision: 0,
             latest_terminal_request: None,
             editing: None,
+            sidebar_drag: None,
+            suppress_sidebar_click: false,
             resize: cx.new(|_| ResizableState::default()),
             scroll: ScrollHandle::new(),
             focus_pending: true,
@@ -391,6 +552,7 @@ impl TerminalWindow {
         app.terminals.insert(
             id.clone(),
             LiveTerminal {
+                checkout_id: String::new(),
                 view,
                 shell: shell.clone(),
             },
@@ -431,6 +593,12 @@ impl TerminalWindow {
         if self.closing {
             return;
         }
+        if self.removing_checkouts.contains(checkout_id) {
+            self.failure =
+                Some("This worktree is being removed. Wait before opening a terminal.".into());
+            cx.notify();
+            return;
+        }
         let Some(checkout) = self.navigation.checkout(checkout_id) else {
             return;
         };
@@ -467,6 +635,7 @@ impl TerminalWindow {
                 app.navigation.pending.remove(&id);
                 match result {
                     Ok(shell) => {
+                        let terminal_checkout_id = checkout_id.clone();
                         let accepted = !app.closing
                             && app.navigation.add_session(
                                 Session {
@@ -487,6 +656,7 @@ impl TerminalWindow {
                             app.terminals.insert(
                                 id.clone(),
                                 LiveTerminal {
+                                    checkout_id: terminal_checkout_id,
                                     view: terminal,
                                     shell,
                                 },
@@ -677,31 +847,49 @@ impl TerminalWindow {
                             .map(|(id, path)| {
                                 let total = navigation::diff_totals(Path::new(&path))
                                     .map_err(|error| log::debug!("muster-native: {path}: {error}"));
-                                (id, total)
+                                (id, path, total)
                             })
                             .collect::<Vec<_>>()
                     })
                     .await;
                 if view
-                    .update(cx, |app, cx| {
-                        for (id, total) in totals {
-                            match total {
-                                Ok(total) => {
-                                    app.diff_totals.insert(id, total);
-                                }
-                                Err(()) => {
-                                    app.diff_totals.remove(&id);
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })
+                    .update(cx, |app, cx| app.apply_diff_totals(epoch, totals, cx))
                     .is_err()
                 {
                     return;
                 }
             }
         }));
+    }
+
+    fn apply_diff_totals(
+        &mut self,
+        revision: u64,
+        totals: Vec<(String, String, Result<DiffTotals, ()>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || self.membership_revision != revision {
+            return;
+        }
+        for (id, path, total) in totals {
+            let is_current = !self.navigation.archived.contains(&id)
+                && self
+                    .navigation
+                    .checkout(&id)
+                    .is_some_and(|checkout| !checkout.is_missing && checkout.path == path);
+            if !is_current {
+                continue;
+            }
+            match total {
+                Ok(total) => {
+                    self.diff_totals.insert(id, total);
+                }
+                Err(()) => {
+                    self.diff_totals.remove(&id);
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn request_close_terminal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -851,7 +1039,7 @@ impl TerminalWindow {
     /// with no resolvable default branch keeps the dialog open and says so: the
     /// starting point is the one thing that cannot be guessed.
     fn open_worktree_dialog(&mut self, repo_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing || self.worktree.is_some() {
+        if self.closing || self.worktree.is_some() || self.worktree_removal.is_some() {
             return;
         }
         let Some(repo) = self
@@ -863,8 +1051,13 @@ impl TerminalWindow {
         else {
             return;
         };
-        if repo.kind != RepoKind::Git || repo.checkouts.iter().any(|item| item.is_missing) {
-            self.failure = Some("Worktrees need an available Git repository.".into());
+        if repo.kind != RepoKind::Git
+            || !repo
+                .checkouts
+                .iter()
+                .any(|item| item.is_primary && !item.is_missing)
+        {
+            self.failure = Some("Worktrees need an available primary Git checkout.".into());
             cx.notify();
             return;
         }
@@ -901,12 +1094,16 @@ impl TerminalWindow {
         ];
         task.read(cx).focus_handle(cx).focus(window, cx);
         let repo_id = repo_id.to_owned();
+        let request_id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
         self.worktree = Some(WorktreeDraft {
+            request_id,
             repo_id: repo_id.clone(),
             task,
             branch,
             base,
-            location: None,
+            // `repo.root` is the canonical primary checkout from discovery.
+            // Show its destination immediately, even if Git cannot guess a base branch.
+            location: Some(PathBuf::from(&repo.root).join(".worktrees")),
             branch_edited: false,
             syncing_branch: false,
             busy: false,
@@ -919,30 +1116,145 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update_in(cx, |app, window, cx| {
-                // A closed dialog answers nothing; a reopened one is a different
-                // conversation with its own repository.
-                let Some(draft) = app.worktree.as_mut().filter(|d| d.repo_id == repo_id) else {
+                app.apply_worktree_defaults(&repo_id, request_id, result, window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_worktree_defaults(
+        &mut self,
+        repo_id: &str,
+        request_id: u64,
+        result: Result<navigation::WorktreeDefaults, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self
+            .worktree
+            .as_mut()
+            .filter(|draft| draft.repo_id == repo_id && draft.request_id == request_id)
+        else {
+            return;
+        };
+        match result {
+            Ok(defaults) => {
+                if draft.base.read(cx).value().trim().is_empty() {
+                    let entity = draft.base.clone();
+                    entity.update(cx, |input, cx| {
+                        input.set_value(defaults.default_branch.clone(), window, cx)
+                    });
+                }
+                draft.location = Some(defaults.location);
+                draft.error = None;
+            }
+            Err(error) => {
+                draft.error = Some(format!(
+                    "Could not load Git defaults: {error}. Enter an existing branch or ref to continue."
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_worktree_removal_dialog(
+        &mut self,
+        repo_id: &str,
+        checkout_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || self.worktree.is_some() || self.worktree_removal.is_some() {
+            return;
+        }
+        let Some(repo) = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(checkout) = repo
+            .checkouts
+            .iter()
+            .find(|item| item.id == checkout_id)
+            .cloned()
+        else {
+            return;
+        };
+        if repo.kind != RepoKind::Git {
+            self.failure = Some("Only a Git worktree can be archived or deleted here.".into());
+            cx.notify();
+            return;
+        }
+        if checkout.is_primary || self.navigation.home.as_deref() == Some(checkout_id) {
+            self.failure =
+                Some("The primary checkout and Home cannot be archived or deleted.".into());
+            cx.notify();
+            return;
+        }
+        if checkout.is_missing {
+            self.failure = Some(
+                "This worktree is missing. Hide it to remove it from the panel; its Git metadata and branch are retained.".into(),
+            );
+            cx.notify();
+            return;
+        }
+
+        let request_id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+        self.worktree_removal = Some(WorktreeRemovalDraft {
+            request_id,
+            repo_id: repo.id.clone(),
+            checkout_id: checkout.id.clone(),
+            info: None,
+            loading: true,
+            busy: false,
+            dirty_confirmed: false,
+            unmerged_confirmed: false,
+            delete_branch: false,
+            error: None,
+        });
+        let worker = cx
+            .background_executor()
+            .spawn(async move { navigation::worktree_removal_info(&repo, &checkout) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, _, cx| {
+                let Some(draft) = app
+                    .worktree_removal
+                    .as_mut()
+                    .filter(|draft| draft.request_id == request_id)
+                else {
                     return;
                 };
+                draft.loading = false;
                 match result {
-                    Ok(defaults) => {
-                        let entity = draft.base.clone();
-                        let name = defaults.default_branch.clone();
-                        entity.update(cx, |input, cx| input.set_value(name, window, cx));
-                        draft.location = Some(defaults.location);
-                    }
-                    Err(_) => {
-                        // Git would not name a default branch. That is a question
-                        // for the person, not a failure: the dialog keeps the
-                        // field and waits for it.
-                        draft.error = None;
-                    }
+                    Ok(info) => draft.info = Some(info),
+                    Err(error) => draft.error = Some(error),
                 }
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn checkout_has_terminal_activity(&self, checkout_id: &str) -> bool {
+        self.navigation
+            .checkout(checkout_id)
+            .is_some_and(|checkout| !checkout.sessions.is_empty())
+            || self
+                .navigation
+                .pending
+                .values()
+                .any(|pending| pending == checkout_id)
+            || self
+                .terminals
+                .values()
+                .any(|terminal| terminal.checkout_id == checkout_id)
     }
 
     /// Follow the task name into the branch, until the person takes the branch
@@ -1122,10 +1434,9 @@ impl TerminalWindow {
                                 "Create and open shell"
                             })
                             .disabled(!ready)
-                            .on_click(move |_, _window, cx| {
-                                let _ = submit_button.update_in(cx, |app, window, cx| {
-                                    app.submit_worktree(window, cx)
-                                });
+                            .on_click(move |_, window, cx| {
+                                let _ = submit_button
+                                    .update(cx, |app, cx| app.submit_worktree(window, cx));
                             }),
                     ),
             )
@@ -1139,6 +1450,547 @@ impl TerminalWindow {
             .into_any_element()
     }
 
+    fn worktree_removal_dialog(
+        &self,
+        draft: &WorktreeRemovalDraft,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = draft.checkout_id.clone();
+        let request_id = draft.request_id;
+        let info = draft.info.clone();
+        let loading = draft.loading;
+        let busy = draft.busy;
+        let dirty_confirmed = draft.dirty_confirmed;
+        let unmerged_confirmed = draft.unmerged_confirmed;
+        let delete_branch = draft.delete_branch;
+        let error = draft.error.clone();
+        let checkout = self.navigation.checkout(&id);
+        let repo = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == draft.repo_id);
+        let branch = info
+            .as_ref()
+            .and_then(|info| info.branch.as_deref())
+            .or_else(|| checkout.and_then(|checkout| checkout.branch.as_deref()))
+            .unwrap_or("detached HEAD");
+        let label = format!(
+            "{} · {}",
+            branch,
+            repo.map_or("Git repository", |repo| repo.name.as_str())
+        );
+        let path = info
+            .as_ref()
+            .map(|info| info.path.clone())
+            .or_else(|| checkout.map(|checkout| checkout.canonical_path.clone()))
+            .unwrap_or_else(|| id.clone());
+        let valid_checkout = repo.is_some_and(|repo| repo.kind == RepoKind::Git)
+            && checkout.is_some_and(|checkout| {
+                !checkout.is_primary
+                    && !checkout.is_missing
+                    && self.navigation.home.as_deref() != Some(&id)
+            });
+        let session_names = checkout
+            .map(|checkout| {
+                checkout
+                    .sessions
+                    .iter()
+                    .map(|session| session.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let retained_terminals = self
+            .terminals
+            .iter()
+            .filter(|(session_id, terminal)| {
+                terminal.checkout_id == id && self.navigation.session(session_id).is_none()
+            })
+            .map(|(session_id, _)| format!("Terminal {session_id}"))
+            .collect::<Vec<_>>();
+        let pending_ids = self
+            .navigation
+            .pending
+            .iter()
+            .filter(|(_, pending)| *pending == &id)
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+        let has_terminal = self.checkout_has_terminal_activity(&id);
+        let has_pending = !pending_ids.is_empty();
+        let can_archive = !busy && valid_checkout && !has_terminal;
+        let can_delete = !loading
+            && !busy
+            && valid_checkout
+            && !has_terminal
+            && info.as_ref().is_some_and(|info| {
+                (info.dirty_files.is_empty() || dirty_confirmed)
+                    && (info.branch.is_some() || info.unmerged_commits == 0 || unmerged_confirmed)
+            });
+        let toggle_dirty = cx.weak_entity();
+        let toggle_unmerged = cx.weak_entity();
+        let toggle_branch = cx.weak_entity();
+        let archive = cx.weak_entity();
+        let delete = cx.weak_entity();
+        let close_for_cancel = cx.weak_entity();
+        let close_for_escape = cx.weak_entity();
+        Dialog::new(cx)
+            .width(px(520.))
+            .title("Archive or delete worktree")
+            .content(move |mut content: DialogContent, _, _| {
+                content = content
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .child("Archive hides this worktree, keeps every file and branch, and does not run Git. Delete removes this selected worktree directory and its Git registration."),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_size(px(11.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child(format!("{label} · {}", escape_git_path(&path))),
+                    );
+                if loading {
+                    content = content.child(
+                        div()
+                            .mt_3()
+                            .text_size(px(12.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child("Checking Git worktree…"),
+                    );
+                }
+                if let Some(info) = info.clone() {
+                    if info.dirty_files.is_empty() {
+                        content = content.child(
+                            div()
+                                .mt_3()
+                                .text_size(px(12.))
+                                .text_color(gpui_kit::rgb(0x8b909c))
+                                .child("No uncommitted files."),
+                        );
+                    } else {
+                        let toggle_dirty = toggle_dirty.clone();
+                        let mut preview = div()
+                            .mt_3()
+                            .p_2()
+                            .bg(gpui_kit::rgb(0x252932))
+                            .text_size(px(12.))
+                            .child(format!(
+                                "{} uncommitted file(s) may be lost if you delete this worktree:",
+                                info.dirty_files.len()
+                            ));
+                        for file in info.dirty_files.iter().take(8) {
+                            preview = preview.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(gpui_kit::rgb(0x8b909c))
+                                    .child(escape_git_path(file)),
+                            );
+                        }
+                        if info.dirty_files.len() > 8 {
+                            preview = preview.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(gpui_kit::rgb(0x8b909c))
+                                    .child(format!("and {} more…", info.dirty_files.len() - 8)),
+                            );
+                        }
+                        content = content
+                            .child(preview)
+                            .child(
+                                Checkbox::new("worktree-confirm-dirty")
+                                    .checked(dirty_confirmed)
+                                    .label("I understand uncommitted files may be lost; delete anyway.")
+                                    .on_change(move |checked, _, cx| {
+                                        let _ = toggle_dirty.update(cx, |app, cx| {
+                                            if let Some(draft) = app
+                                                .worktree_removal
+                                                .as_mut()
+                                                .filter(|draft| draft.request_id == request_id)
+                                            {
+                                                draft.dirty_confirmed = *checked;
+                                                draft.error = None;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                    }
+                    if info.unmerged_commits > 0 {
+                        let warning = if info.branch.is_some() {
+                            format!(
+                                "Branch {} has {} unmerged commit(s) versus {}. The branch is kept unless you choose to delete it.",
+                                info.branch.as_deref().unwrap_or_default(),
+                                info.unmerged_commits,
+                                info.default_branch.as_deref().unwrap_or("the default branch")
+                            )
+                        } else {
+                            format!(
+                                "Detached HEAD has {} commit(s) unreachable from branches, remotes, or tags. Deleting this worktree may lose them.",
+                                info.unmerged_commits
+                            )
+                        };
+                        content = content.child(
+                            div()
+                                .mt_2()
+                                .p_2()
+                                .bg(gpui_kit::rgb(0x252932))
+                                .text_size(px(12.))
+                                .child(warning),
+                        );
+                        if info.branch.is_none() {
+                            let toggle_unmerged = toggle_unmerged.clone();
+                            content = content.child(
+                                Checkbox::new("worktree-confirm-unmerged")
+                                    .checked(unmerged_confirmed)
+                                    .label("I understand these detached commits may be lost; delete anyway.")
+                                    .on_change(move |checked, _, cx| {
+                                        let _ = toggle_unmerged.update(cx, |app, cx| {
+                                            if let Some(draft) = app
+                                                .worktree_removal
+                                                .as_mut()
+                                                .filter(|draft| draft.request_id == request_id)
+                                            {
+                                                draft.unmerged_confirmed = *checked;
+                                                draft.error = None;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                    }
+                    if let Some(branch) = info.branch.as_deref() {
+                        let toggle_branch = toggle_branch.clone();
+                        content = content.child(
+                            Checkbox::new("worktree-delete-branch")
+                                .checked(delete_branch)
+                                .label(format!(
+                                    "Delete local branch {}{}",
+                                    branch,
+                                    if info.unmerged_commits > 0 {
+                                        format!(" and its {} unmerged commit(s)", info.unmerged_commits)
+                                    } else {
+                                        String::new()
+                                    }
+                                ))
+                                .on_change(move |checked, _, cx| {
+                                    let _ = toggle_branch.update(cx, |app, cx| {
+                                        if let Some(draft) = app
+                                            .worktree_removal
+                                            .as_mut()
+                                            .filter(|draft| draft.request_id == request_id)
+                                        {
+                                            draft.delete_branch = *checked;
+                                            draft.error = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                }
+                if has_terminal {
+                    let mut sessions = div()
+                        .mt_2()
+                        .text_size(px(12.))
+                        .text_color(gpui_kit::rgb(0xe3b341))
+                        .child("Close these terminal sessions before archiving or deleting:");
+                    for name in &session_names {
+                        sessions = sessions.child(div().text_size(px(11.)).child(name.clone()));
+                    }
+                    for name in &retained_terminals {
+                        sessions = sessions.child(div().text_size(px(11.)).child(name.clone()));
+                    }
+                    content = content.child(sessions);
+                }
+                if has_pending {
+                    let mut pending = div()
+                        .text_size(px(12.))
+                        .text_color(gpui_kit::rgb(0xe3b341))
+                        .child("Wait for terminal creation to finish before continuing:");
+                    for request in &pending_ids {
+                        pending = pending.child(div().text_size(px(11.)).child(request.clone()));
+                    }
+                    content = content.child(pending);
+                }
+                if let Some(error) = error.clone() {
+                    content = content.child(
+                        div()
+                            .mt_2()
+                            .text_size(px(12.))
+                            .text_color(gpui_kit::rgb(0xd97f84))
+                            .child(error),
+                    );
+                }
+                content
+            })
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("worktree-removal-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                let _ = close_for_cancel.update(cx, |app, cx| {
+                                    close_worktree_dialog(app, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("worktree-archive")
+                            .ghost()
+                            .label(if busy { "Archiving…" } else { "Archive" })
+                            .disabled(!can_archive)
+                            .on_click(move |_, _, cx| {
+                                let _ = archive.update(cx, |app, cx| app.submit_worktree_archive(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("worktree-delete")
+                            .primary()
+                            .label(if busy { "Deleting…" } else { "Delete worktree" })
+                            .disabled(!can_delete)
+                            .on_click(move |_, window, cx| {
+                                let _ = delete.update(cx, |app, cx| {
+                                    app.submit_worktree_delete(window, cx)
+                                });
+                            }),
+                    ),
+            )
+            .on_cancel(move |_, _, cx| {
+                let _ = close_for_escape.update(cx, close_worktree_dialog);
+                false
+            })
+            .into_any_element()
+    }
+
+    fn can_drag_terminal(&self, id: &str) -> bool {
+        let Some(session) = self.navigation.session(id) else {
+            return false;
+        };
+        let source = session.checkout_id.as_str();
+        if self.removing_checkouts.contains(source) {
+            return false;
+        }
+        let reorder = self
+            .navigation
+            .checkout(source)
+            .is_some_and(|checkout| checkout.sessions.iter().any(|session| session.id != id));
+        let move_elsewhere = self
+            .navigation
+            .repos
+            .iter()
+            .flat_map(|repo| &repo.checkouts)
+            .any(|checkout| {
+                checkout.id != source
+                    && !checkout.is_missing
+                    && !self.navigation.archived.contains(&checkout.id)
+                    && !self.removing_checkouts.contains(&checkout.id)
+            });
+        reorder || move_elsewhere
+    }
+
+    fn begin_sidebar_drag(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.suppress_sidebar_click = false;
+        let Some(source_checkout) = self
+            .navigation
+            .session(id)
+            .map(|session| session.checkout_id.clone())
+        else {
+            return;
+        };
+        if self.closing
+            || self.closing_sessions.contains(id)
+            || self.editing.as_ref().is_some_and(|edit| edit.id == id)
+            || !self.can_drag_terminal(id)
+        {
+            self.sidebar_drag = None;
+            return;
+        }
+        let point = (position.x.as_f32(), position.y.as_f32());
+        self.sidebar_drag = Some(SidebarDrag {
+            session_id: id.into(),
+            source_checkout,
+            origin: point,
+            position: point,
+            started: false,
+            target: None,
+        });
+        cx.notify();
+    }
+
+    fn cancel_sidebar_drag(&mut self) {
+        if self.sidebar_drag.take().is_some() {
+            self.suppress_sidebar_click = true;
+        }
+    }
+
+    fn sidebar_drop_target_at(
+        &self,
+        position: Point<Pixels>,
+        rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
+    ) -> Option<SidebarDropTarget> {
+        let drag = self.sidebar_drag.as_ref()?;
+        let rows = rows.borrow();
+        let row = rows.iter().find(|row| {
+            position.x >= row.bounds.left()
+                && position.x <= row.bounds.right()
+                && position.y >= row.bounds.top()
+                && position.y <= row.bounds.bottom()
+        })?;
+        let target = match &row.region {
+            SidebarDropRegion::Append { checkout_id, index } => SidebarDropTarget {
+                checkout_id: checkout_id.clone(),
+                index: *index,
+            },
+            SidebarDropRegion::Session { checkout_id, index } => SidebarDropTarget {
+                checkout_id: checkout_id.clone(),
+                index: index + usize::from(position.y >= row.bounds.center().y),
+            },
+        };
+        let checkout = self.navigation.checkout(&target.checkout_id)?;
+        if checkout.is_missing
+            || self.navigation.archived.contains(&target.checkout_id)
+            || self.removing_checkouts.contains(&target.checkout_id)
+            || self.removing_checkouts.contains(&drag.source_checkout)
+            || (target.checkout_id == drag.source_checkout
+                && !checkout
+                    .sessions
+                    .iter()
+                    .any(|session| session.id != drag.session_id))
+        {
+            return None;
+        }
+        Some(target)
+    }
+
+    fn update_sidebar_drag(
+        &mut self,
+        position: Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+        rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
+        cx: &mut Context<Self>,
+    ) {
+        if pressed_button != Some(MouseButton::Left) {
+            if self.sidebar_drag.is_some() {
+                self.cancel_sidebar_drag();
+                cx.notify();
+            }
+            return;
+        }
+        let point = (position.x.as_f32(), position.y.as_f32());
+        let Some(drag) = self.sidebar_drag.as_mut() else {
+            return;
+        };
+        let position_changed = drag.position != point;
+        drag.position = point;
+        let started_now = !drag.started
+            && (point.0 - drag.origin.0).hypot(point.1 - drag.origin.1) >= SIDEBAR_DRAG_THRESHOLD;
+        drag.started |= started_now;
+        if !drag.started {
+            return;
+        }
+        let target = self.sidebar_drop_target_at(position, rows);
+        let drag = self.sidebar_drag.as_mut().expect("active sidebar drag");
+        let changed = drag.target != target;
+        drag.target = target;
+        if changed || started_now || position_changed {
+            cx.notify();
+        }
+    }
+
+    fn finish_sidebar_drag(
+        &mut self,
+        position: Point<Pixels>,
+        rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_sidebar_drag(position, Some(MouseButton::Left), rows, cx);
+        let Some(drag) = self.sidebar_drag.take() else {
+            return;
+        };
+        if drag.started {
+            self.suppress_sidebar_click = true;
+            if let Some(target) = drag.target {
+                let source_index =
+                    self.navigation
+                        .checkout(&drag.source_checkout)
+                        .and_then(|checkout| {
+                            checkout
+                                .sessions
+                                .iter()
+                                .position(|session| session.id == drag.session_id)
+                        });
+                if let Some(source_index) = source_index {
+                    let index = if target.checkout_id == drag.source_checkout
+                        && source_index < target.index
+                    {
+                        target.index.saturating_sub(1)
+                    } else {
+                        target.index
+                    };
+                    if target.checkout_id != drag.source_checkout || index != source_index {
+                        self.move_terminal(
+                            &drag.session_id,
+                            &target.checkout_id,
+                            index,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn tick_sidebar_drag(
+        &mut self,
+        rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((x, y)) = self
+            .sidebar_drag
+            .as_ref()
+            .filter(|drag| drag.started)
+            .map(|drag| drag.position)
+        else {
+            return;
+        };
+        let position = gpui_kit::point(px(x), px(y));
+        let target = self.sidebar_drop_target_at(position, rows);
+        let drag = self.sidebar_drag.as_mut().expect("active sidebar drag");
+        let mut changed = drag.target != target;
+        drag.target = target;
+
+        let viewport = self.scroll.bounds();
+        if x >= viewport.left().as_f32()
+            && x <= viewport.right().as_f32()
+            && y >= viewport.top().as_f32()
+            && y <= viewport.bottom().as_f32()
+        {
+            let offset = self.scroll.offset();
+            let max = self.scroll.max_offset().y.as_f32();
+            let next = if y < viewport.top().as_f32() + SIDEBAR_SCROLL_EDGE {
+                (offset.y.as_f32() + SIDEBAR_SCROLL_STEP).min(0.0)
+            } else if y > viewport.bottom().as_f32() - SIDEBAR_SCROLL_EDGE {
+                (offset.y.as_f32() - SIDEBAR_SCROLL_STEP).max(-max)
+            } else {
+                offset.y.as_f32()
+            };
+            if next != offset.y.as_f32() {
+                self.scroll.set_offset(gpui_kit::point(offset.x, px(next)));
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     fn move_terminal(
         &mut self,
         id: &str,
@@ -1147,13 +1999,27 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cross_checkout = self
+        let source = self
             .navigation
             .session(id)
-            .is_some_and(|session| session.checkout_id != target);
+            .map(|session| session.checkout_id.clone());
+        if self.removing_checkouts.contains(target)
+            || source
+                .as_deref()
+                .is_some_and(|source| self.removing_checkouts.contains(source))
+        {
+            self.failure =
+                Some("A worktree being deleted cannot receive or move terminal sessions.".into());
+            cx.notify();
+            return;
+        }
+        let cross_checkout = source.as_deref().is_some_and(|source| source != target);
         if let Err(error) = self.navigation.move_session(id, target, index) {
             self.failure = Some(error);
         } else {
+            if let Some(terminal) = self.terminals.get_mut(id) {
+                terminal.checkout_id = target.into();
+            }
             if cross_checkout {
                 self.notice = Some("Terminal moved. Its process and working directory were preserved; no cd was sent.".into());
             }
@@ -1163,13 +2029,237 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn archive(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Err(error) = self.navigation.archive(id) {
-            self.failure = Some(error);
-        } else {
-            self.membership_revision += 1;
-            self.persist();
+    fn dismiss_missing_checkout(&mut self, checkout_id: &str, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
         }
+        if self.checkout_has_terminal_activity(checkout_id) {
+            self.failure = Some("Close this worktree's terminal sessions before hiding it.".into());
+        } else {
+            match self.navigation.dismiss_missing_checkout(checkout_id) {
+                Ok(()) => {
+                    self.diff_totals.remove(checkout_id);
+                    self.membership_revision += 1;
+                    self.persist();
+                    self.notice = Some(
+                        "Missing checkout hidden. No files were deleted; Git metadata and branch were retained."
+                            .into(),
+                    );
+                }
+                Err(error) => self.failure = Some(error),
+            }
+        }
+        cx.notify();
+    }
+
+    fn worktree_removal_error(&mut self, request_id: u64, error: String, cx: &mut Context<Self>) {
+        if let Some(draft) = self
+            .worktree_removal
+            .as_mut()
+            .filter(|draft| draft.request_id == request_id)
+        {
+            draft.error = Some(error);
+            draft.busy = false;
+        }
+        cx.notify();
+    }
+
+    fn submit_worktree_archive(&mut self, cx: &mut Context<Self>) {
+        let Some((request_id, id, busy)) = self
+            .worktree_removal
+            .as_ref()
+            .map(|draft| (draft.request_id, draft.checkout_id.clone(), draft.busy))
+        else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        if self.checkout_has_terminal_activity(&id) {
+            self.worktree_removal_error(
+                request_id,
+                "Close this worktree's terminal sessions before archiving it.".into(),
+                cx,
+            );
+            return;
+        }
+        match self.navigation.archive(&id) {
+            Ok(()) => {
+                self.worktree_removal = None;
+                self.membership_revision += 1;
+                self.persist();
+                cx.notify();
+            }
+            Err(error) => self.worktree_removal_error(request_id, error, cx),
+        }
+    }
+
+    fn submit_worktree_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((request_id, repo_id, id, info, confirm_dirty, confirm_unmerged, delete_branch)) =
+            self.worktree_removal.as_ref().map(|draft| {
+                (
+                    draft.request_id,
+                    draft.repo_id.clone(),
+                    draft.checkout_id.clone(),
+                    draft.info.clone(),
+                    draft.dirty_confirmed,
+                    draft.unmerged_confirmed,
+                    draft.delete_branch,
+                )
+            })
+        else {
+            return;
+        };
+        if self
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| draft.busy || draft.loading)
+        {
+            return;
+        }
+        let Some(info) = info else {
+            self.worktree_removal_error(
+                request_id,
+                "Git has not returned a removal preview.".into(),
+                cx,
+            );
+            return;
+        };
+        let Some(repo) = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .cloned()
+        else {
+            self.worktree_removal_error(
+                request_id,
+                "This repository is no longer open.".into(),
+                cx,
+            );
+            return;
+        };
+        let Some(checkout) = repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == id)
+            .cloned()
+        else {
+            self.worktree_removal_error(request_id, "This worktree is no longer open.".into(), cx);
+            return;
+        };
+        if repo.kind != RepoKind::Git
+            || checkout.is_primary
+            || checkout.is_missing
+            || self.navigation.home.as_deref() == Some(&id)
+            || info.checkout_id != id
+            || info.path != checkout.canonical_path
+        {
+            self.worktree_removal_error(
+                request_id,
+                "This is no longer the selected available non-primary worktree. Refresh and retry."
+                    .into(),
+                cx,
+            );
+            return;
+        }
+        if self.checkout_has_terminal_activity(&id) {
+            self.worktree_removal_error(
+                request_id,
+                "Close every terminal session and wait for pending shell creation before deleting this worktree.".into(),
+                cx,
+            );
+            return;
+        }
+        if !info.dirty_files.is_empty() && !confirm_dirty {
+            self.worktree_removal_error(
+                request_id,
+                "Confirm that uncommitted files may be lost before deleting this worktree.".into(),
+                cx,
+            );
+            return;
+        }
+        if info.branch.is_none() && info.unmerged_commits > 0 && !confirm_unmerged {
+            self.worktree_removal_error(
+                request_id,
+                "Confirm that detached commits may be lost before deleting this worktree.".into(),
+                cx,
+            );
+            return;
+        }
+        if delete_branch && info.branch.is_none() {
+            self.worktree_removal_error(
+                request_id,
+                "This worktree has no local branch to delete.".into(),
+                cx,
+            );
+            return;
+        }
+        if !self.removing_checkouts.insert(id.clone()) {
+            self.worktree_removal_error(
+                request_id,
+                "This worktree is already being removed.".into(),
+                cx,
+            );
+            return;
+        }
+        let confirmation = muster_core::navigation::WorktreeRemovalConfirmation {
+            checkout_id: info.checkout_id.clone(),
+            path: info.path.clone(),
+            branch: info.branch.clone(),
+            head: info.head.clone(),
+            dirty_files: info.dirty_files.clone(),
+            default_ref: info.default_ref.clone(),
+            unmerged_commits: info.unmerged_commits,
+            confirm_dirty,
+            confirm_unmerged,
+            delete_branch,
+        };
+        if let Some(draft) = self
+            .worktree_removal
+            .as_mut()
+            .filter(|draft| draft.request_id == request_id)
+        {
+            draft.busy = true;
+            draft.error = None;
+        }
+        let worker = cx
+            .background_executor()
+            .spawn(async move { navigation::remove_worktree(&repo, &checkout, &confirmation) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                match result {
+                    Ok(removed) => match app.navigation.forget_removed_worktree(&id) {
+                        Ok(()) => {
+                            if app
+                                .worktree_removal
+                                .as_ref()
+                                .is_some_and(|draft| draft.request_id == request_id)
+                            {
+                                app.worktree_removal = None;
+                            }
+                            app.diff_totals.remove(&id);
+                            app.membership_revision += 1;
+                            app.persist();
+                            app.focus_terminal(window, cx);
+                            if let Some(warning) = removed.warning {
+                                app.notice = Some(warning);
+                            }
+                        }
+                        Err(error) => app.worktree_removal_error(
+                            request_id,
+                            format!("Git removed the worktree, but the sidebar could not update: {error}"),
+                            cx,
+                        ),
+                    },
+                    Err(error) => app.worktree_removal_error(request_id, error, cx),
+                }
+                app.removing_checkouts.remove(&id);
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1265,18 +2355,35 @@ impl TerminalWindow {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" && (self.editing.is_some() || self.worktree.is_some()) {
-            if let Some(draft) = self.worktree.as_ref() {
-                // Escape is not a way to make a half-made worktree disappear.
-                if draft.busy {
-                    self.failure =
-                        Some("This worktree is still being created. Wait for it to finish.".into());
-                    cx.notify();
-                    return;
+        if event.keystroke.key == "escape" && self.sidebar_drag.is_some() {
+            self.cancel_sidebar_drag();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let dialog_open = self.worktree.is_some() || self.worktree_removal.is_some();
+        if event.keystroke.key == "escape" && (self.editing.is_some() || dialog_open) {
+            if self.worktree.as_ref().is_some_and(|draft| draft.busy) {
+                self.failure =
+                    Some("This worktree is still being created. Wait for it to finish.".into());
+                cx.notify();
+                return;
+            }
+            if self
+                .worktree_removal
+                .as_ref()
+                .is_some_and(|draft| draft.busy)
+            {
+                if let Some(draft) = self.worktree_removal.as_mut() {
+                    draft.error =
+                        Some("Worktree deletion is in progress. Wait for Git to finish.".into());
                 }
+                cx.notify();
+                return;
             }
             self.editing = None;
             self.worktree = None;
+            self.worktree_removal = None;
             cx.stop_propagation();
             self.focus_terminal(window, cx);
             cx.notify();
@@ -1364,8 +2471,11 @@ impl TerminalWindow {
         // A missing directory has no repository to ask about, and adding a
         // worktree is the one action that has to be a click away rather than a
         // click and a dialog further.
-        let can_add =
-            repo.kind == RepoKind::Git && !repo.checkouts.iter().any(|item| item.is_missing);
+        let can_add = repo.kind == RepoKind::Git
+            && repo
+                .checkouts
+                .iter()
+                .any(|item| item.is_primary && !item.is_missing);
         let can_close = !repo
             .checkouts
             .iter()
@@ -1495,15 +2605,78 @@ impl TerminalWindow {
         }
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
+        let drag_rows = Rc::new(RefCell::new(Vec::new()));
+        let drag_dispatcher = self.sidebar_drag.is_some().then(|| {
+            let move_view = weak.clone();
+            let move_rows = drag_rows.clone();
+            let up_view = weak.clone();
+            let up_rows = drag_rows.clone();
+            let exit_view = weak.clone();
+            let auto_scroll = self.sidebar_drag.as_ref().is_some_and(|drag| {
+                if !drag.started {
+                    return false;
+                }
+                let bounds = self.scroll.bounds();
+                let (x, y) = drag.position;
+                x >= bounds.left().as_f32()
+                    && x <= bounds.right().as_f32()
+                    && y >= bounds.top().as_f32()
+                    && y <= bounds.bottom().as_f32()
+                    && (y < bounds.top().as_f32() + SIDEBAR_SCROLL_EDGE
+                        || y > bounds.bottom().as_f32() - SIDEBAR_SCROLL_EDGE)
+            });
+            let scroll_view = weak.clone();
+            let scroll_rows = drag_rows.clone();
+            sidebar_drag_dispatcher(move |window, _| {
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == gpui_kit::DispatchPhase::Capture {
+                        let position = event.position;
+                        let pressed_button = event.pressed_button;
+                        let _ = move_view.update(cx, |app, cx| {
+                            app.update_sidebar_drag(position, pressed_button, &move_rows, cx)
+                        });
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                    if phase == gpui_kit::DispatchPhase::Capture
+                        && event.button == MouseButton::Left
+                    {
+                        let position = event.position;
+                        let _ = up_view.update(cx, |app, cx| {
+                            app.finish_sidebar_drag(position, &up_rows, window, cx)
+                        });
+                    }
+                });
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+                    if phase == gpui_kit::DispatchPhase::Capture {
+                        let _ = exit_view.update(cx, |app, cx| {
+                            if app.sidebar_drag.is_some() {
+                                app.cancel_sidebar_drag();
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+                if auto_scroll {
+                    window.on_next_frame(move |_, cx| {
+                        let _ = scroll_view
+                            .update(cx, |app, cx| app.tick_sidebar_drag(&scroll_rows, cx));
+                    });
+                }
+            })
+        });
         let mut rows = Vec::<AnyElement>::new();
         for repo in &self.navigation.repos {
             let id = repo.id.clone();
             let folded = self.navigation.folded_repos.contains(&id);
             let toggle_id = id.clone();
-            let has_menu = repo.kind == RepoKind::Git
-                && !repo.checkouts.iter().any(|checkout| checkout.is_missing)
+            let has_menu = (repo.kind == RepoKind::Git
+                && repo
+                    .checkouts
+                    .iter()
+                    .any(|checkout| checkout.is_primary && !checkout.is_missing))
                 || repo
                     .checkouts
                     .iter()
@@ -1515,47 +2688,25 @@ impl TerminalWindow {
             let heading = div()
                 .id(SharedString::from(format!("heading-{id}")))
                 .group(SharedString::from(format!("repo-heading-{id}")))
+                .relative()
                 .flex()
                 .items_baseline()
                 .w_full()
+                .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
                 .pl(px(10.))
                 .pr(px(8.))
                 .pt(px(8.))
                 .pb(px(4.))
                 .child(
                     Button::new(SharedString::from(format!("fold-repo-{id}")))
-                        .ghost()
-                        .small()
-                        .compact()
+                        .text()
                         .rounded(px(0.))
-                        .flex_1()
-                        .min_w_0()
-                        .justify_start()
-                        .h(px(22.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .items_baseline()
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(14.))
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .child(repo.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .text_size(px(11.))
-                                        .text_color(gpui_kit::rgb(0x8b909c))
-                                        .child(repo.root.clone()),
-                                ),
-                        )
+                        .absolute()
+                        .left(px(10.))
+                        .right(px(if has_menu { 36. } else { 8. }))
+                        .top(px(8.))
+                        .h(px(17.))
+                        .p_0()
                         .aria_expanded(!folded)
                         .tooltip(repo.root.clone())
                         .accessibility_label(format!(
@@ -1568,19 +2719,56 @@ impl TerminalWindow {
                             cx.notify();
                         })),
                 )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(14.))
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .child(repo.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(11.))
+                                .text_color(gpui_kit::rgb(0x8b909c))
+                                .child(sidebar_repo_path(
+                                    window,
+                                    &repo.root,
+                                    &repo.name,
+                                    self.navigation.sidebar_width,
+                                    has_menu,
+                                )),
+                        ),
+                )
                 .when(has_menu, |heading| {
                     heading.child(
                         Button::new(SharedString::from(format!("actions-{id}")))
+                            .text()
+                            .absolute()
+                            .right(px(8.))
+                            .top(px(8.))
                             .opacity(0.)
                             .group_hover(
                                 SharedString::from(format!("repo-heading-{id}")),
                                 |style| style.opacity(1.),
                             )
                             .focus(|style| style.opacity(1.))
-                            .ghost()
-                            .small()
-                            .compact()
-                            .icon(IconName::Ellipsis)
+                            .rounded(px(0.))
+                            .h(px(20.))
+                            .w(px(20.))
+                            .p_0()
+                            .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
                             .accessibility_label(format!("Actions for {}", repo.name))
                             .dropdown_menu(self.repo_menu(id.clone(), weak.clone())),
                     )
@@ -1606,27 +2794,49 @@ impl TerminalWindow {
                 let selected = self.navigation.active_checkout.as_deref() == Some(&id)
                     && self.navigation.active_session.is_none();
                 let icon = if checkout.is_missing {
-                    IconName::TriangleAlert
+                    IconName::FolderX
                 } else if self.navigation.home.as_deref() == Some(&id) {
                     IconName::House
                 } else if repo.kind == RepoKind::Plain {
                     IconName::Folder
+                } else if checkout.is_primary {
+                    IconName::FolderGit2
                 } else {
                     IconName::GitBranch
                 };
-                let row = div()
-                    .id(SharedString::from(format!("checkout-row-{id}")))
+                let row_group = SharedString::from(format!("checkout-row-{id}"));
+                let mut row = div()
+                    .id(row_group.clone())
+                    .group(row_group.clone())
                     .flex()
                     .items_center()
+                    .relative()
                     .h(px(26.))
                     .gap(px(7.))
                     .px(px(8.))
                     .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
+                    .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
                     .when(selected, |row| {
-                        row.bg(gpui_kit::rgb(0x2c3b57))
-                            .border_l_2()
-                            .border_color(gpui_kit::rgb(0x5b97ff))
+                        row.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .w(px(2.))
+                                .bg(gpui_kit::rgb(0x5b97ff)),
+                        )
                     })
+                    .on_click(cx.listener({
+                        let row_select_id = select_id.clone();
+                        move |app, _, window, cx| {
+                            if app.navigation.select_checkout(&row_select_id) {
+                                app.persist();
+                                app.focus_terminal(window, cx);
+                                cx.notify();
+                            }
+                        }
+                    }))
                     .child(
                         Button::new(SharedString::from(format!("fold-checkout-{id}")))
                             .ghost()
@@ -1634,51 +2844,73 @@ impl TerminalWindow {
                             .compact()
                             .rounded(px(0.))
                             .h(px(26.))
-                            .w(px(20.))
-                            .icon(if folded {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
+                            .w(px(16.))
+                            .ml(px(-4.))
+                            .p_0()
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .icon(
+                                Icon::new(if folded {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(14.)),
+                            )
                             .aria_expanded(!folded)
                             .accessibility_label(format!(
                                 "{} {title}",
                                 if folded { "Expand" } else { "Collapse" }
                             ))
                             .on_click(cx.listener(move |app, _, _, cx| {
+                                cx.stop_propagation();
                                 toggle(&mut app.navigation.folded_checkouts, &fold_id);
                                 cx.notify();
                             })),
                     )
                     .child(
                         Button::new(SharedString::from(format!("select-checkout-{id}")))
-                            .ghost()
-                            .small()
-                            .compact()
+                            .text()
                             .rounded(px(0.))
-                            .h(px(26.))
-                            .flex_1()
-                            .min_w_0()
-                            .icon(Icon::new(icon).size(px(14.)))
-                            .justify_start()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(title.clone()),
-                            )
-                            .tooltip(format!("{title} — {}", checkout.path))
+                            .absolute()
+                            .left(px(27.))
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .right(px(8.))
+                            .p_0()
                             .aria_selected(selected)
+                            .accessibility_label(if checkout.is_missing {
+                                format!("Unavailable worktree {title}")
+                            } else {
+                                format!("Select worktree {title}")
+                            })
+                            .tooltip(format!("{title} — {}", checkout.path))
                             .disabled(checkout.is_missing)
-                            .on_click(cx.listener(move |app, _, window, cx| {
-                                if app.navigation.select_checkout(&select_id) {
-                                    app.persist();
-                                    app.focus_terminal(window, cx);
-                                    cx.notify();
+                            .on_click(cx.listener({
+                                let click_id = select_id.clone();
+                                move |app, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if app.navigation.select_checkout(&click_id) {
+                                        app.persist();
+                                        app.focus_terminal(window, cx);
+                                        cx.notify();
+                                    }
                                 }
                             })),
+                    )
+                    .child(Icon::new(icon).size(px(14.)).text_color(gpui_kit::rgb(
+                        if checkout.is_missing {
+                            0x565b67
+                        } else {
+                            0x8b909c
+                        },
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(title.clone()),
                     )
                     .when(repo.kind == RepoKind::Git && !checkout.is_missing, |row| {
                         match Self::line_slot(self.diff_totals.get(&id)) {
@@ -1688,22 +2920,56 @@ impl TerminalWindow {
                                     .flex_none()
                                     .flex()
                                     .items_center()
-                                    .gap(px(4.))
                                     .text_size(px(11.))
+                                    // At rest the slot holds a bare `+`/`−`, which says the row
+                                    // has changes in the width this panel has ever reserved for
+                                    // it. The figures are one pointer away.
                                     .when(added > 0, |slot| {
                                         slot.child(
                                             div()
                                                 .text_color(gpui_kit::rgb(0xa1c181))
-                                                .child(format!("+{added}")),
+                                                .group_hover(row_group.clone(), |style| {
+                                                    style.opacity(0.)
+                                                })
+                                                .child("+"),
                                         )
                                     })
                                     .when(removed > 0, |slot| {
                                         slot.child(
                                             div()
                                                 .text_color(gpui_kit::rgb(0xd97f84))
-                                                .child(format!("\u{2212}{removed}")),
+                                                .group_hover(row_group.clone(), |style| {
+                                                    style.opacity(0.)
+                                                })
+                                                .child("\u{2212}"),
                                         )
-                                    }),
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .w(px(0.))
+                                            .group_hover(row_group.clone(), |style| {
+                                                style.w(Length::Auto).ml(px(5.))
+                                            })
+                                            .when(added > 0, |figures| {
+                                                figures.child(
+                                                    div()
+                                                        .text_color(gpui_kit::rgb(0xa1c181))
+                                                        .child(format!("+{added}")),
+                                                )
+                                            })
+                                            .when(removed > 0, |figures| {
+                                                figures.child(
+                                                    div()
+                                                        .text_color(gpui_kit::rgb(0xd97f84))
+                                                        .child(format!("\u{2212}{removed}")),
+                                                )
+                                            }),
+                                    ),
                             ),
                             None => row,
                         }
@@ -1716,26 +2982,95 @@ impl TerminalWindow {
                                 .child("Directory missing"),
                         )
                     })
-                    .when(repo.kind == RepoKind::Git && !checkout.is_primary, |row| {
-                        let archive_id = id.clone();
+                    .when(repo.kind == RepoKind::Git && checkout.is_missing, |row| {
+                        let dismiss_id = id.clone();
                         row.child(
-                            Button::new(SharedString::from(format!("archive-{id}")))
+                            Button::new(SharedString::from(format!("dismiss-missing-{id}")))
                                 .ghost()
-                                .small()
-                                .compact()
-                                .icon(IconName::Archive)
-                                .accessibility_label(format!("Archive worktree {title}"))
-                                .tooltip("Archive worktree; keep every file")
-                                .on_click(
-                                    cx.listener(move |app, _, _, cx| app.archive(&archive_id, cx)),
-                                ),
+                                .rounded(px(0.))
+                                .absolute()
+                                .right(px(8.))
+                                .top(px(3.))
+                                .h(px(20.))
+                                .w(px(20.))
+                                .p_0()
+                                .opacity(0.)
+                                .group_hover(row_group.clone(), |style| style.opacity(1.))
+                                .focus(|style| style.opacity(1.))
+                                .icon(Icon::new(IconName::X).size(px(14.)))
+                                .accessibility_label(format!(
+                                    "Dismiss missing checkout {title}; no files are deleted; Git metadata and branch are retained"
+                                ))
+                                .tooltip(
+                                    "Hide this missing checkout only; no files are deleted, and Git metadata and branch are retained",
+                                )
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    cx.stop_propagation();
+                                    app.dismiss_missing_checkout(&dismiss_id, cx)
+                                })),
                         )
+                    })
+                    .when(
+                        repo.kind == RepoKind::Git && !checkout.is_primary && !checkout.is_missing,
+                        |row| {
+                            let actions_id = id.clone();
+                            let actions_repo_id = repo.id.clone();
+                            // The contextual lifecycle dialog names both reversible archive
+                            // and destructive deletion; no row action deletes immediately.
+                            row.child(
+                                Button::new(SharedString::from(format!("worktree-actions-{id}")))
+                                    .ghost()
+                                    .rounded(px(0.))
+                                    .absolute()
+                                    .right(px(8.))
+                                    .top(px(3.))
+                                    .h(px(20.))
+                                    .w(px(20.))
+                                    .p_0()
+                                    .opacity(0.)
+                                    .group_hover(row_group.clone(), |style| style.opacity(1.))
+                                    .focus(|style| style.opacity(1.))
+                                    .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
+                                    .accessibility_label(format!(
+                                        "Archive or delete worktree {title}"
+                                    ))
+                                    .tooltip("Archive or delete worktree")
+                                    .on_click(cx.listener(move |app, _, window, cx| {
+                                        cx.stop_propagation();
+                                        app.open_worktree_removal_dialog(
+                                            &actions_repo_id,
+                                            &actions_id,
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        },
+                    );
+                let folded_append_marker = folded
+                    && self.sidebar_drag.as_ref().is_some_and(|drag| {
+                        drag.started
+                            && drag.target.as_ref().is_some_and(|target| {
+                                target.checkout_id == id && target.index == checkout.sessions.len()
+                            })
                     });
-                rows.push(row.into_any_element());
+                row = row.when(folded_append_marker, |row| row.child(sidebar_drop_marker()));
+                if !checkout.is_missing && self.sidebar_drag.is_some() {
+                    row = row.child(sidebar_drag_geometry(
+                        SidebarDropRegion::Append {
+                            checkout_id: id.clone(),
+                            index: checkout.sessions.len(),
+                        },
+                        drag_rows.clone(),
+                    ));
+                }
                 if folded || checkout.is_missing {
+                    rows.push(row.into_any_element());
                     continue;
                 }
-                for session in &checkout.sessions {
+                let checkout_row = row.into_any_element();
+                let mut checkout_children = Vec::<AnyElement>::new();
+                for (session_index, session) in checkout.sessions.iter().enumerate() {
                     let Some(terminal) = self.terminals.get(&session.id) else {
                         continue;
                     };
@@ -1750,26 +3085,67 @@ impl TerminalWindow {
                     let busy = status.foreground.running;
                     let unknown =
                         status.poll_error.is_some() || status.shell == ShellState::Unknown;
+                    let failed = !busy
+                        && terminal
+                            .shell
+                            .session
+                            .last_command_exit()
+                            .is_some_and(|code| code != 0);
                     let agent = status.foreground.app.as_deref() == Some("opencode");
                     let id = session.id.clone();
                     let click_id = id.clone();
+                    let drag_id = id.clone();
                     let close_id = id.clone();
+                    let row_click_id = id.clone();
+                    let state_label = format!(
+                        "Terminal session: {title}{}",
+                        if unknown {
+                            ", state unavailable"
+                        } else if failed {
+                            ", last command failed"
+                        } else if matches!(status.shell, ShellState::Exited { .. }) {
+                            ", shell exited"
+                        } else if agent {
+                            ", agent session state not identified"
+                        } else if busy {
+                            ", process running"
+                        } else {
+                            ", idle"
+                        }
+                    );
                     let content =
                         if let Some(editing) = self.editing.as_ref().filter(|edit| edit.id == id) {
-                            Input::new(&editing.input)
-                                .aria_label("Terminal session name")
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
                                 .h(px(26.))
+                                .w_full()
+                                .child(
+                                    Icon::new(if agent {
+                                        IconName::Sparkles
+                                    } else {
+                                        IconName::SquareTerminal
+                                    })
+                                    .size(px(14.)),
+                                )
+                                .child(
+                                    Input::new(&editing.input)
+                                        .aria_label("Terminal session name")
+                                        .h(px(26.))
+                                        .w_full()
+                                        .min_w_0(),
+                                )
                                 .into_any_element()
                         } else {
-                            Button::new(SharedString::from(format!("select-session-{id}")))
-                                .ghost()
-                                .small()
-                                .compact()
-                                .rounded(px(0.))
+                            div()
+                                .flex()
+                                .items_center()
                                 .h(px(26.))
                                 .w_full()
                                 .min_w_0()
-                                .icon(
+                                .gap(px(7.))
+                                .child(
                                     Icon::new(if agent {
                                         IconName::Sparkles
                                     } else {
@@ -1779,6 +3155,8 @@ impl TerminalWindow {
                                     .text_color(
                                         gpui_kit::rgb(if unknown {
                                             0xe3b341
+                                        } else if failed {
+                                            0xf7adb1
                                         } else if busy && !agent {
                                             0xa1c181
                                         } else {
@@ -1786,7 +3164,6 @@ impl TerminalWindow {
                                         }),
                                     ),
                                 )
-                                .justify_start()
                                 .child(
                                     div()
                                         .flex_1()
@@ -1795,25 +3172,74 @@ impl TerminalWindow {
                                         .text_ellipsis()
                                         .child(title.clone()),
                                 )
-                                .aria_selected(selected)
-                                .accessibility_label(format!(
-                                    "Terminal session: {title}{}",
-                                    if unknown {
-                                        ", state unavailable"
-                                    } else if matches!(status.shell, ShellState::Exited { .. }) {
-                                        ", shell exited"
-                                    } else if agent {
-                                        ", agent session state not identified"
-                                    } else if busy {
-                                        ", process running"
-                                    } else {
-                                        ", idle"
+                                .into_any_element()
+                        };
+                    let row_group = SharedString::from(format!("session-row-{id}"));
+                    let row = div()
+                        .id(row_group.clone())
+                        .group(row_group.clone())
+                        .flex()
+                        .items_center()
+                        .relative()
+                        .pl(px(12.))
+                        .pr(px(8.))
+                        .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
+                        .h(px(26.))
+                        .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
+                        .when(!self.closing_sessions.contains(&id), |row| {
+                            row.on_click(cx.listener(
+                                move |app, event: &gpui_kit::ClickEvent, window, cx| {
+                                    if app.suppress_sidebar_click {
+                                        app.suppress_sidebar_click = false;
+                                        return;
                                     }
-                                ))
-                                .tooltip(title.clone())
+                                    if event.click_count() == 2 {
+                                        app.start_rename(&row_click_id, window, cx);
+                                    } else if app.navigation.select_session(&row_click_id) {
+                                        app.persist();
+                                        app.focus_terminal(window, cx);
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                        })
+                        .when(selected, |row| {
+                            row.child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .w(px(2.))
+                                    .bg(gpui_kit::rgb(0x5b97ff)),
+                            )
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("select-session-{id}")))
+                                .text()
+                                .rounded(px(0.))
+                                .absolute()
+                                .left(px(0.))
+                                .right(px(0.))
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .p_0()
+                                .aria_selected(selected)
+                                .accessibility_label(state_label)
                                 .disabled(self.closing_sessions.contains(&id))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |app, event: &MouseDownEvent, _, cx| {
+                                        app.begin_sidebar_drag(&drag_id, event.position, cx);
+                                    }),
+                                )
                                 .on_click(cx.listener(
                                     move |app, event: &gpui_kit::ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        if app.suppress_sidebar_click {
+                                            app.suppress_sidebar_click = false;
+                                            return;
+                                        }
                                         if event.click_count() == 2 {
                                             app.start_rename(&click_id, window, cx);
                                         } else if app.navigation.select_session(&click_id) {
@@ -1822,47 +3248,49 @@ impl TerminalWindow {
                                             cx.notify();
                                         }
                                     },
-                                ))
-                                .into_any_element()
-                        };
-                    let row = div()
-                        .id(SharedString::from(format!("session-row-{id}")))
-                        .flex()
-                        .items_center()
-                        .ml(px(20.))
-                        .pl(px(6.))
-                        .pr(px(8.))
-                        .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                        .h(px(26.))
-                        .when(selected, |row| {
-                            row.bg(gpui_kit::rgb(0x2c3b57))
-                                .border_l_2()
-                                .border_color(gpui_kit::rgb(0x5b97ff))
-                        })
-                        .child(div().flex_1().min_w_0().child(content))
-                        .child(
-                            Button::new(SharedString::from(format!("session-menu-{id}")))
-                                .ghost()
-                                .small()
-                                .compact()
-                                .icon(IconName::Ellipsis)
-                                .accessibility_label(format!("Actions for terminal {title}"))
-                                .dropdown_menu(self.terminal_menu(id.clone(), weak.clone())),
+                                )),
                         )
+                        .child(div().flex_1().min_w_0().pr(px(20.)).child(content))
                         .child(
                             Button::new(SharedString::from(format!("close-session-{id}")))
                                 .ghost()
-                                .small()
-                                .compact()
-                                .icon(IconName::X)
+                                .rounded(px(0.))
+                                .absolute()
+                                .right(px(8.))
+                                .top(px(3.))
+                                .h(px(20.))
+                                .w(px(20.))
+                                .p_0()
+                                .opacity(0.)
+                                .group_hover(row_group.clone(), |style| style.opacity(1.))
+                                .focus(|style| style.opacity(1.))
+                                .icon(Icon::new(IconName::X).size(px(14.)))
+                                .tooltip("Close terminal")
                                 .accessibility_label(format!("Close terminal session: {title}"))
                                 .disabled(self.closing_sessions.contains(&id))
                                 .on_click(cx.listener(move |app, _, window, cx| {
+                                    cx.stop_propagation();
                                     app.request_close_terminal(&close_id, window, cx)
                                 })),
                         );
-                    rows.push(
-                        row.context_menu(self.terminal_menu(id, weak.clone()))
+                    let marker_before = self.sidebar_drag.as_ref().is_some_and(|drag| {
+                        drag.started
+                            && drag.target.as_ref().is_some_and(|target| {
+                                target.checkout_id == checkout.id && target.index == session_index
+                            })
+                    });
+                    checkout_children.push(
+                        row.when(marker_before, |row| row.child(sidebar_drop_marker()))
+                            .when(self.sidebar_drag.is_some(), |row| {
+                                row.child(sidebar_drag_geometry(
+                                    SidebarDropRegion::Session {
+                                        checkout_id: checkout.id.clone(),
+                                        index: session_index,
+                                    },
+                                    drag_rows.clone(),
+                                ))
+                            })
+                            .context_menu(self.terminal_menu(id, weak.clone()))
                             .into_any_element(),
                     );
                 }
@@ -1872,9 +3300,9 @@ impl TerminalWindow {
                     .iter()
                     .filter(|(_, pending)| *pending == &checkout.id)
                 {
-                    rows.push(
+                    checkout_children.push(
                         div()
-                            .ml(px(26.))
+                            .pl(px(12.))
                             .h(px(26.))
                             .child(format!(
                                 "Starting terminal in {}…",
@@ -1884,22 +3312,42 @@ impl TerminalWindow {
                     );
                 }
                 let create_id = checkout.id.clone();
-                rows.push(
+                let append_marker = self.sidebar_drag.as_ref().is_some_and(|drag| {
+                    drag.started
+                        && drag.target.as_ref().is_some_and(|target| {
+                            target.checkout_id == checkout.id
+                                && target.index == checkout.sessions.len()
+                        })
+                });
+                checkout_children.push(
                     div()
-                        .ml(px(26.))
+                        .relative()
+                        .pl(px(12.))
+                        .when(append_marker, |row| row.child(sidebar_drop_marker()))
+                        .when(self.sidebar_drag.is_some(), |row| {
+                            row.child(sidebar_drag_geometry(
+                                SidebarDropRegion::Append {
+                                    checkout_id: checkout.id.clone(),
+                                    index: checkout.sessions.len(),
+                                },
+                                drag_rows.clone(),
+                            ))
+                        })
                         .child(
                             Button::new(SharedString::from(format!(
                                 "new-terminal-{}",
                                 checkout.id
                             )))
                             .ghost()
-                            .small()
-                            .compact()
                             .rounded(px(0.))
                             .h(px(26.))
                             .w_full()
-                            .icon(IconName::Plus)
-                            .label("New terminal")
+                            .p_0()
+                            .gap(px(7.))
+                            .justify_start()
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child(Icon::new(IconName::Plus).size(px(14.)))
+                            .child("New terminal")
                             .accessibility_label(format!("New terminal for {title}"))
                             .on_click(cx.listener(
                                 move |app, _, window, cx| {
@@ -1907,6 +3355,24 @@ impl TerminalWindow {
                                 },
                             )),
                         )
+                        .into_any_element(),
+                );
+                let guide = div()
+                    .ml(px(14.))
+                    .border_l_1()
+                    .border_color(gpui_kit::rgb(0x1c1f26))
+                    .group_hover(
+                        SharedString::from(format!("checkout-row-{}", checkout.id)),
+                        |style| style.border_color(gpui_kit::rgb(0x2c313b)),
+                    )
+                    .children(checkout_children);
+                rows.push(
+                    div()
+                        .group(SharedString::from(format!("checkout-row-{}", checkout.id)))
+                        .flex()
+                        .flex_col()
+                        .child(checkout_row)
+                        .child(guide)
                         .into_any_element(),
                 );
             }
@@ -1920,8 +3386,19 @@ impl TerminalWindow {
                     .into_any_element(),
             );
         }
+        let ghost = self
+            .sidebar_drag
+            .as_ref()
+            .filter(|drag| drag.started)
+            .and_then(|drag| {
+                self.navigation
+                    .session(&drag.session_id)
+                    .map(|session| (drag.position, session.name.clone()))
+            });
+        let scroll_origin = self.scroll.bounds().origin;
         div()
             .id("navigation-panel")
+            .relative()
             .h_full()
             .w_full()
             .min_w_0()
@@ -1930,6 +3407,8 @@ impl TerminalWindow {
             .flex_col()
             .min_h_0()
             .text_size(px(13.))
+            .font_family(SIDEBAR_FONT_FAMILY)
+            .text_color(gpui_kit::rgb(0xd7dae0))
             .bg(gpui_kit::rgb(0x1c1f26))
             .child(
                 div()
@@ -1949,7 +3428,6 @@ impl TerminalWindow {
                 div()
                     .border_t_1()
                     .border_color(gpui_kit::rgb(0x2c313b))
-                    .p_1()
                     .child(
                         Button::new("open-directory")
                             .ghost()
@@ -1967,6 +3445,27 @@ impl TerminalWindow {
                             ),
                     ),
             )
+            .when_some(drag_dispatcher, |panel, dispatcher| panel.child(dispatcher))
+            .when_some(ghost, |panel, (position, name)| {
+                panel.child(
+                    div()
+                        .id("terminal-drag-ghost")
+                        .absolute()
+                        .left(px(position.0 - scroll_origin.x.as_f32() + 10.))
+                        .top(px(position.1 - scroll_origin.y.as_f32() + 8.))
+                        .max_w(px(180.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(11.))
+                        .px(px(6.))
+                        .py(px(3.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(gpui_kit::rgb(0x5b97ff))
+                        .bg(gpui_kit::rgb(0x343d4c))
+                        .child(format!("↕ {name}")),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2046,7 +3545,7 @@ impl Render for TerminalWindow {
             .child(body)
             .into_any_element();
         let content = if !self.injected && self.navigation.panels_visible {
-            let sidebar = self.sidebar(cx);
+            let sidebar = self.sidebar(window, cx);
             h_resizable("workspace-panels")
                 .with_state(&self.resize)
                 .child(
@@ -2071,7 +3570,12 @@ impl Render for TerminalWindow {
         let dialog = self
             .worktree
             .as_ref()
-            .map(|draft| self.worktree_dialog(draft, cx));
+            .map(|draft| self.worktree_dialog(draft, cx))
+            .or_else(|| {
+                self.worktree_removal
+                    .as_ref()
+                    .map(|draft| self.worktree_removal_dialog(draft, cx))
+            });
         div()
             .id("workspace-root")
             .size_full()
@@ -2174,19 +3678,33 @@ fn toggle(set: &mut std::collections::HashSet<String>, id: &str) {
     }
 }
 
-/// Give up on the worktree dialog, unless Git is already making one.
-///
-/// A creation that has reached Git owns a branch and a directory; cancelling
-/// the form cannot undo either, and pretending it did is how a person loses a
-/// worktree they were told had not been made.
+fn escape_git_path(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_default().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Close a worktree dialog only when its non-cancellable Git mutation is idle.
 fn close_worktree_dialog(app: &mut TerminalWindow, cx: &mut Context<TerminalWindow>) {
-    match app.worktree.as_mut() {
-        Some(draft) if draft.busy => {
+    if let Some(draft) = app.worktree.as_mut() {
+        if draft.busy {
             draft.error =
                 Some("This worktree is still being created. Wait for it to finish.".into());
+        } else {
+            app.worktree = None;
         }
-        Some(_) => app.worktree = None,
-        None => {}
+    } else if let Some(draft) = app.worktree_removal.as_mut() {
+        if draft.busy {
+            draft.error = Some("Worktree deletion is in progress. Wait for Git to finish.".into());
+        } else {
+            app.worktree_removal = None;
+        }
     }
     cx.notify();
 }
@@ -2210,6 +3728,7 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
         })
         .unwrap_or_default();
     let mut nav = Navigation::new();
+    let active_checkout_id = state.active_checkout_id.clone();
     nav.sidebar_width = state.sidebar_width;
     nav.archived = state.archived_checkout_ids.into_iter().collect();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -2262,8 +3781,8 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
             }
         }
     }
-    // The explicitly launched directory remains the first shell's cwd, as in
-    // the terminal MVP. A restored selection is used when it is that directory.
+    // Launching a directory selects it by default; a persisted available checkout
+    // overrides that fallback after all registered roots have been discovered.
     match navigation::open_directory(cwd) {
         Ok(opened) => nav.merge(opened, true),
         Err(error) => {
@@ -2273,6 +3792,7 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
             }
         }
     }
+    nav.restore_active_checkout(active_checkout_id.as_deref());
     RestoredNavigation {
         navigation: nav,
         state_path,

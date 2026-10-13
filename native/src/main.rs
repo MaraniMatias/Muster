@@ -16,6 +16,9 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            // Before any window exists: the sidebar's family has to be registered
+            // before the first frame asks for it, or GPUI answers with a fallback.
+            app::load_fonts(cx);
             gpui_kit::open_window(
                 app::window_bounds(cx),
                 cx,

@@ -32,6 +32,16 @@ pub const MAX_TITLE_CHARS: usize = 80;
 /// already far past anything real while staying cheap to compare.
 pub const MAX_CLIPBOARD_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// Longest OSC payload this scanner holds while it waits for a terminator, in
+/// bytes.
+///
+/// Every OSC is accumulated, not only OSC 133, so the cap has to clear the
+/// largest one a real program sends -- a clipboard write. Past it the payload is
+/// refused whole rather than truncated: half a marker is not a marker, and
+/// reading `133;D;1` off the front of a flood would report an exit status nobody
+/// sent.
+const MAX_OSC_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// A cell as the view needs it.
 ///
 /// No alacritty type crosses this boundary. A view holding a parser `Color` would
@@ -206,6 +216,10 @@ pub struct TerminalCore {
     string_scan: StringScan,
     /// The payload of the OSC sequence being scanned, across reads.
     osc: Vec<u8>,
+    /// That payload outgrew [`MAX_OSC_PAYLOAD_BYTES`] and was refused, so what is
+    /// left of it is not a payload at all. One flag per payload: the next
+    /// `\x1b]` starts a fresh one.
+    osc_oversized: bool,
     /// Everything the parser reported since the window last asked. Held here
     /// rather than translated on demand so a report is never made twice, and so
     /// nothing is reported before the window is ready to act on it.
@@ -248,6 +262,7 @@ impl TerminalCore {
             parser: Processor::new(),
             string_scan: StringScan::Ground,
             osc: Vec::new(),
+            osc_oversized: false,
             pending: Vec::new(),
             title: None,
             prompt_anchor: None,
@@ -275,6 +290,7 @@ impl TerminalCore {
                     // and a terminal that drops the half it already saw reports
                     // no prompt at all.
                     self.osc.clear();
+                    self.osc_oversized = false;
                     StringScan::Osc
                 }
                 (StringScan::Escape, 0x1b) => StringScan::Escape,
@@ -286,7 +302,7 @@ impl TerminalCore {
                 (StringScan::OscEscape, 0x1b) => StringScan::OscEscape,
                 (StringScan::OscEscape, _) => StringScan::Osc,
                 (StringScan::Osc, _) => {
-                    self.osc.push(byte);
+                    self.scan_osc(byte);
                     StringScan::Osc
                 }
                 (StringScan::Ground, _) => StringScan::Ground,
@@ -300,7 +316,9 @@ impl TerminalCore {
                 // position the marker was written at.
                 self.parser.advance(&mut self.term, &bytes[offset..=index]);
                 let marker = std::mem::take(&mut self.osc);
-                self.apply_shell_marker(&marker);
+                if !self.osc_oversized {
+                    self.apply_shell_marker(&marker);
+                }
                 self.handle_events_at_position();
                 offset = index + 1;
             }
@@ -310,6 +328,23 @@ impl TerminalCore {
             self.handle_events_at_position();
         }
         self.string_scan = state;
+    }
+
+    /// One byte of the OSC payload being scanned, kept only while it fits.
+    ///
+    /// The refusal is sticky: a payload that outgrew the cap is never refilled,
+    /// because a fresh buffer halfway through an oversized sequence is exactly
+    /// how a truncated `133;D;1` would end up read as a status.
+    fn scan_osc(&mut self, byte: u8) {
+        if self.osc_oversized {
+            return;
+        }
+        if self.osc.len() >= MAX_OSC_PAYLOAD_BYTES {
+            self.osc.clear();
+            self.osc_oversized = true;
+            return;
+        }
+        self.osc.push(byte);
     }
 
     /// What one OSC 133 payload means, applied at the position it was written.
@@ -482,6 +517,13 @@ impl TerminalCore {
         self.prompt_anchor = None;
     }
 
+    /// The exit status the last *finished* command reported over OSC 133 `D`.
+    ///
+    /// `None` covers three states the parser cannot tell apart and a reader must
+    /// not guess between: no command has finished, a new one started (`C`), and
+    /// the status was absent or unparseable. Only what the child printed is
+    /// recorded here -- never the shell's own exit status, and never anything
+    /// about a foreground program.
     pub fn command_exit(&self) -> Option<i32> {
         self.command_exit
     }
@@ -939,6 +981,108 @@ mod tests {
             core.prompt_anchor().is_none(),
             "a clipboard write is not a prompt"
         );
+    }
+
+    /// `133;D;<code>` is the only thing that records a command's status, and it
+    /// records it the same way whether it arrives whole, ended by BEL, ended by
+    /// ST, or split anywhere across reads.
+    #[test]
+    fn a_command_exit_marker_records_the_status_however_it_arrives() {
+        for ending in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let marker = [b"\x1b]133;D;3".as_slice(), ending].concat();
+            for split in 1..marker.len() {
+                let mut core = core();
+                core.feed(&marker[..split]);
+                assert_eq!(core.command_exit(), None, "nothing yet, split {split}");
+                core.feed(&marker[split..]);
+                assert_eq!(
+                    core.command_exit(),
+                    Some(3),
+                    "split at {split}, ended by {ending:?}"
+                );
+            }
+        }
+    }
+
+    /// A new command retires the last one's status, and success is a status like
+    /// any other: the question a sidebar asks is "did it fail", so zero has to
+    /// answer that, not be mistaken for a status that says nothing.
+    #[test]
+    fn a_new_command_and_a_success_each_clear_the_previous_failure() {
+        let mut core = core();
+        core.feed(b"\x1b]133;C\x07");
+        core.feed(b"\x1b]133;D;1\x07");
+        assert_eq!(core.command_exit(), Some(1), "the command failed");
+        core.feed(b"\x1b]133;C\x07");
+        assert_eq!(core.command_exit(), None, "the next command starts clean");
+        core.feed(b"\x1b]133;D;0\x07");
+        assert_eq!(core.command_exit(), Some(0), "success is still a status");
+    }
+
+    /// Somebody else's OSC is not a statement about the command, so it neither
+    /// claims a status nor takes one away -- including `1339`, which shares the
+    /// prefix, and `133;A`, which is this sequence's own prompt marker.
+    #[test]
+    fn an_osc_that_is_not_a_133_d_marker_leaves_the_exit_status_alone() {
+        for other in [
+            &b"\x1b]1339;D;1\x07"[..],
+            b"\x1b]52;c;aGVsbG8=\x07",
+            b"\x1b]133;A;1\x07",
+            b"\x1b]0;a title\x07",
+        ] {
+            let mut core = core();
+            core.feed(b"\x1b]133;D;1\x07");
+            core.feed(other);
+            assert_eq!(core.command_exit(), Some(1), "{other:?} said nothing");
+        }
+    }
+
+    /// A `133;D` with no readable integer is a command that finished without
+    /// saying how, and it takes the claim away rather than leaving a failure on
+    /// screen from two commands ago. That is the safe direction: no claim is
+    /// recoverable, a wrong claim is not.
+    #[test]
+    fn a_133_d_marker_with_no_readable_integer_leaves_no_status_claimed() {
+        for malformed in [
+            &b"\x1b]133;D\x07"[..],
+            b"\x1b]133;D;\x07",
+            b"\x1b]133;D;abc\x07",
+            b"\x1b]133;D;1;2\x07",
+            b"\x1b]133;D;\x1b\\",
+        ] {
+            let mut core = core();
+            core.feed(b"\x1b]133;D;1\x07");
+            core.feed(malformed);
+            assert_eq!(core.command_exit(), None, "{malformed:?} claims nothing");
+        }
+    }
+
+    /// A child that opens an OSC and never closes it must not be able to grow
+    /// this terminal, and a sequence too large to hold must be refused whole
+    /// rather than read off the front.
+    #[test]
+    fn an_unterminated_or_oversized_osc_is_bounded_and_reads_as_nothing() {
+        let mut unflooded = core();
+        let mut never_terminated = b"\x1b]".to_vec();
+        never_terminated.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES * 8));
+        unflooded.feed(&never_terminated);
+        assert!(
+            unflooded.osc.len() <= MAX_OSC_PAYLOAD_BYTES,
+            "an unterminated OSC is bounded, kept {}",
+            unflooded.osc.len()
+        );
+
+        let mut big = core();
+        let mut oversized = b"\x1b]133;D;1".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES));
+        oversized.push(0x07);
+        big.feed(&oversized);
+        assert_eq!(
+            big.command_exit(),
+            None,
+            "a marker truncated by an oversized payload is not a marker"
+        );
+        assert!(big.osc.len() <= MAX_OSC_PAYLOAD_BYTES);
     }
 
     /// A click inside the editable prompt moves the caret; a click on the

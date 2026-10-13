@@ -26,6 +26,9 @@ portable-pty = "0.9"
 libc = "0.2"
 log = "0.4"
 alacritty_terminal = "0.26.0"
+# The shell-integration scripts are written to a private directory that has to
+# outlive the spawn and disappear with the session; nothing else owns that.
+tempfile = "3"
 
 [dev-dependencies]
 # Same crate, test-support on: unit tests build the same type universe as the app.

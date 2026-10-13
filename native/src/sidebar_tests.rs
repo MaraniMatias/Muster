@@ -4,8 +4,24 @@ use std::process::Command;
 
 use super::*;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-use gpui_kit::{AnyWindowHandle, TestAppContext};
+use gpui_kit::{
+    AnyWindowHandle, App, InputEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, TestAppContext, Window,
+};
 use tempfile::TempDir;
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 /// A real Git repository with one commit, so a worktree can actually be made.
 ///
@@ -50,6 +66,36 @@ fn a_task_name_suggests_a_branch_only_while_the_person_has_not_edited_it() {
     assert_eq!(TerminalWindow::slug_for(".hidden/x"), "hidden-x");
 }
 
+#[gpui_kit::test]
+fn the_sidebar_bundles_truetype_faces_and_shapes_fitted_labels(cx: &mut TestAppContext) {
+    for bytes in [
+        include_bytes!("../assets/fonts/FiraCode-Regular.ttf").as_slice(),
+        include_bytes!("../assets/fonts/FiraCode-Bold.ttf").as_slice(),
+    ] {
+        assert_eq!(&bytes[..4], b"\x00\x01\x00\x00", "expected a TrueType face");
+    }
+
+    // The measurement the repo path's fit runs on, in the family the sidebar
+    // draws with: shaped, not a character count, and growing with the size.
+    let fixture = open(cx);
+    cx.update_window(fixture.handle, |_, window, _| {
+        assert!(sidebar_text_width(window, "MMMM", 11.) > sidebar_text_width(window, "MM", 11.));
+        let root = "/home/person/workspace/deeply/nested/checkout";
+        assert!(sidebar_text_width(window, root, 11.) > sidebar_text_width(window, root, 10.));
+        assert_eq!(
+            sidebar_repo_path(window, root, "checkout", 500., false),
+            root
+        );
+        let elided = sidebar_repo_path(window, root, "checkout", 200., false);
+        assert!(
+            elided.starts_with('…') && elided.len() < root.len(),
+            "a path wider than the panel kept every segment: {elided}"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
 struct Fixture {
     _directory: TempDir,
     handle: AnyWindowHandle,
@@ -67,6 +113,7 @@ fn open(cx: &mut TestAppContext) -> Fixture {
     let mut sessions = Vec::new();
     cx.update(|cx| {
         gpui_kit::init(cx);
+        load_fonts(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
     });
     let (handle, view) = cx.update(|cx| {
@@ -105,6 +152,7 @@ fn open(cx: &mut TestAppContext) -> Fixture {
                     app.terminals.insert(
                         id.clone(),
                         LiveTerminal {
+                            checkout_id: checkout.clone(),
                             view: terminal,
                             shell,
                         },
@@ -150,6 +198,73 @@ fn dispose(fixture: &Fixture, cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+fn pointer_move(
+    window: &mut Window,
+    position: Point<Pixels>,
+    pressed_button: Option<MouseButton>,
+    cx: &mut App,
+) {
+    window.dispatch_event(
+        MouseMoveEvent {
+            position,
+            pressed_button,
+            modifiers: Default::default(),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn pointer_down(window: &mut Window, position: Point<Pixels>, cx: &mut App) {
+    window.dispatch_event(
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn pointer_up(window: &mut Window, position: Point<Pixels>, cx: &mut App) {
+    window.dispatch_event(
+        MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Default::default(),
+            click_count: 1,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn pointer_exit(window: &mut Window, position: Point<Pixels>, cx: &mut App) {
+    window.dispatch_event(
+        MouseExitEvent {
+            position,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Default::default(),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn drag_pointer(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, cx: &mut App) {
+    pointer_move(window, from, None, cx);
+    pointer_down(window, from, cx);
+    pointer_move(window, to, Some(MouseButton::Left), cx);
+    pointer_up(window, to, cx);
 }
 
 #[gpui_kit::test]
@@ -272,6 +387,29 @@ fn checkout_fold_hides_controls_but_keeps_live_sessions_and_selection(cx: &mut T
 }
 
 #[gpui_kit::test]
+fn sidebar_rows_keep_close_controls_out_of_flow(cx: &mut TestAppContext) {
+    // The action stays in the tab order but is an absolute overlay, so the name
+    // has the same measured space at rest and while the pointer is over the row.
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    let name = SharedString::from(format!("select-session-{id}"));
+    let action = SharedString::from(format!("close-session-{id}"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let before = window.find(name.clone()).bounds();
+        let close_before = window.find(action.clone()).bounds();
+        assert_eq!(close_before.size.width, px(20.));
+        window.hover(name.clone(), cx);
+        let after = window.find(name).bounds();
+        let close_after = window.find(action).bounds();
+        assert_eq!(before.size.width, after.size.width);
+        assert_eq!(close_before.origin.x, close_after.origin.x);
+        assert_eq!(close_before.size.width, close_after.size.width);
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
 fn panels_shortcut_captures_the_focused_terminal_without_losing_it(cx: &mut TestAppContext) {
     let fixture = open(cx);
     let selected = fixture.sessions[1].clone();
@@ -365,6 +503,251 @@ fn moving_a_row_preserves_pty_and_view_identity(cx: &mut TestAppContext) {
     dispose(&fixture, cx);
 }
 
+#[gpui_kit::test]
+fn sidebar_drag_reorders_a_terminal_and_retains_its_pty(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    let other = fixture.sessions[1].clone();
+    let entity = fixture
+        .view
+        .read_with(cx, |app, _| app.terminals[&id].view.entity_id());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let from_bounds = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds();
+        let to_bounds = window
+            .find(SharedString::from(format!("select-session-{other}")))
+            .bounds();
+        drag_pointer(
+            window,
+            from_bounds.center(),
+            gpui_kit::point(to_bounds.center().x, to_bounds.bottom() - px(3.)),
+            cx,
+        );
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = &app.navigation.checkout(&fixture.checkout).unwrap().sessions;
+        assert_eq!(order[0].id, other);
+        assert_eq!(order[1].id, id);
+        assert_eq!(app.terminals[&id].view.entity_id(), entity);
+    });
+    assert!(fixture.backend.status(&id).is_ok());
+    assert!(fixture.backend.status(&other).is_ok());
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn sidebar_drag_moves_a_terminal_to_another_checkout_without_restarting_it(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open(cx);
+    let target_dir = tempfile::tempdir().unwrap();
+    let repo = Repo::plain(target_dir.path(), "target").unwrap();
+    let target = repo.checkouts[0].id.clone();
+    let id = fixture.sessions[0].clone();
+    let entity = fixture
+        .view
+        .read_with(cx, |app, _| app.terminals[&id].view.entity_id());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.merge(
+                navigation::OpenedDirectory {
+                    repo,
+                    checkout_id: target.clone(),
+                },
+                false,
+            );
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let from = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds()
+            .center();
+        let to = window
+            .find(SharedString::from(format!("new-terminal-{target}")))
+            .bounds()
+            .center();
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, to, Some(MouseButton::Left), cx);
+        assert_eq!(
+            fixture
+                .view
+                .read(cx)
+                .sidebar_drag
+                .as_ref()
+                .and_then(|drag| drag.target.as_ref())
+                .map(|target| (target.checkout_id.as_str(), target.index)),
+            Some((target.as_str(), 0))
+        );
+        pointer_up(window, to, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.navigation.session(&id).unwrap().checkout_id, target);
+        assert_eq!(
+            app.navigation.checkout(&fixture.checkout).unwrap().sessions[0].id,
+            fixture.sessions[1]
+        );
+        assert_eq!(app.navigation.checkout(&target).unwrap().sessions[0].id, id);
+        assert_eq!(app.terminals[&id].checkout_id, target);
+        assert_eq!(app.terminals[&id].view.entity_id(), entity);
+        assert_eq!(app.navigation.active_session.as_deref(), Some(id.as_str()));
+    });
+    assert!(fixture.backend.status(&id).is_ok());
+    assert!(fixture.backend.status(&fixture.sessions[1]).is_ok());
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn sidebar_click_stays_a_click_below_the_five_pixel_drag_threshold(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    let other = fixture.sessions[1].clone();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let bounds = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds();
+        let from = bounds.center();
+        let near = gpui_kit::point(from.x + px(4.), from.y);
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, near, Some(MouseButton::Left), cx);
+        assert!(!fixture.view.read(cx).sidebar_drag.as_ref().unwrap().started);
+        pointer_up(window, near, cx);
+        assert!(fixture.view.read(cx).sidebar_drag.is_none());
+        assert_eq!(
+            fixture.view.read(cx).navigation.active_session.as_deref(),
+            Some(id.as_str())
+        );
+
+        let from = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds()
+            .center();
+        let threshold = gpui_kit::point(from.x + px(5.), from.y);
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, threshold, Some(MouseButton::Left), cx);
+        assert!(fixture.view.read(cx).sidebar_drag.as_ref().unwrap().started);
+        window.press("escape", cx);
+        assert!(fixture.view.read(cx).sidebar_drag.is_none());
+        pointer_up(window, threshold, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = &app.navigation.checkout(&fixture.checkout).unwrap().sessions;
+        assert_eq!(order[0].id, id);
+        assert_eq!(order[1].id, other);
+        assert_eq!(app.navigation.active_session.as_deref(), Some(id.as_str()));
+    });
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn sidebar_drag_autoscrolls_near_the_scroll_viewport_edge(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    let directory = tempfile::tempdir().unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            for index in 0..16 {
+                let path = directory.path().join(format!("root-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                let repo = Repo::plain(&path, format!("extra-{index}")).unwrap();
+                let checkout_id = repo.checkouts[0].id.clone();
+                app.navigation
+                    .merge(navigation::OpenedDirectory { repo, checkout_id }, false);
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(fixture.view.read(cx).scroll.max_offset().y > px(0.));
+        let from = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds()
+            .center();
+        let viewport = fixture.view.read(cx).scroll.bounds();
+        let edge = gpui_kit::point(from.x, viewport.bottom() - px(4.));
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, edge, Some(MouseButton::Left), cx);
+        for _ in 0..3 {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        }
+        assert!(fixture.view.read(cx).scroll.offset().y < px(0.));
+        window.press("escape", cx);
+        pointer_up(window, edge, cx);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture.view.read_with(cx, |app, _| app
+            .navigation
+            .session(&id)
+            .unwrap()
+            .checkout_id
+            .clone()),
+        fixture.checkout
+    );
+    assert!(fixture.backend.status(&id).is_ok());
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn escape_cancels_a_sidebar_drag_without_reordering_or_selecting_the_drop_row(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    let other = fixture.sessions[1].clone();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let from = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds()
+            .center();
+        let target = window
+            .find(SharedString::from(format!("select-session-{other}")))
+            .bounds();
+        let to = gpui_kit::point(target.center().x, target.bottom() - px(3.));
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, to, Some(MouseButton::Left), cx);
+        assert!(fixture.view.read(cx).sidebar_drag.as_ref().unwrap().started);
+        window.press("escape", cx);
+        assert!(fixture.view.read(cx).sidebar_drag.is_none());
+        pointer_up(window, to, cx);
+
+        let from = window
+            .find(SharedString::from(format!("select-session-{id}")))
+            .bounds()
+            .center();
+        let target = window
+            .find(SharedString::from(format!("select-session-{other}")))
+            .bounds();
+        let to = gpui_kit::point(target.center().x, target.bottom() - px(3.));
+        pointer_move(window, from, None, cx);
+        pointer_down(window, from, cx);
+        pointer_move(window, to, Some(MouseButton::Left), cx);
+        assert!(fixture.view.read(cx).sidebar_drag.as_ref().unwrap().started);
+        pointer_exit(window, to, cx);
+        assert!(fixture.view.read(cx).sidebar_drag.is_none());
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = &app.navigation.checkout(&fixture.checkout).unwrap().sessions;
+        assert_eq!(order[0].id, id);
+        assert_eq!(order[1].id, other);
+        assert_eq!(
+            app.navigation.active_session.as_deref(),
+            Some(other.as_str())
+        );
+    });
+    dispose(&fixture, cx);
+}
+
 /// A window over one real Git repository, with no terminals of its own.
 /// Named with a leading underscore because it exists to be dropped: the
 /// worktree lives inside it and the row is read from the window, not the disk.
@@ -385,6 +768,7 @@ fn open_git(cx: &mut TestAppContext) -> GitFixture {
     let checkout = opened.checkout_id.clone();
     cx.update(|cx| {
         gpui_kit::init(cx);
+        load_fonts(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
     });
     let (handle, view) = cx.update(|cx| {
@@ -421,6 +805,485 @@ fn close(fixture: &GitFixture, cx: &mut TestAppContext) {
     fixture.view.update(cx, |app, _| app.owner.stop());
 }
 
+fn add_worktree(fixture: &GitFixture, cx: &mut TestAppContext) -> (String, PathBuf) {
+    let repo = fixture.view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == fixture.repo_id)
+            .unwrap()
+            .clone()
+    });
+    let opened = navigation::create_worktree(&repo, "task", "feature/task", "").unwrap();
+    let checkout = opened
+        .repo
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == opened.checkout_id)
+        .unwrap();
+    let id = checkout.id.clone();
+    let path = PathBuf::from(&checkout.path);
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    (id, path)
+}
+
+#[gpui_kit::test]
+async fn archiving_keeps_worktree_files_and_git_registration(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    let saved_file = path.join("keep me.txt");
+    std::fs::write(&saved_file, "archive keeps files").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(format!("select-checkout-{id}")), cx);
+        window.render_frame(cx);
+        window.click(SharedString::from(format!("worktree-actions-{id}")), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| draft.info.is_some())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("worktree-archive");
+        window.click("worktree-archive", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).navigation.archived.contains(&id)
+    })
+    .await;
+
+    assert!(path.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(saved_file).unwrap(),
+        "archive keeps files"
+    );
+    run_git(
+        &fixture.root,
+        &["show-ref", "--verify", "--quiet", "refs/heads/feature/task"],
+    );
+    let listed = Command::new("git")
+        .current_dir(&fixture.root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(path.to_str().unwrap()));
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn stale_diff_totals_require_the_same_revision_and_checkout_membership(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, cx| {
+        let id = fixture.checkout.clone();
+        let path = app.navigation.checkout(&id).unwrap().path.clone();
+        let stale_revision = app.membership_revision;
+        app.membership_revision += 1;
+        app.apply_diff_totals(
+            stale_revision,
+            vec![(
+                id.clone(),
+                path.clone(),
+                Ok(DiffTotals {
+                    additions: 9,
+                    deletions: 3,
+                }),
+            )],
+            cx,
+        );
+        assert!(!app.diff_totals.contains_key(&id));
+
+        let current_revision = app.membership_revision;
+        app.apply_diff_totals(
+            current_revision,
+            vec![(
+                id.clone(),
+                path.clone(),
+                Ok(DiffTotals {
+                    additions: 4,
+                    deletions: 1,
+                }),
+            )],
+            cx,
+        );
+        assert_eq!(app.diff_totals[&id].additions, 4);
+        app.diff_totals.remove(&id);
+        app.navigation.repos[0]
+            .checkouts
+            .retain(|checkout| checkout.id != id);
+        app.apply_diff_totals(
+            current_revision,
+            vec![(id.clone(), path, Ok(DiffTotals::default()))],
+            cx,
+        );
+        assert!(!app.diff_totals.contains_key(&id));
+    });
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn late_worktree_defaults_cannot_update_a_reopened_dialog(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_dialog(&fixture.repo_id, window, cx);
+            let stale_request = app.worktree.as_ref().unwrap().request_id;
+            close_worktree_dialog(app, cx);
+            app.open_worktree_dialog(&fixture.repo_id, window, cx);
+            let current_request = app.worktree.as_ref().unwrap().request_id;
+            assert_ne!(stale_request, current_request);
+
+            app.apply_worktree_defaults(
+                &fixture.repo_id,
+                stale_request,
+                Err("late response".into()),
+                window,
+                cx,
+            );
+            let draft = app.worktree.as_ref().unwrap();
+            assert_eq!(draft.request_id, current_request);
+            assert!(draft.error.is_none());
+            assert!(draft.base.read(cx).value().is_empty());
+            close_worktree_dialog(app, cx);
+        });
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn archive_does_not_wait_for_a_git_removal_preview(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.worktree_removal = Some(WorktreeRemovalDraft {
+                request_id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+                repo_id: fixture.repo_id.clone(),
+                checkout_id: id.clone(),
+                info: None,
+                loading: true,
+                busy: false,
+                dirty_confirmed: false,
+                unmerged_confirmed: false,
+                delete_branch: false,
+                error: None,
+            });
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.find("worktree-archive");
+        window.click("worktree-archive", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).navigation.archived.contains(&id)
+    })
+    .await;
+    assert!(path.is_dir());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn detached_worktree_delete_requires_acknowledging_unreferenced_commits(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    let path = fixture._directory.path().join("detached");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::write(path.join("detached.txt"), "detached commit").unwrap();
+    run_git(&path, &["add", "detached.txt"]);
+    run_git(
+        &path,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "-m",
+            "detached-only commit",
+        ],
+    );
+    let opened = navigation::open_directory(&path).unwrap();
+    let id = opened.checkout_id.clone();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_removal_dialog(&fixture.repo_id, &id, window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| {
+                draft
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.branch.is_none() && info.unmerged_commits == 1)
+            })
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.worktree_removal.as_ref().unwrap().unmerged_confirmed);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.submit_worktree_delete(window, cx));
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.worktree_removal.as_ref().unwrap().error.is_some());
+    });
+    assert!(path.is_dir());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("worktree-confirm-unmerged");
+        window.click("worktree-confirm-unmerged", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| draft.unmerged_confirmed)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("worktree-delete", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        let app = fixture.view.read(cx);
+        app.worktree_removal.is_none() && app.navigation.checkout(&id).is_none()
+    })
+    .await;
+    assert!(!path.exists());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn dirty_worktree_delete_needs_ack_and_preserves_branch_by_default(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    run_git(
+        &path,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "unmerged worktree commit",
+        ],
+    );
+    std::fs::write(path.join("uncommitted file.txt"), "unsaved").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(format!("select-checkout-{id}")), cx);
+        window.render_frame(cx);
+        window.click(SharedString::from(format!("worktree-actions-{id}")), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| {
+                draft.info.as_ref().is_some_and(|info| {
+                    info.dirty_files
+                        .iter()
+                        .any(|file| file == "uncommitted file.txt")
+                        && info.unmerged_commits == 1
+                })
+            })
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        let draft = app.worktree_removal.as_ref().unwrap();
+        assert!(!draft.dirty_confirmed);
+        assert!(!draft.delete_branch);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("worktree-delete-branch", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.worktree_removal.as_ref().unwrap().delete_branch);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("worktree-delete-branch", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.worktree_removal.as_ref().unwrap().delete_branch);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("worktree-confirm-dirty");
+        window.find("worktree-delete-branch");
+        window.find("worktree-delete");
+        fixture
+            .view
+            .update(cx, |app, cx| app.submit_worktree_delete(window, cx));
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.worktree_removal.as_ref().unwrap().error.is_some());
+    });
+    assert!(path.is_dir(), "an unconfirmed delete removed the checkout");
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("worktree-confirm-dirty", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.worktree_removal.as_ref().unwrap().dirty_confirmed);
+    });
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("worktree-confirm-dirty").checked(), Some(true));
+        window.click("worktree-delete", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        let app = fixture.view.read(cx);
+        app.worktree_removal.is_none() && app.navigation.checkout(&id).is_none()
+    })
+    .await;
+    assert!(!path.exists());
+    run_git(
+        &fixture.root,
+        &["show-ref", "--verify", "--quiet", "refs/heads/feature/task"],
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn pending_terminal_creation_blocks_archive_and_delete(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation
+                .pending
+                .insert("pending-shell".into(), id.clone());
+            app.open_worktree_removal_dialog(&fixture.repo_id, &id, window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| draft.info.is_some())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.submit_worktree_delete(window, cx));
+        fixture
+            .view
+            .update(cx, |app, cx| app.submit_worktree_archive(cx));
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.pending.remove("pending-shell");
+            app.navigation
+                .repos
+                .iter_mut()
+                .flat_map(|repo| &mut repo.checkouts)
+                .find(|checkout| checkout.id == id)
+                .unwrap()
+                .sessions
+                .push(Session {
+                    id: "active-terminal".into(),
+                    checkout_id: id.clone(),
+                    name: "sh".into(),
+                    created_at: "test".into(),
+                    session_type: SessionType::Shell,
+                    status: SavedSessionStatus::Active,
+                });
+            app.submit_worktree_delete(window, cx);
+            app.submit_worktree_archive(cx);
+            assert!(app.removing_checkouts.insert(id.clone()));
+            app.request_terminal(&id, window, cx);
+            assert!(app
+                .navigation
+                .pending
+                .values()
+                .all(|pending| pending != &id));
+        });
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.navigation.checkout(&id).is_some());
+        assert!(!app.navigation.archived.contains(&id));
+        assert!(app.worktree_removal.as_ref().unwrap().error.is_some());
+    });
+    assert!(path.is_dir());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn an_owned_terminal_blocks_lifecycle_even_if_its_sidebar_session_is_stale(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open(cx);
+    fixture.view.update(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter_mut()
+            .flat_map(|repo| &mut repo.checkouts)
+            .find(|checkout| checkout.id == fixture.checkout)
+            .unwrap()
+            .sessions
+            .clear();
+        assert!(app.checkout_has_terminal_activity(&fixture.checkout));
+    });
+    dispose(&fixture, cx);
+}
+
 #[gpui_kit::test]
 async fn a_worktree_is_created_from_the_dialog_and_a_shell_opens_in_it(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -437,7 +1300,7 @@ async fn a_worktree_is_created_from_the_dialog_and_a_shell_opens_in_it(cx: &mut 
             .read(cx)
             .worktree
             .as_ref()
-            .is_some_and(|draft| draft.location.is_some())
+            .is_some_and(|draft| draft.location.is_some() && draft.base.read(cx).value() == "main")
     })
     .await;
     fixture.view.read_with(cx, |app, cx| {
@@ -466,9 +1329,7 @@ async fn a_worktree_is_created_from_the_dialog_and_a_shell_opens_in_it(cx: &mut 
     });
 
     cx.update_window(fixture.handle, |_, window, cx| {
-        fixture
-            .view
-            .update(cx, |app, cx| app.submit_worktree(window, cx));
+        window.click("worktree-create", cx);
     })
     .unwrap();
     cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
@@ -540,6 +1401,128 @@ async fn a_worktree_is_created_from_the_dialog_and_a_shell_opens_in_it(cx: &mut 
 }
 
 #[gpui_kit::test]
+async fn creating_a_worktree_is_allowed_while_another_checkout_is_missing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let missing_path = fixture._directory.path().join("missing-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "stale",
+            missing_path.to_str().unwrap(),
+        ],
+    );
+    let missing_path = missing_path.canonicalize().unwrap();
+    std::fs::remove_dir_all(&missing_path).unwrap();
+    let opened = navigation::open_directory(&fixture.root).unwrap();
+    let missing = opened
+        .repo
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.path == missing_path.to_str().unwrap())
+        .expect("Git still lists the unavailable worktree");
+    assert!(missing.is_missing);
+    let missing_id = missing.id.clone();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_dialog(&fixture.repo_id, window, cx)
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read_with(cx, |app, cx| {
+            app.worktree
+                .as_ref()
+                .is_some_and(|draft| draft.base.read(cx).value() == "main")
+        })
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.submit_worktree(window, cx));
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        fixture.view.read(cx).navigation.repos.iter().any(|repo| {
+            repo.checkouts
+                .iter()
+                .any(|checkout| checkout.branch.as_deref() == Some("feature/new-task"))
+        })
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.worktree.is_none());
+        assert!(app.navigation.checkout(&missing_id).unwrap().is_missing);
+    });
+    assert!(fixture.root.join(".worktrees/new-task").is_dir());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn a_missing_default_branch_keeps_manual_base_creation_available(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    run_git(&fixture.root, &["branch", "-m", "trunk"]);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_dialog(&fixture.repo_id, window, cx)
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read_with(cx, |app, _| {
+            app.worktree.as_ref().is_some_and(|draft| {
+                draft.location.is_some()
+                    && draft
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("default branch"))
+            })
+        })
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        let draft = app.worktree.as_ref().unwrap();
+        assert_eq!(
+            draft.location.as_deref(),
+            Some(
+                fixture
+                    .root
+                    .canonicalize()
+                    .unwrap()
+                    .join(".worktrees")
+                    .as_path()
+            )
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let base = app.worktree.as_ref().unwrap().base.clone();
+            base.update(cx, |input, cx| input.set_value("trunk", window, cx));
+            app.submit_worktree(window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        fixture.view.read(cx).navigation.repos.iter().any(|repo| {
+            repo.checkouts
+                .iter()
+                .any(|checkout| checkout.branch.as_deref() == Some("feature/new-task"))
+        })
+    })
+    .await;
+    assert!(fixture.root.join(".worktrees/new-task").is_dir());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
 async fn a_worktree_with_nothing_to_start_from_is_refused_before_git_is_asked(
     cx: &mut TestAppContext,
 ) {
@@ -556,7 +1539,7 @@ async fn a_worktree_with_nothing_to_start_from_is_refused_before_git_is_asked(
             .read(cx)
             .worktree
             .as_ref()
-            .is_some_and(|draft| draft.location.is_some())
+            .is_some_and(|draft| draft.location.is_some() && draft.base.read(cx).value() == "main")
     })
     .await;
 
@@ -592,6 +1575,160 @@ async fn a_worktree_with_nothing_to_start_from_is_refused_before_git_is_asked(
         .unwrap();
     cx.run_until_parked();
     assert!(fixture.view.read_with(cx, |app, _| app.worktree.is_none()));
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_restored(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    let missing_path = fixture._directory.path().join("missing-worktree");
+    let other_path = fixture._directory.path().join("other-missing-worktree");
+    for (branch, path) in [("stale", &missing_path), ("other-stale", &other_path)] {
+        run_git(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ],
+        );
+    }
+    let missing_path = missing_path.canonicalize().unwrap();
+    let other_path = other_path.canonicalize().unwrap();
+    std::fs::remove_dir_all(&missing_path).unwrap();
+    std::fs::remove_dir_all(&other_path).unwrap();
+
+    let opened = navigation::open_directory(&fixture.root).unwrap();
+    let checkout_at = |path: &Path| {
+        opened
+            .repo
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.path == path.to_str().unwrap())
+            .expect("Git still lists the missing worktree")
+            .clone()
+    };
+    let missing_id = checkout_at(&missing_path).id.clone();
+    let other_id = checkout_at(&other_path).id.clone();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    let state_path = fixture._directory.path().join("native-workspace.json");
+    fixture.view.update(cx, |app, _| {
+        *app.owner.writer.lock().unwrap() = Some(StateWriter::new(state_path.clone()).unwrap());
+    });
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(
+            SharedString::from(format!("fold-checkout-{missing_id}")),
+            cx,
+        );
+        window.render_frame(cx);
+        let action = SharedString::from(format!("dismiss-missing-{missing_id}"));
+        window.find(action.clone());
+        window.click(action, cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .navigation
+            .archived
+            .contains(&missing_id)
+    })
+    .await;
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, _| {
+        state_path.exists()
+    })
+    .await;
+
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.navigation.checkout(&missing_id).is_some());
+        assert!(app.navigation.checkout(&other_id).is_some());
+        assert!(app.navigation.archived.contains(&missing_id));
+        assert!(!app.navigation.archived.contains(&other_id));
+        assert_eq!(
+            app.navigation.persistent_state().archived_checkout_ids,
+            vec![missing_id.clone()]
+        );
+    });
+    let saved = navigation::load(&state_path).unwrap();
+    assert_eq!(saved.archived_checkout_ids, vec![missing_id.clone()]);
+
+    // A normal repository refresh retains the dismissal and both stale registrations.
+    let refreshed = navigation::open_directory(&fixture.root).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.merge(refreshed, false);
+        assert!(app.navigation.archived.contains(&missing_id));
+        assert!(!app.navigation.archived.contains(&other_id));
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(SharedString::from(format!("fold-checkout-{other_id}")), cx);
+        window.render_frame(cx);
+        window.find(format!("dismiss-missing-{other_id}"));
+    })
+    .unwrap();
+    let listed = Command::new("git")
+        .current_dir(&fixture.root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let registrations = String::from_utf8_lossy(&listed.stdout);
+    for (path, branch) in [(&missing_path, "stale"), (&other_path, "other-stale")] {
+        assert!(registrations.contains(path.to_str().unwrap()));
+        assert!(registrations.contains(&format!("branch refs/heads/{branch}")));
+        let reference = format!("refs/heads/{branch}");
+        run_git(
+            &fixture.root,
+            &["show-ref", "--verify", "--quiet", &reference],
+        );
+    }
+
+    // Restoring the archived id makes the retained checkout visible again.
+    fixture.view.update(cx, |app, _| {
+        assert!(app.navigation.archived.remove(&missing_id));
+        app.membership_revision += 1;
+        app.persist();
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        !fixture
+            .view
+            .read(cx)
+            .navigation
+            .archived
+            .contains(&missing_id)
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.navigation.checkout(&missing_id).is_some());
+        assert_eq!(
+            app.navigation
+                .checkout(&missing_id)
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("stale")
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(
+            SharedString::from(format!("fold-checkout-{missing_id}")),
+            cx,
+        );
+        window.render_frame(cx);
+        window.find(format!("dismiss-missing-{missing_id}"));
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 
@@ -679,6 +1816,8 @@ async fn closing_a_busy_terminal_requires_consent_and_keeps_its_sibling(cx: &mut
     let fixture = open(cx);
     let id = fixture.sessions[0].clone();
     cx.update_window(fixture.handle, |_, window, cx| {
+        // The close is behind the row's hover, so the pointer arrives on the row first.
+        window.hover(SharedString::from(format!("select-session-{id}")), cx);
         window.click(SharedString::from(format!("close-session-{id}")), cx);
     })
     .unwrap();
@@ -690,6 +1829,7 @@ async fn closing_a_busy_terminal_requires_consent_and_keeps_its_sibling(cx: &mut
         .view
         .read_with(cx, |app, _| app.terminals[&id].shell.session.is_closing()));
     cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(SharedString::from(format!("select-session-{id}")), cx);
         window.click(SharedString::from(format!("close-session-{id}")), cx);
     })
     .unwrap();
