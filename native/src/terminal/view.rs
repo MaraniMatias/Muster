@@ -25,10 +25,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui_kit::{
-    canvas, div, point, px, quad, App, Bounds, Context, FocusHandle, FontId, FontStyle, FontWeight,
-    Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
-    Render, Rgba, SharedString, StrikethroughStyle, Styled, Task, TextAlign, TextStyle,
-    UnderlineStyle, Window, WindowTextSystem,
+    canvas, div, point, px, quad, App, Bounds, Context, FocusHandle, FontStyle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Render,
+    Rgba, SharedString, StrikethroughStyle, Styled, Task, TextAlign, TextStyle, UnderlineStyle,
+    Window, WindowTextSystem,
 };
 
 use super::input::{self, FocusState};
@@ -149,6 +149,7 @@ pub struct Palette {
     pub foreground: (u8, u8, u8),
     /// The same, behind the character.
     pub background: (u8, u8, u8),
+    pub cursor: (u8, u8, u8),
 }
 
 impl Default for Palette {
@@ -156,6 +157,7 @@ impl Default for Palette {
         Self {
             foreground: (0xdc, 0xe0, 0xe5),
             background: (0x22, 0x24, 0x36),
+            cursor: CURSOR_COLOR,
         }
     }
 }
@@ -263,12 +265,17 @@ fn compatible_run_end(cells: &[CellSnapshot], start: usize, wide: bool) -> usize
     let Some(first) = cells.get(start) else {
         return start;
     };
-    if wide || (first.c == ' ' && !first.underline && !first.strikethrough) {
+    if wide
+        || !first.zerowidth.is_empty()
+        || (first.c == ' ' && !first.underline && !first.strikethrough)
+    {
         return start + 1;
     }
     let mut end = start + 1;
     while let Some(next) = cells.get(end) {
-        if next.fg != first.fg
+        if next.width != 1
+            || !next.zerowidth.is_empty()
+            || next.fg != first.fg
             || next.bg != first.bg
             || next.bold != first.bold
             || next.dim != first.dim
@@ -283,6 +290,15 @@ fn compatible_run_end(cells: &[CellSnapshot], start: usize, wide: bool) -> usize
         end += 1;
     }
     end
+}
+
+fn mouse_button(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        MouseButton::Navigate(_) => None,
+    }
 }
 
 fn grid_point(
@@ -325,12 +341,17 @@ pub struct Placement {
 /// A pure function of the row, which is what makes the CJK case testable
 /// without a window: the arithmetic is the same whether it is being asserted
 /// here or run against a real font 60 times a second.
-pub fn place_row(cells: &[CellSnapshot], is_wide: impl Fn(char) -> bool) -> Vec<Placement> {
+pub fn place_row(cells: &[CellSnapshot]) -> Vec<Placement> {
     let mut placements = Vec::with_capacity(cells.len());
     let mut column = 0;
     while column < cells.len() {
-        let glyph = cells[column].c;
-        let columns = usize::from(is_wide(glyph)) + 1;
+        let source = &cells[column];
+        if source.width == 0 {
+            column += 1;
+            continue;
+        }
+        let glyph = source.c;
+        let columns = usize::from(source.width).min(cells.len() - column);
         placements.push(Placement {
             column,
             columns,
@@ -363,17 +384,32 @@ pub struct TerminalView {
     /// first frame has a text system to ask.
     cell: Option<CellSize>,
     style: TextStyle,
-    font_id: Option<FontId>,
     /// Whether a left-button text drag is in progress.
     dragging: bool,
     click_origin: Option<(usize, usize)>,
-    last_click: Option<(std::time::Instant, (usize, usize))>,
+    last_click: Option<(std::time::Instant, (usize, usize), u8)>,
+    click_count: u8,
+    mouse_buttons: [bool; 3],
+    mouse_cell: Option<(usize, usize, u8)>,
+    gesture_screen: bool,
+    gesture_tracking: bool,
+    gesture_size: (u16, u16),
+    scroll_remainder: f32,
+    scrollbar_drag: bool,
+    drag_edge: i32,
+    drag_point: (usize, usize),
+    next_drag_scroll: std::time::Instant,
+    blink_visible: bool,
+    blink_enabled: bool,
+    blink_deadline: std::time::Instant,
+    reported_focus: Option<(bool, bool)>,
+    marked_text: String,
+    marked_selection: std::ops::Range<usize>,
     modified_click: bool,
     left_mouse: Option<(f32, f32)>,
     dragged: bool,
     /// Selection currently shown in the last rendered frame.
     selection_range: Cell<Option<GridRange>>,
-    selection_origin: Cell<(usize, usize)>,
     canvas_origin: Rc<Cell<gpui_kit::Point<Pixels>>>,
 
     /// The size the PTY has last been told about, shared with the paint pass.
@@ -418,17 +454,32 @@ impl TerminalView {
                 line_height: gpui_kit::DefiniteLength::Fraction(LINE_HEIGHT),
                 ..TextStyle::default()
             },
-            font_id: None,
             applied: Rc::new(Cell::new((0, 0))),
             metrics,
             dragging: false,
             click_origin: None,
             last_click: None,
+            click_count: 1,
+            mouse_buttons: [false; 3],
+            mouse_cell: None,
+            gesture_screen: false,
+            gesture_tracking: false,
+            gesture_size: (0, 0),
+            scroll_remainder: 0.0,
+            scrollbar_drag: false,
+            drag_edge: 0,
+            drag_point: (0, 0),
+            next_drag_scroll: std::time::Instant::now(),
+            blink_visible: true,
+            blink_enabled: false,
+            blink_deadline: std::time::Instant::now() + Duration::from_millis(500),
+            reported_focus: None,
+            marked_text: String::new(),
+            marked_selection: 0..0,
             modified_click: false,
             left_mouse: None,
             dragged: false,
             selection_range: Cell::new(None),
-            selection_origin: Cell::new((0, 0)),
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
         };
         // Detached rather than remembered: the task ends when the session
@@ -519,12 +570,10 @@ impl TerminalView {
             ("liga".to_owned(), 1),
             ("calt".to_owned(), 1),
         ]));
-        let shaping_font_id = window.text_system().resolve_font(&self.style.font());
 
         let font_size = self.style.font_size.to_pixels(window.rem_size());
         match CellSize::measure(window.text_system(), &self.style, font_size) {
             Some(cell) => {
-                self.font_id = Some(shaping_font_id);
                 *self.metrics.lock().expect("measured cell poisoned") = CellMetrics {
                     width: cell_px(cell.width),
                     height: cell_px(cell.height),
@@ -575,16 +624,48 @@ impl TerminalView {
             modifiers.control && modifiers.shift && key.eq_ignore_ascii_case("v")
         };
         if paste_shortcut {
-            self.paste_clipboard(cx);
+            self.paste_clipboard(window, cx);
             cx.stop_propagation();
             return;
         }
 
         // Only one source of printable text exists here, which is what keeps a
         // press from being sent twice. See `input` for why it is this one.
+        let scroll_shortcut = !modifiers.alt
+            && !modifiers.control
+            && if cfg!(target_os = "macos") {
+                modifiers.platform
+            } else {
+                modifiers.shift
+            };
+        if scroll_shortcut && matches!(key.as_str(), "pageup" | "pagedown" | "home" | "end") {
+            let snapshot = self.session.snapshot();
+            match key.as_str() {
+                "pageup" => self.session.scroll_by(snapshot.rows.len() as i32),
+                "pagedown" => self.session.scroll_by(-(snapshot.rows.len() as i32)),
+                "home" => self.session.set_display_offset(snapshot.history_size),
+                "end" => self.session.set_display_offset(0),
+                _ => {
+                    return;
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        self.reset_blink();
         let input::Input::Press(press) = input::press(&event.keystroke) else {
             return;
         };
+        // Text commits belong exclusively to the native input handler. Let
+        // plain printable keys and IME composition reach the platform first.
+        if !press.ctrl
+            && !press.alt
+            && !press.meta
+            && (matches!(press.key, super::Key::Char(_)) || !self.marked_text.is_empty())
+        {
+            return;
+        }
         if key == "tab" {
             // Capture phase prevents GPUI's focus traversal binding from taking it.
             cx.stop_propagation();
@@ -595,6 +676,7 @@ impl TerminalView {
             cx.stop_propagation();
             cx.notify();
         }
+        cx.stop_propagation();
         if let Err(error) = self.session.send_key(&press) {
             log::warn!("muster-native: a keystroke was not sent: {error}");
             cx.notify();
@@ -619,10 +701,35 @@ impl TerminalView {
     }
 
     /// Read system clipboard text and queue a terminal-aware paste.
-    fn paste_clipboard(&self, cx: &mut Context<Self>) {
+    fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if let Err(error) = self.session.paste(&text) {
-                log::warn!("muster-native: clipboard paste was refused: {error}");
+            self.paste_text(text, window, cx);
+        }
+    }
+
+    fn paste_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        match self.session.paste(&text) {
+            Err(super::SessionError::Paste(super::PasteError::Unsafe)) => {
+                let prompt = window.prompt(gpui_kit::PromptLevel::Warning,
+                        "Paste multiple lines?", Some("This program has not enabled bracketed paste. Pasting may execute commands."),
+                        &["Cancel", "Paste"], cx);
+                cx.spawn_in(window, async move |view, cx| {
+                    if prompt.await == Ok(1) {
+                        let _ = view.update(cx, |view, cx| {
+                            if let Err(error) = view.session.paste_confirmed(&text) {
+                                log::warn!("muster-native: paste was refused: {error}");
+                            }
+                            view.reset_blink();
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            Err(error) => log::warn!("muster-native: clipboard paste was refused: {error}"),
+            Ok(()) => {
+                self.reset_blink();
+                cx.notify();
             }
         }
     }
@@ -631,32 +738,280 @@ impl TerminalView {
         self.session.snapshot().selection_range
     }
 
-    fn move_prompt_caret(&self, count: usize, right: bool) {
-        let press = super::keys::KeyPress {
-            key: if right {
-                super::keys::Key::Right
-            } else {
-                super::keys::Key::Left
-            },
-            shift: false,
-            ctrl: false,
-            alt: false,
-            meta: false,
-            text: None,
+    fn reset_blink(&mut self) {
+        self.blink_visible = true;
+        self.blink_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    }
+
+    fn point_at(&self, position: gpui_kit::Point<Pixels>) -> (usize, usize) {
+        grid_point(
+            position,
+            self.canvas_origin.get(),
+            self.cell.unwrap_or(CellSize {
+                width: px(1.0),
+                height: px(1.0),
+            }),
+            self.applied.get(),
+        )
+    }
+
+    fn report_mouse(
+        &self,
+        position: gpui_kit::Point<Pixels>,
+        button: u8,
+        release: bool,
+        motion: bool,
+        modifiers: gpui_kit::Modifiers,
+    ) {
+        let (row, col) = self.point_at(position);
+        if let Err(error) = self.session.send_mouse(super::MouseReport {
+            button,
+            row,
+            col,
+            release,
+            motion,
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            ctrl: modifiers.control,
+        }) {
+            log::warn!("muster-native: mouse input was refused: {error}");
+        }
+    }
+
+    fn scroll_thumb_to(&self, position: gpui_kit::Point<Pixels>) {
+        let snapshot = self.session.snapshot();
+        let Some(cell) = self.cell else {
+            return;
         };
-        for _ in 0..count {
-            if let Err(error) = self.session.send_key(&press) {
-                log::warn!("muster-native: prompt caret movement failed: {error}");
-                break;
+        let height = cell.height.as_f32() * f32::from(self.applied.get().1);
+        if height > 0.0 {
+            let fraction =
+                ((position.y - self.canvas_origin.get().y).as_f32() / height).clamp(0.0, 1.0);
+            self.session.set_display_offset(
+                ((1.0 - fraction) * snapshot.history_size as f32).round() as usize,
+            );
+        }
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &gpui_kit::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus.focus(window, cx);
+        let (cols, rows) = self.applied.get();
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let snapshot = self.session.snapshot();
+        if self.gesture_screen != snapshot.alt_screen
+            || self.gesture_tracking != snapshot.mouse_tracking
+        {
+            self.last_click = None;
+        }
+        self.gesture_screen = snapshot.alt_screen;
+        self.gesture_tracking = snapshot.mouse_tracking;
+        self.gesture_size = self.applied.get();
+        if event.button == MouseButton::Left
+            && !snapshot.alt_screen
+            && snapshot.history_size > 0
+            && self.cell.is_some_and(|cell| {
+                event.position.x
+                    >= self.canvas_origin.get().x + cell.width * f32::from(cols) - px(8.0)
+            })
+        {
+            self.scrollbar_drag = true;
+            self.scroll_thumb_to(event.position);
+        } else if snapshot.mouse_tracking && !event.modifiers.shift {
+            if let Some(button) = mouse_button(event.button) {
+                self.mouse_buttons[button as usize] = true;
+                self.report_mouse(event.position, button, false, false, event.modifiers);
+            }
+        } else if event.button == MouseButton::Left {
+            let point = self.point_at(event.position);
+            let now = std::time::Instant::now();
+            self.click_count = self
+                .last_click
+                .filter(|(time, previous, _)| {
+                    *previous == point && now.duration_since(*time) < Duration::from_millis(500)
+                })
+                .map_or(1, |(_, _, count)| count % 3 + 1);
+            self.last_click = Some((now, point, self.click_count));
+            self.left_mouse = Some((event.position.x.as_f32(), event.position.y.as_f32()));
+            self.click_origin = Some(point);
+            self.dragged = false;
+            self.dragging = false;
+            self.modified_click = event.modifiers.shift
+                || event.modifiers.control
+                || event.modifiers.alt
+                || event.modifiers.platform;
+            self.session.start_selection(
+                point,
+                match self.click_count {
+                    2 => super::SelectionKind::Word,
+                    3 => super::SelectionKind::Line,
+                    _ => super::SelectionKind::Simple,
+                },
+            );
+            self.selection_range.set(self.snapshot_range());
+        }
+        self.reset_blink();
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &gpui_kit::MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scrollbar_drag {
+            self.scroll_thumb_to(event.position);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(origin) = self
+            .click_origin
+            .filter(|_| event.pressed_button == Some(MouseButton::Left))
+        {
+            let point = self.point_at(event.position);
+            self.dragged |= self.left_mouse.is_some_and(|(x, y)| {
+                (event.position.x.as_f32() - x).hypot(event.position.y.as_f32() - y) > 3.0
+            });
+            self.dragging |= point != origin;
+            self.drag_point = point;
+            self.drag_edge = self.cell.map_or(0, |cell| {
+                let top = self.canvas_origin.get().y;
+                if event.position.y < top {
+                    1
+                } else if event.position.y >= top + cell.height * f32::from(self.applied.get().1) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if self.dragging || self.click_count > 1 || self.dragged {
+                self.session.update_selection(point);
+                self.selection_range.set(self.snapshot_range());
+            }
+            cx.notify();
+            cx.stop_propagation();
+        } else if !event.modifiers.shift {
+            let button = event.pressed_button.and_then(mouse_button).unwrap_or(3);
+            let point = self.point_at(event.position);
+            if self.mouse_cell != Some((point.0, point.1, button)) {
+                self.mouse_cell = Some((point.0, point.1, button));
+                self.report_mouse(event.position, button, false, true, event.modifiers);
             }
         }
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        event: &gpui_kit::MouseUpEvent,
+        outside: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(button) = mouse_button(event.button) {
+            if std::mem::take(&mut self.mouse_buttons[button as usize]) {
+                self.report_mouse(event.position, button, true, false, event.modifiers);
+                cx.stop_propagation();
+            }
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let snapshot = self.session.snapshot();
+        if snapshot.alt_screen != self.gesture_screen
+            || snapshot.mouse_tracking != self.gesture_tracking
+        {
+            self.click_origin = None;
+        }
+        if let Some(point) = self.click_origin.take() {
+            if self.dragged || self.dragging || self.click_count > 1 {
+                self.copy_selection(cx);
+            } else {
+                self.session.clear_selection();
+                if !outside && !self.modified_click {
+                    if let Err(error) = self.session.move_caret_to(point.0, point.1) {
+                        log::warn!("muster-native: prompt movement was refused: {error}");
+                    }
+                }
+            }
+            cx.stop_propagation();
+        }
+        self.scrollbar_drag = false;
+        self.left_mouse = None;
+        self.dragged = false;
+        self.dragging = false;
+        self.drag_edge = 0;
+        self.modified_click = false;
+        self.reset_blink();
+        cx.notify();
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &gpui_kit::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cell) = self.cell else {
+            return;
+        };
+        self.scroll_remainder += match event.delta {
+            gpui_kit::ScrollDelta::Pixels(delta) => delta.y / cell.height,
+            gpui_kit::ScrollDelta::Lines(delta) => delta.y,
+        };
+        let lines = self.scroll_remainder.trunc().clamp(-100.0, 100.0) as i32;
+        self.scroll_remainder -= lines as f32;
+        let snapshot = self.session.snapshot();
+        if snapshot.mouse_tracking && !event.modifiers.shift {
+            for _ in 0..lines.unsigned_abs() {
+                self.report_mouse(
+                    event.position,
+                    if lines > 0 { 64 } else { 65 },
+                    false,
+                    false,
+                    event.modifiers,
+                );
+            }
+        } else if snapshot.alt_screen && snapshot.modes.alternate_scroll && !event.modifiers.shift {
+            let key = if lines > 0 {
+                super::Key::Up
+            } else {
+                super::Key::Down
+            };
+            for _ in 0..lines.unsigned_abs() {
+                if let Err(error) = self.session.send_key(&super::KeyPress {
+                    key,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    meta: false,
+                    text: None,
+                }) {
+                    log::warn!("muster-native: scroll input was refused: {error}");
+                    break;
+                }
+            }
+        } else {
+            self.session.scroll_by(lines);
+            if self.click_origin.is_some() {
+                self.session.update_selection(self.drag_point);
+            }
+        }
+        cx.notify();
+        cx.stop_propagation();
     }
 
     fn frame(&self) -> Frame {
         Frame {
             palette: self.palette,
             style: self.style.clone(),
-            font_id: self.font_id,
         }
     }
 }
@@ -666,7 +1021,6 @@ impl TerminalView {
 struct Frame {
     palette: Palette,
     style: TextStyle,
-    font_id: Option<FontId>,
 }
 
 /// Everything one paint pass needs about the grid, gathered so the painter takes
@@ -678,6 +1032,7 @@ struct FrameInput<'a> {
     rows: u16,
     focus: FocusState,
     selection_range: Option<GridRange>,
+    composition: &'a str,
 }
 
 struct TextRun<'a> {
@@ -704,10 +1059,8 @@ impl Frame {
             rows,
             focus,
             selection_range,
+            composition,
         } = input;
-        let text_system = window.text_system().clone();
-        let font_id = self.font_id;
-        let font_size = self.style.font_size.to_pixels(window.rem_size());
 
         // A window too small for one whole cell draws its background and
         // nothing else. A cell cannot be drawn at a fraction of its own size,
@@ -717,16 +1070,21 @@ impl Frame {
             return;
         }
 
+        window.paint_quad(quad(
+            bounds,
+            px(0.0),
+            snapshot
+                .background
+                .map_or_else(|| self.palette.background(ColorSnapshot::Default), opaque),
+            px(0.0),
+            gpui_kit::transparent_black(),
+            Default::default(),
+        ));
         let cursor = cursor_cell(snapshot, (columns, rows));
-        let is_wide = |c: char| {
-            let Some(font_id) = font_id else { return false };
-            let advance = text_system.layout_width(font_id, font_size, c);
-            advance > cell.width * 1.5
-        };
 
         for (row_index, row) in snapshot.rows.iter().take(rows as usize).enumerate() {
             let y = bounds.origin.y + row_index as f32 * cell.height;
-            let mut placements = place_row(&row.cells, is_wide).into_iter().peekable();
+            let mut placements = place_row(&row.cells).into_iter().peekable();
             while let Some(placement) = placements.next() {
                 let Some(source) = row.cells.get(placement.column) else {
                     break;
@@ -736,13 +1094,17 @@ impl Frame {
                     origin: point(x, y),
                     size: gpui_kit::size(placement.columns as f32 * cell.width, cell.height),
                 };
-                let at_cursor = cursor == Some((row_index, placement.column));
+                let at_cursor = cursor.is_some_and(|(r, c)| {
+                    r == row_index
+                        && (placement.column..placement.column + placement.columns).contains(&c)
+                });
                 let selected = selection_range.is_some_and(|(start, end)| {
                     let point = (row_index, placement.column);
                     start <= point && point <= end
                 });
 
                 let mut run = source.c.to_string();
+                run.extend(source.zerowidth.iter());
                 let mut run_columns = placement.columns;
                 if !at_cursor && placement.columns == 1 {
                     let end =
@@ -782,9 +1144,77 @@ impl Frame {
                 );
 
                 if at_cursor {
-                    paint_cursor(span, snapshot.cursor.shape, focus, &self.palette, window);
+                    paint_cursor(
+                        span,
+                        snapshot.cursor.shape,
+                        focus,
+                        snapshot.cursor.color.unwrap_or(self.palette.cursor),
+                        window,
+                    );
                 }
             }
+        }
+        if !composition.is_empty() {
+            if let Some((row, col)) = cursor {
+                if let Some(source) = snapshot.rows.get(row).and_then(|r| r.cells.get(col)) {
+                    let mut source = source.clone();
+                    source.underline = true;
+                    source.inverse = false;
+                    let span = Bounds {
+                        origin: point(
+                            bounds.origin.x + cell.width * col as f32,
+                            bounds.origin.y + cell.height * row as f32,
+                        ),
+                        size: gpui_kit::size(
+                            cell.width * composition.chars().count().max(1) as f32,
+                            cell.height,
+                        ),
+                    };
+                    window.paint_quad(quad(
+                        span,
+                        px(0.0),
+                        self.palette.background(source.bg),
+                        px(0.0),
+                        gpui_kit::transparent_black(),
+                        Default::default(),
+                    ));
+                    self.paint_text_run(
+                        TextRun {
+                            bounds: span,
+                            cell: &source,
+                            text: composition,
+                            at_cursor: false,
+                            selected: false,
+                        },
+                        snapshot,
+                        focus,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+        if snapshot.history_size > 0 && !snapshot.alt_screen {
+            let total = snapshot.history_size as f32 + f32::from(rows);
+            let height = (bounds.size.height * (f32::from(rows) / total))
+                .max(px(12.0))
+                .min(bounds.size.height);
+            let fraction = 1.0 - snapshot.display_offset as f32 / snapshot.history_size as f32;
+            let thumb = Bounds {
+                origin: point(
+                    bounds.right() - px(6.0),
+                    bounds.top() + (bounds.size.height - height) * fraction,
+                ),
+                size: gpui_kit::size(px(5.0), height),
+            };
+            window.paint_quad(quad(
+                thumb,
+                px(2.0),
+                opaque((0x62, 0x68, 0x83)),
+                px(0.0),
+                gpui_kit::transparent_black(),
+                Default::default(),
+            ));
         }
     }
 
@@ -825,6 +1255,11 @@ impl Frame {
                 Default::default(),
             ));
         }
+        let cursor_color = snapshot
+            .cursor
+            .color
+            .or_else(|| (cell.c == ' ' && cell.zerowidth.is_empty()).then_some(self.palette.cursor))
+            .map(opaque);
         let cursor_colors = block_cursor_colors(
             foreground,
             background,
@@ -832,6 +1267,7 @@ impl Frame {
                 && snapshot.cursor.visible
                 && snapshot.cursor.shape == CursorShapeSnapshot::Block,
             focus,
+            cursor_color,
         );
         if cursor_colors.background != background {
             window.paint_quad(quad(
@@ -903,11 +1339,12 @@ fn block_cursor_colors(
     background: Hsla,
     at_cursor: bool,
     focus: FocusState,
+    color: Option<Hsla>,
 ) -> CellColors {
     if at_cursor && focus.accepts_input() {
         CellColors {
             foreground: background,
-            background: foreground,
+            background: color.unwrap_or(foreground),
         }
     } else {
         CellColors {
@@ -936,10 +1373,10 @@ fn paint_cursor(
     bounds: Bounds<Pixels>,
     shape: CursorShapeSnapshot,
     focus: FocusState,
-    _palette: &Palette,
+    color: (u8, u8, u8),
     window: &mut Window,
 ) {
-    let foreground = opaque(CURSOR_COLOR);
+    let foreground = opaque(color);
 
     let mark = |window: &mut Window, bounds: Bounds<Pixels>| {
         window.paint_quad(quad(
@@ -1057,7 +1494,28 @@ fn start_wake_task(
         // for all of them.
         while !session.is_closing() {
             background.timer(WAKE_POLL).await;
-            if wake.take() && view.update(cx, |_, cx| cx.notify()).is_err() {
+            let dirty = wake.take();
+            if view
+                .update(cx, |view, cx| {
+                    let now = std::time::Instant::now();
+                    let blink = view.blink_enabled && now >= view.blink_deadline;
+                    if blink {
+                        view.blink_visible = !view.blink_visible;
+                        view.blink_deadline = now + Duration::from_millis(500);
+                    }
+                    let scroll =
+                        view.dragged && view.drag_edge != 0 && now >= view.next_drag_scroll;
+                    if scroll {
+                        view.session.scroll_by(view.drag_edge);
+                        view.session.update_selection(view.drag_point);
+                        view.next_drag_scroll = now + Duration::from_millis(80);
+                    }
+                    if dirty || blink || scroll {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
                 return;
             }
         }
@@ -1080,12 +1538,47 @@ impl Render for TerminalView {
         // One snapshot for the frame, read here rather than in the paint pass:
         // it is one lock, and reading it inside the closure would be one lock
         // per element the closure happened to be painted into.
-        let snapshot = self.session.snapshot();
+        let mut snapshot = self.session.snapshot();
+        if self.gesture_screen != snapshot.alt_screen
+            || self.gesture_tracking != snapshot.mouse_tracking
+            || self.gesture_size != self.applied.get()
+        {
+            self.click_origin = None;
+            self.left_mouse = None;
+            self.drag_edge = 0;
+            self.mouse_buttons = [false; 3];
+            self.mouse_cell = None;
+            self.last_click = None;
+            self.gesture_screen = snapshot.alt_screen;
+            self.gesture_tracking = snapshot.mouse_tracking;
+            self.gesture_size = self.applied.get();
+        }
+        let focus_state = (snapshot.modes.focus_reporting, focus.accepts_input());
+        if self.reported_focus != Some(focus_state) {
+            if let Err(error) = self.session.send_focus(focus_state.1) {
+                log::warn!("muster-native: focus report was refused: {error}");
+            }
+            self.reported_focus = Some(focus_state);
+        }
+        let blink_enabled = snapshot.cursor.blinking
+            && snapshot.cursor.visible
+            && focus.accepts_input()
+            && self.marked_text.is_empty();
+        if self.blink_enabled != blink_enabled {
+            self.reset_blink();
+        }
+        self.blink_enabled = blink_enabled;
+        if blink_enabled && !self.blink_visible {
+            snapshot.cursor.visible = false;
+        }
         self.selection_range.set(snapshot.selection_range);
         let frame = self.frame();
         let canvas_origin = Rc::clone(&self.canvas_origin);
         let applied = Rc::clone(&self.applied);
         let cell = self.cell;
+        let input_view = cx.entity();
+        let input_focus = self.focus.clone();
+        let composition = self.marked_text.clone();
 
         div()
             .id("muster-terminal")
@@ -1094,136 +1587,35 @@ impl Render for TerminalView {
             // A click anywhere in the grid is a click on the terminal. There is
             // nothing inside it to click, so without this the window would take
             // focus only when the pointer happened to land on the chrome.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
-                    this.focus.focus(window, cx);
-                    let (cols, rows) = this.applied.get();
-                    let snapshot = this.session.snapshot();
-                    let modified = event.modifiers.shift
-                        || event.modifiers.control
-                        || event.modifiers.alt
-                        || event.modifiers.platform;
-                    if cols > 0 && rows > 0 && !snapshot.mouse_tracking {
-                        cx.stop_propagation();
-                        let point = grid_point(
-                            event.position,
-                            this.canvas_origin.get(),
-                            this.cell.unwrap_or(CellSize {
-                                width: px(1.0),
-                                height: px(1.0),
-                            }),
-                            (cols, rows),
-                        );
-                        this.selection_origin.set(point);
-                        this.left_mouse =
-                            Some((event.position.x.as_f32(), event.position.y.as_f32()));
-                        this.dragged = false;
-                        this.dragging = false;
-                        this.click_origin = Some(point);
-                        this.modified_click = modified;
-                        // Every click that starts a new gesture drops the old
-                        // selection, modified or not: a selection that survives
-                        // a click somewhere else is one the person cannot get
-                        // rid of, and `Cmd+C` would then copy text they can no
-                        // longer see.
-                        this.session.clear_selection();
-                        this.selection_range.set(None);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui_kit::MouseMoveEvent, _, cx| {
-                    if let Some(origin) = this
-                        .click_origin
-                        .filter(|_| event.pressed_button == Some(MouseButton::Left))
-                    {
-                        let point = grid_point(
-                            event.position,
-                            this.canvas_origin.get(),
-                            this.cell.unwrap_or(CellSize {
-                                width: px(1.0),
-                                height: px(1.0),
-                            }),
-                            this.applied.get(),
-                        );
-                        if point != origin {
-                            this.dragging = true;
-                        }
-                        if this.left_mouse.is_some_and(|(x, y)| {
-                            (event.position.x.as_f32() - x).hypot(event.position.y.as_f32() - y)
-                                > 3.0
-                        }) {
-                            this.dragged = true;
-                        }
-                        if this.dragging && !this.modified_click {
-                            this.session.select(origin, point);
-                            this.selection_range.set(this.snapshot_range());
-                        }
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if let Some(point) = this.click_origin.take() {
-                        if !this.modified_click && !this.dragged {
-                            // A plain click always clears any old selection, even
-                            // when it lands on output rather than the editable line.
-                            this.session.clear_selection();
-                            this.selection_range.set(None);
-                            let now = std::time::Instant::now();
-                            let double = this.last_click.is_some_and(|(time, previous)| {
-                                previous == point
-                                    && now.duration_since(time) < Duration::from_millis(500)
-                            });
-                            if double {
-                                this.session.select(
-                                    (point.0, point.1.saturating_sub(1)),
-                                    (point.0, point.1 + 1),
-                                );
-                                this.selection_range.set(this.snapshot_range());
-                                this.copy_selection(cx);
-                                this.last_click = None;
-                            } else {
-                                this.last_click = Some((now, point));
-                                let snapshot = this.session.snapshot();
-                                if let Some(count) =
-                                    this.session.move_prompt_caret(point.0, point.1)
-                                {
-                                    this.move_prompt_caret(count, point.1 > snapshot.cursor.col);
-                                }
-                            }
-                        }
-                    }
-                    if this.dragged && !this.modified_click {
-                        this.copy_selection(cx);
-                    }
-                    this.left_mouse = None;
-                    this.dragged = false;
-                    this.dragging = false;
-                    this.modified_click = false;
-                    cx.notify();
-                }),
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, false, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, false, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, false, cx)),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if this.dragged && !this.modified_click {
-                        this.copy_selection(cx);
-                    }
-                    this.left_mouse = None;
-                    this.dragged = false;
-                    this.click_origin = None;
-                    this.dragging = false;
-                    this.modified_click = false;
-                    cx.notify();
-                }),
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, true, cx)),
             )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, true, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event, _, cx| this.on_mouse_up(event, true, cx)),
+            )
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 canvas(
@@ -1251,6 +1643,11 @@ impl Render for TerminalView {
                         }
                     },
                     move |bounds, state, window, cx| {
+                        window.handle_input(
+                            &input_focus,
+                            gpui_kit::ElementInputHandler::new(bounds, input_view),
+                            cx,
+                        );
                         let Some((cell, (columns, rows))) = state else {
                             return;
                         };
@@ -1263,6 +1660,7 @@ impl Render for TerminalView {
                                 rows,
                                 focus,
                                 selection_range: snapshot.selection_range,
+                                composition: &composition,
                             },
                             window,
                             cx,
@@ -1277,6 +1675,150 @@ impl Render for TerminalView {
     }
 }
 
+// The IME owns only its uncommitted buffer. The shell remains the owner of
+// committed text; no native range edit guesses at Readline/ZLE's edit buffer.
+impl gpui_kit::EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let utf16: Vec<_> = self.marked_text.encode_utf16().collect();
+        let text = String::from_utf16(utf16.get(range.clone())?).ok()?;
+        *adjusted = Some(range);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui_kit::UTF16Selection> {
+        self.focus_state(window)
+            .accepts_input()
+            .then(|| gpui_kit::UTF16Selection {
+                range: self.marked_selection.clone(),
+                reversed: false,
+            })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        (!self.marked_text.is_empty()).then(|| 0..self.marked_text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus_state(window).accepts_input() || self.session.is_closing() {
+            return;
+        }
+        let Some(committed) = replace_marked(&self.marked_text, range, text) else {
+            return;
+        };
+        if let Err(error) = self.session.send_text(&committed) {
+            log::warn!("muster-native: text commit was refused: {error}");
+            return;
+        }
+        self.marked_text.clear();
+        self.marked_selection = 0..0;
+        self.session.clear_selection();
+        self.reset_blink();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        selected: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus_state(window).accepts_input() || self.session.is_closing() {
+            return;
+        }
+        let Some(marked) = replace_marked(&self.marked_text, range, text) else {
+            return;
+        };
+        let len = marked.encode_utf16().count();
+        self.marked_selection = selected
+            .filter(|r| r.start <= r.end && r.end <= len)
+            .unwrap_or(len..len);
+        self.marked_text = marked;
+        self.reset_blink();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let cell = self.cell?;
+        let cursor = self.session.snapshot().cursor;
+        Some(Bounds {
+            origin: point(
+                self.canvas_origin.get().x + cell.width * cursor.col as f32,
+                self.canvas_origin.get().y + cell.height * cursor.row as f32,
+            ),
+            size: gpui_kit::size(cell.width, cell.height),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui_kit::Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, window: &mut Window, _: &mut Context<Self>) -> bool {
+        self.focus_state(window).accepts_input() && !self.session.is_closing()
+    }
+
+    fn paste(
+        &mut self,
+        item: gpui_kit::ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(text) = item.text() {
+            self.paste_text(text, window, cx);
+        }
+    }
+}
+
+fn replace_marked(old: &str, range: Option<std::ops::Range<usize>>, text: &str) -> Option<String> {
+    let mut utf16: Vec<_> = old.encode_utf16().collect();
+    let range = range.unwrap_or(0..utf16.len());
+    // Refuse invalid offsets, including positions inside a surrogate pair.
+    String::from_utf16(utf16.get(..range.start)?).ok()?;
+    String::from_utf16(utf16.get(range.clone())?).ok()?;
+    utf16.splice(range, text.encode_utf16());
+    String::from_utf16(&utf16).ok()
+}
+
 impl gpui_kit::Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus.clone()
@@ -1287,10 +1829,13 @@ impl gpui_kit::Focusable for TerminalView {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{EntityInputHandler, InputEvent};
 
     fn cell(c: char) -> CellSnapshot {
         CellSnapshot {
             c,
+            zerowidth: Vec::new(),
+            width: if cjk_is_wide(c) { 2 } else { 1 },
             fg: ColorSnapshot::Default,
             bg: ColorSnapshot::Default,
             bold: false,
@@ -1307,12 +1852,7 @@ mod tests {
     }
 
     /// Every character in the test rows is one column, which is what a
-    /// headless `NoopTextSystem` measures: no font is loaded, so nothing is
-    /// ever wide.
-    fn never_wide(_: char) -> bool {
-        false
-    }
-
+    /// test fixture supplies parser widths independently of font measurements.
     /// Wide only for CJK, which is the case the arithmetic exists for.
     fn cjk_is_wide(c: char) -> bool {
         ('\u{1100}'..='\u{9fff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c)
@@ -1426,6 +1966,10 @@ mod tests {
     /// something to echo, without the child exiting: a test that raced an exiting
     /// child would be a test about scheduling.
     fn echo_session() -> TerminalSession {
+        script_session("printf selection-text; cat")
+    }
+
+    fn script_session(script: &str) -> TerminalSession {
         let backend = Arc::new(crate::pty::TerminalBackend::default());
         let mut config = crate::terminal::TerminalSessionConfig::new(
             format!("muster-native-view-{}", std::process::id()),
@@ -1434,10 +1978,7 @@ mod tests {
             24,
             Some(std::path::PathBuf::from("/bin/sh")),
         );
-        config.args = Some(vec![
-            "-c".to_owned(),
-            "printf selection-text; cat".to_owned(),
-        ]);
+        config.args = Some(vec!["-c".to_owned(), script.to_owned()]);
         config.drain_deadline = Duration::from_millis(500);
         TerminalSession::spawn(Arc::clone(&backend), config).expect("the test session spawns")
     }
@@ -1561,7 +2102,7 @@ mod tests {
             // The pause is the resize: the grid is measured after the child
             // starts, and a resize drops an anchor it cannot place, so a prompt
             // that announced itself first would be forgotten.
-            "stty -echo; sleep 0.3; printf 'abcd\\033]133;B\\007cd'; IFS= read -r line; printf 'GOT:%s\\n' \"$line\" | cat -v; sleep 30"
+            "stty -echo; sleep 0.3; printf 'abcd\\033]133;B\\007cdxy\\033[2D'; IFS= read -r line; printf 'GOT:%s\\n' \"$line\" | cat -v; sleep 30"
                 .to_owned(),
         ]);
         config.drain_deadline = Duration::from_millis(500);
@@ -1569,7 +2110,12 @@ mod tests {
     }
 
     /// What the child answered, once it has answered.
+    ///
+    /// `od` pads its columns, so both sides are compared with runs of whitespace
+    /// collapsed: the question is which bytes arrived, not how they were aligned.
     fn wait_for_line(session: &TerminalSession, wanted: &str) -> Option<String> {
+        let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wanted = squeezed(wanted);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let text: String = session
@@ -1579,7 +2125,7 @@ mod tests {
                 .flat_map(|row| row.cells.iter())
                 .map(|cell| cell.c)
                 .collect();
-            if let Some(rest) = text.split(wanted).nth(1) {
+            if let Some(rest) = squeezed(&text).split(&wanted).nth(1) {
                 return Some(rest.trim_end().to_owned());
             }
             if std::time::Instant::now() >= deadline {
@@ -1652,7 +2198,7 @@ mod tests {
         for _ in 0..3 {
             cx.update(|window, cx| window.render_frame(cx));
         }
-        assert!(wait_for_char(&session, 'c'), "the prompt never drew");
+        assert!(wait_for_char(&session, 'y'), "the prompt never drew");
 
         let (origin, cell) = view.read_with(cx, |view, _| {
             (
@@ -1680,6 +2226,270 @@ mod tests {
         let answer = wait_for_line(&session, "GOT:");
         let _ = session.close().wait();
         answer
+    }
+
+    #[test]
+    fn marked_text_replacements_use_utf16_without_splitting_surrogates() {
+        assert_eq!(
+            replace_marked("a😀b", Some(1..3), "中").as_deref(),
+            Some("a中b")
+        );
+        assert_eq!(replace_marked("😀", Some(1..2), "x"), None);
+        assert_eq!(replace_marked("a", Some(3..4), "x"), None);
+        assert_eq!(replace_marked("日本", None, "語").as_deref(), Some("語"));
+    }
+
+    #[test]
+    fn cursor_override_and_sidebar_focus_preserve_readability() {
+        let fg = opaque((200, 80, 40));
+        let bg = opaque((20, 30, 40));
+        let normal = opaque(CURSOR_COLOR);
+        let focused = FocusState {
+            focused: true,
+            window_active: true,
+        };
+        let empty = block_cursor_colors(fg, bg, true, focused, Some(normal));
+        assert_eq!(empty.background, normal);
+        assert_eq!(empty.foreground, bg);
+        let hidden = block_cursor_colors(fg, bg, false, focused, Some(normal));
+        assert_eq!(hidden.background, bg);
+        assert_eq!(hidden.foreground, fg);
+        let sidebar = FocusState {
+            focused: false,
+            window_active: true,
+        };
+        assert!(sidebar.draws_unfocused_cursor());
+        let colors = block_cursor_colors(fg, bg, true, sidebar, None);
+        assert_eq!(colors.foreground, fg);
+        assert_eq!(colors.background, bg);
+    }
+
+    #[test]
+    fn layout_uses_parser_widths_including_leading_spacers_and_combining_cells() {
+        let mut spacer = cell(' ');
+        spacer.width = 0;
+        let mut wide = cell('x'); // Width is from the parser, not the font/character.
+        wide.width = 2;
+        let cells = [spacer.clone(), wide, spacer, cell('a')];
+        assert_eq!(
+            place_row(&cells)
+                .iter()
+                .map(|p| (p.column, p.columns))
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (3, 1)]
+        );
+        let mut combined = cell('e');
+        combined.zerowidth.push('\u{301}');
+        assert_eq!(compatible_run_end(&[combined, cell('f')], 0, false), 1);
+    }
+
+    #[gpui_kit::test]
+    fn word_line_and_shift_selection_copy_on_release(cx: &mut gpui_kit::TestAppContext) {
+        let session = script_session("printf 'alpha beta'; cat");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&session, 'b'));
+        let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
+        let at = |col| point(origin.x + cell.width * col, origin.y + cell.height * 0.5);
+        cx.simulate_click(at(2.2), Default::default());
+        cx.simulate_click(at(2.2), Default::default());
+        assert_eq!(session.snapshot().selection.as_deref(), Some("alpha"));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text())
+                .as_deref(),
+            Some("alpha")
+        );
+        cx.simulate_click(at(2.2), Default::default());
+        assert_eq!(
+            session.snapshot().selection.as_deref(),
+            Some("alpha beta\n")
+        );
+        let shift = gpui_kit::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(at(0.2), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(9.8), MouseButton::Left, shift);
+        cx.simulate_mouse_up(at(9.8), MouseButton::Left, shift);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text())
+                .as_deref(),
+            Some("alpha beta")
+        );
+        let _ = session.close().wait();
+    }
+
+    #[gpui_kit::test]
+    fn composition_stays_local_until_commit_and_plain_text_is_sent_once(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let session = echo_session();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |v, _| Arc::clone(v.session()));
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&session, 's'));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|window, cx| view.update(cx, |v, cx| v.focus.focus(window, cx)));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(None, "日本", Some(2..2), window, cx);
+                assert_eq!(v.marked_text_range(window, cx), Some(0..2));
+            })
+        });
+        assert!(!session
+            .snapshot()
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .any(|c| c.c == '日'));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(None, "日本", window, cx);
+                assert_eq!(v.marked_text_range(window, cx), None);
+            })
+        });
+        assert!(wait_for_char(&session, '日'));
+        cx.simulate_keystrokes("q");
+        assert!(wait_for_char(&session, 'q'));
+        assert_eq!(
+            session
+                .snapshot()
+                .rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .filter(|c| c.c == 'q')
+                .count(),
+            1
+        );
+        let _ = session.close().wait();
+    }
+
+    #[gpui_kit::test]
+    fn wheel_scrolls_history_and_typing_returns_to_the_live_view(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let session = script_session("i=0; while [ $i -lt 200 ]; do printf 'history-%s\\n' \"$i\"; i=$((i+1)); done; printf Z; cat");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |v, _| Arc::clone(v.session()));
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&session, 'Z'));
+        let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
+        let position = point(origin.x + cell.width * 2.5, origin.y + cell.height * 0.5);
+        cx.simulate_click(position, Default::default());
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui_kit::ScrollWheelEvent {
+                    position,
+                    delta: gpui_kit::ScrollDelta::Lines(point(0., 3.)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        assert_eq!(session.snapshot().display_offset, 3);
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("q");
+        assert_eq!(session.snapshot().display_offset, 0);
+        assert!(wait_for_char(&session, 'q'));
+        let _ = session.close().wait();
+    }
+
+    #[gpui_kit::test]
+    fn tui_mouse_reports_reach_the_child_but_shift_drag_remains_local(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let session = script_session("stty raw -echo; sleep 0.3; printf 'alpha beta\\033[?1000h\\033[?1006h'; dd bs=1 count=18 2>/dev/null | od -An -tx1; sleep 30");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |v, _| Arc::clone(v.session()));
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&session, 'b'));
+        assert!(session.snapshot().mouse_tracking);
+        let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
+        let at = |col| point(origin.x + cell.width * col, origin.y + cell.height * 0.5);
+        let shift = gpui_kit::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(at(0.2), MouseButton::Left, shift);
+        cx.simulate_mouse_move(at(9.8), MouseButton::Left, shift);
+        cx.simulate_mouse_up(at(9.8), MouseButton::Left, shift);
+        assert_eq!(session.snapshot().selection.as_deref(), Some("alpha beta"));
+        // No bytes were sent by the local override; dd still needs both reports.
+        cx.simulate_click(at(2.2), Default::default());
+        let got = wait_for_line(&session, "1b 5b 3c 30 3b 33 3b 31 4d").unwrap_or_else(|| {
+            panic!(
+                "missing SGR press: {}",
+                session
+                    .snapshot()
+                    .rows
+                    .iter()
+                    .map(|r| r
+                        .cells
+                        .iter()
+                        .map(|c| c.c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        assert!(
+            got.contains("6d"),
+            "the SGR release also reached the child: {got}"
+        );
+        let _ = session.close().wait();
     }
 
     #[test]
@@ -1756,11 +2566,11 @@ mod tests {
             window_active: false,
         };
 
-        let inverted = block_cursor_colors(foreground, background, true, focused);
+        let inverted = block_cursor_colors(foreground, background, true, focused, None);
         assert_eq!(inverted.foreground, background);
         assert_eq!(inverted.background, foreground);
 
-        let unfocused = block_cursor_colors(foreground, background, true, inactive);
+        let unfocused = block_cursor_colors(foreground, background, true, inactive, None);
         assert_eq!(
             unfocused,
             CellColors {
@@ -1768,7 +2578,7 @@ mod tests {
                 background
             }
         );
-        let hidden = block_cursor_colors(foreground, background, false, focused);
+        let hidden = block_cursor_colors(foreground, background, false, focused, None);
         assert_eq!(
             hidden,
             CellColors {
@@ -1787,7 +2597,7 @@ mod tests {
         let cells = vec![cell('a'), cell('中'), cell(' '), cell('b')];
         assert_eq!(cells.len(), 4, "the parser gave the wide glyph two columns");
 
-        let placements = place_row(&cells, cjk_is_wide);
+        let placements = place_row(&cells);
         assert_eq!(
             placements,
             vec![
@@ -1831,7 +2641,7 @@ mod tests {
     #[test]
     fn a_wide_character_at_the_end_of_a_row_does_not_run_past_it() {
         let cells = vec![cell('中'), cell(' ')];
-        let placements = place_row(&cells, cjk_is_wide);
+        let placements = place_row(&cells);
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].columns, 2);
         assert_eq!(
@@ -1869,7 +2679,7 @@ mod tests {
     #[test]
     fn a_row_with_nothing_wide_is_one_placement_per_column() {
         let cells = row("hello");
-        let placements = place_row(&cells, never_wide);
+        let placements = place_row(&cells);
         assert_eq!(placements.len(), cells.len());
         assert!(placements.iter().all(|p| p.columns == 1));
         assert_eq!(

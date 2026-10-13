@@ -6,20 +6,9 @@
 //! rather than an unknown one. All of that arrives here, and the only thing
 //! that leaves is a [`KeyPress`] or a refusal.
 //!
-//! ### One source of text, on purpose
-//!
-//! A physical press can reach a view twice: once as a native key event and once
-//! as committed text from the input method. Sending both is how a shell ends up
-//! with `lls` for two presses of `l`, and it is invisible until something
-//! breaks. **The native key event is the only source here.** This view never
-//! registers a [`gpui_kit::InputHandler`], so the text-input path never fires
-//! for it and there is no second event to deduplicate.
-//!
-//! What that costs is a real IME *composition* -- the underlining text a person
-//! is halfway through typing. A commit is not lost, though: it arrives on the
-//! key event as a multi-character `key_char`, and it is carried whole in
-//! [`KeyPress::text`] for the encoder to send as bytes. What is lost is the
-//! in-progress marking, which is the next milestone's problem and not this one's.
+//! Printable text is committed by the native input handler, never also sent
+//! from key-down. This adapter remains the source of control, navigation and
+//! modified terminal keys. Uncommitted IME text stays in the view until commit.
 
 use gpui_kit::Keystroke;
 
@@ -61,7 +50,7 @@ impl FocusState {
 
     /// Whether the cursor is drawn as though nobody is typing.
     pub fn draws_unfocused_cursor(self) -> bool {
-        !self.window_active
+        !self.accepts_input()
     }
 }
 
@@ -173,6 +162,66 @@ fn printable(keystroke: &Keystroke) -> Option<String> {
     (!only.is_control()).then(|| only.to_string())
 }
 
+/// One grid-relative mouse report, independent of the window's coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseReport {
+    /// Left/middle/right = 0/1/2, no button = 3, wheel up/down = 64/65.
+    pub button: u8,
+    pub row: usize,
+    pub col: usize,
+    pub release: bool,
+    pub motion: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+pub(super) fn encode_mouse(report: MouseReport, modes: &super::TerminalModes) -> Option<Vec<u8>> {
+    if !(modes.mouse_click || modes.mouse_drag || modes.mouse_motion)
+        || (report.motion && !(modes.mouse_motion || (modes.mouse_drag && report.button < 3)))
+        || !matches!(report.button, 0..=3 | 64 | 65)
+    {
+        return None;
+    }
+    let modifiers =
+        4 * u8::from(report.shift) + 8 * u8::from(report.alt) + 16 * u8::from(report.ctrl);
+    let button = if report.release && !modes.mouse_sgr {
+        3
+    } else {
+        report.button
+    };
+    let code = button + modifiers + 32 * u8::from(report.motion);
+    if modes.mouse_sgr {
+        return Some(
+            format!(
+                "\x1b[<{code};{};{}{}",
+                report.col + 1,
+                report.row + 1,
+                if report.release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        );
+    }
+    let limit = if modes.mouse_utf8 { 2014 } else { 222 };
+    if report.row > limit || report.col > limit {
+        return None;
+    }
+    let mut bytes = b"\x1b[M".to_vec();
+    for value in [usize::from(code) + 32, report.col + 33, report.row + 33] {
+        if modes.mouse_utf8 {
+            let mut encoded = [0; 4];
+            bytes.extend_from_slice(
+                char::from_u32(value as u32)?
+                    .encode_utf8(&mut encoded)
+                    .as_bytes(),
+            );
+        } else {
+            bytes.push(value as u8);
+        }
+    }
+    Some(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use gpui_kit::Modifiers;
@@ -185,6 +234,91 @@ mod tests {
             key: key.to_owned(),
             key_char: key_char.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn mouse_reports_follow_negotiated_modes_and_formats() {
+        let report = MouseReport {
+            button: 0,
+            row: 2,
+            col: 4,
+            release: false,
+            motion: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        let mut modes = super::super::TerminalModes::default();
+        assert_eq!(encode_mouse(report, &modes), None);
+        modes.mouse_click = true;
+        assert_eq!(encode_mouse(report, &modes), Some(b"\x1b[M %#".to_vec()));
+        modes.mouse_sgr = true;
+        assert_eq!(encode_mouse(report, &modes), Some(b"\x1b[<0;5;3M".to_vec()));
+        assert_eq!(
+            encode_mouse(
+                MouseReport {
+                    release: true,
+                    ..report
+                },
+                &modes
+            ),
+            Some(b"\x1b[<0;5;3m".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseReport {
+                    motion: true,
+                    ..report
+                },
+                &modes
+            ),
+            None
+        );
+        modes.mouse_drag = true;
+        assert_eq!(
+            encode_mouse(
+                MouseReport {
+                    motion: true,
+                    ctrl: true,
+                    ..report
+                },
+                &modes
+            ),
+            Some(b"\x1b[<48;5;3M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseReport {
+                    motion: true,
+                    button: 3,
+                    ..report
+                },
+                &modes
+            ),
+            None
+        );
+        modes.mouse_motion = true;
+        assert_eq!(
+            encode_mouse(
+                MouseReport {
+                    motion: true,
+                    button: 3,
+                    ..report
+                },
+                &modes
+            ),
+            Some(b"\x1b[<35;5;3M".to_vec())
+        );
+        modes.mouse_sgr = false;
+        assert_eq!(
+            encode_mouse(MouseReport { col: 223, ..report }, &modes),
+            None
+        );
+        modes.mouse_utf8 = true;
+        assert_eq!(
+            encode_mouse(MouseReport { col: 223, ..report }, &modes),
+            Some("\x1b[M \u{100}#".as_bytes().to_vec())
+        );
     }
 
     fn plain(key: &str) -> Keystroke {

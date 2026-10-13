@@ -8,18 +8,14 @@
 //! the window asks for it, and read by everything that decides which bytes a key
 //! press becomes.
 //!
-//! Only the modes that change what is *sent* are here. A mouse-reporting mode
-//! changes what the window does with a click, not what a keystroke is, and a
-//! mode nothing on the input path reads is one this crate would have to keep
-//! honest for no benefit.
+//! Keyboard, mouse and focus reporting read the same negotiated state. A click
+//! must go to exactly one owner: either the child or the local selection.
 //!
 //! No alacritty type crosses this boundary for the same reason
 //! [`CellSnapshot`](super::CellSnapshot) exists: the parser's names resolve
 //! against the parser's world, and this half has to stay usable without it.
 
-/// Six bools rather than a word of bits, because each one is a question this
-/// crate asks of a child -- and a child that has never been asked anything is
-/// `false` in all six.
+/// Parser-independent negotiated input modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TerminalModes {
     /// `DECCKM`: arrows are `SS3 A`.. rather than `CSI A`..
@@ -45,4 +41,11 @@ pub struct TerminalModes {
     /// `LNM`, `TermMode::LINE_FEED_NEW_LINE`: Enter is a line feed where it
     /// would otherwise be a carriage return.
     pub newline_is_return: bool,
+    pub mouse_click: bool,
+    pub mouse_drag: bool,
+    pub mouse_motion: bool,
+    pub mouse_sgr: bool,
+    pub mouse_utf8: bool,
+    pub alternate_scroll: bool,
+    pub focus_reporting: bool,
 }

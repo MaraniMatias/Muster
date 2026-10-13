@@ -21,15 +21,15 @@ pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Why a paste was refused, with both numbers.
-///
-/// The attempted size is reported because the useful message is "this paste was
-/// 3.1 MB and the limit is 1 MB", and a caller that cannot say that is showing
-/// the same error for a paste one byte over the line and for a clipboard that
-/// holds a video file's worth of text.
+/// Why a paste was refused before any bytes reached the child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteError {
-    TooLarge { bytes: usize, limit: usize },
+    TooLarge {
+        bytes: usize,
+        limit: usize,
+    },
+    /// Without bracketed paste, a line ending may execute a command.
+    Unsafe,
 }
 
 /// Encode a paste for `modes`, or refuse it.
@@ -39,6 +39,22 @@ pub enum PasteError {
 /// they already hold; the two markers and the CRLF folding can only make the
 /// result smaller.
 pub fn encode_paste(text: &str, modes: &TerminalModes) -> Result<Vec<u8>, PasteError> {
+    encode_paste_inner(text, modes, false)
+}
+
+/// User approval bypasses only the multiline check, never control sanitization.
+pub(super) fn encode_paste_confirmed(
+    text: &str,
+    modes: &TerminalModes,
+) -> Result<Vec<u8>, PasteError> {
+    encode_paste_inner(text, modes, true)
+}
+
+fn encode_paste_inner(
+    text: &str,
+    modes: &TerminalModes,
+    confirmed: bool,
+) -> Result<Vec<u8>, PasteError> {
     if text.len() > MAX_PASTE_BYTES {
         return Err(PasteError::TooLarge {
             bytes: text.len(),
@@ -46,12 +62,32 @@ pub fn encode_paste(text: &str, modes: &TerminalModes) -> Result<Vec<u8>, PasteE
         });
     }
 
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !modes.bracketed_paste && !confirmed && text.contains(['\r', '\n']) {
+        return Err(PasteError::Unsafe);
+    }
+
     // A clipboard on macOS or Windows carries CRLF, and a terminal in raw mode
     // reads CR as a byte in its own right rather than as half of a line ending.
     // Every terminal emulator folds it on paste, and a child that wanted the
     // carriage return never asked for it -- it was in the clipboard, not in the
     // keypress.
-    let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalised: String = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .map(|c| {
+            // ESC can terminate bracketed paste; other C0/C1 controls can edit,
+            // suspend or interrupt the process. Spaces keep tokens separated.
+            if c.is_control() && c != '\t' && c != '\n' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
 
     let bracketed = modes.bracketed_paste;
     let mut bytes = Vec::with_capacity(normalised.len() + 2 * BRACKETED_PASTE_START.len());
@@ -93,8 +129,9 @@ mod tests {
         // Markers sent to a child that never asked are six and six characters
         // of escape sequence sitting in its input line, which is exactly what
         // the markers exist to prevent in the other direction.
+        assert_eq!(encode_paste(text, &plain()), Err(PasteError::Unsafe));
         assert_eq!(
-            encode_paste(text, &plain()).expect("a paste under the limit"),
+            encode_paste_confirmed(text, &plain()).expect("the user approved the line ending"),
             b"git status\n"
         );
 
@@ -123,7 +160,7 @@ mod tests {
                 "{input:?}"
             );
             assert_eq!(
-                encode_paste(input, &plain()).expect("a paste under the limit"),
+                encode_paste_confirmed(input, &plain()).expect("a confirmed paste under the limit"),
                 expected.as_bytes(),
                 "{input:?}"
             );
@@ -133,7 +170,7 @@ mod tests {
         // on its own first would turn a CR into a LF and leave the LF that
         // followed it as a blank line of its own.
         assert_eq!(
-            encode_paste("a\r\nb", &plain()).expect("a paste under the limit"),
+            encode_paste_confirmed("a\r\nb", &plain()).expect("a confirmed paste under the limit"),
             b"a\nb"
         );
     }
@@ -195,12 +232,39 @@ mod tests {
 
     #[test]
     fn an_empty_paste_encodes_to_nothing_rather_than_to_just_the_markers() {
-        // There is nothing to tell the child about, and a child in bracketed
-        // paste mode treats the two markers as an empty paste it should run.
-        assert_eq!(
-            encode_paste("", &bracketed()),
-            Ok(b"\x1b[200~\x1b[201~".to_vec())
-        );
+        assert_eq!(encode_paste("", &bracketed()), Ok(Vec::new()));
         assert_eq!(encode_paste("", &plain()), Ok(Vec::new()));
+        assert_eq!(encode_paste_confirmed("", &bracketed()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn controls_cannot_escape_the_paste_even_after_confirmation() {
+        let input = "café\t界\u{301}\x1b[201~\x00\x03\x08\x7f\u{85}\nnext";
+        let sanitized = "café\t界\u{301} [201~     \nnext";
+        assert_eq!(
+            encode_paste(input, &bracketed()).unwrap(),
+            format!("\x1b[200~{sanitized}\x1b[201~").into_bytes()
+        );
+        assert_eq!(encode_paste(input, &plain()), Err(PasteError::Unsafe));
+        assert_eq!(
+            encode_paste_confirmed(input, &plain()).unwrap(),
+            sanitized.as_bytes()
+        );
+        for control in (0u8..=31).chain([127]) {
+            if b"\t\n\r".contains(&control) {
+                continue;
+            }
+            let input = format!("a{}b", char::from(control));
+            assert_eq!(encode_paste(&input, &plain()).unwrap(), b"a b");
+        }
+    }
+
+    #[test]
+    fn every_nonbracketed_line_ending_needs_approval() {
+        for input in ["cmd\n", "cmd\r", "cmd\r\n", "a\nb"] {
+            assert_eq!(encode_paste(input, &plain()), Err(PasteError::Unsafe));
+            assert!(encode_paste_confirmed(input, &plain()).is_ok());
+            assert!(encode_paste(input, &bracketed()).is_ok());
+        }
     }
 }

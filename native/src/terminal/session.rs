@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use super::core::{CursorSnapshot, PromptAnchor, RowSnapshot, TerminalCore, TerminalEvent};
 use super::keys::{encode_key, KeyPress};
 use super::modes::TerminalModes;
-use super::paste::{encode_paste, PasteError};
+use super::paste::{encode_paste, encode_paste_confirmed, PasteError};
 use super::write_queue::{EnqueueError, WriteQueue};
 use crate::pty::{OutputSink, ReaderEnd, ReaderEndSink, SpawnOptions, TerminalBackend};
 use crate::workspace::TerminalProcessState;
@@ -121,7 +121,7 @@ pub struct TerminalHost {
     /// Called for every `ColorRequest`, including the ones the parser could
     /// have answered itself: the terminal's own palette is a preference, and
     /// only the host holds it.
-    pub resolve_color: Box<dyn Fn(u8) -> (u8, u8, u8) + Send + Sync>,
+    pub resolve_color: Box<dyn Fn(usize) -> (u8, u8, u8) + Send + Sync>,
     /// The current cell size, asked again for every query rather than cached:
     /// a font size can change under a window that is still open.
     pub cell_metrics: Box<dyn Fn() -> CellMetrics + Send + Sync>,
@@ -457,6 +457,8 @@ pub struct TerminalSnapshot {
     pub alt_screen: bool,
     pub mouse_tracking: bool,
     pub display_offset: usize,
+    pub history_size: usize,
+    pub background: Option<(u8, u8, u8)>,
     pub prompt_anchor: Option<PromptAnchor>,
 }
 
@@ -652,6 +654,9 @@ struct Shared {
     /// system clipboard is a claim about the user's data that this crate cannot
     /// check, so the request becomes a state the host can see and refuse.
     clipboard_requested: AtomicBool,
+    /// A reply could not be delivered. Sticky across otherwise successful polls:
+    /// the child may still be waiting and must not appear healthy again.
+    protocol_error: Mutex<Option<String>>,
     /// Bells, counted rather than flagged so a host can rate-limit them.
     bell: AtomicU64,
     /// The size the child is to believe, which is what a `TextAreaSizeRequest`
@@ -673,6 +678,7 @@ impl Shared {
             stream: Mutex::new(StreamState::Open),
             status: Mutex::new(PolledStatus::default()),
             clipboard_requested: AtomicBool::new(false),
+            protocol_error: Mutex::new(None),
             bell: AtomicU64::new(0),
             requested: Mutex::new((cols, rows)),
             applied: Mutex::new((cols, rows)),
@@ -905,20 +911,26 @@ impl Inner {
         Box::new(move |bytes: &[u8]| {
             side.shared.chunks.fetch_add(1, Ordering::Relaxed);
 
-            // The parser lock is the outermost lock in this file. The reader
-            // takes it to parse and to answer the child's queries, the resize
-            // worker takes it to resize the grid, and the view takes it to
-            // snapshot. Nothing taken while holding it takes it again.
-            {
+            // Capture events in order under the parser lock, then release it
+            // before invoking the host or waiting for writer budget. Both the
+            // view and resize worker must be able to read while replies wait.
+            let events = {
                 let mut core = side.shared.core();
                 core.feed(bytes);
-                handle_events(&side, &mut core);
+                core.take_events()
+            };
+            let result = handle_events(&side, events);
+            if let Err(error) = &result {
+                *side
+                    .shared
+                    .protocol_error
+                    .lock()
+                    .expect("terminal protocol error poisoned") = Some(error.clone());
             }
 
-            // After the parse, never before: a wake the view acts on before the
-            // bytes are parsed is a wake it renders nothing from.
+            // After parsing and recording failures, never before either.
             side.wake.signal();
-            Ok(())
+            result
         })
     }
 
@@ -1028,7 +1040,7 @@ impl Inner {
             shell: polled.shell,
             foreground: polled.foreground,
             stream,
-            poll_error: polled.poll_error,
+            poll_error: side_protocol_error(&self.side).or(polled.poll_error),
         }
     }
 
@@ -1160,17 +1172,33 @@ fn apply_resize(inner: &Inner, request: ResizeRequest) {
     }
 }
 
-/// Act on what the parser reported, on the reader thread.
-///
-/// Everything here happens before the wake, because everything here is part of
-/// what the view is about to be woken for.
-fn handle_events(side: &ReaderSide, core: &mut TerminalCore) {
-    for event in core.take_events() {
+fn side_protocol_error(side: &ReaderSide) -> Option<String> {
+    side.shared
+        .protocol_error
+        .lock()
+        .expect("terminal protocol error poisoned")
+        .clone()
+}
+
+/// Dispatch drained events in order, with no parser guard held. Complete before
+/// the wake so callbacks and delivery failures are visible to the next frame.
+fn handle_events(side: &ReaderSide, events: Vec<TerminalEvent>) -> Result<(), String> {
+    // Closing suppresses child-driven host effects but still allows tail parsing.
+    if side.shared.closing.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if let Some(error) = side_protocol_error(side) {
+        return Err(error);
+    }
+    for event in events {
+        if side.shared.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match event {
             // Never dropped, and never given a private path around the queue:
             // a reply that is late is survivable, one that is dropped is a
             // child that waits for a second it will never be sent.
-            TerminalEvent::PtyWrite(reply) => push_reply(&side.queue, reply.into_bytes()),
+            TerminalEvent::PtyWrite(reply) => push_reply(side, reply.into_bytes())?,
             // The core is the authority on the title; it already stored the
             // sanitised one while translating, and `snapshot` reads it there.
             TerminalEvent::TitleChanged(_) => {}
@@ -1187,9 +1215,8 @@ fn handle_events(side: &ReaderSide, core: &mut TerminalCore) {
                 // 256. An index past the end is a program asking for an entry
                 // that does not exist, and it is still blocked on an answer, so
                 // it gets one rather than silence.
-                let index = u8::try_from(index).unwrap_or(0);
                 let (r, g, b) = (side.host.resolve_color)(index);
-                push_reply(&side.queue, respond(r, g, b).into_bytes());
+                push_reply(side, respond(r, g, b).into_bytes())?;
             }
             // Answered from the session's own size, because a child asking how
             // big its text area is is asking how big it will be.
@@ -1197,15 +1224,16 @@ fn handle_events(side: &ReaderSide, core: &mut TerminalCore) {
                 let (cols, rows) = side.shared.requested();
                 let metrics = (side.host.cell_metrics)();
                 push_reply(
-                    &side.queue,
+                    side,
                     respond(cols, rows, metrics.width, metrics.height).into_bytes(),
-                );
+                )?;
             }
             TerminalEvent::Bell => {
                 side.shared.bell.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+    Ok(())
 }
 
 /// Hand a protocol reply to the write queue, waiting its turn for room.
@@ -1214,24 +1242,22 @@ fn handle_events(side: &ReaderSide, core: &mut TerminalCore) {
 /// two ways out of a full budget are to wait or to exceed it. Waiting is what a
 /// blocked child needs; a deadline on that waiting is what stops a closing
 /// session from waiting for a child that will never read.
-fn push_reply(queue: &WriteQueue, reply: Vec<u8>) {
+fn push_reply(side: &ReaderSide, reply: Vec<u8>) -> Result<(), String> {
     let deadline = Instant::now() + REPLY_ROOM_DEADLINE;
     loop {
-        let outcome = queue.push(reply.clone());
-        match outcome {
-            Ok(()) => return,
+        if side.shared.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match side.queue.push(reply.clone()) {
+            Ok(()) => return Ok(()),
             Err(EnqueueError::Stopped) => {
-                // The session is over and the child is going with it. There is
-                // nobody left to answer.
-                log::warn!("a terminal reply was not sent because the session stopped writing");
-                return;
+                return Err("terminal protocol reply failed: the writer stopped".to_owned());
             }
             Err(error) => {
                 if Instant::now() >= deadline {
-                    log::warn!(
-                        "a terminal reply was dropped after waiting for queue room: {error:?}"
-                    );
-                    return;
+                    return Err(format!(
+                        "terminal protocol reply queue timed out: {error:?}"
+                    ));
                 }
                 thread::sleep(REPLY_ROOM_RETRY);
             }
@@ -1424,6 +1450,8 @@ impl TerminalSession {
             alt_screen: core.is_alt_screen(),
             mouse_tracking: core.is_mouse_tracking(),
             display_offset: core.display_offset(),
+            history_size: core.history_size(),
+            background: core.background(),
             prompt_anchor: core.prompt_anchor(),
         }
     }
@@ -1431,6 +1459,82 @@ impl TerminalSession {
     /// Update terminal text selection from viewport grid coordinates.
     pub fn select(&self, start: (usize, usize), end: (usize, usize)) {
         self.inner.shared().core().select(start, end);
+    }
+
+    pub fn start_selection(&self, point: (usize, usize), kind: super::SelectionKind) {
+        self.inner.shared().core().start_selection(point, kind);
+    }
+
+    pub fn update_selection(&self, point: (usize, usize)) {
+        self.inner.shared().core().update_selection(point);
+    }
+
+    pub fn scroll_by(&self, lines: i32) {
+        let mut core = self.inner.shared().core();
+        if !core.is_alt_screen() {
+            core.scroll_by(lines);
+        }
+    }
+
+    pub fn set_display_offset(&self, offset: usize) {
+        let mut core = self.inner.shared().core();
+        if !core.is_alt_screen() {
+            core.set_display_offset(offset);
+        }
+    }
+
+    /// Queue the entire movement from a single grid/mode read, or nothing.
+    pub fn move_caret_to(&self, row: usize, col: usize) -> Result<(), SessionError> {
+        self.accept_new_work()?;
+        let bytes = {
+            let core = self.inner.shared().core();
+            let Some((count, right)) = core.prompt_caret_move(row, col) else {
+                return Ok(());
+            };
+            let arrow = if right { b'C' } else { b'D' };
+            let sequence = [
+                0x1b,
+                if core.modes().app_cursor { b'O' } else { b'[' },
+                arrow,
+            ];
+            let mut bytes = Vec::with_capacity(count * sequence.len());
+            for _ in 0..count {
+                bytes.extend_from_slice(&sequence);
+            }
+            bytes
+        };
+        self.inner.push_input(bytes)
+    }
+
+    pub fn send_mouse(&self, report: super::MouseReport) -> Result<(), SessionError> {
+        self.accept_new_work()?;
+        let bytes = {
+            let core = self.inner.shared().core();
+            if report.row >= usize::from(core.rows()) || report.col >= usize::from(core.cols()) {
+                return Ok(());
+            }
+            super::input::encode_mouse(report, &core.modes())
+        };
+        if let Some(bytes) = bytes {
+            self.inner.push_input(bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn send_focus(&self, focused: bool) -> Result<(), SessionError> {
+        self.accept_new_work()?;
+        if self.modes().focus_reporting {
+            self.inner
+                .push_input(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec())?;
+        }
+        Ok(())
+    }
+
+    pub fn send_text(&self, text: &str) -> Result<(), SessionError> {
+        self.accept_new_work()?;
+        self.inner.push_input(text.as_bytes().to_vec())?;
+        self.inner.shared().core().scroll_to_bottom();
+        Ok(())
     }
 
     pub fn clear_selection(&self) {
@@ -1534,15 +1638,37 @@ impl TerminalSession {
         if press.key == super::keys::Key::Enter {
             self.invalidate_prompt_anchor();
         }
-        self.inner.push_input(bytes)
+        self.inner.push_input(bytes)?;
+        self.inner.shared().core().scroll_to_bottom();
+        Ok(())
     }
 
     /// Encode a paste against the child's bracketed-paste mode, and queue it.
     pub fn paste(&self, text: &str) -> Result<(), SessionError> {
+        self.paste_inner(text, false)
+    }
+
+    /// Paste after explicit user approval of possible command execution.
+    /// Approval never bypasses size limits or control-character sanitization.
+    pub fn paste_confirmed(&self, text: &str) -> Result<(), SessionError> {
+        self.paste_inner(text, true)
+    }
+
+    fn paste_inner(&self, text: &str, confirmed: bool) -> Result<(), SessionError> {
         self.accept_new_work()?;
         let modes = self.modes();
-        let bytes = encode_paste(text, &modes).map_err(SessionError::Paste)?;
-        self.inner.push_input(bytes)
+        let bytes = if confirmed {
+            encode_paste_confirmed(text, &modes)
+        } else {
+            encode_paste(text, &modes)
+        }
+        .map_err(SessionError::Paste)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.inner.push_input(bytes)?;
+        self.inner.shared().core().scroll_to_bottom();
+        Ok(())
     }
 
     fn modes(&self) -> TerminalModes {
@@ -1879,7 +2005,7 @@ mod tests {
     fn probe_size(session: &TerminalSession) -> String {
         let before = occurrences(&grid(session), "PROBE");
         session
-            .paste("stty size; printf 'PROB%s\\n' E\n")
+            .paste_confirmed("stty size; printf 'PROB%s\\n' E\n")
             .expect("the probe is written");
         wait_for("the child to answer the probe", || {
             occurrences(&grid(session), "PROBE") > before
@@ -1922,6 +2048,106 @@ mod tests {
             return false;
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn host_callbacks_can_read_the_parser_and_events_keep_their_order() {
+        let shared = Arc::new(Shared::new(80, 24, TEST_SCROLLBACK));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let callback = |kind: &'static str| {
+            let shared = Arc::clone(&shared);
+            let calls = Arc::clone(&calls);
+            move || {
+                assert!(
+                    shared.parser.try_lock().is_ok(),
+                    "host held the parser lock"
+                );
+                calls.lock().unwrap().push(kind);
+            }
+        };
+        let clipboard = callback("clipboard");
+        let color = callback("color");
+        let metrics = callback("metrics");
+        let (wake, _) = Wake::new();
+        let side = ReaderSide {
+            shared,
+            queue: Arc::new(WriteQueue::spawn(|_| Ok(()))),
+            host: Arc::new(TerminalHost {
+                store_clipboard: Box::new(move |_| clipboard()),
+                resolve_color: Box::new(move |_| {
+                    color();
+                    (1, 2, 3)
+                }),
+                cell_metrics: Box::new(move || {
+                    metrics();
+                    CellMetrics {
+                        width: 8,
+                        height: 16,
+                    }
+                }),
+            }),
+            wake: Arc::new(wake),
+        };
+        let mut sink = Inner::output_sink(side.clone());
+        sink(b"\x1b]52;c;aGVsbG8=\x07\x1b]4;1;?\x07\x1b[14t").unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["clipboard", "color", "metrics"]);
+        side.queue.stop();
+    }
+
+    #[test]
+    fn a_reply_wait_does_not_lock_the_parser_and_failure_is_recorded() {
+        use std::sync::mpsc;
+
+        let shared = Arc::new(Shared::new(80, 24, TEST_SCROLLBACK));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut first = true;
+        let queue = Arc::new(WriteQueue::spawn(move |_| {
+            if first {
+                first = false;
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            }
+            Ok(())
+        }));
+        queue.push(vec![b'x']).unwrap();
+        started_rx.recv_timeout(PATIENCE).unwrap();
+        for _ in 0..super::super::write_queue::MAX_QUEUED_REQUESTS {
+            queue.push(Vec::new()).unwrap();
+        }
+        let (callback_tx, callback_rx) = mpsc::channel();
+        let (wake, _) = Wake::new();
+        let side = ReaderSide {
+            shared: Arc::clone(&shared),
+            queue: Arc::clone(&queue),
+            host: Arc::new(TerminalHost {
+                cell_metrics: Box::new(move || {
+                    callback_tx.send(()).unwrap();
+                    CellMetrics {
+                        width: 8,
+                        height: 16,
+                    }
+                }),
+                ..TerminalHost::default()
+            }),
+            wake: Arc::new(wake),
+        };
+        let reader_side = side.clone();
+        let reader = thread::spawn(move || {
+            let mut sink = Inner::output_sink(reader_side);
+            sink(b"\x1b[14t")
+        });
+        let callback_seen = callback_rx.recv_timeout(PATIENCE).is_ok();
+        let parser_available = shared.parser.try_lock().is_ok();
+        // Keep the queue full until the reply deadline, without holding the
+        // parser. Release the writer before asserting so cleanup cannot hang.
+        let result = reader.join().unwrap();
+        release_tx.send(()).unwrap();
+        queue.stop();
+        assert!(callback_seen);
+        assert!(parser_available, "reply wait held the parser lock");
+        assert!(result.is_err());
+        assert!(side_protocol_error(&side).is_some_and(|error| error.contains("queue timed out")));
     }
 
     #[test]
@@ -2208,6 +2434,10 @@ mod tests {
             Err(SessionError::Closing)
         ));
         assert!(matches!(session.paste("hello"), Err(SessionError::Closing)));
+        assert!(matches!(
+            session.paste_confirmed("hello\n"),
+            Err(SessionError::Closing)
+        ));
         assert!(matches!(
             session.resize(100, 40),
             Err(SessionError::Closing)

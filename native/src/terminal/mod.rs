@@ -29,9 +29,9 @@ mod write_queue;
 
 pub use self::core::{
     CellSnapshot, ColorSnapshot, CursorShapeSnapshot, CursorSnapshot, PromptAnchor, RowSnapshot,
-    TerminalCore, TerminalEvent, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_TITLE_CHARS,
+    SelectionKind, TerminalCore, TerminalEvent, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_TITLE_CHARS,
 };
-pub use self::input::{FocusState, Input};
+pub use self::input::{FocusState, Input, MouseReport};
 pub use self::keys::{encode_key, Key, KeyPress};
 pub use self::modes::TerminalModes;
 pub use self::paste::{encode_paste, PasteError, MAX_PASTE_BYTES};

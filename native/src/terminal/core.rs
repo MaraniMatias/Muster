@@ -2,15 +2,17 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::{Colors, COUNT as COLOR_COUNT};
 // Not a test-only path, despite living in a module called `test`: the vendored
 // crate leaves `pub mod test` ungated, and it is the crate's own `Dimensions`
 // implementation, so there is no reason for this crate to grow a second one.
 // `native/src/terminal_parser.rs` already reaches for the same type.
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
+use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
 
 use super::modes::TerminalModes;
 
@@ -50,6 +52,10 @@ const MAX_OSC_PAYLOAD_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellSnapshot {
     pub c: char,
+    /// Codepoints attached to the base cell, including combining marks.
+    pub zerowidth: Vec<char>,
+    /// Parser-owned column span: zero for spacers, one or two otherwise.
+    pub width: u8,
     pub fg: ColorSnapshot,
     pub bg: ColorSnapshot,
     pub bold: bool,
@@ -99,6 +105,9 @@ pub struct CursorSnapshot {
     /// real one.
     pub visible: bool,
     pub shape: CursorShapeSnapshot,
+    pub blinking: bool,
+    /// OSC 12 override, if the program supplied one.
+    pub color: Option<(u8, u8, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +117,14 @@ pub enum CursorShapeSnapshot {
     Beam,
     HollowBlock,
     Hidden,
+}
+
+/// Local selection granularity; the parser expands words and wrapped lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionKind {
+    Simple,
+    Word,
+    Line,
 }
 
 /// Something the parser reported that the window has to act on.
@@ -238,6 +255,10 @@ impl TerminalCore {
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
         let config = Config {
             scrolling_history: scrollback_lines,
+            default_cursor_style: CursorStyle {
+                shape: CursorShape::Block,
+                blinking: true,
+            },
             // Shift+Enter is only a distinct key to a program that has been told
             // it may disambiguate one, and this is what tells it.
             kitty_keyboard: true,
@@ -314,7 +335,7 @@ impl TerminalCore {
                 // The grid is read after the parser has consumed exactly up to
                 // the terminator and before anything after it, which is the
                 // position the marker was written at.
-                self.parser.advance(&mut self.term, &bytes[offset..=index]);
+                self.advance(&bytes[offset..=index]);
                 let marker = std::mem::take(&mut self.osc);
                 if !self.osc_oversized {
                     self.apply_shell_marker(&marker);
@@ -324,10 +345,22 @@ impl TerminalCore {
             }
         }
         if offset < bytes.len() {
-            self.parser.advance(&mut self.term, &bytes[offset..]);
+            self.advance(&bytes[offset..]);
             self.handle_events_at_position();
         }
         self.string_scan = state;
+    }
+
+    /// A full-damage operation can scroll or replace rows. There is no parser
+    /// marker API to follow our separate prompt anchor through that operation,
+    /// so retire it rather than allow a click to edit unrelated content. Merely
+    /// scrolling the viewport is safe and is not part of this input operation.
+    fn advance(&mut self, bytes: &[u8]) {
+        self.term.reset_damage();
+        self.parser.advance(&mut self.term, bytes);
+        if matches!(self.term.damage(), TermDamage::Full) || self.is_alt_screen() {
+            self.prompt_anchor = None;
+        }
     }
 
     /// One byte of the OSC payload being scanned, kept only while it fits.
@@ -367,7 +400,7 @@ impl TerminalCore {
                 self.command_exit = None;
                 self.prompt_anchor = None;
             }
-            "B" => {
+            "B" if !self.is_alt_screen() => {
                 let grid = self.term.grid();
                 self.prompt_anchor = Some(PromptAnchor {
                     line: grid.cursor.point.line.0,
@@ -452,12 +485,19 @@ impl TerminalCore {
             // is dropped: the palette and the cell metrics are the host's, so both
             // are handed on with the reply attached, and a program that asked once
             // gets exactly one chance to be unblocked.
-            Event::ColorRequest(index, format) => Some(TerminalEvent::ColorRequested {
-                index,
-                respond: Box::new(move |r, g, b| {
-                    format(alacritty_terminal::vte::ansi::Rgb { r, g, b })
-                }),
-            }),
+            Event::ColorRequest(index, format) => {
+                if index < COLOR_COUNT {
+                    if let Some(color) = self.term.colors()[index] {
+                        return Some(TerminalEvent::PtyWrite(format(color)));
+                    }
+                }
+                Some(TerminalEvent::ColorRequested {
+                    index,
+                    respond: Box::new(move |r, g, b| {
+                        format(alacritty_terminal::vte::ansi::Rgb { r, g, b })
+                    }),
+                })
+            }
             Event::TextAreaSizeRequest(format) => Some(TerminalEvent::TextAreaSizeRequested {
                 respond: Box::new(move |cols, rows, cell_width, cell_height| {
                     format(WindowSize {
@@ -483,34 +523,114 @@ impl TerminalCore {
     pub fn prompt_anchor(&self) -> Option<PromptAnchor> {
         let anchor = self.prompt_anchor?;
         let grid = self.term.grid();
-        // Only preserve an anchor while its line's display mapping is unchanged.
-        // Any scroll/reflow we cannot prove invalidates it rather than guessing.
-        (anchor.display_offset == grid.display_offset()
-            && (-(grid.total_lines() as i32)..grid.screen_lines() as i32).contains(&anchor.line))
-        .then_some(anchor)
+        // Display scrolling does not change a grid line's identity. Input that
+        // can move or replace rows is guarded separately in `advance`.
+        (-(grid.history_size() as i32)..grid.screen_lines() as i32)
+            .contains(&anchor.line)
+            .then_some(anchor)
     }
 
     pub fn move_prompt_caret(&mut self, row: usize, column: usize) -> Option<usize> {
+        self.prompt_caret_move(row, column).map(|(count, _)| count)
+    }
+
+    /// Arrow count and direction (`true` for right) from one authoritative read.
+    /// Soft-wrapped rows are one edit line; hard newlines, tabs and combining
+    /// clusters are refused because shell editors can count them differently.
+    pub fn prompt_caret_move(&self, row: usize, column: usize) -> Option<(usize, bool)> {
+        if self.is_alt_screen() || self.is_mouse_tracking() {
+            return None;
+        }
         let anchor = self.prompt_anchor()?;
         let grid = self.term.grid();
-        let anchor_row = anchor.line + grid.display_offset() as i32;
-        let cursor_row = grid.cursor.point.line.0 + grid.display_offset() as i32;
-        // Movement is intentionally limited to the same physical line. The PTY
-        // does not expose Readline/ZLE's logical line mapping, so wrapped or
-        // multiline input is ambiguous and must remain inert.
-        if row as i32 != anchor_row || cursor_row != anchor_row || row != cursor_row as usize {
+        if row >= grid.screen_lines() || column >= grid.columns() {
             return None;
         }
-        let start = anchor.column;
-        let end = grid.cursor.point.column.0;
-        // Before the prompt is not editable, and on the caret is nowhere to go.
-        // Past the caret is allowed in both directions: the shell's own line is
-        // longer than its cursor whenever the caret sits in the middle of it,
-        // and refusing that is refusing half the line.
-        if column < start || column == end {
+        let target = Point::new(
+            Line(row as i32 - grid.display_offset() as i32),
+            Column(column),
+        );
+        let start = Point::new(Line(anchor.line), Column(anchor.column));
+        let cursor = grid.cursor.point;
+        if target < start || cursor < start {
             return None;
         }
-        Some(column.abs_diff(end))
+
+        // Find the logical line, following only rows explicitly soft-wrapped by
+        // the parser. A separate continuation prompt is not guessed to be input.
+        let mut last_line = start.line;
+        while last_line < grid.bottommost_line()
+            && grid[last_line][grid.last_column()]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            last_line += 1;
+        }
+        if target.line > last_line || cursor.line > last_line {
+            return None;
+        }
+        let columns = grid.columns();
+        let ordinal =
+            |point: Point| (point.line - start.line).0 as usize * columns + point.column.0;
+        let cursor_offset = ordinal(cursor) + usize::from(grid.cursor.input_needs_wrap);
+        let mut target_offset = ordinal(target);
+        if grid[target.line][target.column]
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER)
+        {
+            target_offset = target_offset.saturating_sub(1);
+        }
+
+        // The caret certifies occupied cells up to itself. Text to its right
+        // certifies the remaining input, but empty padding past that is inert.
+        let mut end = cursor_offset;
+        for line in start.line.0..=last_line.0 {
+            let first = if line == start.line.0 {
+                start.column.0
+            } else {
+                0
+            };
+            for col in first..columns {
+                let cell = &grid[Line(line)][Column(col)];
+                if cell.c == '\t' {
+                    // A tab and its fill columns are not individual edit keys.
+                    return None;
+                }
+                if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                        2
+                    } else {
+                        1
+                    };
+                    end = end.max(ordinal(Point::new(Line(line), Column(col))) + width);
+                }
+            }
+        }
+        if target_offset > end || target_offset == cursor_offset {
+            return None;
+        }
+
+        let (from, to) = if target_offset < cursor_offset {
+            (target_offset, cursor_offset)
+        } else {
+            (cursor_offset, target_offset)
+        };
+        let mut count = 0;
+        for offset in from..to {
+            let line = start.line + (offset / columns) as i32;
+            let col = Column(offset % columns);
+            let cell = &grid[line][col];
+            if cell.zerowidth().is_some_and(|chars| !chars.is_empty()) {
+                return None;
+            }
+            if !cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                count += 1;
+            }
+        }
+        (count > 0).then_some((count, target_offset > cursor_offset))
     }
 
     pub fn invalidate_prompt_anchor(&mut self) {
@@ -543,7 +663,12 @@ impl TerminalCore {
         (0..grid.screen_lines())
             .map(|row| RowSnapshot {
                 cells: (0..grid.columns())
-                    .map(|col| cell_snapshot(&grid[Line(row as i32 - offset)][Column(col)]))
+                    .map(|col| {
+                        cell_snapshot(
+                            &grid[Line(row as i32 - offset)][Column(col)],
+                            self.term.colors(),
+                        )
+                    })
                     .collect(),
             })
             .collect()
@@ -567,6 +692,8 @@ impl TerminalCore {
             row: row.max(0).min(grid.screen_lines().saturating_sub(1) as i32) as usize,
             col: grid.cursor.point.column.0,
             visible,
+            blinking: self.term.cursor_style().blinking,
+            color: self.term.colors()[NamedColor::Cursor].map(|color| (color.r, color.g, color.b)),
             shape: match shape {
                 CursorShape::Block => CursorShapeSnapshot::Block,
                 CursorShape::Underline => CursorShapeSnapshot::Underline,
@@ -580,6 +707,14 @@ impl TerminalCore {
     /// How many lines the view is scrolled back from the live bottom.
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    pub fn background(&self) -> Option<(u8, u8, u8)> {
+        self.term.colors()[NamedColor::Background].map(|color| (color.r, color.g, color.b))
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -640,6 +775,13 @@ impl TerminalCore {
             disambiguate_esc_codes: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
             report_event_types: mode.contains(TermMode::REPORT_EVENT_TYPES),
             newline_is_return: mode.contains(TermMode::LINE_FEED_NEW_LINE),
+            mouse_click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
+            mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
+            mouse_sgr: mode.contains(TermMode::SGR_MOUSE),
+            mouse_utf8: mode.contains(TermMode::UTF8_MOUSE),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
         }
     }
 
@@ -665,31 +807,45 @@ impl TerminalCore {
         self.term.selection.as_ref()?.to_range(&self.term)
     }
 
+    fn selection_point(&self, (row, col): (usize, usize)) -> Point {
+        let grid = self.term.grid();
+        Point::new(
+            Line(
+                row.min(grid.screen_lines().saturating_sub(1)) as i32
+                    - grid.display_offset() as i32,
+            ),
+            Column(col.min(grid.columns().saturating_sub(1))),
+        )
+    }
+
+    /// Capture an anchor in grid coordinates once, not once per drag frame.
+    /// The parser rotates this selection with output, independently of the view.
+    pub fn start_selection(&mut self, point: (usize, usize), kind: SelectionKind) {
+        let point = self.selection_point(point);
+        let ty = match kind {
+            SelectionKind::Simple => SelectionType::Simple,
+            SelectionKind::Word => SelectionType::Semantic,
+            SelectionKind::Line => SelectionType::Lines,
+        };
+        let mut selection = Selection::new(ty, point, Side::Left);
+        if kind != SelectionKind::Simple {
+            selection.update(point, Side::Right);
+        }
+        self.term.selection = Some(selection);
+    }
+
+    pub fn update_selection(&mut self, end: (usize, usize)) {
+        let end = self.selection_point(end);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(end, Side::Right);
+            selection.include_all();
+        }
+    }
+
     /// Select the inclusive grid range described by viewport cells.
     pub fn select(&mut self, start: (usize, usize), end: (usize, usize)) {
-        use alacritty_terminal::index::{Point, Side};
-        use alacritty_terminal::selection::{Selection, SelectionType};
-
-        let grid = self.term.grid();
-        let clamp = |(row, col): (usize, usize)| {
-            Point::new(
-                Line(
-                    row.min(grid.screen_lines().saturating_sub(1)) as i32
-                        - grid.display_offset() as i32,
-                ),
-                Column(col.min(grid.columns().saturating_sub(1))),
-            )
-        };
-        let start = clamp(start);
-        let end = clamp(end);
-        let (anchor, anchor_side, head, head_side) = if start <= end {
-            (start, Side::Left, end, Side::Right)
-        } else {
-            (start, Side::Right, end, Side::Left)
-        };
-        let mut selection = Selection::new(SelectionType::Simple, anchor, anchor_side);
-        selection.update(head, head_side);
-        self.term.selection = Some(selection);
+        self.start_selection(start, SelectionKind::Simple);
+        self.update_selection(end);
     }
 }
 
@@ -714,11 +870,22 @@ fn sanitise_title(raw: &str) -> Option<String> {
 }
 
 /// Copy one grid cell into the shape the view reads.
-fn cell_snapshot(cell: &Cell) -> CellSnapshot {
+fn cell_snapshot(cell: &Cell, colors: &Colors) -> CellSnapshot {
     CellSnapshot {
         c: cell.c,
-        fg: color_snapshot(cell.fg),
-        bg: color_snapshot(cell.bg),
+        zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+        width: if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            0
+        } else if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        },
+        fg: color_snapshot(cell.fg, colors),
+        bg: color_snapshot(cell.bg, colors),
         bold: cell.flags.contains(Flags::BOLD),
         dim: cell.flags.contains(Flags::DIM),
         italic: cell.flags.contains(Flags::ITALIC),
@@ -731,9 +898,24 @@ fn cell_snapshot(cell: &Cell) -> CellSnapshot {
 }
 
 /// Map a parser colour onto the three cases a palette has to answer for.
-fn color_snapshot(color: Color) -> ColorSnapshot {
+fn color_snapshot(color: Color, colors: &Colors) -> ColorSnapshot {
+    let override_color = match color {
+        Color::Spec(rgb) => Some(rgb),
+        Color::Indexed(index) => colors[index as usize],
+        Color::Named(named) => colors[named].or_else(|| {
+            matches!(
+                named,
+                NamedColor::BrightForeground | NamedColor::DimForeground
+            )
+            .then(|| colors[NamedColor::Foreground])
+            .flatten()
+        }),
+    };
+    if let Some(rgb) = override_color {
+        return ColorSnapshot::Rgb(rgb.r, rgb.g, rgb.b);
+    }
     match color {
-        Color::Spec(rgb) => ColorSnapshot::Rgb(rgb.r, rgb.g, rgb.b),
+        Color::Spec(_) => unreachable!("literal RGB was resolved above"),
         Color::Indexed(index) => ColorSnapshot::Indexed(index),
         Color::Named(named) => {
             // `NamedColor` is documented as castable to an index precisely so it
@@ -762,7 +944,9 @@ fn color_snapshot(color: Color) -> ColorSnapshot {
                 _ => return ColorSnapshot::Default,
             };
 
-            ColorSnapshot::Indexed(index as u8)
+            colors[index].map_or(ColorSnapshot::Indexed(index as u8), |rgb| {
+                ColorSnapshot::Rgb(rgb.r, rgb.g, rgb.b)
+            })
         }
     }
 }
@@ -914,6 +1098,222 @@ mod tests {
         assert_eq!(core.selection_text().as_deref(), Some("o\nwo"));
         core.select((1, 1), (0, 4));
         assert_eq!(core.selection_text().as_deref(), Some("o\nwo"));
+    }
+
+    #[test]
+    fn snapshots_keep_combining_codepoints_and_parser_widths() {
+        let mut core = TerminalCore::new(8, 2, 10);
+        core.feed("e\u{301}界".as_bytes());
+        let row = &core.visible_rows()[0].cells;
+        assert_eq!(row[0].c, 'e');
+        assert_eq!(row[0].zerowidth, ['\u{301}']);
+        assert_eq!(row[0].width, 1);
+        assert_eq!(row[1].c, '界');
+        assert_eq!(row[1].width, 2);
+        assert_eq!(row[2].width, 0);
+
+        let mut wrapped = TerminalCore::new(4, 2, 10);
+        wrapped.feed("abc界".as_bytes());
+        let rows = wrapped.visible_rows();
+        assert_eq!(rows[0].cells[3].width, 0, "leading spacer is not a glyph");
+        assert_eq!(rows[1].cells[0].width, 2);
+        assert_eq!(rows[1].cells[1].width, 0);
+    }
+
+    #[test]
+    fn word_and_line_selection_expand_and_stay_granular_during_drag() {
+        let mut core = TerminalCore::new(16, 2, 10);
+        core.feed(b"alpha beta");
+        core.start_selection((0, 2), SelectionKind::Word);
+        assert_eq!(core.selection_text().as_deref(), Some("alpha"));
+        core.update_selection((0, 7));
+        assert_eq!(core.selection_text().as_deref(), Some("alpha beta"));
+        core.update_selection((0, 0));
+        assert_eq!(core.selection_text().as_deref(), Some("alpha"));
+
+        let mut wrapped = TerminalCore::new(5, 3, 10);
+        wrapped.feed(b"abcdefgh\r\nnext");
+        wrapped.start_selection((1, 1), SelectionKind::Line);
+        assert_eq!(wrapped.selection_text().as_deref(), Some("abcdefgh\n"));
+    }
+
+    #[test]
+    fn drag_anchor_stays_on_content_when_viewport_or_output_scrolls() {
+        let mut core = TerminalCore::new(8, 2, 10);
+        core.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!(core.history_size(), 1);
+        core.start_selection((0, 0), SelectionKind::Simple);
+        core.scroll_by(1);
+        core.update_selection((0, 0));
+        assert_eq!(core.selection_text().as_deref(), Some("one\nt"));
+
+        core.scroll_to_bottom();
+        core.start_selection((0, 0), SelectionKind::Simple);
+        core.update_selection((0, 2));
+        assert_eq!(core.selection_text().as_deref(), Some("two"));
+        core.feed(b"\r\nfour");
+        core.scroll_by(1);
+        core.update_selection((0, 2));
+        assert_eq!(core.selection_text().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn dynamic_colors_are_used_for_cells_cursor_queries_and_reset() {
+        let mut core = core();
+        core.feed(b"\x1b]4;1;#112233\x07\x1b]10;#445566\x07\x1b]11;#778899\x07\x1b]12;#abcdef\x07");
+        core.feed(b"\x1b[31mx\x1b[0my");
+        let row = &core.visible_rows()[0].cells;
+        assert_eq!(row[0].fg, ColorSnapshot::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(row[1].fg, ColorSnapshot::Rgb(0x44, 0x55, 0x66));
+        assert_eq!(row[1].bg, ColorSnapshot::Rgb(0x77, 0x88, 0x99));
+        assert_eq!(core.background(), Some((0x77, 0x88, 0x99)));
+        assert_eq!(core.cursor().color, Some((0xab, 0xcd, 0xef)));
+        core.take_events();
+        core.feed(b"\x1b]4;1;?\x07\x1b]11;?\x07");
+        let replies: Vec<_> = core
+            .take_events()
+            .into_iter()
+            .filter_map(|event| {
+                if let TerminalEvent::PtyWrite(reply) = event {
+                    Some(reply)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                "\x1b]4;1;rgb:1111/2222/3333\x07",
+                "\x1b]11;rgb:7777/8888/9999\x07",
+            ]
+        );
+        core.feed(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+        assert_eq!(
+            core.visible_rows()[0].cells[0].fg,
+            ColorSnapshot::Indexed(1)
+        );
+        assert_eq!(core.visible_rows()[0].cells[1].fg, ColorSnapshot::Default);
+        assert_eq!(core.background(), None);
+        assert_eq!(core.cursor().color, None);
+        core.feed(b"\x1b]11;?\x07");
+        assert!(core.take_events().iter().any(|event| matches!(event,
+            TerminalEvent::ColorRequested { index, .. } if *index == NamedColor::Background as usize)));
+    }
+
+    #[test]
+    fn cursor_blink_and_shape_follow_program_requests() {
+        let mut core = core();
+        assert!(core.cursor().blinking);
+        core.feed(b"\x1b[2 q");
+        assert!(!core.cursor().blinking);
+        assert_eq!(core.cursor().shape, CursorShapeSnapshot::Block);
+        core.feed(b"\x1b[5 q");
+        assert!(core.cursor().blinking);
+        assert_eq!(core.cursor().shape, CursorShapeSnapshot::Beam);
+        core.feed(b"\x1b[0 q");
+        assert!(core.cursor().blinking);
+        assert_eq!(core.cursor().shape, CursorShapeSnapshot::Block);
+        core.feed(b"\x1b[?25l");
+        assert!(!core.cursor().visible);
+    }
+
+    #[test]
+    fn snapshots_expose_negotiated_mouse_and_focus_modes() {
+        let mut core = core();
+        core.feed(b"\x1b[?1000h\x1b[?1006h\x1b[?1004h");
+        let modes = core.modes();
+        assert!(modes.mouse_click && modes.mouse_sgr && modes.focus_reporting);
+        assert!(!modes.mouse_drag && !modes.mouse_motion);
+        core.feed(b"\x1b[?1002h");
+        assert!(core.modes().mouse_drag);
+        assert!(!core.modes().mouse_click);
+        core.feed(b"\x1b[?1003h\x1b[?1005h\x1b[?1007l");
+        assert!(core.modes().mouse_motion && core.modes().mouse_utf8);
+        assert!(!core.modes().mouse_sgr && !core.modes().alternate_scroll);
+    }
+
+    #[test]
+    fn prompt_click_counts_wide_characters_once_and_handles_wraps() {
+        let mut core = TerminalCore::new(8, 3, 10);
+        core.feed("> \x1b]133;B\x07ab界cdef".as_bytes());
+        assert_eq!(core.prompt_caret_move(0, 4), Some((5, false)));
+        assert_eq!(
+            core.prompt_caret_move(0, 5),
+            Some((5, false)),
+            "spacer maps to glyph"
+        );
+        core.feed(b"\x1b[1;3H");
+        assert_eq!(core.prompt_caret_move(1, 1), Some((6, true)));
+        assert_eq!(
+            core.prompt_caret_move(1, 2),
+            Some((7, true)),
+            "line end is editable"
+        );
+        assert_eq!(
+            core.prompt_caret_move(1, 3),
+            None,
+            "padding beyond line end"
+        );
+        assert_eq!(core.prompt_caret_move(0, 1), None, "before prompt");
+    }
+
+    #[test]
+    fn prompt_clicks_refuse_tabs_combining_cells_and_non_shell_screens() {
+        let mut tab = core();
+        tab.feed(b"> \x1b]133;B\x07a\tb");
+        assert_eq!(tab.prompt_caret_move(0, 3), None);
+        let mut combining = core();
+        combining.feed("> \x1b]133;B\x07e\u{301}x".as_bytes());
+        assert_eq!(combining.prompt_caret_move(0, 2), None);
+        let mut terminal = core();
+        terminal.feed(b"> \x1b]133;B\x07abc\x1b[?1000h");
+        assert_eq!(terminal.prompt_caret_move(0, 2), None);
+        terminal.feed(b"\x1b[?1000l\x1b[?1049h\x1b]133;B\x07abc");
+        assert!(terminal.prompt_anchor().is_none());
+        assert_eq!(terminal.prompt_caret_move(0, 2), None);
+    }
+
+    #[test]
+    fn full_history_scroll_and_screen_replacement_retire_prompt_identity() {
+        let mut core = TerminalCore::new(8, 2, 1);
+        core.feed(b"old\r\nold\r\n> \x1b]133;B\x07abc");
+        assert_eq!(core.history_size(), 1);
+        assert!(core.prompt_anchor().is_some());
+        core.feed(b"\r\n");
+        assert_eq!(
+            core.history_size(),
+            1,
+            "eviction hides growth but not scrolling"
+        );
+        assert!(core.prompt_anchor().is_none());
+        core.feed(b"> \x1b]133;B\x07abc\x1b[2J");
+        assert!(
+            core.prompt_anchor().is_none(),
+            "replaced content is not the same input"
+        );
+    }
+
+    #[test]
+    fn prompt_anchor_survives_viewport_scroll_but_not_output_scroll_or_resize() {
+        let mut core = TerminalCore::new(8, 3, 2);
+        core.feed(b"old\r\nold\r\n> \x1b]133;B\x07abc");
+        core.scroll_by(1);
+        assert!(core.prompt_anchor().is_some());
+        core.scroll_to_bottom();
+        assert_eq!(core.prompt_caret_move(2, 2), Some((3, false)));
+        core.feed(b"\r\n");
+        assert!(
+            core.prompt_anchor().is_none(),
+            "output scrolled the marker row"
+        );
+        core.feed(b"> \x1b]133;B\x07abc");
+        assert!(core.prompt_anchor().is_some());
+        core.resize(10, 3);
+        assert!(
+            core.prompt_anchor().is_none(),
+            "reflow needs a fresh marker"
+        );
     }
 
     /// `133;B` after `hello` anchors the prompt at column 5, the exact
@@ -1090,7 +1490,8 @@ mod tests {
     #[test]
     fn a_click_on_the_prompt_measures_the_move_and_nothing_else_does() {
         let mut core = core();
-        core.feed(b"ab\x1b]133;B\x07cd");
+        // The caret is in the middle of a real edit buffer, not beyond its end.
+        core.feed(b"ab\x1b]133;B\x07cdef\x1b[2D");
         assert!(
             core.prompt_anchor().is_some(),
             "the prompt is where the marker said it was"
