@@ -21,14 +21,15 @@ docs/             the migration plan, and what the port has to satisfy
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 66 tests and `native` holds 84. The PTY tests are `core`'s: they
+- `core` holds 70 tests and `native` holds 176. The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
 - A focused test: `cargo test --locked -p muster-core pty::`.
-- The native app has no headless UI test suite yet. GPUI's `test-support` feature
-  is on in dev-dependencies; `native/src/app.rs` uses it for the window, focus
-  and close-path cases, and `native/src/sidebar_tests.rs` for the sidebar rows,
-  the worktree dialog and the directory picker.
+- The native app uses GPUI's `test-support` feature for headless UI coverage;
+  `native/src/app.rs` uses it for the window, focus and close-path cases,
+  `native/src/sidebar_tests.rs` for the sidebar rows, the worktree dialog and
+  the directory picker, and `native/src/titlebar_tests.rs` for the title bar:
+  its crumbs, its menus and the window it belongs to.
 - The native workspace lives in `~/.muster/native-workspace.json`, written by
   `core::navigation`. It is **not** the Legacy SQLite database and nothing reads
   the old one. It holds roots, archived checkout ids, the active checkout and

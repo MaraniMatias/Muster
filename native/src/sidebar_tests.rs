@@ -563,16 +563,20 @@ fn worktree_creation_cannot_submit_while_defaults_are_loading(cx: &mut TestAppCo
     close(&fixture, cx);
 }
 
-struct Fixture {
+/// A plain directory with two live terminals, as the sidebar tests open one.
+///
+/// `pub(super)` because the title bar's own tests draw over the same window
+/// rather than standing up a second fixture for it.
+pub(super) struct Fixture {
     _directory: TempDir,
-    handle: AnyWindowHandle,
-    view: Entity<TerminalWindow>,
+    pub(super) handle: AnyWindowHandle,
+    pub(super) view: Entity<TerminalWindow>,
     backend: Arc<TerminalBackend>,
-    checkout: String,
-    sessions: Vec<String>,
+    pub(super) checkout: String,
+    pub(super) sessions: Vec<String>,
 }
 
-fn open(cx: &mut TestAppContext) -> Fixture {
+pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let repo = Repo::plain(directory.path(), "test").unwrap();
     let checkout = repo.checkouts[0].id.clone();
@@ -660,7 +664,7 @@ fn open(cx: &mut TestAppContext) -> Fixture {
     }
 }
 
-fn dispose(fixture: &Fixture, cx: &mut TestAppContext) {
+pub(super) fn dispose(fixture: &Fixture, cx: &mut TestAppContext) {
     cx.update_window(fixture.handle, |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
@@ -1222,16 +1226,16 @@ fn escape_cancels_a_sidebar_drag_without_reordering_or_selecting_the_drop_row(
 /// A window over one real Git repository, with no terminals of its own.
 /// Named with a leading underscore because it exists to be dropped: the
 /// worktree lives inside it and the row is read from the window, not the disk.
-struct GitFixture {
+pub(super) struct GitFixture {
     _directory: TempDir,
-    handle: AnyWindowHandle,
-    view: Entity<TerminalWindow>,
-    root: PathBuf,
-    repo_id: String,
-    checkout: String,
+    pub(super) handle: AnyWindowHandle,
+    pub(super) view: Entity<TerminalWindow>,
+    pub(super) root: PathBuf,
+    pub(super) repo_id: String,
+    pub(super) checkout: String,
 }
 
-fn open_git(cx: &mut TestAppContext) -> GitFixture {
+pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
     let directory = tempfile::tempdir().unwrap();
     let root = git_repository(directory.path());
     let opened = navigation::open_directory(&root).unwrap();
@@ -1269,7 +1273,7 @@ fn open_git(cx: &mut TestAppContext) -> GitFixture {
     }
 }
 
-fn close(fixture: &GitFixture, cx: &mut TestAppContext) {
+pub(super) fn close(fixture: &GitFixture, cx: &mut TestAppContext) {
     cx.update_window(fixture.handle, |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
@@ -2386,6 +2390,13 @@ async fn native_directory_picker_adds_a_checkout_without_spawning_a_shell(cx: &m
         );
         assert_eq!(app.navigation.active_session, None);
         assert_eq!(app.terminals.len(), 2);
+        let repo = app
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.checkouts.iter().any(|item| item.id == checkout))
+            .unwrap();
+        assert_eq!(repo.kind, RepoKind::Plain);
         assert!(app
             .navigation
             .checkout(&checkout)
@@ -2394,6 +2405,9 @@ async fn native_directory_picker_adds_a_checkout_without_spawning_a_shell(cx: &m
             .is_empty());
     });
     cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(format!("select-checkout-{checkout}")).visible());
+        assert!(window.try_find("worktree-crumb").is_none());
         window.click("open-directory", cx)
     })
     .unwrap();

@@ -119,6 +119,17 @@ Use native titlebar/window support and Kit menus; build the breadcrumb row with 
 
 Menu keyboard behavior must support arrows, Enter, Escape, outside click and focus return. A context menu and a breadcrumb popup cannot both remain active accidentally.
 
+### Not ported with the bar
+
+The bar in `native/src/app.rs` carries the window chrome, the three crumbs and the panel toggle. Four pieces of the reference header are **not** migrated, because the surfaces behind them do not exist in the native build yet and a header row for them would be chrome for nothing:
+
+- The settings action: there is no native settings surface to open.
+- The focus/split layout toggle: the native window has one layout, not two.
+- The document/diff crumb and its file glyph: there is no native inspector to open a file from.
+- The maximized-state tracking the reference kept to label its own restore button: the native controls ask the window.
+
+They arrive with the surface each one opens, not before.
+
 ### Checks
 
 - Opening one crumb closes the previous one.

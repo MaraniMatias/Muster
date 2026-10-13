@@ -286,9 +286,10 @@ fn a_drag_in_the_real_window_selects_text_and_copies_it(cx: &mut TestAppContext)
     let mut cx = VisualTestContext::from_window(handle, cx);
     cx.update(|window, _| window.activate_window());
     cx.write_to_clipboard(ClipboardItem::new_string("previous clipboard".to_owned()));
-    // Start on the first row beneath the title bar.
+    // Start on the first row beneath the title bar: the bar is 32px tall, and
+    // a drag that starts on it moves the window rather than selecting.
     cx.simulate_mouse_down(
-        gpui_kit::point(px(4.), px(30.)),
+        gpui_kit::point(px(4.), px(40.)),
         MouseButton::Left,
         Default::default(),
     );
