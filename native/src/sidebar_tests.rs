@@ -86,6 +86,23 @@ fn the_sidebar_bundles_truetype_faces_and_shapes_fitted_labels(cx: &mut TestAppC
             sidebar_repo_path(window, root, "checkout", 500., false),
             root
         );
+        let branch = "feature/sidebar/weigh-a-label";
+        assert_eq!(sidebar_name(window, branch, 1000.), branch);
+        let tail = "…/weigh-a-label";
+        assert_eq!(
+            sidebar_name(
+                window,
+                branch,
+                sidebar_text_width(window, tail, 13.).as_f32()
+            ),
+            tail
+        );
+        assert_eq!(sidebar_name(window, branch, 0.), tail);
+        assert_eq!(sidebar_name(window, "shell", 0.), "shell");
+        assert_eq!(
+            sidebar_name(window, "feature//unicode/日本語", 0.),
+            "…/日本語"
+        );
         let elided = sidebar_repo_path(window, root, "checkout", 200., false);
         assert!(
             elided.starts_with('…') && elided.len() < root.len(),
@@ -94,6 +111,248 @@ fn the_sidebar_bundles_truetype_faces_and_shapes_fitted_labels(cx: &mut TestAppC
     })
     .unwrap();
     dispose(&fixture, cx);
+}
+
+#[test]
+fn sidebar_drag_scroll_speed_grows_toward_the_edge_and_is_bounded() {
+    assert_eq!(sidebar_scroll_step(1.), 2.);
+    assert_eq!(sidebar_scroll_step(12.), 6.);
+    assert_eq!(sidebar_scroll_step(36.), 14.);
+    assert_eq!(sidebar_scroll_step(-1.), -2.);
+    assert_eq!(sidebar_scroll_step(-36.), -14.);
+}
+
+#[gpui_kit::test]
+fn rename_limits_typed_names_and_preserves_unicode(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = fixture.sessions[0].clone();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.double_click(format!("select-session-{id}"), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(format!("select-session-{id}")).is_none());
+        window.click(format!("rename-session-{id}"), cx);
+        assert!(fixture.view.read_with(cx, |app, _| app.editing.is_some()));
+        window.press(
+            if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            },
+            cx,
+        );
+        window.input(&"a".repeat(61), cx);
+        fixture.view.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.editing
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                "a".repeat(60)
+            );
+        });
+        window.press(
+            if cfg!(target_os = "macos") {
+                "cmd-a"
+            } else {
+                "ctrl-a"
+            },
+            cx,
+        );
+        window.input(&"é".repeat(60), cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.navigation.session(&id).unwrap().name, "é".repeat(60));
+    });
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn keyboard_focus_on_a_session_reveals_its_sibling_close_button(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let id = &fixture.sessions[0];
+    cx.update_window(fixture.handle, |_, window, cx| {
+        pointer_move(window, gpui_kit::point(px(600.), px(400.)), None, cx);
+        window.blur(cx);
+        window.focus_next(cx);
+        window.render_frame(cx);
+        for _ in 0..20 {
+            window.press("tab", cx);
+            if window.find(format!("select-session-{id}")).focused() == Some(true) {
+                window.render_frame(cx);
+                assert!(window.find(format!("close-session-{id}")).visible());
+                return;
+            }
+        }
+        panic!("the terminal row was not reachable in the tab order");
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn repo_menu_trigger_stays_visible_until_escape_dismisses_its_menu(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let actions = format!("actions-{}", fixture.repo_id);
+        window.hover(format!("fold-repo-{}", fixture.repo_id), cx);
+        window.click(actions.clone(), cx);
+        fixture.view.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_repo_menu.as_deref(),
+                Some(fixture.repo_id.as_str())
+            );
+            assert!(!app.navigation.folded_repos.contains(&fixture.repo_id));
+        });
+        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
+        window.render_frame(cx);
+        assert!(window.find(actions).visible());
+        window.press("escape", cx);
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.open_repo_menu.is_none()));
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn protected_checkouts_have_no_lifecycle_controls(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let home = "checkout:home-worktree";
+    fixture.view.update(cx, |app, cx| {
+        let repo = &mut app.navigation.repos[0];
+        repo.kind = RepoKind::Git;
+        repo.checkouts[0].is_missing = true;
+        let mut checkout = repo.checkouts[0].clone();
+        checkout.id = home.into();
+        checkout.is_primary = false;
+        checkout.is_missing = false;
+        checkout.sessions.clear();
+        repo.checkouts.push(checkout);
+        app.navigation.home = Some(home.into());
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .try_find(format!("dismiss-missing-{}", fixture.checkout))
+            .is_none());
+        assert!(window
+            .try_find(format!("worktree-actions-{home}"))
+            .is_none());
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn insertion_row_does_not_change_a_stationary_drag_target(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let first = &fixture.sessions[0];
+    let dragged = &fixture.sessions[1];
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let from = window
+            .find(format!("select-session-{dragged}"))
+            .bounds()
+            .center();
+        let first_bounds = window.find(format!("select-session-{first}")).bounds();
+        let to = gpui_kit::point(first_bounds.center().x, first_bounds.top() + px(3.));
+        pointer_down(window, from, cx);
+        pointer_move(window, to, Some(MouseButton::Left), cx);
+        window.render_frame(cx);
+        for _ in 0..3 {
+            pointer_move(window, to, Some(MouseButton::Left), cx);
+            window.render_frame(cx);
+            fixture.view.read_with(cx, |app, _| {
+                assert_eq!(
+                    app.sidebar_drag
+                        .as_ref()
+                        .unwrap()
+                        .target
+                        .as_ref()
+                        .unwrap()
+                        .index,
+                    0
+                );
+            });
+        }
+        pointer_up(window, to, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.navigation.checkout(&fixture.checkout).unwrap().sessions[0].id,
+            *dragged
+        );
+    });
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn diff_refresh_is_immediate_coalesced_and_skips_plain_folders(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let plain = tempfile::tempdir().unwrap();
+    let opened = navigation::open_directory(plain.path()).unwrap();
+    let plain_id = opened.checkout_id.clone();
+    let path = fixture.root.join("new-file");
+    std::fs::write(&path, "one\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.merge(opened, false);
+        app.refresh_diff_totals(cx);
+        assert!(app.diff_refresh_running);
+        app.refresh_diff_totals(cx);
+        assert!(app.diff_refresh_again);
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        let app = fixture.view.read(cx);
+        !app.diff_refresh_running
+            && app
+                .diff_totals
+                .get(&fixture.checkout)
+                .is_some_and(|counts| counts.additions == 1)
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.diff_refresh_again);
+        assert!(!app.diff_totals.contains_key(&plain_id));
+    });
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_totals
+            .get(&fixture.checkout)
+            .is_some_and(|counts| counts.additions == 2)
+    })
+    .await;
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn worktree_creation_cannot_submit_while_defaults_are_loading(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_dialog(&fixture.repo_id, window, cx);
+            assert!(app.worktree.as_ref().unwrap().loading_defaults);
+            app.submit_worktree(window, cx);
+            assert!(!app.worktree.as_ref().unwrap().busy);
+        });
+    })
+    .unwrap();
+    close(&fixture, cx);
 }
 
 struct Fixture {
@@ -530,6 +789,10 @@ fn sidebar_drag_reorders_a_terminal_and_retains_its_pty(cx: &mut TestAppContext)
         let order = &app.navigation.checkout(&fixture.checkout).unwrap().sessions;
         assert_eq!(order[0].id, other);
         assert_eq!(order[1].id, id);
+        assert_eq!(
+            app.navigation.active_session.as_deref(),
+            Some(other.as_str())
+        );
         assert_eq!(app.terminals[&id].view.entity_id(), entity);
     });
     assert!(fixture.backend.status(&id).is_ok());
@@ -1635,6 +1898,40 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         window.click(action, cx);
     })
     .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(!fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.archived.contains(&missing_id)));
+
+    // A pending terminal that arrives during confirmation must prevent hiding the row.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(format!("fold-checkout-{missing_id}"), cx);
+        window.render_frame(cx);
+        window.click(format!("dismiss-missing-{missing_id}"), cx);
+        fixture.view.update(cx, |app, _| {
+            app.navigation
+                .pending
+                .insert("pending".into(), missing_id.clone());
+        });
+    })
+    .unwrap();
+    cx.simulate_prompt_answer("Hide checkout");
+    cx.run_until_parked();
+    fixture.view.update(cx, |app, _| {
+        assert!(!app.navigation.archived.contains(&missing_id));
+        assert!(app.failure.as_ref().unwrap().contains("terminal sessions"));
+        app.navigation.pending.clear();
+    });
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(format!("fold-checkout-{missing_id}"), cx);
+        window.render_frame(cx);
+        window.click(format!("dismiss-missing-{missing_id}"), cx);
+    })
+    .unwrap();
+    cx.simulate_prompt_answer("Hide checkout");
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
             .view

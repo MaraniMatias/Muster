@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     checkbox::Checkbox,
     dialog::{Dialog, DialogContent, DialogFooter},
     input::{Input, InputEvent, InputState},
@@ -80,6 +80,55 @@ fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixel
         .text_system()
         .shape_line(text.into(), px(size), &[run], None)
         .width()
+}
+
+/// Keep the identifying tail of a namespaced branch or session title.
+fn sidebar_name(window: &Window, name: &str, room: f32) -> String {
+    if sidebar_text_width(window, name, 13.).as_f32() <= room {
+        return name.to_owned();
+    }
+    let segments = name
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidate = name.to_owned();
+    for start in 1..segments.len() {
+        candidate = format!("…/{}", segments[start..].join("/"));
+        if sidebar_text_width(window, &candidate, 13.).as_f32() <= room {
+            break;
+        }
+    }
+    candidate
+}
+
+/// A non-tab-stop focus scope lets sibling controls reveal a row's trailing slot.
+fn sidebar_row_focus(window: &mut Window, cx: &mut App, id: &str) -> (gpui_kit::FocusHandle, bool) {
+    let state = window.use_keyed_state(
+        SharedString::from(format!("row-focus-{id}")),
+        cx,
+        |window, cx| {
+            let handle = cx.focus_handle().tab_index(-1);
+            let enter = cx.weak_entity();
+            let leave = enter.clone();
+            let entered = window.on_focus_in(&handle, cx, move |_, cx| {
+                let _ = enter.update(cx, |_, cx| cx.notify());
+            });
+            let left = window.on_focus_out(&handle, cx, move |_, _, cx| {
+                let _ = leave.update(cx, |_, cx| cx.notify());
+            });
+            (handle, entered, left)
+        },
+    );
+    let handle = state.read(cx).0.clone();
+    let focused = handle.contains_focused(window, cx);
+    (handle, focused)
+}
+
+fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .foreground(gpui_kit::rgb(0x8b909c).into())
+        .hover(gpui_kit::rgb(0x2d323c).into())
+        .active(gpui_kit::rgb(0x2d323c).into())
 }
 
 fn sidebar_repo_path(
@@ -357,14 +406,18 @@ struct WorktreeDraft {
     /// Set while the task name is rewriting the branch, so a programmatic
     /// value is not read back as the person having taken the branch over.
     syncing_branch: bool,
+    loading_defaults: bool,
     busy: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
 const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
-const SIDEBAR_SCROLL_EDGE: f32 = 28.0;
-const SIDEBAR_SCROLL_STEP: f32 = 4.0;
+const SIDEBAR_SCROLL_EDGE: f32 = 36.0;
+
+fn sidebar_scroll_step(distance: f32) -> f32 {
+    distance.signum() * (distance.abs() / 2.).clamp(2., 14.)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct SidebarDropTarget {
@@ -385,6 +438,7 @@ struct SidebarDrag {
 enum SidebarDropRegion {
     Session { checkout_id: String, index: usize },
     Append { checkout_id: String, index: usize },
+    Insertion { checkout_id: String, index: usize },
 }
 
 struct SidebarRowBounds {
@@ -409,14 +463,35 @@ fn sidebar_drag_geometry(
     .into_any_element()
 }
 
-fn sidebar_drop_marker() -> AnyElement {
+fn sidebar_drop_marker(
+    target: SidebarDropTarget,
+    rows: Rc<RefCell<Vec<SidebarRowBounds>>>,
+) -> AnyElement {
     div()
-        .absolute()
-        .left(px(8.))
-        .right(px(8.))
-        .top(px(0.))
-        .h(px(2.))
-        .bg(gpui_kit::rgb(0x5b97ff))
+        .id(SharedString::from(format!(
+            "drop-slot-{}-{}",
+            target.checkout_id, target.index
+        )))
+        .relative()
+        .flex()
+        .items_center()
+        .h(px(26.))
+        .pl(px(12.))
+        .gap(px(7.))
+        .border_1()
+        .border_dashed()
+        .border_color(gpui_kit::rgb(0x5b97ff))
+        .text_color(gpui_kit::rgb(0x5b97ff))
+        .text_size(px(11.))
+        .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
+        .child("Drop terminal here")
+        .child(sidebar_drag_geometry(
+            SidebarDropRegion::Insertion {
+                checkout_id: target.checkout_id,
+                index: target.index,
+            },
+            rows,
+        ))
         .into_any_element()
 }
 
@@ -439,12 +514,15 @@ pub struct TerminalWindow {
     /// Absent means "not counted", never "no changes": a checkout Git could
     /// not be asked about draws nothing rather than a confident zero.
     diff_totals: HashMap<String, DiffTotals>,
+    diff_refresh_running: bool,
+    diff_refresh_again: bool,
     worktree: Option<WorktreeDraft>,
     worktree_removal: Option<WorktreeRemovalDraft>,
     owner: Arc<SessionOwner>,
     failure: Option<String>,
     notice: Option<String>,
     opening: bool,
+    open_repo_menu: Option<String>,
     closing: bool,
     closing_sessions: std::collections::HashSet<String>,
     removing_checkouts: HashSet<String>,
@@ -469,12 +547,15 @@ impl TerminalWindow {
             navigation: Navigation::new(),
             terminals: HashMap::new(),
             diff_totals: HashMap::new(),
+            diff_refresh_running: false,
+            diff_refresh_again: false,
             worktree: None,
             worktree_removal: None,
             owner: SessionOwner::new(backend, owns_backend),
             failure: None,
             notice: None,
             opening: false,
+            open_repo_menu: None,
             closing: false,
             closing_sessions: Default::default(),
             removing_checkouts: Default::default(),
@@ -514,6 +595,7 @@ impl TerminalWindow {
                 app.opening = false;
                 app.failure = loaded.errors.first().cloned();
                 app.navigation = loaded.navigation;
+                app.refresh_diff_totals(cx);
                 match loaded.state_path.map(StateWriter::new).transpose() {
                     Ok(writer) => {
                         *app.owner
@@ -727,6 +809,7 @@ impl TerminalWindow {
                                 app.navigation.merge(opened, select);
                                 app.membership_revision += 1;
                                 app.persist();
+                                app.refresh_diff_totals(cx);
                                 if select { app.focus_terminal(window, cx); }
                             }
                         }
@@ -747,7 +830,7 @@ impl TerminalWindow {
             loop {
                 background.timer(Duration::from_secs(2)).await;
                 ticks += 1;
-                let Ok((epoch, repos, closing, counts)) = view.update(cx, |app, cx| {
+                let Ok((epoch, repos, closing)) = view.update(cx, |app, cx| {
                     if let Some(error) = app
                         .owner
                         .writer
@@ -764,20 +847,9 @@ impl TerminalWindow {
                     // Counted far less often than membership is refreshed: a
                     // line total is a full Git read of every changed file, and
                     // this is a background refresh, not a Git watcher.
-                    let counts = if ticks.is_multiple_of(COUNT_EVERY_TICKS) {
-                        app.navigation
-                            .repos
-                            .iter()
-                            .flat_map(|repo| repo.checkouts.iter())
-                            .filter(|checkout| {
-                                !checkout.is_missing
-                                    && !app.navigation.archived.contains(&checkout.id)
-                            })
-                            .map(|checkout| (checkout.id.clone(), checkout.path.clone()))
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
+                    if ticks.is_multiple_of(COUNT_EVERY_TICKS) {
+                        app.refresh_diff_totals(cx);
+                    }
                     (
                         app.membership_revision,
                         app.navigation
@@ -787,7 +859,6 @@ impl TerminalWindow {
                             .map(|repo| (repo.id.clone(), repo.root.clone()))
                             .collect::<Vec<_>>(),
                         app.closing,
-                        counts,
                     )
                 }) else {
                     return;
@@ -808,6 +879,7 @@ impl TerminalWindow {
                         if app.closing || app.membership_revision != epoch {
                             return;
                         }
+                        let previous = app.diff_checkout_paths();
                         for (id, result) in results {
                             if !app.navigation.repos.iter().any(|repo| repo.id == id) {
                                 continue;
@@ -827,39 +899,72 @@ impl TerminalWindow {
                                 }
                             }
                         }
+                        if previous != app.diff_checkout_paths() {
+                            app.refresh_diff_totals(cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
                 {
                     return;
                 }
-                // A checkout Git cannot be counted drops its total rather than
-                // showing a zero it did not measure. The message goes to the log
-                // because the row itself is honest by drawing nothing, and the
-                // dialog that does need the answer asks Git for itself.
-                if counts.is_empty() {
-                    continue;
-                }
-                let totals = background
-                    .spawn(async move {
-                        counts
-                            .into_iter()
-                            .map(|(id, path)| {
-                                let total = navigation::diff_totals(Path::new(&path))
-                                    .map_err(|error| log::debug!("muster-native: {path}: {error}"));
-                                (id, path, total)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-                if view
-                    .update(cx, |app, cx| app.apply_diff_totals(epoch, totals, cx))
-                    .is_err()
-                {
-                    return;
-                }
             }
         }));
+    }
+
+    fn diff_checkout_paths(&self) -> Vec<(String, String)> {
+        self.navigation
+            .repos
+            .iter()
+            .filter(|repo| repo.kind == RepoKind::Git)
+            .flat_map(|repo| &repo.checkouts)
+            .filter(|checkout| {
+                !checkout.is_missing && !self.navigation.archived.contains(&checkout.id)
+            })
+            .map(|checkout| (checkout.id.clone(), checkout.path.clone()))
+            .collect()
+    }
+
+    /// Selection and membership changes refresh immediately, without overlapping Git sweeps.
+    fn refresh_diff_totals(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        if self.diff_refresh_running {
+            self.diff_refresh_again = true;
+            return;
+        }
+        let paths = self.diff_checkout_paths();
+        self.diff_totals
+            .retain(|id, _| paths.iter().any(|(current, _)| current == id));
+        if paths.is_empty() {
+            return;
+        }
+        let revision = self.membership_revision;
+        self.diff_refresh_running = true;
+        let worker = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .map(|(id, path)| {
+                    let total = navigation::diff_totals(Path::new(&path))
+                        .map_err(|error| log::debug!("muster-native: {path}: {error}"));
+                    (id, path, total)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |view, cx| {
+            let totals = worker.await;
+            let _ = view.update(cx, |app, cx| {
+                app.diff_refresh_running = false;
+                app.apply_diff_totals(revision, totals, cx);
+                if std::mem::take(&mut app.diff_refresh_again)
+                    || revision != app.membership_revision
+                {
+                    app.refresh_diff_totals(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn apply_diff_totals(
@@ -999,7 +1104,8 @@ impl TerminalWindow {
         let name = session.name.clone();
         let id = id.to_owned();
         let input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx);
+            let mut input =
+                InputState::new(window, cx).validate(|value, _| value.chars().count() <= 60);
             input.set_value(name, window, cx);
             input.select_all(window, cx);
             input
@@ -1070,6 +1176,9 @@ impl TerminalWindow {
             })
         };
         let task = field("new-task", cx);
+        task.update(cx, |input, cx| {
+            input.set_validator(|value, _| value.chars().count() <= 120, cx)
+        });
         let branch = field("feature/new-task", cx);
         let base = field("", cx);
         let subscriptions = vec![
@@ -1091,6 +1200,30 @@ impl TerminalWindow {
                     }
                 }
             }),
+            cx.subscribe_in(&branch, window, |app, _, event, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false
+                    }
+                ) {
+                    app.submit_worktree(window, cx);
+                }
+            }),
+            cx.subscribe_in(&base, window, |app, _, event, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false
+                    }
+                ) {
+                    app.submit_worktree(window, cx);
+                } else if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
         ];
         task.read(cx).focus_handle(cx).focus(window, cx);
         let repo_id = repo_id.to_owned();
@@ -1106,6 +1239,7 @@ impl TerminalWindow {
             location: Some(PathBuf::from(&repo.root).join(".worktrees")),
             branch_edited: false,
             syncing_branch: false,
+            loading_defaults: true,
             busy: false,
             error: None,
             _subscriptions: subscriptions,
@@ -1138,6 +1272,7 @@ impl TerminalWindow {
         else {
             return;
         };
+        draft.loading_defaults = false;
         match result {
             Ok(defaults) => {
                 if draft.base.read(cx).value().trim().is_empty() {
@@ -1288,7 +1423,7 @@ impl TerminalWindow {
         let Some(draft) = self.worktree.as_ref() else {
             return;
         };
-        if draft.busy {
+        if draft.busy || draft.loading_defaults {
             return;
         }
         let Some(repo) = self
@@ -1336,6 +1471,7 @@ impl TerminalWindow {
                     app.membership_revision += 1;
                     app.navigation.merge(opened, true);
                     app.persist();
+                    app.refresh_diff_totals(cx);
                     app.request_terminal(&checkout, window, cx);
                 }
                 cx.notify();
@@ -1347,7 +1483,12 @@ impl TerminalWindow {
 
     /// The worktree dialog, drawn over the window it belongs to.
     fn worktree_dialog(&self, draft: &WorktreeDraft, cx: &mut Context<Self>) -> AnyElement {
-        let ready = draft.location.is_some() && !draft.busy;
+        let ready = draft.location.is_some()
+            && !draft.busy
+            && !draft.loading_defaults
+            && !draft.task.read(cx).value().trim().is_empty()
+            && !draft.branch.read(cx).value().trim().is_empty()
+            && !draft.base.read(cx).value().trim().is_empty();
         // The content builder is called again on every repaint, so it holds the
         // three input entities and builds the fields itself rather than closing
         // over elements it would have to hand out twice.
@@ -1359,6 +1500,19 @@ impl TerminalWindow {
             .as_ref()
             .map(|location| format!("Worktrees are created under {}", location.display()));
         let error = draft.error.clone();
+        let loading_defaults = draft.loading_defaults;
+        let context = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == draft.repo_id)
+            .map(|repo| {
+                let root = repo.checkouts.iter().find(|checkout| checkout.is_primary);
+                let context = root
+                    .map(|checkout| checkout.branch.as_deref().unwrap_or(&checkout.path))
+                    .unwrap_or(&repo.root);
+                format!("{context} · {}", repo.name)
+            });
         let cancel_button = cx.weak_entity();
         let cancel_dialog = cx.weak_entity();
         let submit_button = cx.weak_entity();
@@ -1366,6 +1520,22 @@ impl TerminalWindow {
             .width(px(440.))
             .title("Create worktree")
             .content(move |content: DialogContent, _, _| {
+                let content = content.when_some(context.clone(), |content, context| {
+                    content.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child(context),
+                    )
+                });
+                if loading_defaults {
+                    return content.child(
+                        div()
+                            .py_4()
+                            .text_size(px(12.))
+                            .child("Checking Git worktree…"),
+                    );
+                }
                 let mut content = content
                     .child(div().text_size(px(12.)).child("Task name"))
                     .child(Input::new(&task).aria_label("Task name").w_full())
@@ -1526,6 +1696,8 @@ impl TerminalWindow {
                 (info.dirty_files.is_empty() || dirty_confirmed)
                     && (info.branch.is_some() || info.unmerged_commits == 0 || unmerged_confirmed)
             });
+        let shell_checkout_id = id.clone();
+        let open_shell = cx.weak_entity();
         let toggle_dirty = cx.weak_entity();
         let toggle_unmerged = cx.weak_entity();
         let toggle_branch = cx.weak_entity();
@@ -1595,8 +1767,20 @@ impl TerminalWindow {
                                     .child(format!("and {} more…", info.dirty_files.len() - 8)),
                             );
                         }
+                        let open_shell = open_shell.clone();
+                        let shell_checkout_id = shell_checkout_id.clone();
                         content = content
                             .child(preview)
+                            .child(Button::new("worktree-commit-shell")
+                                .text()
+                                .label("Open a shell to commit or stash first")
+                                .disabled(busy)
+                                .on_click(move |_, window, cx| {
+                                    let _ = open_shell.update(cx, |app, cx| {
+                                        close_worktree_dialog(app, cx);
+                                        app.request_terminal(&shell_checkout_id, window, cx);
+                                    });
+                                }))
                             .child(
                                 Checkbox::new("worktree-confirm-dirty")
                                     .checked(dirty_confirmed)
@@ -1749,7 +1933,7 @@ impl TerminalWindow {
                     )
                     .child(
                         Button::new("worktree-delete")
-                            .primary()
+                            .danger()
                             .label(if busy { "Deleting…" } else { "Delete worktree" })
                             .disabled(!can_delete)
                             .on_click(move |_, window, cx| {
@@ -1827,6 +2011,23 @@ impl TerminalWindow {
         }
     }
 
+    /// All insertion indices exclude the dragged session, just like the final list.
+    fn sidebar_drop_slot(&self, checkout_id: &str, index: usize) -> usize {
+        let source_index = self
+            .sidebar_drag
+            .as_ref()
+            .filter(|drag| drag.started && drag.source_checkout == checkout_id)
+            .and_then(|drag| {
+                self.navigation.checkout(checkout_id).and_then(|checkout| {
+                    checkout
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == drag.session_id)
+                })
+            });
+        index - usize::from(source_index.is_some_and(|source| source < index))
+    }
+
     fn sidebar_drop_target_at(
         &self,
         position: Point<Pixels>,
@@ -1841,13 +2042,20 @@ impl TerminalWindow {
                 && position.y <= row.bounds.bottom()
         })?;
         let target = match &row.region {
-            SidebarDropRegion::Append { checkout_id, index } => SidebarDropTarget {
+            SidebarDropRegion::Insertion { checkout_id, index } => SidebarDropTarget {
                 checkout_id: checkout_id.clone(),
                 index: *index,
             },
+            SidebarDropRegion::Append { checkout_id, index } => SidebarDropTarget {
+                checkout_id: checkout_id.clone(),
+                index: self.sidebar_drop_slot(checkout_id, *index),
+            },
             SidebarDropRegion::Session { checkout_id, index } => SidebarDropTarget {
                 checkout_id: checkout_id.clone(),
-                index: index + usize::from(position.y >= row.bounds.center().y),
+                index: self.sidebar_drop_slot(
+                    checkout_id,
+                    index + usize::from(position.y >= row.bounds.center().y),
+                ),
             },
         };
         let checkout = self.navigation.checkout(&target.checkout_id)?;
@@ -1860,6 +2068,15 @@ impl TerminalWindow {
                     .sessions
                     .iter()
                     .any(|session| session.id != drag.session_id))
+        {
+            return None;
+        }
+        if target.checkout_id == drag.source_checkout
+            && checkout
+                .sessions
+                .iter()
+                .position(|session| session.id == drag.session_id)
+                == Some(target.index)
         {
             return None;
         }
@@ -1925,13 +2142,7 @@ impl TerminalWindow {
                                 .position(|session| session.id == drag.session_id)
                         });
                 if let Some(source_index) = source_index {
-                    let index = if target.checkout_id == drag.source_checkout
-                        && source_index < target.index
-                    {
-                        target.index.saturating_sub(1)
-                    } else {
-                        target.index
-                    };
+                    let index = target.index;
                     if target.checkout_id != drag.source_checkout || index != source_index {
                         self.move_terminal(
                             &drag.session_id,
@@ -1975,9 +2186,13 @@ impl TerminalWindow {
             let offset = self.scroll.offset();
             let max = self.scroll.max_offset().y.as_f32();
             let next = if y < viewport.top().as_f32() + SIDEBAR_SCROLL_EDGE {
-                (offset.y.as_f32() + SIDEBAR_SCROLL_STEP).min(0.0)
+                (offset.y.as_f32()
+                    + sidebar_scroll_step(viewport.top().as_f32() + SIDEBAR_SCROLL_EDGE - y))
+                .min(0.0)
             } else if y > viewport.bottom().as_f32() - SIDEBAR_SCROLL_EDGE {
-                (offset.y.as_f32() - SIDEBAR_SCROLL_STEP).max(-max)
+                (offset.y.as_f32()
+                    + sidebar_scroll_step(viewport.bottom().as_f32() - SIDEBAR_SCROLL_EDGE - y))
+                .max(-max)
             } else {
                 offset.y.as_f32()
             };
@@ -2022,11 +2237,47 @@ impl TerminalWindow {
             }
             if cross_checkout {
                 self.notice = Some("Terminal moved. Its process and working directory were preserved; no cd was sent.".into());
+                self.focus_terminal(window, cx);
             }
             self.persist();
-            self.focus_terminal(window, cx);
         }
         cx.notify();
+    }
+
+    fn request_dismiss_missing_checkout(
+        &mut self,
+        checkout_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing {
+            return;
+        }
+        let Some(checkout) = self.navigation.checkout(checkout_id).filter(|checkout| {
+            checkout.is_missing
+                && !checkout.is_primary
+                && self.navigation.home.as_deref() != Some(checkout_id)
+        }) else {
+            return;
+        };
+        let question = format!(
+            "Hide missing checkout “{}” from the sidebar?",
+            checkout.path
+        );
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &question,
+            Some("No files will be deleted. Git metadata and the branch are kept, and the repository menu can restore this row."),
+            &["Cancel", "Hide checkout"],
+            cx,
+        );
+        let id = checkout_id.to_owned();
+        cx.spawn_in(window, async move |view, cx| {
+            if prompt.await == Ok(1) {
+                let _ = view.update(cx, |app, cx| app.dismiss_missing_checkout(&id, cx));
+            }
+        })
+        .detach();
     }
 
     fn dismiss_missing_checkout(&mut self, checkout_id: &str, cx: &mut Context<Self>) {
@@ -2041,6 +2292,7 @@ impl TerminalWindow {
                     self.diff_totals.remove(checkout_id);
                     self.membership_revision += 1;
                     self.persist();
+                    self.refresh_diff_totals(cx);
                     self.notice = Some(
                         "Missing checkout hidden. No files were deleted; Git metadata and branch were retained."
                             .into(),
@@ -2088,6 +2340,7 @@ impl TerminalWindow {
                 self.worktree_removal = None;
                 self.membership_revision += 1;
                 self.persist();
+                self.refresh_diff_totals(cx);
                 cx.notify();
             }
             Err(error) => self.worktree_removal_error(request_id, error, cx),
@@ -2242,6 +2495,7 @@ impl TerminalWindow {
                             app.diff_totals.remove(&id);
                             app.membership_revision += 1;
                             app.persist();
+                            app.refresh_diff_totals(cx);
                             app.focus_terminal(window, cx);
                             if let Some(warning) = removed.warning {
                                 app.notice = Some(warning);
@@ -2276,7 +2530,15 @@ impl TerminalWindow {
         if ids.is_empty() {
             return;
         }
-        let message = format!("Restore {} archived worktree(s)?", ids.len());
+        let message = format!(
+            "Restore {} archived {}?",
+            ids.len(),
+            if ids.len() == 1 {
+                "worktree"
+            } else {
+                "worktrees"
+            }
+        );
         let prompt = window.prompt(
             PromptLevel::Info,
             &message,
@@ -2292,6 +2554,7 @@ impl TerminalWindow {
                     }
                     app.membership_revision += 1;
                     app.persist();
+                    app.refresh_diff_totals(cx);
                     cx.notify();
                 });
             }
@@ -2346,7 +2609,7 @@ impl TerminalWindow {
                             app.navigation.active_checkout = None; app.navigation.active_session = None;
                         }
                         app.navigation.revision += 1;
-                        app.membership_revision += 1; app.persist();
+                        app.membership_revision += 1; app.persist(); app.refresh_diff_totals(cx);
                     } else { app.failure = Some("The repository now has a terminal session. Close it before removing the directory.".into()); }
                     cx.notify();
                 });
@@ -2480,23 +2743,27 @@ impl TerminalWindow {
             .checkouts
             .iter()
             .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
-        move |mut menu, _, _| {
+        move |menu, _, _| {
+            let mut menu = menu.min_w(px(224.));
             if can_add {
                 let id = id.clone();
                 let view = view.clone();
-                menu = menu.item(PopupMenuItem::new("New worktree").on_click(
-                    move |_, _window, cx| {
-                        let _ = view.update_in(cx, |app, window, cx| {
-                            app.open_worktree_dialog(&id, window, cx)
-                        });
-                    },
-                ));
+                menu = menu.item(
+                    PopupMenuItem::new("New worktree")
+                        .icon(IconName::GitBranchPlus)
+                        .on_click(move |_, _window, cx| {
+                            let _ = view.update_in(cx, |app, window, cx| {
+                                app.open_worktree_dialog(&id, window, cx)
+                            });
+                        }),
+                );
             }
-            if archived > 0 {
+            if can_add && archived > 0 {
                 let id = id.clone();
                 let view = view.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(format!("Restore {archived} archived worktree(s)"))
+                    PopupMenuItem::new(format!("Restore archived worktrees ({archived})"))
+                        .icon(IconName::ArchiveRestore)
                         .on_click(move |_, window, cx| {
                             let _ =
                                 view.update(cx, |app, cx| app.restore_archived(&id, window, cx));
@@ -2507,14 +2774,11 @@ impl TerminalWindow {
                 let id = id.clone();
                 let view = view.clone();
                 menu = menu.separator().item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .text_color(gpui_kit::rgb(0xf07178))
-                            .child("Remove from panel")
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = view.update(cx, |app, cx| app.remove_repo(&id, window, cx));
-                    }),
+                    PopupMenuItem::new("Remove from panel")
+                        .icon(IconName::FolderMinus)
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |app, cx| app.remove_repo(&id, window, cx));
+                        }),
                 );
             }
             menu
@@ -2677,10 +2941,6 @@ impl TerminalWindow {
                     .checkouts
                     .iter()
                     .any(|checkout| checkout.is_primary && !checkout.is_missing))
-                || repo
-                    .checkouts
-                    .iter()
-                    .any(|checkout| self.navigation.archived.contains(&checkout.id))
                 || !repo
                     .checkouts
                     .iter()
@@ -2692,6 +2952,7 @@ impl TerminalWindow {
                 .flex()
                 .items_baseline()
                 .w_full()
+                .cursor_pointer()
                 .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
                 .pl(px(10.))
                 .pr(px(8.))
@@ -2710,9 +2971,10 @@ impl TerminalWindow {
                         .aria_expanded(!folded)
                         .tooltip(repo.root.clone())
                         .accessibility_label(format!(
-                            "{} repository {}",
+                            "{} repository {} — {}",
                             if folded { "Expand" } else { "Collapse" },
-                            repo.name
+                            repo.name,
+                            repo.root
                         ))
                         .on_click(cx.listener(move |app, _, _, cx| {
                             toggle(&mut app.navigation.folded_repos, &toggle_id);
@@ -2752,32 +3014,57 @@ impl TerminalWindow {
                         ),
                 )
                 .when(has_menu, |heading| {
+                    let menu_id = id.clone();
+                    let menu_view = weak.clone();
                     heading.child(
-                        Button::new(SharedString::from(format!("actions-{id}")))
-                            .text()
+                        div()
                             .absolute()
                             .right(px(8.))
                             .top(px(8.))
-                            .opacity(0.)
-                            .group_hover(
-                                SharedString::from(format!("repo-heading-{id}")),
-                                |style| style.opacity(1.),
-                            )
-                            .focus(|style| style.opacity(1.))
-                            .rounded(px(0.))
-                            .h(px(20.))
                             .w(px(20.))
-                            .p_0()
-                            .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
-                            .accessibility_label(format!("Actions for {}", repo.name))
-                            .dropdown_menu(self.repo_menu(id.clone(), weak.clone())),
+                            .h(px(20.))
+                            .child(
+                                Button::new(SharedString::from(format!("actions-{id}")))
+                                    .custom(sidebar_action_style(cx))
+                                    .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
+                                        1.
+                                    } else {
+                                        0.
+                                    })
+                                    .group_hover(
+                                        SharedString::from(format!("repo-heading-{id}")),
+                                        |style| style.opacity(1.),
+                                    )
+                                    .focus(|style| style.opacity(1.))
+                                    .rounded(px(0.))
+                                    .h(px(20.))
+                                    .w(px(20.))
+                                    .p_0()
+                                    .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
+                                    .accessibility_label(format!("Actions for {}", repo.name))
+                                    .dropdown_menu(self.repo_menu(id.clone(), weak.clone()))
+                                    .on_open_change(move |open, _, cx| {
+                                        let _ = menu_view.update(cx, |app, cx| {
+                                            if *open {
+                                                app.open_repo_menu = Some(menu_id.clone());
+                                            } else if app.open_repo_menu.as_deref()
+                                                == Some(&menu_id)
+                                            {
+                                                app.open_repo_menu = None;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                     )
                 });
-            rows.push(
+            rows.push(if has_menu {
                 heading
                     .context_menu(self.repo_menu(id, weak.clone()))
-                    .into_any_element(),
-            );
+                    .into_any_element()
+            } else {
+                heading.into_any_element()
+            });
             if folded {
                 rows.push(div().h(px(8.)).into_any_element());
                 continue;
@@ -2793,6 +3080,26 @@ impl TerminalWindow {
                 let select_id = id.clone();
                 let selected = self.navigation.active_checkout.as_deref() == Some(&id)
                     && self.navigation.active_session.is_none();
+                let has_close = repo.kind == RepoKind::Git
+                    && !checkout.is_primary
+                    && self.navigation.home.as_deref() != Some(&id);
+                let line_slot = Self::line_slot(self.diff_totals.get(&id));
+                let figures_width = line_slot.map_or(0., |(added, removed)| {
+                    let text = match (added > 0, removed > 0) {
+                        (true, true) => format!("+{added} −{removed}"),
+                        (true, false) => format!("+{added}"),
+                        _ => format!("−{removed}"),
+                    };
+                    sidebar_text_width(window, &text, 11.).as_f32()
+                });
+                let name = sidebar_name(
+                    window,
+                    &title,
+                    self.navigation.sidebar_width
+                        - 57.
+                        - figures_width
+                        - if has_close { 28. } else { 0. },
+                );
                 let icon = if checkout.is_missing {
                     IconName::FolderX
                 } else if self.navigation.home.as_deref() == Some(&id) {
@@ -2805,8 +3112,10 @@ impl TerminalWindow {
                     IconName::GitBranch
                 };
                 let row_group = SharedString::from(format!("checkout-row-{id}"));
+                let (row_focus, row_focused) = sidebar_row_focus(window, cx, &id);
                 let mut row = div()
                     .id(row_group.clone())
+                    .track_focus(&row_focus)
                     .group(row_group.clone())
                     .flex()
                     .items_center()
@@ -2814,6 +3123,8 @@ impl TerminalWindow {
                     .h(px(26.))
                     .gap(px(7.))
                     .px(px(8.))
+                    .cursor_pointer()
+                    .when(checkout.is_missing, |row| row.cursor(gpui_kit::CursorStyle::OperationNotAllowed))
                     .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
                     .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
                     .when(selected, |row| {
@@ -2832,6 +3143,7 @@ impl TerminalWindow {
                         move |app, _, window, cx| {
                             if app.navigation.select_checkout(&row_select_id) {
                                 app.persist();
+                                app.refresh_diff_totals(cx);
                                 app.focus_terminal(window, cx);
                                 cx.notify();
                             }
@@ -2839,7 +3151,7 @@ impl TerminalWindow {
                     }))
                     .child(
                         Button::new(SharedString::from(format!("fold-checkout-{id}")))
-                            .ghost()
+                            .custom(sidebar_action_style(cx))
                             .small()
                             .compact()
                             .rounded(px(0.))
@@ -2891,6 +3203,7 @@ impl TerminalWindow {
                                     cx.stop_propagation();
                                     if app.navigation.select_checkout(&click_id) {
                                         app.persist();
+                                        app.refresh_diff_totals(cx);
                                         app.focus_terminal(window, cx);
                                         cx.notify();
                                     }
@@ -2910,7 +3223,8 @@ impl TerminalWindow {
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(title.clone()),
+                            .when(checkout.is_missing, |label| label.text_color(gpui_kit::rgb(0x565b67)))
+                            .child(name),
                     )
                     .when(repo.kind == RepoKind::Git && !checkout.is_missing, |row| {
                         match Self::line_slot(self.diff_totals.get(&id)) {
@@ -2921,6 +3235,8 @@ impl TerminalWindow {
                                     .flex()
                                     .items_center()
                                     .text_size(px(11.))
+                                    .when(has_close && row_focused, |slot| slot.mr(px(28.)))
+                                    .when(has_close, |slot| slot.group_hover(row_group.clone(), |style| style.mr(px(28.))))
                                     // At rest the slot holds a bare `+`/`−`, which says the row
                                     // has changes in the width this panel has ever reserved for
                                     // it. The figures are one pointer away.
@@ -2928,8 +3244,10 @@ impl TerminalWindow {
                                         slot.child(
                                             div()
                                                 .text_color(gpui_kit::rgb(0xa1c181))
+                                                .when(row_focused, |mark| mark.w(px(0.)))
+                                                .overflow_hidden()
                                                 .group_hover(row_group.clone(), |style| {
-                                                    style.opacity(0.)
+                                                    style.w(px(0.))
                                                 })
                                                 .child("+"),
                                         )
@@ -2938,8 +3256,10 @@ impl TerminalWindow {
                                         slot.child(
                                             div()
                                                 .text_color(gpui_kit::rgb(0xd97f84))
+                                                .when(row_focused, |mark| mark.w(px(0.)))
+                                                .overflow_hidden()
                                                 .group_hover(row_group.clone(), |style| {
-                                                    style.opacity(0.)
+                                                    style.w(px(0.))
                                                 })
                                                 .child("\u{2212}"),
                                         )
@@ -2951,9 +3271,9 @@ impl TerminalWindow {
                                             .gap(px(5.))
                                             .min_w_0()
                                             .overflow_hidden()
-                                            .w(px(0.))
+                                            .w(if row_focused { Length::Auto } else { px(0.).into() })
                                             .group_hover(row_group.clone(), |style| {
-                                                style.w(Length::Auto).ml(px(5.))
+                                                style.w(Length::Auto)
                                             })
                                             .when(added > 0, |figures| {
                                                 figures.child(
@@ -2978,15 +3298,17 @@ impl TerminalWindow {
                         row.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(gpui_kit::rgb(0xd97f84))
+                                .text_color(gpui_kit::rgb(0xf7adb1))
+                                .when(has_close && row_focused, |note| note.mr(px(28.)))
+                                .when(has_close, |note| note.group_hover(row_group.clone(), |style| style.mr(px(28.))))
                                 .child("Directory missing"),
                         )
                     })
-                    .when(repo.kind == RepoKind::Git && checkout.is_missing, |row| {
+                    .when(has_close && checkout.is_missing, |row| {
                         let dismiss_id = id.clone();
                         row.child(
                             Button::new(SharedString::from(format!("dismiss-missing-{id}")))
-                                .ghost()
+                                .custom(sidebar_action_style(cx))
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -2994,7 +3316,7 @@ impl TerminalWindow {
                                 .h(px(20.))
                                 .w(px(20.))
                                 .p_0()
-                                .opacity(0.)
+                                .opacity(if row_focused { 1. } else { 0. })
                                 .group_hover(row_group.clone(), |style| style.opacity(1.))
                                 .focus(|style| style.opacity(1.))
                                 .icon(Icon::new(IconName::X).size(px(14.)))
@@ -3004,14 +3326,14 @@ impl TerminalWindow {
                                 .tooltip(
                                     "Hide this missing checkout only; no files are deleted, and Git metadata and branch are retained",
                                 )
-                                .on_click(cx.listener(move |app, _, _, cx| {
+                                .on_click(cx.listener(move |app, _, window, cx| {
                                     cx.stop_propagation();
-                                    app.dismiss_missing_checkout(&dismiss_id, cx)
+                                    app.request_dismiss_missing_checkout(&dismiss_id, window, cx)
                                 })),
                         )
                     })
                     .when(
-                        repo.kind == RepoKind::Git && !checkout.is_primary && !checkout.is_missing,
+                        has_close && !checkout.is_missing,
                         |row| {
                             let actions_id = id.clone();
                             let actions_repo_id = repo.id.clone();
@@ -3019,7 +3341,7 @@ impl TerminalWindow {
                             // and destructive deletion; no row action deletes immediately.
                             row.child(
                                 Button::new(SharedString::from(format!("worktree-actions-{id}")))
-                                    .ghost()
+                                    .custom(sidebar_action_style(cx))
                                     .rounded(px(0.))
                                     .absolute()
                                     .right(px(8.))
@@ -3027,10 +3349,10 @@ impl TerminalWindow {
                                     .h(px(20.))
                                     .w(px(20.))
                                     .p_0()
-                                    .opacity(0.)
+                                    .opacity(if row_focused { 1. } else { 0. })
                                     .group_hover(row_group.clone(), |style| style.opacity(1.))
                                     .focus(|style| style.opacity(1.))
-                                    .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
+                                    .icon(Icon::new(IconName::X).size(px(14.)))
                                     .accessibility_label(format!(
                                         "Archive or delete worktree {title}"
                                     ))
@@ -3051,10 +3373,34 @@ impl TerminalWindow {
                     && self.sidebar_drag.as_ref().is_some_and(|drag| {
                         drag.started
                             && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == id && target.index == checkout.sessions.len()
+                                target.checkout_id == id
+                                    && target.index
+                                        == self.sidebar_drop_slot(
+                                            &checkout.id,
+                                            checkout.sessions.len(),
+                                        )
                             })
                     });
-                row = row.when(folded_append_marker, |row| row.child(sidebar_drop_marker()));
+                row = row.when(
+                    self.sidebar_drag.as_ref().is_some_and(|drag| {
+                        drag.started
+                            && drag
+                                .target
+                                .as_ref()
+                                .is_some_and(|target| target.checkout_id == id)
+                    }),
+                    |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .w(px(2.))
+                                .bg(gpui_kit::rgb(0x5b97ff)),
+                        )
+                    },
+                );
                 if !checkout.is_missing && self.sidebar_drag.is_some() {
                     row = row.child(sidebar_drag_geometry(
                         SidebarDropRegion::Append {
@@ -3066,6 +3412,15 @@ impl TerminalWindow {
                 }
                 if folded || checkout.is_missing {
                     rows.push(row.into_any_element());
+                    if folded_append_marker {
+                        rows.push(sidebar_drop_marker(
+                            self.sidebar_drag
+                                .as_ref()
+                                .and_then(|drag| drag.target.clone())
+                                .unwrap(),
+                            drag_rows.clone(),
+                        ));
+                    }
                     continue;
                 }
                 let checkout_row = row.into_any_element();
@@ -3085,13 +3440,14 @@ impl TerminalWindow {
                     let busy = status.foreground.running;
                     let unknown =
                         status.poll_error.is_some() || status.shell == ShellState::Unknown;
-                    let failed = !busy
+                    let agent = status.foreground.app.as_deref() == Some("opencode");
+                    let failed = !agent
+                        && matches!(status.shell, ShellState::Running)
                         && terminal
                             .shell
                             .session
                             .last_command_exit()
                             .is_some_and(|code| code != 0);
-                    let agent = status.foreground.app.as_deref() == Some("opencode");
                     let id = session.id.clone();
                     let click_id = id.clone();
                     let drag_id = id.clone();
@@ -3113,6 +3469,7 @@ impl TerminalWindow {
                             ", idle"
                         }
                     );
+                    let renaming = self.editing.as_ref().is_some_and(|edit| edit.id == id);
                     let content =
                         if let Some(editing) = self.editing.as_ref().filter(|edit| edit.id == id) {
                             div()
@@ -3127,10 +3484,14 @@ impl TerminalWindow {
                                     } else {
                                         IconName::SquareTerminal
                                     })
-                                    .size(px(14.)),
+                                    .size(px(14.))
+                                    .text_color(gpui_kit::rgb(0x8b909c)),
                                 )
                                 .child(
                                     Input::new(&editing.input)
+                                        .id(SharedString::from(format!("rename-session-{id}")))
+                                        .appearance(false)
+                                        .p_0()
                                         .aria_label("Terminal session name")
                                         .h(px(26.))
                                         .w_full()
@@ -3158,9 +3519,9 @@ impl TerminalWindow {
                                         } else if failed {
                                             0xf7adb1
                                         } else if busy && !agent {
-                                            0xa1c181
+                                            0x5fc98a
                                         } else {
-                                            0xabb2bf
+                                            0x8b909c
                                         }),
                                     ),
                                 )
@@ -3170,23 +3531,36 @@ impl TerminalWindow {
                                         .min_w_0()
                                         .overflow_hidden()
                                         .text_ellipsis()
-                                        .child(title.clone()),
+                                        .child(sidebar_name(
+                                            window,
+                                            &title,
+                                            self.navigation.sidebar_width - 73.,
+                                        )),
                                 )
                                 .into_any_element()
                         };
                     let row_group = SharedString::from(format!("session-row-{id}"));
+                    let (row_focus, row_focused) = sidebar_row_focus(window, cx, &id);
                     let row = div()
                         .id(row_group.clone())
+                        .track_focus(&row_focus)
                         .group(row_group.clone())
                         .flex()
                         .items_center()
                         .relative()
                         .pl(px(12.))
                         .pr(px(8.))
+                        .cursor_pointer()
+                        .when(
+                            self.sidebar_drag
+                                .as_ref()
+                                .is_some_and(|drag| drag.started && drag.session_id == id),
+                            |row| row.opacity(0.42),
+                        )
                         .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
                         .h(px(26.))
                         .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
-                        .when(!self.closing_sessions.contains(&id), |row| {
+                        .when(!self.closing_sessions.contains(&id) && !renaming, |row| {
                             row.on_click(cx.listener(
                                 move |app, event: &gpui_kit::ClickEvent, window, cx| {
                                     if app.suppress_sidebar_click {
@@ -3197,6 +3571,7 @@ impl TerminalWindow {
                                         app.start_rename(&row_click_id, window, cx);
                                     } else if app.navigation.select_session(&row_click_id) {
                                         app.persist();
+                                        app.refresh_diff_totals(cx);
                                         app.focus_terminal(window, cx);
                                         cx.notify();
                                     }
@@ -3214,46 +3589,50 @@ impl TerminalWindow {
                                     .bg(gpui_kit::rgb(0x5b97ff)),
                             )
                         })
-                        .child(
-                            Button::new(SharedString::from(format!("select-session-{id}")))
-                                .text()
-                                .rounded(px(0.))
-                                .absolute()
-                                .left(px(0.))
-                                .right(px(0.))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .p_0()
-                                .aria_selected(selected)
-                                .accessibility_label(state_label)
-                                .disabled(self.closing_sessions.contains(&id))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |app, event: &MouseDownEvent, _, cx| {
-                                        app.begin_sidebar_drag(&drag_id, event.position, cx);
-                                    }),
-                                )
-                                .on_click(cx.listener(
-                                    move |app, event: &gpui_kit::ClickEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        if app.suppress_sidebar_click {
-                                            app.suppress_sidebar_click = false;
-                                            return;
-                                        }
-                                        if event.click_count() == 2 {
-                                            app.start_rename(&click_id, window, cx);
-                                        } else if app.navigation.select_session(&click_id) {
-                                            app.persist();
-                                            app.focus_terminal(window, cx);
-                                            cx.notify();
-                                        }
-                                    },
-                                )),
-                        )
+                        .when(!renaming, |row| {
+                            row.child(
+                                Button::new(SharedString::from(format!("select-session-{id}")))
+                                    .text()
+                                    .rounded(px(0.))
+                                    .absolute()
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .p_0()
+                                    .aria_selected(selected)
+                                    .tooltip(state_label.clone())
+                                    .accessibility_label(state_label)
+                                    .disabled(self.closing_sessions.contains(&id))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |app, event: &MouseDownEvent, _, cx| {
+                                            app.begin_sidebar_drag(&drag_id, event.position, cx);
+                                        }),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |app, event: &gpui_kit::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            if app.suppress_sidebar_click {
+                                                app.suppress_sidebar_click = false;
+                                                return;
+                                            }
+                                            if event.click_count() == 2 {
+                                                app.start_rename(&click_id, window, cx);
+                                            } else if app.navigation.select_session(&click_id) {
+                                                app.persist();
+                                                app.refresh_diff_totals(cx);
+                                                app.focus_terminal(window, cx);
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                            )
+                        })
                         .child(div().flex_1().min_w_0().pr(px(20.)).child(content))
                         .child(
                             Button::new(SharedString::from(format!("close-session-{id}")))
-                                .ghost()
+                                .custom(sidebar_action_style(cx))
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -3261,7 +3640,7 @@ impl TerminalWindow {
                                 .h(px(20.))
                                 .w(px(20.))
                                 .p_0()
-                                .opacity(0.)
+                                .opacity(if row_focused { 1. } else { 0. })
                                 .group_hover(row_group.clone(), |style| style.opacity(1.))
                                 .focus(|style| style.opacity(1.))
                                 .icon(Icon::new(IconName::X).size(px(14.)))
@@ -3276,12 +3655,27 @@ impl TerminalWindow {
                     let marker_before = self.sidebar_drag.as_ref().is_some_and(|drag| {
                         drag.started
                             && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == checkout.id && target.index == session_index
+                                target.checkout_id == checkout.id
+                                    && target.index
+                                        == self.sidebar_drop_slot(&checkout.id, session_index)
+                                    && drag.session_id != session.id
                             })
                     });
+                    if marker_before {
+                        checkout_children.push(sidebar_drop_marker(
+                            self.sidebar_drag
+                                .as_ref()
+                                .and_then(|drag| drag.target.clone())
+                                .unwrap(),
+                            drag_rows.clone(),
+                        ));
+                    }
                     checkout_children.push(
-                        row.when(marker_before, |row| row.child(sidebar_drop_marker()))
-                            .when(self.sidebar_drag.is_some(), |row| {
+                        row.when(
+                            self.sidebar_drag
+                                .as_ref()
+                                .is_some_and(|drag| drag.session_id != session.id),
+                            |row| {
                                 row.child(sidebar_drag_geometry(
                                     SidebarDropRegion::Session {
                                         checkout_id: checkout.id.clone(),
@@ -3289,12 +3683,13 @@ impl TerminalWindow {
                                     },
                                     drag_rows.clone(),
                                 ))
-                            })
-                            .context_menu(self.terminal_menu(id, weak.clone()))
-                            .into_any_element(),
+                            },
+                        )
+                        .context_menu(self.terminal_menu(id, weak.clone()))
+                        .into_any_element(),
                     );
                 }
-                for (_, pending) in self
+                for _ in self
                     .navigation
                     .pending
                     .iter()
@@ -3304,10 +3699,12 @@ impl TerminalWindow {
                         div()
                             .pl(px(12.))
                             .h(px(26.))
-                            .child(format!(
-                                "Starting terminal in {}…",
-                                pending.strip_prefix("checkout:").unwrap_or(pending)
-                            ))
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .text_color(gpui_kit::rgb(0x8b909c))
+                            .child(Icon::new(IconName::LoaderCircle).size(px(14.)))
+                            .child(format!("Starting terminal in {title}…"))
                             .into_any_element(),
                     );
                 }
@@ -3316,14 +3713,23 @@ impl TerminalWindow {
                     drag.started
                         && drag.target.as_ref().is_some_and(|target| {
                             target.checkout_id == checkout.id
-                                && target.index == checkout.sessions.len()
+                                && target.index
+                                    == self.sidebar_drop_slot(&checkout.id, checkout.sessions.len())
                         })
                 });
+                if append_marker {
+                    checkout_children.push(sidebar_drop_marker(
+                        self.sidebar_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.clone())
+                            .unwrap(),
+                        drag_rows.clone(),
+                    ));
+                }
                 checkout_children.push(
                     div()
                         .relative()
                         .pl(px(12.))
-                        .when(append_marker, |row| row.child(sidebar_drop_marker()))
                         .when(self.sidebar_drag.is_some(), |row| {
                             row.child(sidebar_drag_geometry(
                                 SidebarDropRegion::Append {
@@ -3338,7 +3744,10 @@ impl TerminalWindow {
                                 "new-terminal-{}",
                                 checkout.id
                             )))
-                            .ghost()
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(gpui_kit::rgb(0x8b909c).into()),
+                            )
                             .rounded(px(0.))
                             .h(px(26.))
                             .w_full()
@@ -3381,8 +3790,15 @@ impl TerminalWindow {
         if rows.is_empty() {
             rows.push(
                 div()
-                    .p_3()
-                    .child("Your opened folders will appear here.")
+                    .id("sidebar-empty")
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_6()
+                    .text_center()
+                    .text_color(gpui_kit::rgb(0x8b909c))
+                    .child("Your opened folders will appear here. Use Open directory below to add one.")
                     .into_any_element(),
             );
         }
@@ -3391,11 +3807,23 @@ impl TerminalWindow {
             .as_ref()
             .filter(|drag| drag.started)
             .and_then(|drag| {
-                self.navigation
-                    .session(&drag.session_id)
-                    .map(|session| (drag.position, session.name.clone()))
+                self.navigation.session(&drag.session_id).map(|session| {
+                    let title = self
+                        .terminals
+                        .get(&session.id)
+                        .map(|terminal| {
+                            let status = terminal.shell.session.status();
+                            let snapshot = terminal.shell.session.snapshot();
+                            session_title(
+                                &session.name,
+                                status.foreground.app.as_deref(),
+                                snapshot.title.as_deref(),
+                            )
+                        })
+                        .unwrap_or_else(|| session.name.clone());
+                    (drag.position, title)
+                })
             });
-        let scroll_origin = self.scroll.bounds().origin;
         div()
             .id("navigation-panel")
             .relative()
@@ -3409,6 +3837,10 @@ impl TerminalWindow {
             .text_size(px(13.))
             .font_family(SIDEBAR_FONT_FAMILY)
             .text_color(gpui_kit::rgb(0xd7dae0))
+            .when(
+                self.sidebar_drag.as_ref().is_some_and(|drag| drag.started),
+                |panel| panel.cursor(gpui_kit::CursorStyle::ClosedHand),
+            )
             .bg(gpui_kit::rgb(0x1c1f26))
             .child(
                 div()
@@ -3430,7 +3862,10 @@ impl TerminalWindow {
                     .border_color(gpui_kit::rgb(0x2c313b))
                     .child(
                         Button::new("open-directory")
-                            .ghost()
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(gpui_kit::rgb(0x8b909c).into()),
+                            )
                             .small()
                             .compact()
                             .rounded(px(0.))
@@ -3439,6 +3874,7 @@ impl TerminalWindow {
                             .icon(IconName::FolderPlus)
                             .label("Open directory")
                             .accessibility_label("Open directory")
+                            .tooltip("Open directory")
                             .disabled(self.opening || self.closing)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.choose_directory(window, cx)),
@@ -3448,22 +3884,37 @@ impl TerminalWindow {
             .when_some(drag_dispatcher, |panel, dispatcher| panel.child(dispatcher))
             .when_some(ghost, |panel, (position, name)| {
                 panel.child(
-                    div()
-                        .id("terminal-drag-ghost")
-                        .absolute()
-                        .left(px(position.0 - scroll_origin.x.as_f32() + 10.))
-                        .top(px(position.1 - scroll_origin.y.as_f32() + 8.))
-                        .max_w(px(180.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(11.))
-                        .px(px(6.))
-                        .py(px(3.))
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(gpui_kit::rgb(0x5b97ff))
-                        .bg(gpui_kit::rgb(0x343d4c))
-                        .child(format!("↕ {name}")),
+                    gpui_kit::deferred(
+                        gpui_kit::anchored()
+                            .position(gpui_kit::point(px(position.0 + 14.), px(position.1 + 14.)))
+                            .snap_to_window()
+                            .child(
+                                div()
+                                    .id("terminal-drag-ghost")
+                                    .font_family(SIDEBAR_FONT_FAMILY)
+                                    .text_color(gpui_kit::rgb(0xd7dae0))
+                                    .max_w(px(240.))
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .text_size(px(13.))
+                                    .px(px(12.))
+                                    .border_1()
+                                    .border_color(gpui_kit::rgb(0x5b97ff))
+                                    .bg(gpui_kit::rgb(0x252932))
+                                    .shadow_md()
+                                    .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(name),
+                                    ),
+                            ),
+                    )
+                    .with_priority(1),
                 )
             })
             .into_any_element()

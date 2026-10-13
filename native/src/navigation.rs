@@ -184,6 +184,19 @@ impl Navigation {
             .session(id)
             .cloned()
             .ok_or("This terminal has already closed.")?;
+        if session.checkout_id == target {
+            let checkout = self
+                .repos
+                .iter_mut()
+                .flat_map(|repo| &mut repo.checkouts)
+                .find(|checkout| checkout.id == target)
+                .expect("validated destination");
+            checkout.sessions.retain(|session| session.id != id);
+            checkout
+                .sessions
+                .insert(index.min(checkout.sessions.len()), session);
+            return Ok(());
+        }
         self.remove_session(id);
         session.checkout_id = target.into();
         let destination = self
@@ -214,9 +227,22 @@ impl Navigation {
                 "Only available worktrees without terminal sessions can be archived.".into(),
             );
         }
+        let fallback = self
+            .repos
+            .iter()
+            .find(|repo| repo.checkouts.iter().any(|checkout| checkout.id == id))
+            .and_then(|repo| {
+                repo.checkouts.iter().find(|checkout| {
+                    checkout.is_primary
+                        && !checkout.is_missing
+                        && !self.archived.contains(&checkout.id)
+                })
+            })
+            .map(|checkout| checkout.id.clone());
         self.archived.insert(id.into());
+        self.selected_by_checkout.remove(id);
         if self.active_checkout.as_deref() == Some(id) {
-            self.active_checkout = None;
+            self.active_checkout = fallback;
             self.active_session = None;
         }
         self.revision += 1;
@@ -614,6 +640,62 @@ mod tests {
         nav.remove_session("two");
         assert_eq!(nav.active_session.as_deref(), Some("one"));
     }
+    #[test]
+    fn reordering_preserves_selection_and_navigation_revision() {
+        let (_dir, mut nav, id) = fixture();
+        nav.add_session(session("one", &id), Some(nav.revision));
+        nav.add_session(session("two", &id), Some(nav.revision));
+        let revision = nav.revision;
+        let selection = nav.selected_by_checkout.clone();
+        nav.move_session("one", &id, usize::MAX).unwrap();
+        assert_eq!(nav.active_session.as_deref(), Some("two"));
+        assert_eq!(nav.selected_by_checkout, selection);
+        assert_eq!(nav.revision, revision);
+        assert_eq!(nav.checkout(&id).unwrap().sessions[1].id, "one");
+
+        nav.move_session("two", &id, 1).unwrap();
+        assert_eq!(nav.active_session.as_deref(), Some("two"));
+        assert_eq!(nav.selected_by_checkout, selection);
+        assert_eq!(nav.revision, revision);
+
+        let other = Repo::plain(tempdir().unwrap().path(), "now").unwrap();
+        let other_id = other.checkouts[0].id.clone();
+        nav.merge(
+            OpenedDirectory {
+                repo: other,
+                checkout_id: other_id.clone(),
+            },
+            true,
+        );
+        let revision = nav.revision;
+        nav.move_session("one", &id, 0).unwrap();
+        assert_eq!(nav.active_checkout.as_deref(), Some(other_id.as_str()));
+        assert_eq!(nav.active_session, None);
+        assert_eq!(nav.selected_by_checkout, selection);
+        assert_eq!(nav.revision, revision);
+    }
+
+    #[test]
+    fn archiving_the_active_worktree_returns_to_its_available_root() {
+        let (_dir, mut nav, primary) = fixture();
+        nav.repos[0].kind = RepoKind::Git;
+        let mut worktree = nav.repos[0].checkouts[0].clone();
+        worktree.id = "checkout:/worktree".into();
+        worktree.is_primary = false;
+        nav.repos[0].checkouts.push(worktree.clone());
+        assert!(nav.select_checkout(&worktree.id));
+        nav.archive(&worktree.id).unwrap();
+        assert_eq!(nav.active_checkout.as_deref(), Some(primary.as_str()));
+        assert_eq!(nav.active_session, None);
+        assert!(nav.archived.contains(&worktree.id));
+
+        nav.archived.remove(&worktree.id);
+        assert!(nav.select_checkout(&worktree.id));
+        nav.repos[0].checkouts[0].is_missing = true;
+        nav.archive(&worktree.id).unwrap();
+        assert_eq!(nav.active_checkout, None);
+    }
+
     #[test]
     fn process_identity_gates_agent_title() {
         assert_eq!(session_title("renamed", None, Some("OC | old")), "renamed");
