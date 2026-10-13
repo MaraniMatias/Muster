@@ -138,6 +138,15 @@ fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
         .active(gpui_kit::rgb(0x2d323c).into())
 }
 
+/// The faint ink a sidebar control wears at rest, `--muster-text-muted`.
+///
+/// Set on the control rather than in a variant so the variant's hover ink can
+/// win: GPUI refines a hover style after the rest style, which is what makes
+/// the reference's `color: var(--muster-text)` lift happen here at all.
+fn sidebar_faint_ink() -> gpui_kit::Hsla {
+    gpui_kit::rgb(0x8b909c).into()
+}
+
 fn sidebar_repo_path(
     window: &Window,
     root: &str,
@@ -3030,10 +3039,18 @@ impl TerminalWindow {
                             .top(px(8.))
                             .w(px(20.))
                             .h(px(20.))
+                            // The trigger stays lit while its menu is open, on the
+                            // surface the button paints rather than on the
+                            // button: a hover refines after the rest style and
+                            // would paint the trigger's own transparent hover
+                            // back over it.
+                            .when(self.open_repo_menu.as_deref() == Some(&id), |trigger| {
+                                trigger.bg(gpui_kit::rgb(0x2d323c))
+                            })
                             .child(
                                 Button::new(SharedString::from(format!("actions-{id}")))
-                                    .custom(sidebar_action_style(cx))
-                                    .cursor_pointer()
+                                    .text()
+                                    .text_color(sidebar_faint_ink())
                                     .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
                                         1.
                                     } else {
@@ -3159,8 +3176,8 @@ impl TerminalWindow {
                     }))
                     .child(
                         Button::new(SharedString::from(format!("fold-checkout-{id}")))
-                            .custom(sidebar_action_style(cx))
-                            .cursor_pointer()
+                            .text()
+                            .text_color(sidebar_faint_ink())
                             .small()
                             .compact()
                             .rounded(px(0.))
@@ -3764,11 +3781,8 @@ impl TerminalWindow {
                                 "new-terminal-{}",
                                 checkout.id
                             )))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .foreground(gpui_kit::rgb(0x8b909c).into()),
-                            )
-                            .cursor_pointer()
+                            .text()
+                            .text_color(sidebar_faint_ink())
                             .rounded(px(0.))
                             .h(px(26.))
                             .w_full()
@@ -3883,11 +3897,8 @@ impl TerminalWindow {
                     .border_color(gpui_kit::rgb(0x2c313b))
                     .child(
                         Button::new("open-directory")
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .foreground(gpui_kit::rgb(0x8b909c).into()),
-                            )
-                            .cursor_pointer()
+                            .text()
+                            .text_color(sidebar_faint_ink())
                             .small()
                             .compact()
                             .rounded(px(0.))
