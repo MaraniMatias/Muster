@@ -1,7 +1,11 @@
 # Terminal-first native Rust implementation specification
 
 **Parent report:** [Migration feasibility and strategy](README.md).  
-**Status:** proposed implementation; this research does not create a Rust executable.  
+**Status:** historical specification; a native executable now exists at the workspace root.
+Terminal/session correctness and workspace navigation have automated coverage.
+Live preferences, safe link/file activation and terminal search remain deferred;
+real OS input, GPU rendering and Linux TUI acceptance are not established by
+headless tests. See [current status and measurements](ghostty-reference.md#11-chrome-pass-theme-state-writer-refusals-and-the-read-cadence).
 **Primary outcome:** a native GPUI Kit window with one real, safe, usable terminal.  
 **Baseline:** Muster v0.21.1 at `4412f63bd385bdb3b9eb12b829858578a2009f81`.
 

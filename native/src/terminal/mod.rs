@@ -41,5 +41,5 @@ pub use self::session::{
     TerminalSessionConfig, TerminalSnapshot, TerminalWake, DEFAULT_DRAIN_DEADLINE,
     DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_INTERVAL,
 };
-pub use self::view::{xterm_256, CellSize, Palette, Placement, TerminalView};
+pub use self::view::{xterm_256, CellSize, InputRefused, Palette, Placement, TerminalView};
 pub use self::write_queue::{EnqueueError, WriteQueue, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS};

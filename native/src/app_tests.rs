@@ -10,6 +10,7 @@ use gpui_kit::{
 };
 
 use super::*;
+use crate::terminal::Palette;
 
 /// How long a test waits for a child before deciding it is not coming.
 ///
@@ -183,6 +184,105 @@ fn a_focused_terminal_sends_a_keystroke_to_the_shell(cx: &mut TestAppContext) {
     assert!(typed, "the keystroke never reached the child's write path");
 }
 
+/// How often the background reads run, and what that costs when nobody is
+/// looking.
+///
+/// Hidden has to be slower than visible or the cadence is not answering the
+/// question, and it has to be finite or the numbers would only move while
+/// somebody watched them — a figure that is wrong the moment they look away
+/// is not a cached figure.
+#[test]
+fn a_hidden_window_reads_less_often_but_still_reads() {
+    let visible = cadence(true);
+    let hidden = cadence(false);
+    assert!(
+        hidden.discover_every > visible.discover_every,
+        "a hidden window asks Git for the worktree list as often as a visible one"
+    );
+    assert!(
+        hidden.count_every > visible.count_every,
+        "a hidden window counts lines as often as a visible one"
+    );
+    for ticks in [visible.count_every, hidden.count_every] {
+        assert!(ticks > 0, "a cadence of zero never runs");
+        assert!(
+            TICK * ticks as u32 <= std::time::Duration::from_secs(5 * 60),
+            "a cadence that waits minutes cannot catch up with an external change"
+        );
+    }
+    // And the hidden cadence is a multiple of the tick, so a pass still lands
+    // on a tick boundary instead of drifting against one.
+    assert_eq!(hidden.count_every % TICK.as_secs(), 0);
+}
+
+/// A checkout that cannot be counted is unknown, never zero.
+///
+/// Zero is a claim: it says Git looked and the working tree is clean. A timed
+/// out read has not looked, and drawing `+0 -0` for it would be a confident
+/// answer to a question nobody asked.
+#[test]
+fn an_uncounted_checkout_draws_nothing_rather_than_zero() {
+    let clean = DiffTotals::default();
+    assert!(
+        TerminalWindow::line_slot(Some(&clean)).is_none(),
+        "a clean working tree draws nothing, which is not the same as unknown"
+    );
+    assert_eq!(
+        TerminalWindow::line_slot(None),
+        TerminalWindow::line_slot(Some(&clean)),
+        "a checkout Git was not asked about must not be drawn as if it were clean"
+    );
+    assert_eq!(
+        TerminalWindow::line_slot(Some(&DiffTotals {
+            additions: 3,
+            deletions: 1,
+        })),
+        Some((3, 1)),
+    );
+}
+/// A refusal reaches the banner the window already draws.
+///
+/// Through the real window, because that is the whole claim: the terminal view
+/// notices, the window hears, and the message lands in the one place this
+/// window says something went wrong. A test that called the view alone would
+/// pass with the sink never wired at all.
+///
+/// The refusal is raised rather than provoked. That the view raises one for a
+/// keystroke and for a paste, and never quotes what it refused, is proven in
+/// the view's own tests; what only a window can prove is the last hop.
+#[gpui_kit::test]
+fn a_refused_input_reaches_the_window_banner(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "cat");
+    let (handle, view) = open(cx, size(px(800.), px(600.)), &backend, &session);
+    settle(cx, handle);
+
+    let terminal = view
+        .read_with(cx, |app, _| app.terminal().cloned())
+        .expect("an injected window has one terminal");
+    cx.update_window(handle, |_, window, cx| {
+        terminal.update(cx, |terminal, cx| {
+            terminal.refuse_for_test(
+                "A keystroke was not sent",
+                &crate::terminal::SessionError::Closing,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let message = view.read_with(cx, |app, _| app.failure.clone());
+    let _ = session.close().wait();
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .unwrap();
+    let message = message.expect("a refused input said nothing in the banner");
+    assert!(
+        message.contains("keystroke") && message.contains("closing"),
+        "the banner does not say what was refused and why: {message:?}"
+    );
+}
+
 #[test]
 fn an_app_quit_ends_the_shell_and_leaves_nothing_to_end_twice() {
     let backend = Arc::new(TerminalBackend::default());
@@ -237,6 +337,16 @@ fn the_host_answers_from_the_measured_cell_and_the_views_palette() {
         "the view publishes into the cell the host reads"
     );
     assert_eq!((host.resolve_color)(196), (255, 0, 0));
+    for index in 0..=255 {
+        assert_eq!(
+            (host.resolve_color)(index),
+            crate::terminal::xterm_256(index as u8)
+        );
+    }
+    let palette = Palette::default();
+    assert_eq!((host.resolve_color)(256), palette.foreground);
+    assert_eq!((host.resolve_color)(257), palette.background);
+    assert_eq!((host.resolve_color)(258), palette.cursor);
     (host.store_clipboard)("ignored");
 }
 

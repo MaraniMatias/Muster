@@ -2,37 +2,28 @@
 //! navigation and folding never own (or restart) a PTY.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    mpsc, Arc, Mutex, Weak,
+    Arc, Mutex, Weak,
 };
-use std::thread;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
-    checkbox::Checkbox,
-    command::{Command, CommandGroup, CommandItem, CommandState},
-    dialog::{Dialog, DialogContent, DialogFooter},
-    input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
-    popover::Popover,
+    input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, ResizableState},
-    scroll::ScrollableElement,
-    window_border, Disableable, Icon, IndexPath, Sizable, TitleBar,
+    window_border, Disableable, Sizable, TitleBar,
 };
 use gpui_kit::{
-    canvas, div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context,
-    Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Length, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
-    Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, TestSupportExt, TitlebarOptions, Window,
+    div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 // The frame is the app's own on the targets that do not draw one: server-side
@@ -40,20 +31,30 @@ use gpui_kit::{
 // this window draws for itself.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use gpui_kit::WindowDecorations;
-use muster_core::navigation::{self, DiffTotals, NavigationState};
+use muster_core::navigation::{self, DiffTotals, GitReadBudget};
 use muster_core::workspace::{
-    Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
+    Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
 };
 
-use crate::navigation::{checkout_title, session_title, Navigation};
+use crate::navigation::{session_title, Navigation};
 use crate::pty::TerminalBackend;
-use crate::terminal::{
-    shutdown, xterm_256, CellMetrics, ColorSnapshot, Palette, ShellState, TerminalHost,
-    TerminalSession, TerminalSessionConfig, TerminalView,
-};
-
+// The test suites drive these two through the window, so the parent module
+// names them rather than each suite reaching into the module that owns them.
 #[cfg(test)]
-use crate::terminal::{CloseReport, SessionError};
+use crate::titlebar::crumb_icon;
+#[cfg(test)]
+use crate::worktree_dialog::close_worktree_dialog;
+
+use crate::session_owner::{OwnedShell, SessionOwner, UNMEASURED_CELL};
+use crate::sidebar::{
+    sidebar_scroll_step, SidebarDrag, SidebarDropRegion, SidebarDropTarget, SidebarRowBounds,
+    SIDEBAR_DRAG_THRESHOLD, SIDEBAR_SCROLL_EDGE,
+};
+use crate::state_writer::StateWriter;
+use crate::terminal::{ShellState, TerminalSession, TerminalSessionConfig, TerminalView};
+use crate::theme::Roles;
+use crate::titlebar::Crumb;
+use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
@@ -78,7 +79,7 @@ pub fn load_fonts(cx: &App) {
     }
 }
 
-fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixels {
+pub(crate) fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixels {
     let style = gpui_kit::TextStyle {
         font_family: SIDEBAR_FONT_FAMILY.into(),
         font_size: px(size).into(),
@@ -92,7 +93,7 @@ fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixel
 }
 
 /// Keep the identifying tail of a namespaced branch or session title.
-fn fitted_name(window: &Window, name: &str, room: f32, size: f32) -> String {
+pub(crate) fn fitted_name(window: &Window, name: &str, room: f32, size: f32) -> String {
     if sidebar_text_width(window, name, size).as_f32() <= room {
         return name.to_owned();
     }
@@ -110,12 +111,16 @@ fn fitted_name(window: &Window, name: &str, room: f32, size: f32) -> String {
     candidate
 }
 
-fn sidebar_name(window: &Window, name: &str, room: f32) -> String {
+pub(crate) fn sidebar_name(window: &Window, name: &str, room: f32) -> String {
     fitted_name(window, name, room, 13.)
 }
 
 /// A non-tab-stop focus scope lets sibling controls reveal a row's trailing slot.
-fn sidebar_row_focus(window: &mut Window, cx: &mut App, id: &str) -> (gpui_kit::FocusHandle, bool) {
+pub(crate) fn sidebar_row_focus(
+    window: &mut Window,
+    cx: &mut App,
+    id: &str,
+) -> (gpui_kit::FocusHandle, bool) {
     let state = window.use_keyed_state(
         SharedString::from(format!("row-focus-{id}")),
         cx,
@@ -139,28 +144,29 @@ fn sidebar_row_focus(window: &mut Window, cx: &mut App, id: &str) -> (gpui_kit::
 
 /// The chrome a sidebar control wears.
 ///
-/// A custom variant keeps its own hover surface — the reference draws a
-/// neutral `#2d323c` behind a row action, not the accent wash a ghost button
-/// paints — but it is neither text nor link, so Kit hands it the default arrow.
-/// The row and the control inside it are one target, and the hand is how that
-/// says so.
-fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
+/// A custom variant keeps its own hover and press surfaces — the same ramp a
+/// hand-drawn row answers the pointer with, rather than the accent wash a ghost
+/// button paints — but it is neither text nor link, so Kit hands it the default
+/// arrow. The row and the control inside it are one target, and the hand is how
+/// that says so.
+pub(crate) fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
+    let roles = Roles::of(cx);
     ButtonCustomVariant::new(cx)
-        .foreground(gpui_kit::rgb(0x8b909c).into())
-        .hover(gpui_kit::rgb(0x2d323c).into())
-        .active(gpui_kit::rgb(0x2d323c).into())
+        .foreground(roles.text_muted)
+        .hover(roles.hover)
+        .active(roles.pressed)
 }
 
-/// The faint ink a sidebar control wears at rest, `--muster-text-muted`.
+/// The ink a sidebar control wears at rest.
 ///
 /// Set on the control rather than in a variant so the variant's hover ink can
-/// win: GPUI refines a hover style after the rest style, which is what makes
-/// the reference's `color: var(--muster-text)` lift happen here at all.
-fn sidebar_faint_ink() -> gpui_kit::Hsla {
-    gpui_kit::rgb(0x8b909c).into()
+/// win: GPUI refines a hover style after the rest style, which is what makes a
+/// control lift to primary ink on hover happen here at all.
+pub(crate) fn sidebar_faint_ink(cx: &App) -> gpui_kit::Hsla {
+    Roles::of(cx).text_muted
 }
 
-fn sidebar_repo_path(
+pub(crate) fn sidebar_repo_path(
     window: &Window,
     root: &str,
     name: &str,
@@ -191,497 +197,151 @@ fn sidebar_repo_path(
 }
 
 /// The `/` that separates one crumb's level from the next.
-fn crumb_separator() -> AnyElement {
-    div()
-        .font_family(SIDEBAR_FONT_FAMILY)
-        .text_size(px(14.))
-        .line_height(px(18.))
-        .text_color(sidebar_faint_ink())
-        .child("/")
-        .into_any_element()
-}
-
-/// The glyph a crumb wears: the one the sidebar gives the row it names, so the
-/// line reads as that panel sideways instead of as a row of text.
-///
-/// The workdir wears none. It is the name that is always there, and a glyph on
-/// it would only repeat a word that never changes.
-fn crumb_icon(crumb: Crumb) -> Option<IconName> {
-    match crumb {
-        Crumb::Workdir => None,
-        Crumb::Worktree => Some(IconName::GitBranch),
-        Crumb::Item => Some(IconName::SquareTerminal),
-    }
-}
-
-/// The button a crumb is drawn as.
-///
-/// The fitted name is what the line has room for at the current width; the
-/// whole name is what the crumb answers to on hover and to a screen reader, so
-/// a crumb that gave up segments is still the name it names.
-fn titlebar_crumb(
-    window: &Window,
-    id: &'static str,
-    label: &str,
-    budget: f32,
-    icon: Option<IconName>,
-    color: gpui_kit::Hsla,
-) -> Button {
-    // Account for the button's inset and icon before fitting the text.
-    let icon_width = if icon.is_some() { 20. } else { 0. };
-    let fitted = fitted_name(window, label, (budget - 8. - icon_width).max(0.), 14.);
-    let crumb = Button::new(id)
-        .text()
-        .small()
-        .rounded(px(0.))
-        .h(px(22.))
-        .px(px(4.))
-        .font_family(SIDEBAR_FONT_FAMILY)
-        .text_size(px(14.))
-        .line_height(px(18.))
-        // Held to its share, so a name the line cannot hold is clipped here
-        // rather than pushing the actions at the far end out of the window.
-        .max_w(px(budget))
-        .text_color(color)
-        .tooltip(label.to_owned())
-        .accessibility_label(label.to_owned())
-        .cursor_pointer();
-    match icon {
-        Some(icon) => crumb.icon(Icon::new(icon).size(px(12.))).label(fitted),
-        None => crumb.label(fitted),
-    }
-}
-
-fn titlebar_crumb_width(window: &Window, label: &str, icon: Option<IconName>) -> f32 {
-    8. + sidebar_text_width(window, label, 14.).as_f32() + if icon.is_some() { 20. } else { 0. }
-}
-
-fn titlebar_crumb_min_width(icon: Option<IconName>) -> f32 {
-    16. + if icon.is_some() { 20. } else { 0. }
-}
-
-fn titlebar_worktree_title(repo: &Repo, checkout: &muster_core::workspace::Checkout) -> String {
-    if repo.kind == RepoKind::Git && checkout.branch.is_none() {
-        "Detached".into()
-    } else {
-        checkout_title(repo, checkout)
-    }
-}
-
-fn shrink_titlebar_crumb(width: &mut f32, minimum: f32, excess: &mut f32) {
-    let removed = (*width - minimum).max(0.).min(*excess);
-    *width -= removed;
-    *excess -= removed;
-}
-
-/// The search state of one crumb menu.
-///
-/// One state per crumb rather than one per bar: two menus sharing a query would
-/// show each other's search in the other's field.
-fn titlebar_command_state(window: &mut Window, cx: &mut App, key: &str) -> Entity<CommandState> {
-    window.use_keyed_state(
-        SharedString::from(format!("titlebar-{key}")),
-        cx,
-        CommandState::new,
-    )
-}
-
-fn titlebar_menu_popover(id: &'static str) -> Popover {
-    Popover::new(id)
-        .appearance(false)
-        .w(px(288.))
-        .bg(gpui_kit::rgb(0x242830))
-        .border_1()
-        .border_color(gpui_kit::rgb(0x3a404c))
-        .rounded(px(0.))
-        .font_family(SIDEBAR_FONT_FAMILY)
-        .text_size(px(13.))
-        .line_height(px(18.))
-        .text_color(gpui_kit::rgb(0xd7dae0))
-}
-
-/// One crumb menu opening or closing.
-///
-/// The open name lives on the window rather than in the menu, so opening one
-/// crumb closes the others instead of stacking them. A close only clears the
-/// name if it is this crumb's: two popovers report their state in the same
-/// gesture sometimes, and the last one to answer must not erase the other's.
-fn crumb_opened(
-    crumb: Crumb,
-    view: gpui_kit::WeakEntity<TerminalWindow>,
-    focus: gpui_kit::FocusHandle,
-) -> impl Fn(&bool, &mut Window, &mut App) {
-    move |open, window, cx| {
-        let _ = view.update(cx, |app, cx| {
-            if *open {
-                app.open_crumb = Some(crumb);
-            } else if app.open_crumb == Some(crumb) {
-                app.open_crumb = None;
-            }
-            cx.notify();
-        });
-        if *open {
-            focus.focus(window, cx);
-        }
-    }
-}
-
-/// A crumb's searchable menu: one group of rows under a search field, with the
-/// action that makes another one at its foot.
-///
-/// The action is in the footer rather than among the rows because a search must
-/// not be able to filter away the one row that is not a choice between the
-/// things on the list.
-fn crumb_menu(
-    state: &Entity<CommandState>,
-    rows: Rc<Vec<CrumbRow>>,
-    placeholder: &'static str,
-    group: &'static str,
-    action: Option<Rc<dyn Fn() -> Button>>,
-    view: gpui_kit::WeakEntity<TerminalWindow>,
-    cx: &App,
-) -> Command {
-    let selected_row = state
-        .read(cx)
-        .selected_index()
-        .map(|index| index.row)
-        .filter(|index| rows.get(*index).is_some_and(|row| !row.disabled))
-        .or_else(|| rows.iter().position(|row| !row.disabled));
-    let selected_row = Rc::new(Cell::new(selected_row));
-    let items = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let label = row.label.clone();
-            let hint = row.hint.clone();
-            let icon = row.icon;
-            let checked = row.checked;
-            let disabled = row.disabled;
-            let selected_row = selected_row.clone();
-            CommandItem::new()
-                .label(label.clone())
-                .keywords(row.keywords.clone())
-                .disabled(disabled)
-                .child(move |_, _| {
-                    let selected = selected_row.get() == Some(index);
-                    div()
-                        .id(SharedString::from(format!("crumb-menu-row-{index}")))
-                        .test_support()
-                        .flex()
-                        .flex_1()
-                        .min_w_0()
-                        .mx(px(-8.))
-                        .my(px(-6.))
-                        .px(px(8.))
-                        .py(px(5.))
-                        .rounded(px(0.))
-                        .border_1()
-                        .border_color(if selected {
-                            gpui_kit::rgb(0x5b97ff)
-                        } else {
-                            gpui_kit::rgb(0x242830)
-                        })
-                        .bg(if selected {
-                            gpui_kit::rgb(0x2d323c)
-                        } else {
-                            gpui_kit::rgb(0x242830)
-                        })
-                        .items_center()
-                        .gap(px(16.))
-                        .when(disabled, |row| {
-                            row.cursor(gpui_kit::CursorStyle::OperationNotAllowed)
-                        })
-                        .when(!disabled, |row| {
-                            row.cursor_pointer()
-                                .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                        })
-                        .child(Icon::new(icon).size_4().text_color(sidebar_faint_ink()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_ellipsis()
-                                .font_family(SIDEBAR_FONT_FAMILY)
-                                .text_size(px(13.))
-                                .line_height(px(18.))
-                                .text_color(if disabled {
-                                    sidebar_faint_ink()
-                                } else {
-                                    gpui_kit::rgb(0xd7dae0).into()
-                                })
-                                .child(label.clone()),
-                        )
-                        .when_some(hint.clone(), |this, hint| {
-                            this.child(
-                                div()
-                                    .ml_auto()
-                                    .min_w_0()
-                                    .max_w(px(112.))
-                                    .text_ellipsis()
-                                    .font_family(SIDEBAR_FONT_FAMILY)
-                                    .text_size(px(11.))
-                                    .line_height(px(14.))
-                                    .text_color(sidebar_faint_ink())
-                                    .child(hint),
-                            )
-                        })
-                        .when(checked, |this| {
-                            this.child(
-                                Icon::new(IconName::Check)
-                                    .size_3()
-                                    .text_color(gpui_kit::rgb(0x5b97ff)),
-                            )
-                        })
-                })
-        })
-        .collect::<Vec<_>>();
-    // Command reports the original item index within this one group; filtering
-    // changes visibility, not the row used to resolve the target.
-    let targets = rows
-        .iter()
-        .map(|row| row.target.clone())
-        .collect::<Vec<_>>();
-    let mut menu = Command::new(state)
-        .placeholder(placeholder)
-        .max_h(px(300.))
-        .bordered(false)
-        .font_family(SIDEBAR_FONT_FAMILY)
-        .text_size(px(13.))
-        .line_height(px(18.))
-        .bg(gpui_kit::rgb(0x242830))
-        .text_color(gpui_kit::rgb(0xd7dae0))
-        .group(CommandGroup::new().label(group).items(items));
-    menu = match action {
-        Some(action) => menu.footer(move |_, _, cx| {
-            div()
-                .w_full()
-                .px(px(4.))
-                .pt(px(4.))
-                .pb(px(4.))
-                .child(
-                    div()
-                        .id("crumb-menu-separator")
-                        .test_support()
-                        .w_full()
-                        .h(px(1.))
-                        .bg(gpui_kit::rgb(0x2c313b)),
-                )
-                .child(
-                    action()
-                        .compact()
-                        .custom(
-                            ButtonCustomVariant::new(cx)
-                                .foreground(gpui_kit::rgb(0x8b909c).into())
-                                .hover(gpui_kit::rgb(0x2d323c).into())
-                                .active(gpui_kit::rgb(0x2d323c).into()),
-                        )
-                        .cursor_pointer()
-                        .w_full()
-                        .justify_start()
-                        .h(px(28.))
-                        .rounded(px(0.))
-                        .px(px(8.))
-                        .font_family(SIDEBAR_FONT_FAMILY)
-                        .text_size(px(13.))
-                        .line_height(px(18.)),
-                )
-        }),
-        None => menu,
-    };
-    let selected_row = selected_row.clone();
-    menu.on_select(move |index: IndexPath, _, _| selected_row.set(Some(index.row)))
-        .on_confirm(move |index: IndexPath, window, cx| {
-            let Some(target) = targets.get(index.row) else {
-                return;
-            };
-            let target = target.clone();
-            let _ = view.update(cx, |app, cx| app.select_crumb_target(&target, window, cx));
-        })
-}
 static OWNERS: Mutex<Vec<Weak<SessionOwner>>> = Mutex::new(Vec::new());
 const INITIAL_COLUMNS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
-/// How many maintenance ticks pass between two line-count passes.
+/// How often the window wakes up to consider what is due.
+const TICK: Duration = Duration::from_secs(2);
+
+/// How many maintenance ticks pass between two line-count passes, on screen.
 ///
 /// Every tick re-reads Git's worktree list; a line count is a full read of
 /// every changed file on top of that, so it runs once every ten seconds rather
 /// than once every two.
 const COUNT_EVERY_TICKS: u64 = 5;
-const UNMEASURED_CELL: CellMetrics = CellMetrics {
-    width: 8,
-    height: 16,
-};
 
-struct OwnedShell {
-    session: TerminalSession,
-    metrics: Arc<Mutex<CellMetrics>>,
-}
-#[derive(Default)]
-struct Ownership {
-    closing: bool,
-    shells: HashMap<String, Arc<OwnedShell>>,
+/// The same interval for a window nobody is looking at.
+///
+/// A minute, not never: the counts still have to catch up with what Git says
+/// while they are unwatched, so returning to a minimised workspace shows a
+/// figure that is at most a minute old rather than one from whenever it
+/// happened to last be on screen.
+const HIDDEN_COUNT_EVERY_TICKS: u64 = 30;
+
+/// The same interval for discovery, off screen.
+const HIDDEN_DISCOVER_EVERY_TICKS: u64 = 30;
+
+/// How long one background pass over the repositories may take.
+///
+/// One deadline for the pass rather than for each Git subprocess: a window
+/// with twenty repositories spends twenty seconds, not twenty minutes, and a
+/// pass that runs out reports that instead of numbers it did not finish
+/// counting.
+const SWEEP_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long one checkout's Git reads may take inside that pass.
+///
+/// The smaller of this and what is left of the sweep. A repository on a
+/// network mount or a spinning disk can spend its whole slice and be cut off,
+/// while every other checkout is still counted from what remains.
+const CHECKOUT_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long one repository's discovery may take inside a pass.
+///
+/// The same shape as `CHECKOUT_BUDGET`, and for the same reason: the pass
+/// shares one deadline, and without a slice of its own the first repository to
+/// be slow would spend it on itself and starve every repository listed after it.
+const REPO_BUDGET: Duration = Duration::from_secs(5);
+
+/// How many checkouts one pass counts at the same time.
+///
+/// Enough to overlap the Git reads without asking Git for the whole worktree
+/// list N times over: the pass is bounded by the slowest batch, and the batch
+/// is bounded by the slowest checkout in it.
+const SWEEP_CONCURRENCY: usize = 4;
+
+/// How often the background reads run, in maintenance ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cadence {
+    /// Ticks between repository discovery passes.
+    pub(crate) discover_every: u64,
+    /// Ticks between line-count passes.
+    pub(crate) count_every: u64,
 }
 
-/// Spawn and shutdown share a gate. A worker cannot publish a late PTY after
-/// quit has drained the registry; ownership starts before any UI entity exists.
-struct SessionOwner {
-    backend: Arc<TerminalBackend>,
-    owns_backend: bool,
-    state: Mutex<Ownership>,
-    stop_gate: Mutex<()>,
-    writer: Mutex<Option<StateWriter>>,
-}
-impl SessionOwner {
-    fn new(backend: Arc<TerminalBackend>, owns_backend: bool) -> Arc<Self> {
-        Arc::new(Self {
-            backend,
-            owns_backend,
-            state: Mutex::new(Ownership::default()),
-            stop_gate: Mutex::new(()),
-            writer: Mutex::new(None),
-        })
-    }
-    fn spawn(&self, mut config: TerminalSessionConfig) -> Result<Arc<OwnedShell>, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.closing {
-            return Err("The workspace is closing.".into());
+/// The cadence for a window in this state.
+///
+/// Hidden slows the reads down and stops the repaints; it does not stop them,
+/// because the counts are a fact about the working tree rather than about the
+/// window, and a number that only moves while somebody is looking at it is a
+/// number that is wrong the moment they look away.
+pub(crate) const fn cadence(visible: bool) -> Cadence {
+    if visible {
+        Cadence {
+            discover_every: 1,
+            count_every: COUNT_EVERY_TICKS,
         }
-        let metrics = Arc::new(Mutex::new(UNMEASURED_CELL));
-        config.host = host(Arc::clone(&metrics));
-        let session = TerminalSession::spawn(Arc::clone(&self.backend), config)
-            .map_err(|error| error.to_string())?;
-        let shell = Arc::new(OwnedShell { session, metrics });
-        state
-            .shells
-            .insert(shell.session.id().into(), shell.clone());
-        Ok(shell)
-    }
-    fn close_one(&self, id: &str) -> Result<(), String> {
-        let shell = self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .shells
-            .get(id)
-            .cloned();
-        if let Some(shell) = shell {
-            shell
-                .session
-                .close()
-                .wait()
-                .map_err(|error| error.to_string())?;
-            self.state
-                .lock()
-                .map_err(|error| error.to_string())?
-                .shells
-                .remove(id);
+    } else {
+        Cadence {
+            discover_every: HIDDEN_DISCOVER_EVERY_TICKS,
+            count_every: HIDDEN_COUNT_EVERY_TICKS,
         }
-        Ok(())
-    }
-    fn stop(&self) {
-        let _gate = self
-            .stop_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shells = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.closing {
-                return;
-            }
-            state.closing = true;
-            state.shells.values().cloned().collect::<Vec<_>>()
-        };
-        // This is synchronous deliberately: GPUI exits the process after its
-        // quit hook. A detached close thread would lose that race.
-        if self.owns_backend {
-            shutdown(&self.backend);
-        }
-        for shell in shells {
-            if let Err(error) = shell.session.close().wait() {
-                log::warn!("terminal cleanup failed: {error}");
-            }
-        }
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shells
-            .clear();
-        self.writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
-}
-impl Drop for SessionOwner {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
-/// One serial writer for this window. UI sends snapshots in order; shutdown
-/// joins it so the last accepted snapshot isn't lost on process exit.
-struct StateWriter {
-    sender: Option<mpsc::Sender<NavigationState>>,
-    thread: Option<thread::JoinHandle<()>>,
-    error: Arc<Mutex<Option<String>>>,
-}
-impl StateWriter {
-    fn new(path: PathBuf) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::channel::<NavigationState>();
-        let error = Arc::new(Mutex::new(None));
-        let failures = error.clone();
-        let thread = thread::Builder::new()
-            .name("muster-navigation-save".into())
-            .spawn(move || {
-                while let Ok(state) = receiver.recv() {
-                    if let Err(cause) = navigation::save(&path, &state) {
-                        *failures
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            sender: Some(sender),
-            thread: Some(thread),
-            error,
-        })
-    }
-    fn send(&self, state: NavigationState) {
-        if let Some(sender) = &self.sender {
-            if let Err(error) = sender.send(state) {
-                *self
-                    .error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
-            }
+/// One checkout waiting to be counted, with the repository it belongs to.
+type CountWork = (String, Repo, Checkout);
+
+/// Count every checkout, at most [`SWEEP_CONCURRENCY`] reads at a time.
+///
+/// Bounded in three ways that answer three different worries. One
+/// [`GitReadBudget`] bounds the whole pass, so the wall-clock cost of the
+/// workspace is capped whatever it contains. A per-checkout slice bounds one
+/// slow repository, so it cannot spend the pass's time on itself. And the
+/// batch size bounds how many Git subprocesses exist at once, so a workspace
+/// with a hundred worktrees does not fork a hundred `git diff` processes.
+///
+/// Every checkout gets an answer, including the ones a deadline cut short: a
+/// timeout is a reason to report "not counted", and reporting it is what keeps
+/// an unfinished read from looking like an empty working tree.
+async fn count_sweep(
+    work: Vec<CountWork>,
+    executor: gpui_kit::BackgroundExecutor,
+) -> Vec<(String, String, Result<DiffTotals, String>)> {
+    let sweep = GitReadBudget::new(SWEEP_BUDGET);
+    let mut counted = Vec::with_capacity(work.len());
+    let mut remaining = work.into_iter();
+    loop {
+        let batch = remaining
+            .by_ref()
+            .take(SWEEP_CONCURRENCY)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let mut reads = Vec::with_capacity(batch.len());
+        for item in batch {
+            // The slice is taken before the read starts, so a checkout that
+            // finds the sweep nearly over is told so rather than begun.
+            let within =
+                GitReadBudget::new(sweep.remaining().unwrap_or_default().min(CHECKOUT_BUDGET));
+            reads.push(executor.spawn(async move {
+                let total = navigation::diff_totals_for_checkout(&item.1, &item.2, within);
+                (item.0, item.2.path, total)
+            }));
+        }
+        for read in reads {
+            counted.push(read.await);
         }
     }
+    counted
 }
-impl Drop for StateWriter {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
+#[cfg(test)]
+pub(crate) use crate::session_owner::{end_shell, host, spawn_and_claim};
+#[cfg(test)]
+use crate::terminal::CellMetrics;
 
 // Kit Button already has a stable ID, but only exposes the generic interactive
 // trait. Use GPUI's native stateful setters on that same interactivity, so fold
 // expansion metadata describes the real focused control, not a second node.
-struct StatefulButton(Button);
+pub(crate) struct StatefulButton(Button);
 impl InteractiveElement for StatefulButton {
     fn interactivity(&mut self) -> &mut gpui_kit::Interactivity {
         self.0.interactivity()
     }
 }
 impl StatefulInteractiveElement for StatefulButton {}
-trait ButtonA11y {
+pub(crate) trait ButtonA11y {
     fn aria_expanded(self, expanded: bool) -> Self;
     fn aria_selected(self, selected: bool) -> Self;
 }
@@ -694,216 +354,66 @@ impl ButtonA11y for Button {
     }
 }
 
-struct LiveTerminal {
-    checkout_id: String,
-    view: Entity<TerminalView>,
-    shell: Arc<OwnedShell>,
+pub(crate) struct LiveTerminal {
+    pub(crate) checkout_id: String,
+    pub(crate) view: Entity<TerminalView>,
+    pub(crate) shell: Arc<OwnedShell>,
 }
-struct Rename {
-    id: String,
-    input: Entity<InputState>,
+pub(crate) struct Rename {
+    pub(crate) id: String,
+    pub(crate) input: Entity<InputState>,
     _subscription: Subscription,
 }
 
-/// The one worktree this window is creating, if it is creating one.
+/// The workspace window.
 ///
-/// Its own struct rather than a field soup because the dialog is a modal
-/// conversation: the three inputs, whether the branch is still the suggestion,
-/// what Git answered about the starting point, and the failure that keeps the
-/// dialog open. The mutation runs on a worker and cannot be rolled back, so
-/// `busy` also refuses the dialog's own Cancel.
-struct WorktreeRemovalDraft {
-    request_id: u64,
-    repo_id: String,
-    checkout_id: String,
-    info: Option<muster_core::navigation::WorktreeRemovalInfo>,
-    loading: bool,
-    busy: bool,
-    dirty_confirmed: bool,
-    unmerged_confirmed: bool,
-    delete_branch: bool,
-    error: Option<String>,
-}
-
-struct WorktreeDraft {
-    request_id: u64,
-    repo_id: String,
-    task: Entity<InputState>,
-    branch: Entity<InputState>,
-    /// The branch this worktree starts from, prefilled when Git named one.
-    ///
-    /// Not optional because a repository whose default branch Git will not
-    /// guess is ordinary enough to meet on the first run, and the answer to
-    /// that is a field to fill rather than a dead dialog. It is also the only
-    /// answer creation uses: a field the person cleared is a starting point
-    /// they refused, and a second, remembered answer would quietly override it.
-    base: Entity<InputState>,
-    /// Where worktrees of this repository go, once Git has answered.
-    location: Option<PathBuf>,
-    branch_edited: bool,
-    /// Set while the task name is rewriting the branch, so a programmatic
-    /// value is not read back as the person having taken the branch over.
-    syncing_branch: bool,
-    loading_defaults: bool,
-    busy: bool,
-    error: Option<String>,
-    _subscriptions: Vec<Subscription>,
-}
-
-/// What a crumb names, and so which of the three menus is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Crumb {
-    /// The workdir: the repository, or the plain directory it is.
-    Workdir,
-    /// The worktree of that repository, which only a Git one has.
-    Worktree,
-    /// What is open inside the workdir.
-    Item,
-}
-
-/// One row of a searchable crumb menu.
-///
-/// The words behind the name are what a search matches on: two worktrees of one
-/// repository have the same kind of name and no other thing to tell them apart.
-struct CrumbRow {
-    label: String,
-    hint: Option<String>,
-    icon: IconName,
-    keywords: Vec<String>,
-    checked: bool,
-    disabled: bool,
-    target: String,
-}
-
-const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
-const SIDEBAR_SCROLL_EDGE: f32 = 36.0;
-
-fn sidebar_scroll_step(distance: f32) -> f32 {
-    distance.signum() * (distance.abs() / 2.).clamp(2., 14.)
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct SidebarDropTarget {
-    checkout_id: String,
-    index: usize,
-}
-
-struct SidebarDrag {
-    session_id: String,
-    source_checkout: String,
-    origin: (f32, f32),
-    position: (f32, f32),
-    started: bool,
-    target: Option<SidebarDropTarget>,
-}
-
-#[derive(Clone)]
-enum SidebarDropRegion {
-    Session { checkout_id: String, index: usize },
-    Append { checkout_id: String, index: usize },
-    Insertion { checkout_id: String, index: usize },
-}
-
-struct SidebarRowBounds {
-    region: SidebarDropRegion,
-    bounds: Bounds<Pixels>,
-}
-
-// Record laid-out, window-local bounds so insertion targets stay correct while scrolling.
-fn sidebar_drag_geometry(
-    region: SidebarDropRegion,
-    rows: Rc<RefCell<Vec<SidebarRowBounds>>>,
-) -> AnyElement {
-    canvas(
-        move |bounds, _, _| rows.borrow_mut().push(SidebarRowBounds { region, bounds }),
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .left(px(0.))
-    .right(px(0.))
-    .top(px(0.))
-    .bottom(px(0.))
-    .into_any_element()
-}
-
-fn sidebar_drop_marker(
-    target: SidebarDropTarget,
-    rows: Rc<RefCell<Vec<SidebarRowBounds>>>,
-) -> AnyElement {
-    div()
-        .id(SharedString::from(format!(
-            "drop-slot-{}-{}",
-            target.checkout_id, target.index
-        )))
-        .relative()
-        .flex()
-        .items_center()
-        .h(px(26.))
-        .pl(px(12.))
-        .gap(px(7.))
-        .border_1()
-        .border_dashed()
-        .border_color(gpui_kit::rgb(0x5b97ff))
-        .text_color(gpui_kit::rgb(0x5b97ff))
-        .text_size(px(11.))
-        .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
-        .child("Drop terminal here")
-        .child(sidebar_drag_geometry(
-            SidebarDropRegion::Insertion {
-                checkout_id: target.checkout_id,
-                index: target.index,
-            },
-            rows,
-        ))
-        .into_any_element()
-}
-
-// Window events track movement past row boundaries; MouseExitEvent cancels an abandoned gesture.
-fn sidebar_drag_dispatcher(register: impl FnOnce(&mut Window, &mut App) + 'static) -> AnyElement {
-    canvas(|_, _, _| (), move |_, _, window, cx| register(window, cx))
-        .absolute()
-        .left(px(0.))
-        .right(px(0.))
-        .top(px(0.))
-        .bottom(px(0.))
-        .into_any_element()
-}
-
+/// Its state is split across this crate's modules by what a reader is looking
+/// at — the sidebar, the crumb line, the worktree dialogs — so every field is
+/// reachable from all of them. Splitting the *code* is not the same as
+/// splitting the *state*: there is one window, and it has one navigation
+/// projection, one terminal registry and one set of dialogs.
 pub struct TerminalWindow {
-    navigation: Navigation,
-    terminals: HashMap<String, LiveTerminal>,
+    pub(crate) navigation: Navigation,
+    pub(crate) terminals: HashMap<String, LiveTerminal>,
     /// Line counts per checkout, absent when nothing was counted yet.
     ///
     /// Absent means "not counted", never "no changes": a checkout Git could
     /// not be asked about draws nothing rather than a confident zero.
-    diff_totals: HashMap<String, DiffTotals>,
-    diff_refresh_running: bool,
-    diff_refresh_again: bool,
-    worktree: Option<WorktreeDraft>,
-    worktree_removal: Option<WorktreeRemovalDraft>,
-    owner: Arc<SessionOwner>,
-    failure: Option<String>,
-    notice: Option<String>,
-    opening: bool,
-    open_repo_menu: Option<String>,
+    pub(crate) diff_totals: HashMap<String, DiffTotals>,
+    pub(crate) diff_refresh_running: bool,
+    pub(crate) diff_refresh_again: bool,
+    pub(crate) worktree: Option<WorktreeDraft>,
+    pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
+    pub(crate) owner: Arc<SessionOwner>,
+    pub(crate) failure: Option<String>,
+    pub(crate) notice: Option<String>,
+    pub(crate) opening: bool,
+    pub(crate) open_repo_menu: Option<String>,
     /// Which crumb's menu is open, so opening one crumb closes the others.
-    open_crumb: Option<Crumb>,
-    closing: bool,
-    closing_sessions: std::collections::HashSet<String>,
-    removing_checkouts: HashSet<String>,
-    membership_revision: u64,
-    latest_terminal_request: Option<String>,
-    editing: Option<Rename>,
-    sidebar_drag: Option<SidebarDrag>,
-    suppress_sidebar_click: bool,
-    resize: Entity<ResizableState>,
-    scroll: ScrollHandle,
-    focus_pending: bool,
-    palette: Palette,
+    pub(crate) open_crumb: Option<Crumb>,
+    pub(crate) closing: bool,
+    pub(crate) closing_sessions: std::collections::HashSet<String>,
+    pub(crate) removing_checkouts: HashSet<String>,
+    pub(crate) membership_revision: u64,
+    pub(crate) latest_terminal_request: Option<String>,
+    pub(crate) editing: Option<Rename>,
+    pub(crate) sidebar_drag: Option<SidebarDrag>,
+    pub(crate) suppress_sidebar_click: bool,
+    pub(crate) resize: Entity<ResizableState>,
+    pub(crate) scroll: ScrollHandle,
+    pub(crate) focus_pending: bool,
+    /// Whether the platform is presenting this window's frames.
+    ///
+    /// From the visibility observer rather than from a frame: a hidden window
+    /// is not asked to draw, so reading it during render would pin it at
+    /// whatever it last was.
+    pub(crate) visible: bool,
     /// Injected-session tests exercise the same view/focus path without touching
     /// the person's state file, directory picker or session ownership.
-    injected: bool,
-    _maintenance: Option<Task<()>>,
+    pub(crate) injected: bool,
+    pub(crate) _maintenance: Option<Task<()>>,
+    /// Keeps the visibility observer registered for this window's life.
+    pub(crate) _visibility: Subscription,
 }
 
 impl TerminalWindow {
@@ -933,10 +443,28 @@ impl TerminalWindow {
             resize: cx.new(|_| ResizableState::default()),
             scroll: ScrollHandle::new(),
             focus_pending: true,
-            palette: Palette::default(),
+            visible: true,
             injected: false,
             _maintenance: None,
+            _visibility: Subscription::new(|| {}),
         }
+    }
+
+    /// Watch whether the platform is presenting this window, and repaint on the
+    /// way back in.
+    ///
+    /// Returning to a minimised window is the moment the numbers, the worktree
+    /// list and the terminal rows are most likely to be out of date, and it is
+    /// also the moment nothing else in this crate would ask for a frame.
+    fn observe_visibility(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        self._visibility = window.observe_window_visibility(move |visibility, _, cx| {
+            let _ = weak.update(cx, |app, cx| {
+                app.visible = visibility.is_visible();
+                cx.notify();
+            });
+        });
+        self.visible = window.is_visible();
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -950,6 +478,7 @@ impl TerminalWindow {
             let _ = weak.update(cx, |app, cx| app.request_window_close(window, cx));
             false
         });
+        app.observe_visibility(window, cx);
         app.opening = true;
         let cwd = working_directory();
         let worker = cx
@@ -963,12 +492,7 @@ impl TerminalWindow {
                 app.navigation = loaded.navigation;
                 app.refresh_diff_totals(cx);
                 match loaded.state_path.map(StateWriter::new).transpose() {
-                    Ok(writer) => {
-                        *app.owner
-                            .writer
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer
-                    }
+                    Ok(writer) => app.owner.install_writer(writer),
                     Err(error) => app.failure = Some(error),
                 }
                 app.persist();
@@ -997,6 +521,7 @@ impl TerminalWindow {
         });
         let id = session.id().to_owned();
         let view = cx.new(|cx| TerminalView::new(session, shell.metrics.clone(), cx));
+        app.attach_refusals(&view, cx);
         app.terminals.insert(
             id.clone(),
             LiveTerminal {
@@ -1025,19 +550,28 @@ impl TerminalWindow {
             .map(|terminal| &terminal.view)
     }
 
-    fn persist(&self) {
-        if let Some(writer) = self
-            .owner
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            writer.send(self.navigation.persistent_state());
-        }
+    /// Route one terminal view's refusals into the banner this window draws.
+    ///
+    /// GPUI subscriptions hold a weak window reference; neither entity is kept
+    /// alive by the event path. Messages never include the refused payload.
+    fn attach_refusals(&mut self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        cx.subscribe(view, |app, _, event: &crate::terminal::InputRefused, cx| {
+            app.failure = Some(event.0.clone());
+            cx.notify();
+        })
+        .detach();
     }
 
-    fn request_terminal(&mut self, checkout_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn persist(&self) {
+        self.owner.persist(self.navigation.persistent_state());
+    }
+
+    pub(crate) fn request_terminal(
+        &mut self,
+        checkout_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.closing {
             return;
         }
@@ -1101,6 +635,7 @@ impl TerminalWindow {
                             let terminal = cx.new(|cx| {
                                 TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
                             });
+                            app.attach_refusals(&terminal, cx);
                             app.terminals.insert(
                                 id.clone(),
                                 LiveTerminal {
@@ -1133,14 +668,14 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal() {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
         }
         self.focus_pending = false;
     }
 
-    fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening || self.closing {
             return;
         }
@@ -1189,41 +724,51 @@ impl TerminalWindow {
         cx.notify();
     }
 
+    /// The window's background loop: one wake every [`TICK`], and on each wake
+    /// whatever the window's current visibility says is due.
+    ///
+    /// Every Git read this window makes comes from here or from a change the
+    /// person made, and each pass carries its own [`GitReadBudget`]. A pass that
+    /// runs out of time reports that; it never reports a number it did not
+    /// finish counting.
     fn start_maintenance(&mut self, cx: &mut Context<Self>) {
         let background = cx.background_executor().clone();
         self._maintenance = Some(cx.spawn(async move |view, cx| {
             let mut ticks: u64 = 0;
             loop {
-                background.timer(Duration::from_secs(2)).await;
+                background.timer(TICK).await;
                 ticks += 1;
-                let Ok((epoch, repos, closing)) = view.update(cx, |app, cx| {
-                    if let Some(error) = app
-                        .owner
-                        .writer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .and_then(|writer| writer.error.lock().ok()?.take())
-                    {
+                let Ok((epoch, roots, closing)) = view.update(cx, |app, cx| {
+                    if let Some(error) = app.owner.writer_failure() {
                         app.failure = Some(error);
                         cx.notify();
                     }
-                    // Status changes repaint inactive terminal rows too.
-                    cx.notify();
+                    let cadence = cadence(app.visible);
+                    // A hidden window is not looked at, so it is not repainted
+                    // on a timer either. It becomes visible again through the
+                    // visibility observer, which repaints on the way back.
+                    if app.visible {
+                        // Status changes repaint inactive terminal rows too.
+                        cx.notify();
+                    }
                     // Counted far less often than membership is refreshed: a
                     // line total is a full Git read of every changed file, and
                     // this is a background refresh, not a Git watcher.
-                    if ticks.is_multiple_of(COUNT_EVERY_TICKS) {
+                    if ticks.is_multiple_of(cadence.count_every) {
                         app.refresh_diff_totals(cx);
                     }
                     (
                         app.membership_revision,
-                        app.navigation
-                            .repos
-                            .iter()
-                            .filter(|repo| repo.kind == RepoKind::Git)
-                            .map(|repo| (repo.id.clone(), repo.root.clone()))
-                            .collect::<Vec<_>>(),
+                        if ticks.is_multiple_of(cadence.discover_every) {
+                            app.navigation
+                                .repos
+                                .iter()
+                                .filter(|repo| repo.kind == RepoKind::Git)
+                                .map(|repo| (repo.id.clone(), repo.root.clone()))
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        },
                         app.closing,
                     )
                 }) else {
@@ -1232,18 +777,42 @@ impl TerminalWindow {
                 if closing {
                     return;
                 }
-                let results = background
-                    .spawn(async move {
-                        repos
-                            .into_iter()
-                            .map(|(id, root)| (id, navigation::open_directory(Path::new(&root))))
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
+                // An empty root list is a tick with no discovery due. It is also
+                // how a hidden window spends its time: still awake, still
+                // counting lines, but not asking Git for anything it has
+                // already been told.
+                if roots.is_empty() {
+                    continue;
+                }
+                let sweep = GitReadBudget::new(SWEEP_BUDGET);
+                let mut results = Vec::with_capacity(roots.len());
+                for batch in roots.chunks(SWEEP_CONCURRENCY) {
+                    let reads = batch
+                        .iter()
+                        .cloned()
+                        .map(|(id, root)| {
+                            let within = GitReadBudget::new(
+                                sweep.remaining().unwrap_or_default().min(REPO_BUDGET),
+                            );
+                            background.spawn(async move {
+                                (
+                                    id,
+                                    navigation::open_directory_with_budget(
+                                        Path::new(&root),
+                                        within,
+                                    ),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    for read in reads {
+                        results.push(read.await);
+                    }
+                }
                 if view
                     .update(cx, |app, cx| {
                         if app.closing || app.membership_revision != epoch {
-                            return;
+                            return false;
                         }
                         let previous = app.diff_checkout_paths();
                         for (id, result) in results {
@@ -1269,6 +838,7 @@ impl TerminalWindow {
                             app.refresh_diff_totals(cx);
                         }
                         cx.notify();
+                        true
                     })
                     .is_err()
                 {
@@ -1291,8 +861,17 @@ impl TerminalWindow {
             .collect()
     }
 
-    /// Selection and membership changes refresh immediately, without overlapping Git sweeps.
-    fn refresh_diff_totals(&mut self, cx: &mut Context<Self>) {
+    /// Count the line changes in every checkout this window can see.
+    ///
+    /// Each checkout is counted from the repository and the checkout this
+    /// window already discovered: `diff_totals_for_checkout` revalidates the
+    /// identity it is handed and never rediscovers, so a sweep is one Git read
+    /// per checkout instead of a fresh `open_directory` per checkout first.
+    ///
+    /// Overlapping requests collapse into one more pass rather than a second
+    /// sweep, and a pass whose result would describe a membership this window
+    /// has since left is dropped by [`Self::apply_diff_totals`].
+    pub(crate) fn refresh_diff_totals(&mut self, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }
@@ -1300,23 +879,18 @@ impl TerminalWindow {
             self.diff_refresh_again = true;
             return;
         }
-        let paths = self.diff_checkout_paths();
+        let work = self.diff_checkout_work();
         self.diff_totals
-            .retain(|id, _| paths.iter().any(|(current, _)| current == id));
-        if paths.is_empty() {
+            .retain(|id, _| work.iter().any(|(checkout_id, ..)| checkout_id == id));
+        if work.is_empty() {
             return;
         }
         let revision = self.membership_revision;
         self.diff_refresh_running = true;
-        let worker = cx.background_executor().spawn(async move {
-            paths
-                .into_iter()
-                .map(|(id, path)| {
-                    let total = navigation::diff_totals(Path::new(&path))
-                        .map_err(|error| log::debug!("muster-native: {path}: {error}"));
-                    (id, path, total)
-                })
-                .collect::<Vec<_>>()
+        let executor = cx.background_executor().clone();
+        let worker = executor.clone().spawn({
+            let executor = executor.clone();
+            async move { count_sweep(work, executor).await }
         });
         cx.spawn(async move |view, cx| {
             let totals = worker.await;
@@ -1333,10 +907,44 @@ impl TerminalWindow {
         .detach();
     }
 
+    /// The checkouts this window should be counting, each with the repository
+    /// it belongs to and the path it was last known to be at.
+    ///
+    /// The open checkout is counted first: it is the one a person is looking
+    /// at, so it is the one that must survive a sweep that runs out of time.
+    fn diff_checkout_work(&self) -> Vec<(String, Repo, Checkout)> {
+        let mut work = Vec::new();
+        for repo in &self.navigation.repos {
+            if repo.kind != RepoKind::Git {
+                continue;
+            }
+            for checkout in &repo.checkouts {
+                if checkout.is_missing || self.navigation.archived.contains(&checkout.id) {
+                    continue;
+                }
+                work.push((checkout.id.clone(), repo.clone(), checkout.clone()));
+            }
+        }
+        if let Some(open) = &self.navigation.active_checkout {
+            if let Some(index) = work.iter().position(|(id, ..)| id == open) {
+                work.swap(0, index);
+            }
+        }
+        work
+    }
+
+    /// Record one pass's answers.
+    ///
+    /// A checkout that could not be counted loses its figure and draws
+    /// nothing: an absent figure is "not counted", and a figure of zero is a
+    /// claim about the working tree that a timed-out read is not entitled to
+    /// make. Whatever was counted before a failure stays counted nowhere for
+    /// that checkout until a later pass answers, so a row never shows a stale
+    /// number as though it were this pass's.
     fn apply_diff_totals(
         &mut self,
         revision: u64,
-        totals: Vec<(String, String, Result<DiffTotals, ()>)>,
+        totals: Vec<(String, String, Result<DiffTotals, String>)>,
         cx: &mut Context<Self>,
     ) {
         if self.closing || self.membership_revision != revision {
@@ -1355,7 +963,8 @@ impl TerminalWindow {
                 Ok(total) => {
                     self.diff_totals.insert(id, total);
                 }
-                Err(()) => {
+                Err(error) => {
+                    log::debug!("muster-native: {path}: {error}");
                     self.diff_totals.remove(&id);
                 }
             }
@@ -1363,7 +972,12 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn request_close_terminal(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn request_close_terminal(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.closing_sessions.contains(id) || self.closing {
             return;
         }
@@ -1420,7 +1034,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }
@@ -1463,7 +1077,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn start_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.navigation.session(id) else {
             return;
         };
@@ -1510,7 +1124,12 @@ impl TerminalWindow {
     /// line inside it rather than a spinner over the whole window. A repository
     /// with no resolvable default branch keeps the dialog open and says so: the
     /// starting point is the one thing that cannot be guessed.
-    fn open_worktree_dialog(&mut self, repo_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_worktree_dialog(
+        &mut self,
+        repo_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.closing || self.worktree.is_some() || self.worktree_removal.is_some() {
             return;
         }
@@ -1659,7 +1278,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn open_worktree_removal_dialog(
+    pub(crate) fn open_worktree_removal_dialog(
         &mut self,
         repo_id: &str,
         checkout_id: &str,
@@ -1743,7 +1362,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn checkout_has_terminal_activity(&self, checkout_id: &str) -> bool {
+    pub(crate) fn checkout_has_terminal_activity(&self, checkout_id: &str) -> bool {
         self.navigation
             .checkout(checkout_id)
             .is_some_and(|checkout| !checkout.sessions.is_empty())
@@ -1785,7 +1404,7 @@ impl TerminalWindow {
     /// after the branch and the directory exist says so and leaves them, because
     /// deleting a branch that now holds someone's commits is worse than a row
     /// the person has to reopen.
-    fn submit_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.worktree.as_ref() else {
             return;
         };
@@ -1848,474 +1467,6 @@ impl TerminalWindow {
     }
 
     /// The worktree dialog, drawn over the window it belongs to.
-    fn worktree_dialog(&self, draft: &WorktreeDraft, cx: &mut Context<Self>) -> AnyElement {
-        let ready = draft.location.is_some()
-            && !draft.busy
-            && !draft.loading_defaults
-            && !draft.task.read(cx).value().trim().is_empty()
-            && !draft.branch.read(cx).value().trim().is_empty()
-            && !draft.base.read(cx).value().trim().is_empty();
-        // The content builder is called again on every repaint, so it holds the
-        // three input entities and builds the fields itself rather than closing
-        // over elements it would have to hand out twice.
-        let task = draft.task.clone();
-        let branch = draft.branch.clone();
-        let base = draft.base.clone();
-        let origin = draft
-            .location
-            .as_ref()
-            .map(|location| format!("Worktrees are created under {}", location.display()));
-        let error = draft.error.clone();
-        let loading_defaults = draft.loading_defaults;
-        let context = self
-            .navigation
-            .repos
-            .iter()
-            .find(|repo| repo.id == draft.repo_id)
-            .map(|repo| {
-                let root = repo.checkouts.iter().find(|checkout| checkout.is_primary);
-                let context = root
-                    .map(|checkout| checkout.branch.as_deref().unwrap_or(&checkout.path))
-                    .unwrap_or(&repo.root);
-                format!("{context} · {}", repo.name)
-            });
-        let cancel_button = cx.weak_entity();
-        let cancel_dialog = cx.weak_entity();
-        let submit_button = cx.weak_entity();
-        Dialog::new(cx)
-            .width(px(440.))
-            .title("Create worktree")
-            .content(move |content: DialogContent, _, _| {
-                let content = content.when_some(context.clone(), |content, context| {
-                    content.child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child(context),
-                    )
-                });
-                if loading_defaults {
-                    return content.child(
-                        div()
-                            .py_4()
-                            .text_size(px(12.))
-                            .child("Checking Git worktree…"),
-                    );
-                }
-                let mut content = content
-                    .child(div().text_size(px(12.)).child("Task name"))
-                    .child(Input::new(&task).aria_label("Task name").w_full())
-                    // Legacy says this under the field, and the native dialog
-                    // had dropped it: the task name is the directory on disk,
-                    // and a person who does not know that will not predict the
-                    // path their worktree lands in.
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child("Used as directory name; unsafe characters are cleaned by Git."),
-                    )
-                    .child(div().mt_3().text_size(px(12.)).child("New branch"))
-                    .child(Input::new(&branch).aria_label("New branch").w_full())
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_size(px(12.))
-                            .child("Starting from branch"),
-                    )
-                    .child(
-                        Input::new(&base)
-                            .aria_label("Starting from branch")
-                            .w_full(),
-                    );
-                if let Some(origin) = origin.clone() {
-                    content = content.child(
-                        div()
-                            .mt_2()
-                            .text_size(px(11.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child(origin),
-                    );
-                }
-                if let Some(error) = error.clone() {
-                    content = content.child(
-                        div()
-                            .mt_2()
-                            .text_size(px(12.))
-                            .text_color(gpui_kit::rgb(0xd97f84))
-                            .child(error),
-                    );
-                }
-                content
-            })
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new("worktree-cancel")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(move |_, _window, cx| {
-                                let _ = cancel_button.update(cx, |app, cx| {
-                                    close_worktree_dialog(app, cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("worktree-create")
-                            .primary()
-                            .label(if draft.busy {
-                                "Creating…"
-                            } else {
-                                "Create and open shell"
-                            })
-                            .disabled(!ready)
-                            .on_click(move |_, window, cx| {
-                                let _ = submit_button
-                                    .update(cx, |app, cx| app.submit_worktree(window, cx));
-                            }),
-                    ),
-            )
-            .on_cancel(move |_, _, cx| {
-                let _ = cancel_dialog.update(cx, |app, cx| {
-                    close_worktree_dialog(app, cx);
-                    cx.notify();
-                });
-                false
-            })
-            .into_any_element()
-    }
-
-    fn worktree_removal_dialog(
-        &self,
-        draft: &WorktreeRemovalDraft,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = draft.checkout_id.clone();
-        let request_id = draft.request_id;
-        let info = draft.info.clone();
-        let loading = draft.loading;
-        let busy = draft.busy;
-        let dirty_confirmed = draft.dirty_confirmed;
-        let unmerged_confirmed = draft.unmerged_confirmed;
-        let delete_branch = draft.delete_branch;
-        let error = draft.error.clone();
-        let checkout = self.navigation.checkout(&id);
-        let repo = self
-            .navigation
-            .repos
-            .iter()
-            .find(|repo| repo.id == draft.repo_id);
-        let branch = info
-            .as_ref()
-            .and_then(|info| info.branch.as_deref())
-            .or_else(|| checkout.and_then(|checkout| checkout.branch.as_deref()))
-            .unwrap_or("detached HEAD");
-        let label = format!(
-            "{} · {}",
-            branch,
-            repo.map_or("Git repository", |repo| repo.name.as_str())
-        );
-        let path = info
-            .as_ref()
-            .map(|info| info.path.clone())
-            .or_else(|| checkout.map(|checkout| checkout.canonical_path.clone()))
-            .unwrap_or_else(|| id.clone());
-        let valid_checkout = repo.is_some_and(|repo| repo.kind == RepoKind::Git)
-            && checkout.is_some_and(|checkout| {
-                !checkout.is_primary
-                    && !checkout.is_missing
-                    && self.navigation.home.as_deref() != Some(&id)
-            });
-        let session_names = checkout
-            .map(|checkout| {
-                checkout
-                    .sessions
-                    .iter()
-                    .map(|session| session.name.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let retained_terminals = self
-            .terminals
-            .iter()
-            .filter(|(session_id, terminal)| {
-                terminal.checkout_id == id && self.navigation.session(session_id).is_none()
-            })
-            .map(|(session_id, _)| format!("Terminal {session_id}"))
-            .collect::<Vec<_>>();
-        let pending_ids = self
-            .navigation
-            .pending
-            .iter()
-            .filter(|(_, pending)| *pending == &id)
-            .map(|(request, _)| request.clone())
-            .collect::<Vec<_>>();
-        let has_terminal = self.checkout_has_terminal_activity(&id);
-        let has_pending = !pending_ids.is_empty();
-        let can_archive = !busy && valid_checkout && !has_terminal;
-        let can_delete = !loading
-            && !busy
-            && valid_checkout
-            && !has_terminal
-            && info.as_ref().is_some_and(|info| {
-                (info.dirty_files.is_empty() || dirty_confirmed)
-                    && (info.branch.is_some() || info.unmerged_commits == 0 || unmerged_confirmed)
-            });
-        let shell_checkout_id = id.clone();
-        let open_shell = cx.weak_entity();
-        let toggle_dirty = cx.weak_entity();
-        let toggle_unmerged = cx.weak_entity();
-        let toggle_branch = cx.weak_entity();
-        let archive = cx.weak_entity();
-        let delete = cx.weak_entity();
-        let close_for_cancel = cx.weak_entity();
-        let close_for_escape = cx.weak_entity();
-        Dialog::new(cx)
-            .width(px(520.))
-            .title("Archive or delete worktree")
-            .content(move |mut content: DialogContent, _, _| {
-                content = content
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .child("Archive hides this worktree, keeps every file and branch, and does not run Git. Delete removes this selected worktree directory and its Git registration."),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_size(px(11.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child(format!("{label} · {}", escape_git_path(&path))),
-                    );
-                if loading {
-                    content = content.child(
-                        div()
-                            .mt_3()
-                            .text_size(px(12.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child("Checking Git worktree…"),
-                    );
-                }
-                if let Some(info) = info.clone() {
-                    if info.dirty_files.is_empty() {
-                        content = content.child(
-                            div()
-                                .mt_3()
-                                .text_size(px(12.))
-                                .text_color(gpui_kit::rgb(0x8b909c))
-                                .child("No uncommitted files."),
-                        );
-                    } else {
-                        let toggle_dirty = toggle_dirty.clone();
-                        let mut preview = div()
-                            .mt_3()
-                            .p_2()
-                            .bg(gpui_kit::rgb(0x252932))
-                            .text_size(px(12.))
-                            .child(format!(
-                                "{} uncommitted file(s) may be lost if you delete this worktree:",
-                                info.dirty_files.len()
-                            ));
-                        for file in info.dirty_files.iter().take(8) {
-                            preview = preview.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(gpui_kit::rgb(0x8b909c))
-                                    .child(escape_git_path(file)),
-                            );
-                        }
-                        if info.dirty_files.len() > 8 {
-                            preview = preview.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(gpui_kit::rgb(0x8b909c))
-                                    .child(format!("and {} more…", info.dirty_files.len() - 8)),
-                            );
-                        }
-                        let open_shell = open_shell.clone();
-                        let shell_checkout_id = shell_checkout_id.clone();
-                        content = content
-                            .child(preview)
-                            .child(Button::new("worktree-commit-shell")
-                                .text()
-                                .label("Open a shell to commit or stash first")
-                                .disabled(busy)
-                                .on_click(move |_, window, cx| {
-                                    let _ = open_shell.update(cx, |app, cx| {
-                                        close_worktree_dialog(app, cx);
-                                        app.request_terminal(&shell_checkout_id, window, cx);
-                                    });
-                                }))
-                            .child(
-                                Checkbox::new("worktree-confirm-dirty")
-                                    .checked(dirty_confirmed)
-                                    .label("I understand uncommitted files may be lost; delete anyway.")
-                                    .on_change(move |checked, _, cx| {
-                                        let _ = toggle_dirty.update(cx, |app, cx| {
-                                            if let Some(draft) = app
-                                                .worktree_removal
-                                                .as_mut()
-                                                .filter(|draft| draft.request_id == request_id)
-                                            {
-                                                draft.dirty_confirmed = *checked;
-                                                draft.error = None;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                    }
-                    if info.unmerged_commits > 0 {
-                        let warning = if info.branch.is_some() {
-                            format!(
-                                "Branch {} has {} unmerged commit(s) versus {}. The branch is kept unless you choose to delete it.",
-                                info.branch.as_deref().unwrap_or_default(),
-                                info.unmerged_commits,
-                                info.default_branch.as_deref().unwrap_or("the default branch")
-                            )
-                        } else {
-                            format!(
-                                "Detached HEAD has {} commit(s) unreachable from branches, remotes, or tags. Deleting this worktree may lose them.",
-                                info.unmerged_commits
-                            )
-                        };
-                        content = content.child(
-                            div()
-                                .mt_2()
-                                .p_2()
-                                .bg(gpui_kit::rgb(0x252932))
-                                .text_size(px(12.))
-                                .child(warning),
-                        );
-                        if info.branch.is_none() {
-                            let toggle_unmerged = toggle_unmerged.clone();
-                            content = content.child(
-                                Checkbox::new("worktree-confirm-unmerged")
-                                    .checked(unmerged_confirmed)
-                                    .label("I understand these detached commits may be lost; delete anyway.")
-                                    .on_change(move |checked, _, cx| {
-                                        let _ = toggle_unmerged.update(cx, |app, cx| {
-                                            if let Some(draft) = app
-                                                .worktree_removal
-                                                .as_mut()
-                                                .filter(|draft| draft.request_id == request_id)
-                                            {
-                                                draft.unmerged_confirmed = *checked;
-                                                draft.error = None;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                        }
-                    }
-                    if let Some(branch) = info.branch.as_deref() {
-                        let toggle_branch = toggle_branch.clone();
-                        content = content.child(
-                            Checkbox::new("worktree-delete-branch")
-                                .checked(delete_branch)
-                                .label(format!(
-                                    "Delete local branch {}{}",
-                                    branch,
-                                    if info.unmerged_commits > 0 {
-                                        format!(" and its {} unmerged commit(s)", info.unmerged_commits)
-                                    } else {
-                                        String::new()
-                                    }
-                                ))
-                                .on_change(move |checked, _, cx| {
-                                    let _ = toggle_branch.update(cx, |app, cx| {
-                                        if let Some(draft) = app
-                                            .worktree_removal
-                                            .as_mut()
-                                            .filter(|draft| draft.request_id == request_id)
-                                        {
-                                            draft.delete_branch = *checked;
-                                            draft.error = None;
-                                        }
-                                        cx.notify();
-                                    });
-                                }),
-                        );
-                    }
-                }
-                if has_terminal {
-                    let mut sessions = div()
-                        .mt_2()
-                        .text_size(px(12.))
-                        .text_color(gpui_kit::rgb(0xe3b341))
-                        .child("Close these terminal sessions before archiving or deleting:");
-                    for name in &session_names {
-                        sessions = sessions.child(div().text_size(px(11.)).child(name.clone()));
-                    }
-                    for name in &retained_terminals {
-                        sessions = sessions.child(div().text_size(px(11.)).child(name.clone()));
-                    }
-                    content = content.child(sessions);
-                }
-                if has_pending {
-                    let mut pending = div()
-                        .text_size(px(12.))
-                        .text_color(gpui_kit::rgb(0xe3b341))
-                        .child("Wait for terminal creation to finish before continuing:");
-                    for request in &pending_ids {
-                        pending = pending.child(div().text_size(px(11.)).child(request.clone()));
-                    }
-                    content = content.child(pending);
-                }
-                if let Some(error) = error.clone() {
-                    content = content.child(
-                        div()
-                            .mt_2()
-                            .text_size(px(12.))
-                            .text_color(gpui_kit::rgb(0xd97f84))
-                            .child(error),
-                    );
-                }
-                content
-            })
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new("worktree-removal-cancel")
-                            .ghost()
-                            .label("Cancel")
-                            .disabled(busy)
-                            .on_click(move |_, _, cx| {
-                                let _ = close_for_cancel.update(cx, |app, cx| {
-                                    close_worktree_dialog(app, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("worktree-archive")
-                            .ghost()
-                            .label(if busy { "Archiving…" } else { "Archive" })
-                            .disabled(!can_archive)
-                            .on_click(move |_, _, cx| {
-                                let _ = archive.update(cx, |app, cx| app.submit_worktree_archive(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("worktree-delete")
-                            .danger()
-                            .label(if busy { "Deleting…" } else { "Delete worktree" })
-                            .disabled(!can_delete)
-                            .on_click(move |_, window, cx| {
-                                let _ = delete.update(cx, |app, cx| {
-                                    app.submit_worktree_delete(window, cx)
-                                });
-                            }),
-                    ),
-            )
-            .on_cancel(move |_, _, cx| {
-                let _ = close_for_escape.update(cx, close_worktree_dialog);
-                false
-            })
-            .into_any_element()
-    }
-
     fn can_drag_terminal(&self, id: &str) -> bool {
         let Some(session) = self.navigation.session(id) else {
             return false;
@@ -2342,7 +1493,12 @@ impl TerminalWindow {
         reorder || move_elsewhere
     }
 
-    fn begin_sidebar_drag(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn begin_sidebar_drag(
+        &mut self,
+        id: &str,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         self.suppress_sidebar_click = false;
         let Some(source_checkout) = self
             .navigation
@@ -2371,14 +1527,14 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn cancel_sidebar_drag(&mut self) {
+    pub(crate) fn cancel_sidebar_drag(&mut self) {
         if self.sidebar_drag.take().is_some() {
             self.suppress_sidebar_click = true;
         }
     }
 
     /// All insertion indices exclude the dragged session, just like the final list.
-    fn sidebar_drop_slot(&self, checkout_id: &str, index: usize) -> usize {
+    pub(crate) fn sidebar_drop_slot(&self, checkout_id: &str, index: usize) -> usize {
         let source_index = self
             .sidebar_drag
             .as_ref()
@@ -2449,7 +1605,7 @@ impl TerminalWindow {
         Some(target)
     }
 
-    fn update_sidebar_drag(
+    pub(crate) fn update_sidebar_drag(
         &mut self,
         position: Point<Pixels>,
         pressed_button: Option<MouseButton>,
@@ -2484,7 +1640,7 @@ impl TerminalWindow {
         }
     }
 
-    fn finish_sidebar_drag(
+    pub(crate) fn finish_sidebar_drag(
         &mut self,
         position: Point<Pixels>,
         rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
@@ -2524,7 +1680,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn tick_sidebar_drag(
+    pub(crate) fn tick_sidebar_drag(
         &mut self,
         rows: &Rc<RefCell<Vec<SidebarRowBounds>>>,
         cx: &mut Context<Self>,
@@ -2572,7 +1728,7 @@ impl TerminalWindow {
         }
     }
 
-    fn move_terminal(
+    pub(crate) fn move_terminal(
         &mut self,
         id: &str,
         target: &str,
@@ -2610,7 +1766,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn request_dismiss_missing_checkout(
+    pub(crate) fn request_dismiss_missing_checkout(
         &mut self,
         checkout_id: &str,
         window: &mut Window,
@@ -2682,7 +1838,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn submit_worktree_archive(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn submit_worktree_archive(&mut self, cx: &mut Context<Self>) {
         let Some((request_id, id, busy)) = self
             .worktree_removal
             .as_ref()
@@ -2713,7 +1869,7 @@ impl TerminalWindow {
         }
     }
 
-    fn submit_worktree_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_worktree_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((request_id, repo_id, id, info, confirm_dirty, confirm_unmerged, delete_branch)) =
             self.worktree_removal.as_ref().map(|draft| {
                 (
@@ -2883,7 +2039,12 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    fn restore_archived(&mut self, repo_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn restore_archived(
+        &mut self,
+        repo_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.navigation.repos.iter().find(|repo| repo.id == repo_id) else {
             return;
         };
@@ -2928,7 +2089,7 @@ impl TerminalWindow {
         .detach();
     }
 
-    fn remove_repo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn remove_repo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.navigation.repos.iter().find(|repo| repo.id == id) else {
             return;
         };
@@ -3071,7 +2232,7 @@ impl TerminalWindow {
     /// because the two say different things and the row can only stay silent
     /// about both: a `+0`/`−0` would claim a measurement nobody made, and the
     /// row is where a person looks to learn whether Git was asked at all.
-    fn line_slot(counts: Option<&DiffTotals>) -> Option<(u64, u64)> {
+    pub(crate) fn line_slot(counts: Option<&DiffTotals>) -> Option<(u64, u64)> {
         let totals = counts?;
         (totals.additions + totals.deletions > 0).then_some((totals.additions, totals.deletions))
     }
@@ -3082,7 +2243,7 @@ impl TerminalWindow {
     /// `-` survive, everything else collapses to one `-`, and a name that
     /// reduces to nothing falls back to `new-task` rather than creating a
     /// worktree called `.worktrees/`.
-    fn slug_for(value: &str) -> String {
+    pub(crate) fn slug_for(value: &str) -> String {
         let mut slug = String::new();
         let mut separator = false;
         for character in value.trim().chars() {
@@ -3102,1723 +2263,37 @@ impl TerminalWindow {
         }
     }
 
-    fn repo_menu(
-        &self,
-        id: String,
-        view: gpui_kit::WeakEntity<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
-        let repo = self
-            .navigation
-            .repos
-            .iter()
-            .find(|repo| repo.id == id)
-            .expect("drawn repository");
-        let archived = repo
-            .checkouts
-            .iter()
-            .filter(|checkout| self.navigation.archived.contains(&checkout.id))
-            .count();
-        // A missing directory has no repository to ask about, and adding a
-        // worktree is the one action that has to be a click away rather than a
-        // click and a dialog further.
-        let can_add = repo.kind == RepoKind::Git
-            && repo
-                .checkouts
-                .iter()
-                .any(|item| item.is_primary && !item.is_missing);
-        let can_close = !repo
-            .checkouts
-            .iter()
-            .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
-        move |menu, _, _| {
-            let mut menu = menu.min_w(px(224.));
-            if can_add {
-                let id = id.clone();
-                let view = view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("New worktree")
-                        .icon(IconName::GitBranchPlus)
-                        .on_click(move |_, _window, cx| {
-                            let _ = view.update_in(cx, |app, window, cx| {
-                                app.open_worktree_dialog(&id, window, cx)
-                            });
-                        }),
-                );
-            }
-            if can_add && archived > 0 {
-                let id = id.clone();
-                let view = view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(format!("Restore archived worktrees ({archived})"))
-                        .icon(IconName::ArchiveRestore)
-                        .on_click(move |_, window, cx| {
-                            let _ =
-                                view.update(cx, |app, cx| app.restore_archived(&id, window, cx));
-                        }),
-                );
-            }
-            if can_close {
-                let id = id.clone();
-                let view = view.clone();
-                menu = menu.separator().item(
-                    PopupMenuItem::new("Remove from panel")
-                        .icon(IconName::FolderMinus)
-                        .on_click(move |_, window, cx| {
-                            let _ = view.update(cx, |app, cx| app.remove_repo(&id, window, cx));
-                        }),
-                );
-            }
-            menu
-        }
-    }
-
-    fn terminal_menu(
-        &self,
-        id: String,
-        view: gpui_kit::WeakEntity<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
-        let session = self.navigation.session(&id).expect("drawn session");
-        let source = session.checkout_id.clone();
-        let sessions = &self
-            .navigation
-            .checkout(&source)
-            .expect("session checkout")
-            .sessions;
-        let index = sessions
-            .iter()
-            .position(|session| session.id == id)
-            .unwrap_or(0);
-        let count = sessions.len();
-        let destinations = self
-            .navigation
-            .repos
-            .iter()
-            .flat_map(|repo| repo.checkouts.iter().map(move |checkout| (repo, checkout)))
-            .filter(|(_, checkout)| {
-                !checkout.is_missing
-                    && !self.navigation.archived.contains(&checkout.id)
-                    && checkout.id != source
-            })
-            .map(|(repo, checkout)| {
-                (
-                    checkout.id.clone(),
-                    format!("Move to {} / {}", repo.name, checkout_title(repo, checkout)),
-                    checkout.sessions.len(),
-                )
-            })
-            .collect::<Vec<_>>();
-        move |mut menu, _, _| {
-            let rename_id = id.clone();
-            let rename_view = view.clone();
-            menu = menu.item(PopupMenuItem::new("Rename terminal").on_click(
-                move |_, window, cx| {
-                    let _ =
-                        rename_view.update(cx, |app, cx| app.start_rename(&rename_id, window, cx));
-                },
-            ));
-            for (label, target_index, available) in [
-                ("Move up", index.saturating_sub(1), index > 0),
-                ("Move down", index + 1, index + 1 < count),
-            ] {
-                let id = id.clone();
-                let source = source.clone();
-                let view = view.clone();
-                menu = menu.item(PopupMenuItem::new(label).disabled(!available).on_click(
-                    move |_, window, cx| {
-                        let _ = view.update(cx, |app, cx| {
-                            app.move_terminal(&id, &source, target_index, window, cx)
-                        });
-                    },
-                ));
-            }
-            for (target, label, index) in &destinations {
-                let id = id.clone();
-                let target = target.clone();
-                let index = *index;
-                let view = view.clone();
-                menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
-                    move |_, window, cx| {
-                        let _ = view.update(cx, |app, cx| {
-                            app.move_terminal(&id, &target, index, window, cx)
-                        });
-                    },
-                ));
-            }
-            let id = id.clone();
-            let view = view.clone();
-            menu.separator()
-                .item(
-                    PopupMenuItem::new("Close terminal").on_click(move |_, window, cx| {
-                        let _ =
-                            view.update(cx, |app, cx| app.request_close_terminal(&id, window, cx));
-                    }),
-                )
-        }
-    }
-
     /// The name a session is drawn under: what the live process says it is
     /// doing, or what it was launched as when nothing answers.
     ///
     /// The same name in the crumb and in the sidebar, so the menu of the open
     /// terminal and the row that opened it cannot say two different things
     /// about the same session.
-    fn session_label(&self, session: &Session) -> String {
+    pub(crate) fn session_label(&self, session: &Session) -> String {
         self.terminals
             .get(&session.id)
             .map(|terminal| {
                 let status = terminal.shell.session.status();
-                let snapshot = terminal.shell.session.snapshot();
+                // The title alone: a full snapshot would build the whole
+                // visible grid to read one string the grid already holds.
                 session_title(
                     &session.name,
                     status.foreground.app.as_deref(),
-                    snapshot.title.as_deref(),
+                    terminal.shell.session.title().as_deref(),
                 )
             })
             .unwrap_or_else(|| session.name.clone())
-    }
-
-    /// Searchable choices of live sessions in the active checkout.
-    fn session_rows(&self, checkout_id: &str) -> Rc<Vec<CrumbRow>> {
-        Rc::new(
-            self.navigation
-                .checkout(checkout_id)
-                .into_iter()
-                .flat_map(|checkout| &checkout.sessions)
-                .filter(|session| self.terminals.contains_key(&session.id))
-                .map(|session| CrumbRow {
-                    label: self.session_label(session),
-                    hint: None,
-                    icon: IconName::SquareTerminal,
-                    keywords: vec![session.name.clone()],
-                    checked: self.navigation.active_session.as_deref() == Some(session.id.as_str()),
-                    disabled: false,
-                    target: session.id.clone(),
-                })
-                .collect(),
-        )
-    }
-
-    /// What a crumb menu does with the row it was opened on.
-    ///
-    /// The one path every crumb selection takes, so the header, the sidebar and
-    /// the terminal cannot answer the same choice three different ways.
-    fn close_crumb_menu(&mut self, cx: &mut Context<Self>) {
-        self.open_crumb = None;
-        cx.notify();
-    }
-
-    fn select_crumb_target(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_crumb_menu(cx);
-        if !self.navigation.select_session(target) && !self.navigation.select_checkout(target) {
-            return;
-        }
-        self.persist();
-        self.refresh_diff_totals(cx);
-        self.focus_terminal(window, cx);
-        cx.notify();
-    }
-
-    /// The bar across the top: the window's own chrome, the crumb line over it,
-    /// and the actions at its far end.
-    ///
-    /// What belongs to the window rather than to the app is `TitleBar`'s: the
-    /// macOS traffic-light room, the client-side frame and the controls on it,
-    /// the drag of empty space and the double-click that zooms. The crumb line
-    /// is the app's, and it is the sidebar read sideways — each crumb names one
-    /// level of it and opens the list of that level.
-    fn titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let view = cx.weak_entity();
-        let active = self
-            .navigation
-            .active_checkout
-            .as_deref()
-            .and_then(|id| self.navigation.checkout(id));
-        let repo = active.and_then(|checkout| {
-            self.navigation
-                .repos
-                .iter()
-                .find(|repo| repo.checkouts.iter().any(|item| item.id == checkout.id))
-        });
-        // Keep the breadcrumb line within the reference's 70% cap; each crumb
-        // gets its measured content width, and the branch gives up space first.
-        let share = px((window.viewport_size().width.as_f32() * 0.7).max(0.));
-        let worktree_label = active
-            .zip(repo)
-            .filter(|(_, repo)| repo.kind == RepoKind::Git)
-            .map(|(checkout, repo)| titlebar_worktree_title(repo, checkout));
-        let item_label = self
-            .terminal()
-            .and(self.navigation.active_session.as_deref())
-            .and_then(|id| self.navigation.session(id))
-            .map(|session| self.session_label(session));
-        let mut repo_budget = repo
-            .map(|repo| titlebar_crumb_width(window, &repo.name, crumb_icon(Crumb::Workdir)))
-            .unwrap_or(0.);
-        let mut worktree_budget = worktree_label
-            .as_deref()
-            .map(|label| titlebar_crumb_width(window, label, crumb_icon(Crumb::Worktree)))
-            .unwrap_or(0.);
-        let mut item_budget = item_label
-            .as_deref()
-            .map(|label| titlebar_crumb_width(window, label, crumb_icon(Crumb::Item)))
-            .unwrap_or(0.);
-        let crumb_count = usize::from(repo.is_some())
-            + usize::from(worktree_label.is_some())
-            + usize::from(item_label.is_some());
-        let separators_width = if crumb_count > 1 {
-            (crumb_count - 1) as f32 * (sidebar_text_width(window, "/", 14.).as_f32() + 12.)
-        } else {
-            0.
-        };
-        let available = (share.as_f32() - separators_width).max(0.);
-        let mut excess = (repo_budget + worktree_budget + item_budget - available).max(0.);
-        if worktree_label.is_some() {
-            shrink_titlebar_crumb(
-                &mut worktree_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Worktree)),
-                &mut excess,
-            );
-        }
-        if item_label.is_some() {
-            shrink_titlebar_crumb(
-                &mut item_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Item)),
-                &mut excess,
-            );
-        }
-        if repo.is_some() {
-            shrink_titlebar_crumb(
-                &mut repo_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Workdir)),
-                &mut excess,
-            );
-        }
-        let mut crumbs = Vec::<AnyElement>::new();
-        if let (Some(checkout), Some(repo)) = (active, repo) {
-            // Every checkout this window has open, named the way the sidebar
-            // names its rows, with the path behind the name as the words a
-            // search matches on.
-            let workdirs = Rc::new(
-                self.navigation
-                    .repos
-                    .iter()
-                    .flat_map(|repo| {
-                        repo.checkouts.iter().map(move |checkout| CrumbRow {
-                            label: checkout_title(repo, checkout),
-                            hint: Some(checkout.path.clone()),
-                            icon: if repo.kind == RepoKind::Git {
-                                IconName::FolderGit2
-                            } else {
-                                IconName::Folder
-                            },
-                            keywords: vec![checkout.path.clone(), repo.root.clone()],
-                            checked: self.navigation.active_checkout.as_deref()
-                                == Some(checkout.id.as_str()),
-                            disabled: checkout.is_missing
-                                || self.navigation.archived.contains(&checkout.id),
-                            target: checkout.id.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            // The workdir wears no glyph: it is the name that is always there,
-            // and one would only repeat a word that never changes.
-            let workdir_state = titlebar_command_state(window, cx, "workdir");
-            let workdir_focus = workdir_state.focus_handle(cx);
-            crumbs.push(
-                titlebar_menu_popover("popover:repo-crumb")
-                    .open(self.open_crumb == Some(Crumb::Workdir))
-                    .on_open_change(crumb_opened(
-                        Crumb::Workdir,
-                        view.clone(),
-                        workdir_focus.clone(),
-                    ))
-                    .track_focus(&workdir_focus)
-                    .trigger(titlebar_crumb(
-                        window,
-                        "repo-crumb",
-                        &repo.name,
-                        repo_budget,
-                        crumb_icon(Crumb::Workdir),
-                        gpui_kit::rgb(0xd7dae0).into(),
-                    ))
-                    .content({
-                        let rows = workdirs.clone();
-                        let state = workdir_state.clone();
-                        let menu = view.clone();
-                        let chooser = view.clone();
-                        move |_, _, cx| {
-                            crumb_menu(
-                                &state,
-                                rows.clone(),
-                                "Search workdirs…",
-                                "This Window",
-                                Some(Rc::new({
-                                    let chooser = chooser.clone();
-                                    move || {
-                                        let chooser = chooser.clone();
-                                        Button::new("workdir-open-directory")
-                                            .text()
-                                            .small()
-                                            .label("Open directory")
-                                            .icon(Icon::new(IconName::FolderPlus).size_4())
-                                            .on_click(move |_, window, cx| {
-                                                let _ = chooser.update(cx, |app, cx| {
-                                                    app.close_crumb_menu(cx);
-                                                    app.choose_directory(window, cx)
-                                                });
-                                            })
-                                    }
-                                })),
-                                menu.clone(),
-                                cx,
-                            )
-                        }
-                    })
-                    .into_any_element(),
-            );
-            if repo.kind == RepoKind::Git {
-                // The worktree is the one level only a Git repository has, and
-                // its detached state is still a name worth showing.
-                crumbs.push(crumb_separator());
-                let worktrees = Rc::new(
-                    repo.checkouts
-                        .iter()
-                        .map(|checkout| CrumbRow {
-                            label: titlebar_worktree_title(repo, checkout),
-                            hint: Some(checkout.path.clone()),
-                            icon: if checkout.is_missing {
-                                IconName::FolderX
-                            } else if checkout.is_primary {
-                                IconName::FolderGit2
-                            } else {
-                                IconName::GitBranch
-                            },
-                            keywords: vec![checkout.path.clone()],
-                            checked: self.navigation.active_checkout.as_deref()
-                                == Some(checkout.id.as_str()),
-                            disabled: checkout.is_missing
-                                || self.navigation.archived.contains(&checkout.id),
-                            target: checkout.id.clone(),
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                // A worktree is added to the repository's root, wherever the
-                // active workdir is, so the action names the repository.
-                let dialog = view.clone();
-                let repo_id = repo.id.clone();
-                let worktree_state = titlebar_command_state(window, cx, "worktree");
-                let worktree_focus = worktree_state.focus_handle(cx);
-                crumbs.push(
-                    titlebar_menu_popover("popover:worktree-crumb")
-                        .open(self.open_crumb == Some(Crumb::Worktree))
-                        .on_open_change(crumb_opened(
-                            Crumb::Worktree,
-                            view.clone(),
-                            worktree_focus.clone(),
-                        ))
-                        .track_focus(&worktree_focus)
-                        .trigger(titlebar_crumb(
-                            window,
-                            "worktree-crumb",
-                            worktree_label.as_deref().unwrap_or("Detached"),
-                            worktree_budget,
-                            crumb_icon(Crumb::Worktree),
-                            sidebar_faint_ink(),
-                        ))
-                        .content({
-                            let rows = worktrees.clone();
-                            let state = worktree_state.clone();
-                            let menu = view.clone();
-                            let repo_id = repo_id.clone();
-                            let dialog = dialog.clone();
-                            move |_, _, cx| {
-                                crumb_menu(
-                                    &state,
-                                    rows.clone(),
-                                    "Search worktrees…",
-                                    "Worktrees",
-                                    Some(Rc::new({
-                                        let dialog = dialog.clone();
-                                        let repo_id = repo_id.clone();
-                                        move || {
-                                            let dialog = dialog.clone();
-                                            let repo_id = repo_id.clone();
-                                            Button::new("worktree-new")
-                                                .text()
-                                                .small()
-                                                .label("New worktree")
-                                                .icon(Icon::new(IconName::GitBranchPlus).size_4())
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = dialog.update(cx, |app, cx| {
-                                                        app.close_crumb_menu(cx);
-                                                        app.open_worktree_dialog(
-                                                            &repo_id, window, cx,
-                                                        )
-                                                    });
-                                                })
-                                        }
-                                    })),
-                                    menu.clone(),
-                                    cx,
-                                )
-                            }
-                        })
-                        .into_any_element(),
-                );
-            }
-            // Name only the terminal that is currently presented, not a saved
-            // session whose process has no live terminal view.
-            if let Some(label) = item_label.as_deref() {
-                crumbs.push(crumb_separator());
-                let rows = self.session_rows(&checkout.id);
-                let session_state = titlebar_command_state(window, cx, "session");
-                let session_focus = session_state.focus_handle(cx);
-                let add = view.clone();
-                let checkout_id = checkout.id.clone();
-                crumbs.push(
-                    titlebar_menu_popover("popover:item-crumb")
-                        .open(self.open_crumb == Some(Crumb::Item))
-                        .on_open_change(crumb_opened(
-                            Crumb::Item,
-                            view.clone(),
-                            session_focus.clone(),
-                        ))
-                        .track_focus(&session_focus)
-                        .trigger(titlebar_crumb(
-                            window,
-                            "item-crumb",
-                            label,
-                            item_budget,
-                            crumb_icon(Crumb::Item),
-                            sidebar_faint_ink(),
-                        ))
-                        .content({
-                            let rows = rows.clone();
-                            let state = session_state.clone();
-                            let menu = view.clone();
-                            move |_, _, cx| {
-                                crumb_menu(
-                                    &state,
-                                    rows.clone(),
-                                    "Search terminals…",
-                                    "Terminals",
-                                    Some(Rc::new({
-                                        let add = add.clone();
-                                        let checkout_id = checkout_id.clone();
-                                        move || {
-                                            let add = add.clone();
-                                            let checkout_id = checkout_id.clone();
-                                            Button::new("item-new-terminal")
-                                                .text()
-                                                .small()
-                                                .label("New terminal")
-                                                .icon(Icon::new(IconName::Plus).size_4())
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = add.update(cx, |app, cx| {
-                                                        app.close_crumb_menu(cx);
-                                                        app.request_terminal(
-                                                            &checkout_id,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                })
-                                        }
-                                    })),
-                                    menu.clone(),
-                                    cx,
-                                )
-                            }
-                        })
-                        .into_any_element(),
-                );
-            }
-        }
-        let mut bar: Vec<AnyElement> = Vec::new();
-        if !crumbs.is_empty() {
-            // The line is held to the share: a name it cannot hold is given up
-            // by the crumb that wears it rather than by the window.
-            bar.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .max_w(share)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .min_w_0()
-                            .gap(px(6.))
-                            .children(crumbs),
-                    )
-                    .into_any_element(),
-            );
-        }
-        // The room between the line and the actions is the window's to drag.
-        bar.push(div().flex_1().min_w(px(8.)).into_any_element());
-        bar.push(
-            Button::new("toggle-panels")
-                .ghost()
-                .small()
-                .compact()
-                .h(px(20.))
-                .cursor_pointer()
-                .icon(IconName::PanelLeftClose)
-                .accessibility_label("Toggle side panels")
-                .tooltip("Toggle side panels — Cmd/Ctrl+/")
-                // The bar moves the window from the press; a press on an action
-                // is the action, not a drag that starts one.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|app, _, window, cx| {
-                    app.navigation.panels_visible = !app.navigation.panels_visible;
-                    app.focus_terminal(window, cx);
-                    cx.notify();
-                }))
-                .into_any_element(),
-        );
-        let close = view.clone();
-        TitleBar::new()
-            .h(px(32.))
-            .bg(gpui_kit::rgb(0x1c1f26))
-            .border_b_1()
-            .border_color(gpui_kit::rgb(0x2c313b))
-            .children(bar)
-            // Linux has no frame of its own, so the close it draws would
-            // otherwise take the window down without closing what is running
-            // in it. Only Linux draws these controls, and only Linux reads this.
-            .on_close_window(move |_, _window, cx| {
-                let _ = close.update_in(cx, |app, window, cx| app.request_window_close(window, cx));
-            })
-            .into_any_element()
-    }
-
-    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let weak = cx.weak_entity();
-        let dragging = self.sidebar_drag.as_ref().is_some_and(|drag| drag.started);
-        let drag_rows = Rc::new(RefCell::new(Vec::new()));
-        let drag_dispatcher = self.sidebar_drag.is_some().then(|| {
-            let move_view = weak.clone();
-            let move_rows = drag_rows.clone();
-            let up_view = weak.clone();
-            let up_rows = drag_rows.clone();
-            let exit_view = weak.clone();
-            let auto_scroll = self.sidebar_drag.as_ref().is_some_and(|drag| {
-                if !drag.started {
-                    return false;
-                }
-                let bounds = self.scroll.bounds();
-                let (x, y) = drag.position;
-                x >= bounds.left().as_f32()
-                    && x <= bounds.right().as_f32()
-                    && y >= bounds.top().as_f32()
-                    && y <= bounds.bottom().as_f32()
-                    && (y < bounds.top().as_f32() + SIDEBAR_SCROLL_EDGE
-                        || y > bounds.bottom().as_f32() - SIDEBAR_SCROLL_EDGE)
-            });
-            let scroll_view = weak.clone();
-            let scroll_rows = drag_rows.clone();
-            sidebar_drag_dispatcher(move |window, _| {
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                    if phase == gpui_kit::DispatchPhase::Capture {
-                        let position = event.position;
-                        let pressed_button = event.pressed_button;
-                        let _ = move_view.update(cx, |app, cx| {
-                            app.update_sidebar_drag(position, pressed_button, &move_rows, cx)
-                        });
-                    }
-                });
-                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                    if phase == gpui_kit::DispatchPhase::Capture
-                        && event.button == MouseButton::Left
-                    {
-                        let position = event.position;
-                        let _ = up_view.update(cx, |app, cx| {
-                            app.finish_sidebar_drag(position, &up_rows, window, cx)
-                        });
-                    }
-                });
-                window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
-                    if phase == gpui_kit::DispatchPhase::Capture {
-                        let _ = exit_view.update(cx, |app, cx| {
-                            if app.sidebar_drag.is_some() {
-                                app.cancel_sidebar_drag();
-                                cx.notify();
-                            }
-                        });
-                    }
-                });
-                if auto_scroll {
-                    window.on_next_frame(move |_, cx| {
-                        let _ = scroll_view
-                            .update(cx, |app, cx| app.tick_sidebar_drag(&scroll_rows, cx));
-                    });
-                }
-            })
-        });
-        let mut rows = Vec::<AnyElement>::new();
-        for repo in &self.navigation.repos {
-            let id = repo.id.clone();
-            let folded = self.navigation.folded_repos.contains(&id);
-            let toggle_id = id.clone();
-            let has_menu = (repo.kind == RepoKind::Git
-                && repo
-                    .checkouts
-                    .iter()
-                    .any(|checkout| checkout.is_primary && !checkout.is_missing))
-                || !repo
-                    .checkouts
-                    .iter()
-                    .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
-            let heading = div()
-                .id(SharedString::from(format!("heading-{id}")))
-                .group(SharedString::from(format!("repo-heading-{id}")))
-                .relative()
-                .flex()
-                .items_end()
-                .w_full()
-                .when(!dragging, |heading| heading.cursor_pointer())
-                .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                .pl(px(10.))
-                .pr(px(8.))
-                .pt(px(8.))
-                .pb(px(4.))
-                .child(
-                    Button::new(SharedString::from(format!("fold-repo-{id}")))
-                        .text()
-                        .rounded(px(0.))
-                        .absolute()
-                        .left(px(10.))
-                        .right(px(if has_menu { 36. } else { 8. }))
-                        .top(px(8.))
-                        .h(px(17.))
-                        .p_0()
-                        .when(dragging, |button| {
-                            button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                        })
-                        .aria_expanded(!folded)
-                        .tooltip(repo.root.clone())
-                        .accessibility_label(format!(
-                            "{} repository {} — {}",
-                            if folded { "Expand" } else { "Collapse" },
-                            repo.name,
-                            repo.root
-                        ))
-                        .on_click(cx.listener(move |app, _, _, cx| {
-                            toggle(&mut app.navigation.folded_repos, &toggle_id);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        // Bottom, not baseline: the flex engine is handed no
-                        // baseline to align, so `items_baseline` degrades to the
-                        // top, and a 14px name and an 11px path each sit half
-                        // their own leading below the line they share. Measured
-                        // against the reference, the path hung about 2.5px low;
-                        // aligning their boxes at the foot puts the two
-                        // baselines within a fifth of a pixel.
-                        .items_end()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(14.))
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .child(repo.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(11.))
-                                .text_color(gpui_kit::rgb(0x8b909c))
-                                .child(sidebar_repo_path(
-                                    window,
-                                    &repo.root,
-                                    &repo.name,
-                                    self.navigation.sidebar_width,
-                                    has_menu,
-                                )),
-                        ),
-                )
-                .when(has_menu, |heading| {
-                    let menu_id = id.clone();
-                    let menu_view = weak.clone();
-                    heading.child(
-                        div()
-                            .absolute()
-                            .right(px(8.))
-                            .top(px(8.))
-                            .w(px(20.))
-                            .h(px(20.))
-                            // The trigger stays lit while its menu is open, on the
-                            // surface the button paints rather than on the
-                            // button: a hover refines after the rest style and
-                            // would paint the trigger's own transparent hover
-                            // back over it.
-                            .when(self.open_repo_menu.as_deref() == Some(&id), |trigger| {
-                                trigger.bg(gpui_kit::rgb(0x2d323c))
-                            })
-                            .child(
-                                Button::new(SharedString::from(format!("actions-{id}")))
-                                    .text()
-                                    .text_color(sidebar_faint_ink())
-                                    .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
-                                        1.
-                                    } else {
-                                        0.
-                                    })
-                                    .group_hover(
-                                        SharedString::from(format!("repo-heading-{id}")),
-                                        |style| style.opacity(1.),
-                                    )
-                                    .focus(|style| style.opacity(1.))
-                                    .rounded(px(0.))
-                                    .h(px(20.))
-                                    .w(px(20.))
-                                    .p_0()
-                                    .when(dragging, |button| {
-                                        button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                                    })
-                                    .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
-                                    .accessibility_label(format!("Actions for {}", repo.name))
-                                    .dropdown_menu(self.repo_menu(id.clone(), weak.clone()))
-                                    .on_open_change(move |open, _, cx| {
-                                        let _ = menu_view.update(cx, |app, cx| {
-                                            if *open {
-                                                app.open_repo_menu = Some(menu_id.clone());
-                                            } else if app.open_repo_menu.as_deref()
-                                                == Some(&menu_id)
-                                            {
-                                                app.open_repo_menu = None;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                    )
-                });
-            rows.push(if has_menu {
-                heading
-                    .context_menu(self.repo_menu(id, weak.clone()))
-                    .into_any_element()
-            } else {
-                heading.into_any_element()
-            });
-            if folded {
-                rows.push(div().h(px(8.)).into_any_element());
-                continue;
-            }
-            for checkout in &repo.checkouts {
-                if self.navigation.archived.contains(&checkout.id) {
-                    continue;
-                }
-                let title = checkout_title(repo, checkout);
-                let folded = self.navigation.folded_checkouts.contains(&checkout.id);
-                let id = checkout.id.clone();
-                let fold_id = id.clone();
-                let select_id = id.clone();
-                let selected = self.navigation.active_checkout.as_deref() == Some(&id)
-                    && self.navigation.active_session.is_none();
-                let has_close = repo.kind == RepoKind::Git
-                    && !checkout.is_primary
-                    && self.navigation.home.as_deref() != Some(&id);
-                let line_slot = Self::line_slot(self.diff_totals.get(&id));
-                let figures_width = line_slot.map_or(0., |(added, removed)| {
-                    let text = match (added > 0, removed > 0) {
-                        (true, true) => format!("+{added} −{removed}"),
-                        (true, false) => format!("+{added}"),
-                        _ => format!("−{removed}"),
-                    };
-                    sidebar_text_width(window, &text, 11.).as_f32()
-                });
-                let name = sidebar_name(
-                    window,
-                    &title,
-                    self.navigation.sidebar_width
-                        - 57.
-                        - figures_width
-                        - if has_close { 28. } else { 0. },
-                );
-                let icon = if checkout.is_missing {
-                    IconName::FolderX
-                } else if self.navigation.home.as_deref() == Some(&id) {
-                    IconName::House
-                } else if repo.kind == RepoKind::Plain {
-                    IconName::Folder
-                } else if checkout.is_primary {
-                    IconName::FolderGit2
-                } else {
-                    IconName::GitBranch
-                };
-                let row_group = SharedString::from(format!("checkout-row-{id}"));
-                let (row_focus, row_focused) = sidebar_row_focus(window, cx, &id);
-                let mut row = div()
-                    .id(row_group.clone())
-                    .track_focus(&row_focus)
-                    .group(row_group.clone())
-                    .flex()
-                    .items_center()
-                    .relative()
-                    .h(px(26.))
-                    .gap(px(7.))
-                    .px(px(8.))
-                    .when(!dragging && !checkout.is_missing, |row| row.cursor_pointer())
-                    .when(
-                        !dragging && checkout.is_missing,
-                        |row| row.cursor(gpui_kit::CursorStyle::OperationNotAllowed),
-                    )
-                    .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                    .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
-                    .when(selected, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left(px(0.))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .w(px(2.))
-                                .bg(gpui_kit::rgb(0x5b97ff)),
-                        )
-                    })
-                    .on_click(cx.listener({
-                        let row_select_id = select_id.clone();
-                        move |app, _, window, cx| {
-                            if app.navigation.select_checkout(&row_select_id) {
-                                app.persist();
-                                app.refresh_diff_totals(cx);
-                                app.focus_terminal(window, cx);
-                                cx.notify();
-                            }
-                        }
-                    }))
-                    .child(
-                        Button::new(SharedString::from(format!("fold-checkout-{id}")))
-                            .text()
-                            .text_color(sidebar_faint_ink())
-                            .small()
-                            .compact()
-                            .rounded(px(0.))
-                            .h(px(26.))
-                            .w(px(16.))
-                            .ml(px(-4.))
-                            .p_0()
-                            .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .icon(
-                                Icon::new(if folded {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(px(14.)),
-                            )
-                            .aria_expanded(!folded)
-                            .accessibility_label(format!(
-                                "{} {title}",
-                                if folded { "Expand" } else { "Collapse" }
-                            ))
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                cx.stop_propagation();
-                                toggle(&mut app.navigation.folded_checkouts, &fold_id);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("select-checkout-{id}")))
-                            .text()
-                            .rounded(px(0.))
-                            .absolute()
-                            .left(px(27.))
-                            .top(px(0.))
-                            .bottom(px(0.))
-                            .right(px(8.))
-                            .p_0()
-                            .aria_selected(selected)
-                            .accessibility_label(if checkout.is_missing {
-                                format!("Unavailable worktree {title}")
-                            } else {
-                                format!("Select worktree {title}")
-                            })
-                            .tooltip(format!("{title} — {}", checkout.path))
-                            .disabled(checkout.is_missing)
-                            .when(dragging && !checkout.is_missing, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                            .when(checkout.is_missing, |button| button.cursor(gpui_kit::CursorStyle::OperationNotAllowed))
-                            .on_click(cx.listener({
-                                let click_id = select_id.clone();
-                                move |app, _, window, cx| {
-                                    cx.stop_propagation();
-                                    if app.navigation.select_checkout(&click_id) {
-                                        app.persist();
-                                        app.refresh_diff_totals(cx);
-                                        app.focus_terminal(window, cx);
-                                        cx.notify();
-                                    }
-                                }
-                            })),
-                    )
-                    .child(Icon::new(icon).size(px(14.)).text_color(gpui_kit::rgb(
-                        if checkout.is_missing {
-                            0x565b67
-                        } else {
-                            0x8b909c
-                        },
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .when(checkout.is_missing, |label| label.text_color(gpui_kit::rgb(0x565b67)))
-                            .child(name),
-                    )
-                    .when(repo.kind == RepoKind::Git && !checkout.is_missing, |row| {
-                        match Self::line_slot(self.diff_totals.get(&id)) {
-                            Some((added, removed)) => row.child(
-                                div()
-                                    .id(SharedString::from(format!("diff-{id}")))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(11.))
-                                    .when(has_close && row_focused, |slot| slot.mr(px(28.)))
-                                    .when(has_close, |slot| slot.group_hover(row_group.clone(), |style| style.mr(px(28.))))
-                                    // At rest the slot holds a bare `+`/`−`, which says the row
-                                    // has changes in the width this panel has ever reserved for
-                                    // it. The figures are one pointer away.
-                                    .when(added > 0, |slot| {
-                                        slot.child(
-                                            div()
-                                                .id(SharedString::from(format!("diff-mark-add-{id}")))
-                                                .test_support()
-                                                .text_color(gpui_kit::rgb(0xa1c181))
-                                                .when(row_focused, |mark| mark.w(px(0.)))
-                                                .overflow_hidden()
-                                                .group_hover(row_group.clone(), |style| {
-                                                style.w(px(0.))
-                                            })
-                                                .child("+"),
-                                        )
-                                    })
-                                    .when(removed > 0, |slot| {
-                                        slot.child(
-                                            div()
-                                                .id(SharedString::from(format!("diff-mark-del-{id}")))
-                                                .test_support()
-                                                .text_color(gpui_kit::rgb(0xd97f84))
-                                                .when(row_focused, |mark| mark.w(px(0.)))
-                                                .overflow_hidden()
-                                                .group_hover(row_group.clone(), |style| {
-                                                    style.w(px(0.))
-                                                })
-                                                .child("\u{2212}"),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("diff-figures-{id}")))
-                                            .test_support()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(5.))
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .w(if row_focused { Length::Auto } else { px(0.).into() })
-                                            .group_hover(row_group.clone(), |style| {
-                                                style.w(Length::Auto).ml(px(5.))
-                                            })
-                                            .when(added > 0, |figures| {
-                                                figures.child(
-                                                    div()
-                                                        .text_color(gpui_kit::rgb(0xa1c181))
-                                                        .child(format!("+{added}")),
-                                                )
-                                            })
-                                            .when(removed > 0, |figures| {
-                                                figures.child(
-                                                    div()
-                                                        .text_color(gpui_kit::rgb(0xd97f84))
-                                                        .child(format!("\u{2212}{removed}")),
-                                                )
-                                            }),
-                                    ),
-                            ),
-                            None => row,
-                        }
-                    })
-                    .when(checkout.is_missing, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(gpui_kit::rgb(0xf7adb1))
-                                .when(has_close && row_focused, |note| note.mr(px(28.)))
-                                .when(has_close, |note| note.group_hover(row_group.clone(), |style| style.mr(px(28.))))
-                                .child("Directory missing"),
-                        )
-                    })
-                    .when(has_close && checkout.is_missing, |row| {
-                        let dismiss_id = id.clone();
-                        row.child(
-                            Button::new(SharedString::from(format!("dismiss-missing-{id}")))
-                                .custom(sidebar_action_style(cx))
-                                .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                .when(!dragging, |button| button.cursor_pointer())
-                                .rounded(px(0.))
-                                .absolute()
-                                .right(px(8.))
-                                .top(px(3.))
-                                .h(px(20.))
-                                .w(px(20.))
-                                .p_0()
-                                .opacity(if row_focused { 1. } else { 0. })
-                                .group_hover(row_group.clone(), |style| style.opacity(1.))
-                                .focus(|style| style.opacity(1.))
-                                .icon(Icon::new(IconName::X).size(px(14.)))
-                                .accessibility_label(format!(
-                                    "Dismiss missing checkout {title}; no files are deleted; Git metadata and branch are retained"
-                                ))
-                                .tooltip(
-                                    "Hide this missing checkout only; no files are deleted, and Git metadata and branch are retained",
-                                )
-                                .on_click(cx.listener(move |app, _, window, cx| {
-                                    cx.stop_propagation();
-                                    app.request_dismiss_missing_checkout(&dismiss_id, window, cx)
-                                })),
-                        )
-                    })
-                    .when(
-                        has_close && !checkout.is_missing,
-                        |row| {
-                            let actions_id = id.clone();
-                            let actions_repo_id = repo.id.clone();
-                            // The contextual lifecycle dialog names both reversible archive
-                            // and destructive deletion; no row action deletes immediately.
-                            row.child(
-                                Button::new(SharedString::from(format!("worktree-actions-{id}")))
-                                    .custom(sidebar_action_style(cx))
-                                    .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                    .when(!dragging, |button| button.cursor_pointer())
-                                    .rounded(px(0.))
-                                    .absolute()
-                                    .right(px(8.))
-                                    .top(px(3.))
-                                    .h(px(20.))
-                                    .w(px(20.))
-                                    .p_0()
-                                    .opacity(if row_focused { 1. } else { 0. })
-                                    .group_hover(row_group.clone(), |style| style.opacity(1.))
-                                    .focus(|style| style.opacity(1.))
-                                    .icon(Icon::new(IconName::X).size(px(14.)))
-                                    .accessibility_label(format!(
-                                        "Archive or delete worktree {title}"
-                                    ))
-                                    .tooltip("Archive or delete worktree")
-                                    .on_click(cx.listener(move |app, _, window, cx| {
-                                        cx.stop_propagation();
-                                        app.open_worktree_removal_dialog(
-                                            &actions_repo_id,
-                                            &actions_id,
-                                            window,
-                                            cx,
-                                        )
-                                    })),
-                            )
-                        },
-                    );
-                let folded_append_marker = folded
-                    && self.sidebar_drag.as_ref().is_some_and(|drag| {
-                        drag.started
-                            && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == id
-                                    && target.index
-                                        == self.sidebar_drop_slot(
-                                            &checkout.id,
-                                            checkout.sessions.len(),
-                                        )
-                            })
-                    });
-                row = row.when(
-                    self.sidebar_drag.as_ref().is_some_and(|drag| {
-                        drag.started
-                            && drag
-                                .target
-                                .as_ref()
-                                .is_some_and(|target| target.checkout_id == id)
-                    }),
-                    |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left(px(0.))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .w(px(2.))
-                                .bg(gpui_kit::rgb(0x5b97ff)),
-                        )
-                    },
-                );
-                if !checkout.is_missing && self.sidebar_drag.is_some() {
-                    row = row.child(sidebar_drag_geometry(
-                        SidebarDropRegion::Append {
-                            checkout_id: id.clone(),
-                            index: checkout.sessions.len(),
-                        },
-                        drag_rows.clone(),
-                    ));
-                }
-                if folded || checkout.is_missing {
-                    rows.push(row.into_any_element());
-                    if folded_append_marker {
-                        rows.push(sidebar_drop_marker(
-                            self.sidebar_drag
-                                .as_ref()
-                                .and_then(|drag| drag.target.clone())
-                                .unwrap(),
-                            drag_rows.clone(),
-                        ));
-                    }
-                    continue;
-                }
-                let checkout_row = row.into_any_element();
-                let mut checkout_children = Vec::<AnyElement>::new();
-                for (session_index, session) in checkout.sessions.iter().enumerate() {
-                    let Some(terminal) = self.terminals.get(&session.id) else {
-                        continue;
-                    };
-                    let status = terminal.shell.session.status();
-                    let snapshot = terminal.shell.session.snapshot();
-                    let title = session_title(
-                        &session.name,
-                        status.foreground.app.as_deref(),
-                        snapshot.title.as_deref(),
-                    );
-                    let selected = self.navigation.active_session.as_deref() == Some(&session.id);
-                    let busy = status.foreground.running;
-                    let unknown =
-                        status.poll_error.is_some() || status.shell == ShellState::Unknown;
-                    let agent = status.foreground.app.as_deref() == Some("opencode");
-                    let failed = !agent
-                        && matches!(status.shell, ShellState::Running)
-                        && terminal
-                            .shell
-                            .session
-                            .last_command_exit()
-                            .is_some_and(|code| code != 0);
-                    let id = session.id.clone();
-                    let click_id = id.clone();
-                    let drag_id = id.clone();
-                    let close_id = id.clone();
-                    let row_click_id = id.clone();
-                    let state_label = format!(
-                        "Terminal session: {title}{}",
-                        if unknown {
-                            ", state unavailable"
-                        } else if failed {
-                            ", last command failed"
-                        } else if matches!(status.shell, ShellState::Exited { .. }) {
-                            ", shell exited"
-                        } else if agent {
-                            ", agent session state not identified"
-                        } else if busy {
-                            ", process running"
-                        } else {
-                            ", idle"
-                        }
-                    );
-                    let closing = self.closing_sessions.contains(&id);
-                    let renaming = self.editing.as_ref().is_some_and(|edit| edit.id == id);
-                    let row_clickable = !closing && !renaming;
-                    let content =
-                        if let Some(editing) = self.editing.as_ref().filter(|edit| edit.id == id) {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(7.))
-                                .h(px(26.))
-                                .w_full()
-                                .child(
-                                    Icon::new(if agent {
-                                        IconName::Sparkles
-                                    } else {
-                                        IconName::SquareTerminal
-                                    })
-                                    .size(px(14.))
-                                    .text_color(gpui_kit::rgb(0x8b909c)),
-                                )
-                                .child(
-                                    Input::new(&editing.input)
-                                        .id(SharedString::from(format!("rename-session-{id}")))
-                                        .appearance(false)
-                                        .p_0()
-                                        .aria_label("Terminal session name")
-                                        .h(px(26.))
-                                        .w_full()
-                                        .min_w_0(),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex()
-                                .items_center()
-                                .h(px(26.))
-                                .w_full()
-                                .min_w_0()
-                                .gap(px(7.))
-                                .child(
-                                    Icon::new(if agent {
-                                        IconName::Sparkles
-                                    } else {
-                                        IconName::SquareTerminal
-                                    })
-                                    .size(px(14.))
-                                    .text_color(
-                                        gpui_kit::rgb(if unknown {
-                                            0xe3b341
-                                        } else if failed {
-                                            0xf7adb1
-                                        } else if busy && !agent {
-                                            0x5fc98a
-                                        } else {
-                                            0x8b909c
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(sidebar_name(
-                                            window,
-                                            &title,
-                                            self.navigation.sidebar_width - 73.,
-                                        )),
-                                )
-                                .into_any_element()
-                        };
-                    let row_group = SharedString::from(format!("session-row-{id}"));
-                    let (row_focus, row_focused) = sidebar_row_focus(window, cx, &id);
-                    let row = div()
-                        .id(row_group.clone())
-                        .track_focus(&row_focus)
-                        .group(row_group.clone())
-                        .flex()
-                        .items_center()
-                        .relative()
-                        .pl(px(12.))
-                        .pr(px(8.))
-                        .when(!dragging && row_clickable, |row| row.cursor_pointer())
-                        .when(
-                            self.sidebar_drag
-                                .as_ref()
-                                .is_some_and(|drag| drag.started && drag.session_id == id),
-                            |row| row.opacity(0.42),
-                        )
-                        .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                        .h(px(26.))
-                        .when(selected, |row| row.bg(gpui_kit::rgb(0x2c3b57)))
-                        .when(row_clickable, |row| {
-                            row.on_click(cx.listener(
-                                move |app, event: &gpui_kit::ClickEvent, window, cx| {
-                                    if app.suppress_sidebar_click {
-                                        app.suppress_sidebar_click = false;
-                                        return;
-                                    }
-                                    if event.click_count() == 2 {
-                                        app.start_rename(&row_click_id, window, cx);
-                                    } else if app.navigation.select_session(&row_click_id) {
-                                        app.persist();
-                                        app.refresh_diff_totals(cx);
-                                        app.focus_terminal(window, cx);
-                                        cx.notify();
-                                    }
-                                },
-                            ))
-                        })
-                        .when(selected, |row| {
-                            row.child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(0.))
-                                    .bottom(px(0.))
-                                    .w(px(2.))
-                                    .bg(gpui_kit::rgb(0x5b97ff)),
-                            )
-                        })
-                        .when(!renaming, |row| {
-                            row.child(
-                                Button::new(SharedString::from(format!("select-session-{id}")))
-                                    .text()
-                                    .rounded(px(0.))
-                                    .absolute()
-                                    .left(px(0.))
-                                    .right(px(0.))
-                                    .top(px(0.))
-                                    .bottom(px(0.))
-                                    .p_0()
-                                    .aria_selected(selected)
-                                    .tooltip(state_label.clone())
-                                    .accessibility_label(state_label)
-                                    .disabled(closing)
-                                    .when(dragging && !closing, |button| {
-                                        button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |app, event: &MouseDownEvent, _, cx| {
-                                            app.begin_sidebar_drag(&drag_id, event.position, cx);
-                                        }),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |app, event: &gpui_kit::ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            if app.suppress_sidebar_click {
-                                                app.suppress_sidebar_click = false;
-                                                return;
-                                            }
-                                            if event.click_count() == 2 {
-                                                app.start_rename(&click_id, window, cx);
-                                            } else if app.navigation.select_session(&click_id) {
-                                                app.persist();
-                                                app.refresh_diff_totals(cx);
-                                                app.focus_terminal(window, cx);
-                                                cx.notify();
-                                            }
-                                        },
-                                    )),
-                            )
-                        })
-                        .child(div().flex_1().min_w_0().pr(px(20.)).child(content))
-                        .child(
-                            Button::new(SharedString::from(format!("close-session-{id}")))
-                                .custom(sidebar_action_style(cx))
-                                .when(!dragging && !closing, |button| button.cursor_pointer())
-                                .rounded(px(0.))
-                                .absolute()
-                                .right(px(8.))
-                                .top(px(3.))
-                                .h(px(20.))
-                                .w(px(20.))
-                                .p_0()
-                                .opacity(if row_focused { 1. } else { 0. })
-                                .group_hover(row_group.clone(), |style| style.opacity(1.))
-                                .focus(|style| style.opacity(1.))
-                                .icon(Icon::new(IconName::X).size(px(14.)))
-                                .tooltip("Close terminal")
-                                .accessibility_label(format!("Close terminal session: {title}"))
-                                .disabled(closing)
-                                .when(dragging && !closing, |button| {
-                                    button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                                })
-                                .on_click(cx.listener(move |app, _, window, cx| {
-                                    cx.stop_propagation();
-                                    app.request_close_terminal(&close_id, window, cx)
-                                })),
-                        );
-                    let marker_before = self.sidebar_drag.as_ref().is_some_and(|drag| {
-                        drag.started
-                            && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == checkout.id
-                                    && target.index
-                                        == self.sidebar_drop_slot(&checkout.id, session_index)
-                                    && drag.session_id != session.id
-                            })
-                    });
-                    if marker_before {
-                        checkout_children.push(sidebar_drop_marker(
-                            self.sidebar_drag
-                                .as_ref()
-                                .and_then(|drag| drag.target.clone())
-                                .unwrap(),
-                            drag_rows.clone(),
-                        ));
-                    }
-                    checkout_children.push(
-                        row.when(
-                            self.sidebar_drag
-                                .as_ref()
-                                .is_some_and(|drag| drag.session_id != session.id),
-                            |row| {
-                                row.child(sidebar_drag_geometry(
-                                    SidebarDropRegion::Session {
-                                        checkout_id: checkout.id.clone(),
-                                        index: session_index,
-                                    },
-                                    drag_rows.clone(),
-                                ))
-                            },
-                        )
-                        .context_menu(self.terminal_menu(id, weak.clone()))
-                        .into_any_element(),
-                    );
-                }
-                for _ in self
-                    .navigation
-                    .pending
-                    .iter()
-                    .filter(|(_, pending)| *pending == &checkout.id)
-                {
-                    checkout_children.push(
-                        div()
-                            .pl(px(12.))
-                            .h(px(26.))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .text_color(gpui_kit::rgb(0x8b909c))
-                            .child(Icon::new(IconName::LoaderCircle).size(px(14.)))
-                            .child(format!("Starting terminal in {title}…"))
-                            .into_any_element(),
-                    );
-                }
-                let create_id = checkout.id.clone();
-                let append_marker = self.sidebar_drag.as_ref().is_some_and(|drag| {
-                    drag.started
-                        && drag.target.as_ref().is_some_and(|target| {
-                            target.checkout_id == checkout.id
-                                && target.index
-                                    == self.sidebar_drop_slot(&checkout.id, checkout.sessions.len())
-                        })
-                });
-                if append_marker {
-                    checkout_children.push(sidebar_drop_marker(
-                        self.sidebar_drag
-                            .as_ref()
-                            .and_then(|drag| drag.target.clone())
-                            .unwrap(),
-                        drag_rows.clone(),
-                    ));
-                }
-                // Match the terminal rows' glyph axis: the guide's 14px margin,
-                // 1px border, and 12px child inset put it 27px into the sidebar.
-                let new_terminal_row = div()
-                    .relative()
-                    .w_full()
-                    .hover(|style| style.bg(gpui_kit::rgb(0x2d323c)))
-                    .when(self.sidebar_drag.is_some(), |row| {
-                        row.child(sidebar_drag_geometry(
-                            SidebarDropRegion::Append {
-                                checkout_id: checkout.id.clone(),
-                                index: checkout.sessions.len(),
-                            },
-                            drag_rows.clone(),
-                        ))
-                    })
-                    .child(
-                        // Keep the full row clickable while the glyph group stays
-                        // on the terminal rows' shared axis.
-                        BaseButton::new(SharedString::from(format!(
-                            "new-terminal-{}",
-                            checkout.id
-                        )))
-                        .h(px(26.))
-                        .w_full()
-                        .p_0()
-                        .pl(px(27.))
-                        .justify_start()
-                        .when(dragging, |button| {
-                            button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                        })
-                        .when(!dragging, |button| button.cursor_pointer())
-                        .text_color(sidebar_faint_ink())
-                        .hover(|style| style.text_color(gpui_kit::rgb(0xd7dae0)))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "new-terminal-content-{}",
-                                    checkout.id
-                                )))
-                                .test_support()
-                                .flex()
-                                .items_center()
-                                .gap(px(7.))
-                                .child(Icon::new(IconName::Plus).size(px(14.)))
-                                .child("New terminal"),
-                        )
-                        .accessibility_label(format!("New terminal for {title}"))
-                        .on_click(cx.listener(
-                            move |app, _, window, cx| app.request_terminal(&create_id, window, cx),
-                        )),
-                    )
-                    .into_any_element();
-                let guide = div()
-                    .ml(px(14.))
-                    .border_l_1()
-                    .border_color(gpui_kit::rgb(0x1c1f26))
-                    .group_hover(
-                        SharedString::from(format!("checkout-children-{}", checkout.id)),
-                        |style| style.border_color(gpui_kit::rgb(0x2c313b)),
-                    )
-                    .children(checkout_children);
-                rows.push(
-                    div()
-                        .group(SharedString::from(format!(
-                            "checkout-children-{}",
-                            checkout.id
-                        )))
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .child(checkout_row)
-                        .child(guide)
-                        .child(new_terminal_row)
-                        .into_any_element(),
-                );
-            }
-            rows.push(div().h(px(8.)).into_any_element());
-        }
-        if rows.is_empty() {
-            rows.push(
-                div()
-                    .id("sidebar-empty")
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_6()
-                    .text_center()
-                    .text_color(gpui_kit::rgb(0x8b909c))
-                    .child("Your opened folders will appear here. Use Open directory below to add one.")
-                    .into_any_element(),
-            );
-        }
-        let ghost = self
-            .sidebar_drag
-            .as_ref()
-            .filter(|drag| drag.started)
-            .and_then(|drag| {
-                self.navigation.session(&drag.session_id).map(|session| {
-                    let title = self
-                        .terminals
-                        .get(&session.id)
-                        .map(|terminal| {
-                            let status = terminal.shell.session.status();
-                            let snapshot = terminal.shell.session.snapshot();
-                            session_title(
-                                &session.name,
-                                status.foreground.app.as_deref(),
-                                snapshot.title.as_deref(),
-                            )
-                        })
-                        .unwrap_or_else(|| session.name.clone());
-                    (drag.position, title)
-                })
-            });
-        div()
-            .id("navigation-panel")
-            .relative()
-            .h_full()
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .min_h_0()
-            .text_size(px(13.))
-            .font_family(SIDEBAR_FONT_FAMILY)
-            .text_color(gpui_kit::rgb(0xd7dae0))
-            .when(dragging, |panel| {
-                panel.cursor(gpui_kit::CursorStyle::ClosedHand)
-            })
-            .bg(gpui_kit::rgb(0x1c1f26))
-            .child(
-                div()
-                    .id("navigation-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(rows)
-                    .vertical_scrollbar(&self.scroll),
-            )
-            .child(
-                div()
-                    .border_t_1()
-                    .border_color(gpui_kit::rgb(0x2c313b))
-                    .child(
-                        Button::new("open-directory")
-                            .text()
-                            .text_color(sidebar_faint_ink())
-                            .small()
-                            .compact()
-                            .rounded(px(0.))
-                            .w_full()
-                            .h(px(26.))
-                            .icon(IconName::FolderPlus)
-                            .label("Open directory")
-                            .accessibility_label("Open directory")
-                            .tooltip("Open directory")
-                            .disabled(self.opening || self.closing)
-                            .when(dragging && !self.opening && !self.closing, |button| {
-                                button.cursor(gpui_kit::CursorStyle::ClosedHand)
-                            })
-                            .on_click(
-                                cx.listener(|app, _, window, cx| app.choose_directory(window, cx)),
-                            ),
-                    ),
-            )
-            .when_some(drag_dispatcher, |panel, dispatcher| panel.child(dispatcher))
-            .when_some(ghost, |panel, (position, name)| {
-                panel.child(
-                    gpui_kit::deferred(
-                        gpui_kit::anchored()
-                            .position(gpui_kit::point(px(position.0 + 14.), px(position.1 + 14.)))
-                            .snap_to_window()
-                            .child(
-                                div()
-                                    .id("terminal-drag-ghost")
-                                    .font_family(SIDEBAR_FONT_FAMILY)
-                                    .text_color(gpui_kit::rgb(0xd7dae0))
-                                    .max_w(px(240.))
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.))
-                                    .text_size(px(13.))
-                                    .px(px(12.))
-                                    .border_1()
-                                    .border_color(gpui_kit::rgb(0x5b97ff))
-                                    .bg(gpui_kit::rgb(0x252932))
-                                    .shadow_md()
-                                    .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .child(name),
-                                    ),
-                            ),
-                    )
-                    .with_priority(1),
-                )
-            })
-            .into_any_element()
     }
 }
 
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let roles = Roles::of(cx);
         if self.focus_pending {
             self.focus_terminal(window, cx);
         }
-        let background = self.palette.background(ColorSnapshot::Default);
-        let text = self.palette.foreground(ColorSnapshot::Default);
+        let background = roles.surface_base;
+        let text = roles.text;
         let body: AnyElement = if let Some(terminal) = self.terminal() {
             terminal.clone().into_any_element()
         } else {
@@ -4850,6 +2325,12 @@ impl Render for TerminalWindow {
                             "Open directory"
                         })
                         .disabled(self.opening || self.closing)
+                        .when(self.opening || self.closing, |button| {
+                            button
+                                .bg(roles.disabled_surface)
+                                .text_color(roles.text_disabled)
+                                .border_color(gpui_kit::transparent_black())
+                        })
                         .on_click(cx.listener(move |app, _, window, cx| {
                             if available {
                                 if let Some(id) = app.navigation.active_checkout.clone() {
@@ -4900,6 +2381,19 @@ impl Render for TerminalWindow {
                     .as_ref()
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
             });
+        // A failure and a notice are the same bar in the same place, and they
+        // are not the same thing: one says something went wrong, the other says
+        // something happened. Two inks, so they can be told apart without
+        // reading them.
+        let banner = self
+            .failure
+            .as_ref()
+            .map(|message| (message.clone(), roles.status.warning))
+            .or_else(|| {
+                self.notice
+                    .as_ref()
+                    .map(|message| (message.clone(), roles.status.info))
+            });
         // On a target whose window has no frame of its own, the frame is this
         // one: it insets the content out of the shadow, draws the border and
         // owns the resize band. It is a pass-through everywhere else.
@@ -4913,33 +2407,31 @@ impl Render for TerminalWindow {
                 .text_color(text)
                 .capture_key_down(cx.listener(Self::on_key))
                 .child(self.titlebar(window, cx))
-                .when_some(
-                    self.failure.clone().or_else(|| self.notice.clone()),
-                    |root, message| {
-                        root.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .px_2()
-                                .text_size(px(12.))
-                                .text_color(gpui_kit::rgb(0xe3b341))
-                                .child(div().flex_1().child(message))
-                                .child(
-                                    Button::new("dismiss-message")
-                                        .ghost()
-                                        .small()
-                                        .compact()
-                                        .icon(IconName::X)
-                                        .accessibility_label("Dismiss message")
-                                        .on_click(cx.listener(|app, _, _, cx| {
-                                            app.failure = None;
-                                            app.notice = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                    },
-                )
+                // The one place this window says something went wrong.
+                .when_some(banner, |root, (message, ink)| {
+                    root.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_2()
+                            .text_size(px(12.))
+                            .text_color(ink)
+                            .child(div().flex_1().child(message))
+                            .child(
+                                Button::new("dismiss-message")
+                                    .custom(sidebar_action_style(cx))
+                                    .small()
+                                    .compact()
+                                    .icon(IconName::X)
+                                    .accessibility_label("Dismiss message")
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.failure = None;
+                                        app.notice = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
                 .child(content)
                 .when_some(dialog, |root, dialog| root.child(dialog)),
         )
@@ -4974,41 +2466,10 @@ fn shortcut(key: &gpui_kit::Keystroke) -> Option<Shortcut> {
         _ => None,
     }
 }
-fn toggle(set: &mut std::collections::HashSet<String>, id: &str) {
+pub(crate) fn toggle(set: &mut std::collections::HashSet<String>, id: &str) {
     if !set.remove(id) {
         set.insert(id.into());
     }
-}
-
-fn escape_git_path(path: &str) -> String {
-    path.chars()
-        .map(|character| {
-            if character.is_control() {
-                character.escape_default().to_string()
-            } else {
-                character.to_string()
-            }
-        })
-        .collect()
-}
-
-/// Close a worktree dialog only when its non-cancellable Git mutation is idle.
-fn close_worktree_dialog(app: &mut TerminalWindow, cx: &mut Context<TerminalWindow>) {
-    if let Some(draft) = app.worktree.as_mut() {
-        if draft.busy {
-            draft.error =
-                Some("This worktree is still being created. Wait for it to finish.".into());
-        } else {
-            app.worktree = None;
-        }
-    } else if let Some(draft) = app.worktree_removal.as_mut() {
-        if draft.busy {
-            draft.error = Some("Worktree deletion is in progress. Wait for Git to finish.".into());
-        } else {
-            app.worktree_removal = None;
-        }
-    }
-    cx.notify();
 }
 
 struct RestoredNavigation {
@@ -5117,18 +2578,6 @@ pub fn install_quit_path(cx: &mut App) {
     })
     .detach();
 }
-fn host(metrics: Arc<Mutex<CellMetrics>>) -> TerminalHost {
-    TerminalHost {
-        cell_metrics: Box::new(move || metrics.lock().map(|cell| *cell).unwrap_or(UNMEASURED_CELL)),
-        resolve_color: Box::new(|index| match index {
-            0..=255 => xterm_256(index as u8),
-            257 => Palette::default().background,
-            258 => Palette::default().cursor,
-            _ => Palette::default().foreground,
-        }),
-        store_clipboard: Box::new(|_| {}),
-    }
-}
 pub fn working_directory() -> PathBuf {
     directory_from(std::env::args_os())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -5156,9 +2605,9 @@ pub fn window_bounds(cx: &App) -> WindowOptions {
             ..TitleBar::title_bar_options()
         }),
         app_id: Some("dev.muster.workspace".into()),
-        // Opaque from the first frame, in the palette's own background: the
-        // root paints `#16181d`, and a transparent launch shows the desktop
-        // through a window that has nothing transparent to show.
+        // Opaque from the first frame, in the terminal palette's own
+        // background: a transparent launch shows the desktop through a window
+        // that has nothing transparent to show.
         window_background: WindowBackgroundAppearance::Opaque,
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         window_decorations: Some(WindowDecorations::Client),
@@ -5166,29 +2615,6 @@ pub fn window_bounds(cx: &App) -> WindowOptions {
         // read a title bar there.
         ..TitleBar::window_options()
     }
-}
-
-// The original ownership regression test remains isolated from production
-// window ownership. Injected views never claim or terminate somebody else's PTY.
-#[cfg(test)]
-static TEST_OWNER: Mutex<Option<Arc<SessionOwner>>> = Mutex::new(None);
-#[cfg(test)]
-fn spawn_and_claim(
-    backend: Arc<TerminalBackend>,
-    config: TerminalSessionConfig,
-) -> Result<Arc<OwnedShell>, String> {
-    let owner = SessionOwner::new(backend, true);
-    let shell = owner.spawn(config)?;
-    *TEST_OWNER.lock().unwrap() = Some(owner);
-    Ok(shell)
-}
-#[cfg(test)]
-fn end_shell() -> Option<Result<CloseReport, SessionError>> {
-    let owner = TEST_OWNER.lock().ok()?.take()?;
-    let shell = owner.state.lock().ok()?.shells.values().next()?.clone();
-    let report = shell.session.close().wait();
-    owner.stop();
-    Some(report)
 }
 #[cfg(test)]
 #[path = "app_tests.rs"]

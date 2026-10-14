@@ -19,9 +19,9 @@
 //!   output ends up with a ghost character and every column after it half a
 //!   cell out.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::{
@@ -40,33 +40,100 @@ use super::{
 /// The terminal's font size and line spacing, matching the legacy terminal defaults.
 const FONT_SIZE: Pixels = px(16.0);
 const LINE_HEIGHT: f32 = 1.2;
+/// `--muster-cursor` from the legacy dark theme, which is also the editor's caret.
 const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);
-static BUNDLED_FONT: OnceLock<Result<(), String>> = OnceLock::new();
-static BOLD_FONT: OnceLock<Result<(), String>> = OnceLock::new();
 
-fn load_bundled_font(
-    window: &mut Window,
-    loaded: &OnceLock<Result<(), String>>,
-    bytes: &'static [u8],
-) -> Result<(), String> {
-    loaded
-        .get_or_init(|| {
-            window
-                .text_system()
-                .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .copied()
-        .map_err(Clone::clone)
+/// `--muster-selection` from the legacy dark theme: the content accent at a quarter.
+///
+/// It is translucent and it does not replace a cell's colours, because legacy
+/// drew it into xterm.js' background layer and left the glyph in whatever
+/// colour it arrived with. A selection is a band over what it covers, so the
+/// text under one still reads and a block cursor over one still inverts
+/// against the cell rather than against the band.
+const SELECTION_COLOR: (u8, u8, u8, u8) = (0x74, 0xad, 0xe8, 0x3d);
+
+/// `--muster-scrollbar` from the legacy dark theme, painted as this app's own
+/// overlay: a toolkit scrollbar reserves width the grid would have to give
+/// back as columns, so the thumb covers the right edge and takes no layout.
+const SCROLLBAR_COLOR: (u8, u8, u8, u8) = (0xc8, 0xcc, 0xd4, 0x4c);
+/// Legacy's terminal scrollbar: a six pixel thumb two pixels in from the edge.
+const SCROLLBAR_WIDTH: Pixels = px(6.);
+const SCROLLBAR_INSET: Pixels = px(2.);
+/// A thumb thinner than this cannot be aimed with a mouse.
+const MIN_SCROLLBAR_THUMB: f32 = 28.;
+
+/// Where this app's scrollbar thumb sits on a track of a known height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollbarGeometry {
+    /// How far down the track the thumb starts.
+    top: f32,
+    /// How tall it is, never more than the track.
+    height: f32,
+    /// Whether there is anything to scroll, which is whether a thumb is worth drawing.
+    scrollable: bool,
 }
 
-/// How often the coalesced wake is sampled.
+/// Legacy's arithmetic (`legacy/src/lib/overlay-scrollbar.ts`), over lines
+/// rather than pixels: the scrollback is the content, the visible rows are the
+/// viewport, and the offset is how far back the viewport has been scrolled.
 ///
-/// One frame at 60Hz. The wake channel holds a single token, so sampling twice
-/// as fast could not turn one burst of output into a second repaint; it could
-/// only add a wake-up per frame to a window that has nothing to show.
-const WAKE_POLL: Duration = Duration::from_millis(16);
+/// Every number is clamped rather than trusted, because a scrollport is
+/// measured by a grid whose content changes between one frame and the next.
+fn scrollbar_geometry(history: usize, offset: usize, rows: usize, track: f32) -> ScrollbarGeometry {
+    let viewport = rows.max(1);
+    let content = history.saturating_add(viewport).max(viewport);
+    let max_offset = content.saturating_sub(viewport);
+    let track = track.max(0.);
+    if track == 0. {
+        return ScrollbarGeometry {
+            top: 0.,
+            height: 0.,
+            scrollable: max_offset > 0,
+        };
+    }
+    if max_offset == 0 {
+        return ScrollbarGeometry {
+            top: 0.,
+            height: track,
+            scrollable: false,
+        };
+    }
+    // `offset` counts back from the newest line, so the viewport's position
+    // measured from the top of the scrollback is the history it has left.
+    let scroll_top = history.saturating_sub(offset).min(max_offset);
+    let height = track.min(MIN_SCROLLBAR_THUMB.max(track * viewport as f32 / content as f32));
+    ScrollbarGeometry {
+        top: scroll_top as f32 / max_offset as f32 * (track - height),
+        height,
+        scrollable: true,
+    }
+}
+fn load_bundled_fonts(window: &mut Window) -> Result<bool, String> {
+    // The app registers these faces before its first window so the sidebar is
+    // already measured with them. A standalone terminal view (including a
+    // headless test) still needs the same faces, but adding them twice to GPUI's
+    // family is what produces duplicate PostScript-name warnings.
+    if window
+        .text_system()
+        .all_font_names()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("Fira Code"))
+    {
+        return Ok(true);
+    }
+    window
+        .text_system()
+        .add_fonts(vec![
+            std::borrow::Cow::Borrowed(
+                include_bytes!("../../assets/fonts/FiraCode-Regular.ttf").as_slice(),
+            ),
+            std::borrow::Cow::Borrowed(
+                include_bytes!("../../assets/fonts/FiraCode-Bold.ttf").as_slice(),
+            ),
+        ])
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
 
 /// The thickness of bar and underline cursors, as a fraction of the cell extent.
 const CURSOR_BAR: f32 = 0.08;
@@ -99,7 +166,7 @@ const DIM_BLEND: f32 = 0.45;
 // Colour
 // ---------------------------------------------------------------------------------------------
 
-/// ANSI entries 0 to 15 in the legacy terminal's dark theme.
+/// ANSI entries 0 to 15, transcribed from `--muster-ansi-*` in `legacy/src/muster.css`.
 const ANSI_COLORS: [(u8, u8, u8); 16] = [
     (0x28, 0x2c, 0x34), // black
     (0xe0, 0x6c, 0x75), // red
@@ -142,13 +209,17 @@ pub fn xterm_256(index: u8) -> (u8, u8, u8) {
 
 /// Every colour this terminal draws with.
 ///
-/// The defaults and ANSI colors for the terminal palette.
+/// The defaults and ANSI colors for the terminal palette. Every one of them is
+/// a `--muster-*` token out of the legacy dark theme in `legacy/src/muster.css`
+///: legacy read that file to build xterm.js' theme, and this is the same table
+/// rather than a second one that happens to agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// What a cell with no colour of its own is drawn in, matching the dark legacy theme.
+    /// `--muster-content-text`: what a cell with no colour of its own is drawn in.
     pub foreground: (u8, u8, u8),
-    /// The same, behind the character.
+    /// `--muster-content-bg-0`: the same, behind the character.
     pub background: (u8, u8, u8),
+    /// `--muster-cursor`, and `--muster-content-bg-0` as the block's glyph.
     pub cursor: (u8, u8, u8),
 }
 
@@ -156,7 +227,7 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             foreground: (0xdc, 0xe0, 0xe5),
-            background: (0x16, 0x18, 0x1c),
+            background: (0x22, 0x24, 0x36),
             cursor: CURSOR_COLOR,
         }
     }
@@ -185,11 +256,16 @@ impl Palette {
 }
 
 fn opaque((r, g, b): (u8, u8, u8)) -> Hsla {
+    rgba((r, g, b, 255))
+}
+
+/// A colour from its bytes, alpha included.
+fn rgba((r, g, b, a): (u8, u8, u8, u8)) -> Hsla {
     Hsla::from(Rgba {
         r: f32::from(r) / 255.0,
         g: f32::from(g) / 255.0,
         b: f32::from(b) / 255.0,
-        a: 1.0,
+        a: f32::from(a) / 255.0,
     })
 }
 
@@ -366,13 +442,17 @@ pub fn place_row(cells: &[CellSnapshot]) -> Vec<Placement> {
 // The view
 // ---------------------------------------------------------------------------------------------
 
-/// One terminal, drawn in one element.
-///
-/// Owns the session because everything a frame needs is on this side of it: a
-/// snapshot, a wake, a key. Nothing here reaches back into the parser, and the
-/// session does not know this type exists.
+/// A user input refusal, with an explanation but never the input payload.
+pub struct InputRefused(pub String);
+
+impl gpui_kit::EventEmitter<InputRefused> for TerminalView {}
+
+/// One terminal view retaining its session, but never its workers.
 pub struct TerminalView {
     session: Arc<TerminalSession>,
+    _wake_task: Option<Task<()>>,
+    repaint: Rc<RefCell<Repaint>>,
+    blink_task: Option<Task<()>>,
     palette: Palette,
     focus: FocusHandle,
     /// Whether the window's own activation has been observed yet.
@@ -383,6 +463,7 @@ pub struct TerminalView {
     /// The measured cell, and the face it was measured in. `None` until the
     /// first frame has a text system to ask.
     cell: Option<CellSize>,
+    bold_font_loaded: bool,
     style: TextStyle,
     /// Whether a left-button text drag is in progress.
     dragging: bool,
@@ -426,26 +507,89 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    /// Record and report one refused input.
+    ///
+    /// Logged and reported together: the log is what outlives a banner the
+    /// person dismissed, and the banner is what they can act on now.
+    fn refuse(&mut self, what: &str, error: &super::SessionError, cx: &mut Context<Self>) {
+        let message = format!("{what}: {error}");
+        log::warn!("muster-native: {message}");
+        self.report(message, cx);
+        cx.notify();
+    }
+
+    /// Hand one refusal to whoever is listening, if anyone is.
+    fn report(&self, message: String, cx: &mut Context<Self>) {
+        cx.emit(InputRefused(message));
+    }
+
+    /// Raise one refusal the way an input path would.
+    ///
+    /// For the test that proves a refusal reaches the window. The refusal
+    /// itself is already covered where it is raised; reproducing a full write
+    /// queue through a real PTY would make the window wiring depend on how fast
+    /// a child happens to read.
+    #[cfg(test)]
+    pub(crate) fn refuse_for_test(
+        &mut self,
+        what: &str,
+        error: &super::SessionError,
+        cx: &mut Context<Self>,
+    ) {
+        let message = format!("{what}: {error}");
+        log::warn!("muster-native: {message}");
+        self.report(message, cx);
+    }
+}
+
+/// Do not consume another output wake until the requested frame is rendered.
+/// Hidden views therefore leave a single coalesced token pending, not a loop.
+#[derive(Default)]
+struct Repaint {
+    pending: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl Repaint {
+    fn rendered(&mut self) {
+        self.pending = false;
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl TerminalView {
     /// Take the session's wake and start watching it.
     pub fn new(
         session: TerminalSession,
         metrics: Arc<Mutex<CellMetrics>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // These headless tests use real PTY threads, not deterministic fake IO.
+        #[cfg(test)]
+        if cx.background_executor().is_test() {
+            cx.background_executor().allow_parking();
+        }
         let session = Arc::new(session);
 
         // Focus first, because every other input path in the window is
         // downstream of somebody having focused this element.
         let focus = cx.focus_handle();
 
-        let wake_task = start_wake_task(Arc::clone(&session), cx);
+        let repaint = Rc::new(RefCell::new(Repaint::default()));
+        let wake_task = start_wake_task(&session, Rc::clone(&repaint), cx);
 
-        let view = Self {
+        Self {
             session,
+            _wake_task: wake_task,
+            repaint,
+            blink_task: None,
             palette: Palette::default(),
             focus,
             observing: false,
             cell: None,
+            bold_font_loaded: false,
             style: TextStyle {
                 font_size: FONT_SIZE.into(),
                 line_height: gpui_kit::DefiniteLength::Fraction(LINE_HEIGHT),
@@ -475,14 +619,7 @@ impl TerminalView {
             dragged: false,
             selection_range: Cell::new(None),
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
-        };
-        // Detached rather than remembered: the task ends when the session
-        // closes or the entity goes, and holding it as a field would keep the
-        // entity alive for as long as the session is.
-        if let Some(task) = wake_task {
-            task.detach();
         }
-        view
     }
 
     /// The session this draws. What the window closes through.
@@ -515,29 +652,16 @@ impl TerminalView {
             return;
         }
 
-        let regular_font_loaded = load_bundled_font(
-            window,
-            &BUNDLED_FONT,
-            include_bytes!("../../assets/fonts/FiraCode-Regular.ttf"),
-        )
-        .is_ok();
-        if !regular_font_loaded {
-            log::error!(
-                "muster-native: bundled terminal font could not load; using an installed fallback"
-            );
-        }
-        let bold_font_loaded = load_bundled_font(
-            window,
-            &BOLD_FONT,
-            include_bytes!("../../assets/fonts/FiraCode-Bold.ttf"),
-        )
-        .is_ok();
-        if !bold_font_loaded {
-            log::error!("muster-native: bundled bold terminal font could not load");
-        }
+        self.bold_font_loaded = match load_bundled_fonts(window) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::error!("muster-native: bundled terminal fonts could not load: {error}");
+                false
+            }
+        };
 
         let installed = window.text_system().all_font_names();
-        let family = if regular_font_loaded
+        let family = if self.bold_font_loaded
             && installed
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case("Fira Code"))
@@ -633,7 +757,7 @@ impl TerminalView {
                 modifiers.shift
             };
         if scroll_shortcut && matches!(key.as_str(), "pageup" | "pagedown" | "home" | "end") {
-            let snapshot = self.session.snapshot();
+            let snapshot = self.session.painting_snapshot();
             match key.as_str() {
                 "pageup" => self.session.scroll_by(snapshot.rows.len() as i32),
                 "pagedown" => self.session.scroll_by(-(snapshot.rows.len() as i32)),
@@ -648,6 +772,7 @@ impl TerminalView {
             return;
         }
         self.reset_blink();
+        cx.notify();
         let input::Input::Press(press) = input::press(&event.keystroke) else {
             return;
         };
@@ -672,8 +797,7 @@ impl TerminalView {
         }
         cx.stop_propagation();
         if let Err(error) = self.session.send_key(&press) {
-            log::warn!("muster-native: a keystroke was not sent: {error}");
-            cx.notify();
+            self.refuse("A keystroke was not sent", &error, cx);
         }
     }
 
@@ -686,8 +810,7 @@ impl TerminalView {
     fn copy_selection(&self, cx: &mut Context<Self>) {
         if let Some(text) = self
             .session
-            .snapshot()
-            .selection
+            .selection_text()
             .filter(|text| !text.is_empty())
         {
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
@@ -711,7 +834,7 @@ impl TerminalView {
                     if prompt.await == Ok(1) {
                         let _ = view.update(cx, |view, cx| {
                             if let Err(error) = view.session.paste_confirmed(&text) {
-                                log::warn!("muster-native: paste was refused: {error}");
+                                view.refuse("The paste was refused", &error, cx);
                             }
                             view.reset_blink();
                             cx.notify();
@@ -720,7 +843,9 @@ impl TerminalView {
                 })
                 .detach();
             }
-            Err(error) => log::warn!("muster-native: clipboard paste was refused: {error}"),
+            Err(error) => {
+                self.refuse("The clipboard paste was refused", &error, cx);
+            }
             Ok(()) => {
                 self.reset_blink();
                 cx.notify();
@@ -729,7 +854,7 @@ impl TerminalView {
     }
 
     fn snapshot_range(&self) -> Option<GridRange> {
-        self.session.snapshot().selection_range
+        self.session.painting_snapshot().selection_range
     }
 
     fn reset_blink(&mut self) {
@@ -891,7 +1016,7 @@ impl TerminalView {
                 self.session.clear_selection();
                 if !outside && !self.modified_click {
                     if let Err(error) = self.session.move_caret_to(point.0, point.1) {
-                        log::warn!("muster-native: prompt movement was refused: {error}");
+                        self.refuse("Prompt movement was refused", &error, cx);
                     }
                 }
             }
@@ -946,7 +1071,7 @@ impl TerminalView {
                     meta: false,
                     text: None,
                 }) {
-                    log::warn!("muster-native: scroll input was refused: {error}");
+                    self.refuse("Scroll input was refused", &error, cx);
                     break;
                 }
             }
@@ -964,6 +1089,7 @@ impl TerminalView {
         Frame {
             palette: self.palette,
             style: self.style.clone(),
+            bold_font_loaded: self.bold_font_loaded,
         }
     }
 }
@@ -973,6 +1099,7 @@ impl TerminalView {
 struct Frame {
     palette: Palette,
     style: TextStyle,
+    bold_font_loaded: bool,
 }
 
 /// Everything one paint pass needs about the grid, gathered so the painter takes
@@ -1106,6 +1233,7 @@ impl Frame {
                 }
             }
         }
+        self.paint_scrollbar(bounds, snapshot, rows, window);
         if !composition.is_empty() {
             if let Some((row, col)) = cursor {
                 if let Some(source) = snapshot.rows.get(row).and_then(|r| r.cells.get(col)) {
@@ -1148,6 +1276,40 @@ impl Frame {
         }
     }
 
+    /// The scrollback thumb, drawn over the right edge of the grid.
+    fn paint_scrollbar(
+        &self,
+        bounds: Bounds<Pixels>,
+        snapshot: &TerminalSnapshot,
+        rows: u16,
+        window: &mut Window,
+    ) {
+        let geometry = scrollbar_geometry(
+            snapshot.history_size,
+            snapshot.display_offset,
+            rows as usize,
+            bounds.size.height.as_f32(),
+        );
+        if !geometry.scrollable || geometry.height <= 0. {
+            return;
+        }
+        let height = px(geometry.height.min(bounds.size.height.as_f32()));
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(
+                    bounds.origin.x + bounds.size.width - SCROLLBAR_INSET - SCROLLBAR_WIDTH,
+                    bounds.origin.y + px(geometry.top),
+                ),
+                size: gpui_kit::size(SCROLLBAR_WIDTH, height),
+            },
+            px(0.0),
+            rgba(SCROLLBAR_COLOR),
+            px(0.0),
+            gpui_kit::transparent_black(),
+            Default::default(),
+        ));
+    }
+
     fn paint_text_run(
         &self,
         run: TextRun<'_>,
@@ -1168,11 +1330,7 @@ impl Frame {
         if cell.inverse {
             std::mem::swap(&mut foreground, &mut background);
         }
-        if selected {
-            background = opaque((0x45, 0x52, 0x79));
-            foreground = opaque((0xff, 0xff, 0xff));
-        }
-        if cell.dim && !selected {
+        if cell.dim {
             foreground = fade_toward(foreground, background);
         }
         if background != self.palette.background(ColorSnapshot::Default) {
@@ -1180,6 +1338,18 @@ impl Frame {
                 bounds,
                 px(0.0),
                 background,
+                px(0.0),
+                gpui_kit::transparent_black(),
+                Default::default(),
+            ));
+        }
+        // The band goes over the cell and under the cursor block and the glyph,
+        // in that order, which is the order legacy painted them in.
+        if selected {
+            window.paint_quad(quad(
+                bounds,
+                px(0.0),
+                rgba(SELECTION_COLOR),
                 px(0.0),
                 gpui_kit::transparent_black(),
                 Default::default(),
@@ -1211,7 +1381,7 @@ impl Frame {
         }
         let mut style = self.style.clone();
         style.color = cursor_colors.foreground;
-        style.font_weight = if cell.bold && BOLD_FONT.get().is_some_and(Result::is_ok) {
+        style.font_weight = if cell.bold && self.bold_font_loaded {
             FontWeight::BOLD
         } else {
             FontWeight::NORMAL
@@ -1402,16 +1572,16 @@ fn fade_toward(color: Hsla, toward: Hsla) -> Hsla {
     })
 }
 
-/// Sample the coalesced wake, and repaint when one arrives.
+/// Await output and at most one outstanding repaint, without retaining the session.
 ///
 /// `None` when the wake has already been taken: there is then nothing left to
 /// coalesce, and a loop watching a token nobody sends is a thread that never
 /// ends.
 fn start_wake_task(
-    session: Arc<TerminalSession>,
+    session: &TerminalSession,
+    repaint: Rc<RefCell<Repaint>>,
     cx: &mut Context<TerminalView>,
 ) -> Option<Task<()>> {
-    let background = cx.background_executor().clone();
     let wake = session.take_wake()?;
 
     // An async closure rather than a closure returning an async block: the
@@ -1422,31 +1592,33 @@ fn start_wake_task(
         // burst behind it collapses into one repaint. That is the coalescing: a
         // `yes` in the shell is thousands of 64 KiB reads and this is one frame
         // for all of them.
-        while !session.is_closing() {
-            background.timer(WAKE_POLL).await;
-            let dirty = wake.take();
+        while wake.recv().await {
             if view
-                .update(cx, |view, cx| {
-                    let now = std::time::Instant::now();
-                    let blink = view.blink_enabled && now >= view.blink_deadline;
-                    if blink {
-                        view.blink_visible = !view.blink_visible;
-                        view.blink_deadline = now + Duration::from_millis(500);
-                    }
-                    if dirty || blink {
-                        cx.notify();
-                    }
+                .update(cx, |_, cx| {
+                    repaint.borrow_mut().pending = true;
+                    cx.notify();
                 })
                 .is_err()
             {
                 return;
             }
+            std::future::poll_fn(|cx| {
+                let mut repaint = repaint.borrow_mut();
+                if repaint.pending {
+                    repaint.waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
         }
     }))
 }
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.repaint.borrow_mut().rendered();
         self.measure(window);
 
         // The cursor is drawn differently when the window is not the one being
@@ -1461,7 +1633,7 @@ impl Render for TerminalView {
         // One snapshot for the frame, read here rather than in the paint pass:
         // it is one lock, and reading it inside the closure would be one lock
         // per element the closure happened to be painted into.
-        let mut snapshot = self.session.snapshot();
+        let mut snapshot = self.session.painting_snapshot();
         if self.gesture_screen != snapshot.alt_screen
             || self.gesture_tracking != snapshot.mouse_tracking
             || self.gesture_size != self.applied.get()
@@ -1490,6 +1662,32 @@ impl Render for TerminalView {
             self.reset_blink();
         }
         self.blink_enabled = blink_enabled;
+        // A single deadline per rendered frame. Losing focus or unmounting the
+        // view cannot leave a detached, repeating blink loop behind.
+        self.blink_task = if blink_enabled {
+            let deadline = self.blink_deadline;
+            let timer = cx
+                .background_executor()
+                .timer(deadline.saturating_duration_since(std::time::Instant::now()));
+            Some(cx.spawn_in(window, async move |view, cx| {
+                timer.await;
+                let _ = view.update_in(cx, |view, window, cx| {
+                    if view.blink_enabled
+                        && view.focus_state(window).accepts_input()
+                        && window.is_visible()
+                        && view.marked_text.is_empty()
+                        && view.blink_deadline == deadline
+                    {
+                        view.blink_visible = !view.blink_visible;
+                        view.blink_deadline =
+                            std::time::Instant::now() + Duration::from_millis(500);
+                        cx.notify();
+                    }
+                });
+            }))
+        } else {
+            None
+        };
         if blink_enabled && !self.blink_visible {
             snapshot.cursor.visible = false;
         }
@@ -1655,7 +1853,7 @@ impl gpui_kit::EntityInputHandler for TerminalView {
             return;
         };
         if let Err(error) = self.session.send_text(&committed) {
-            log::warn!("muster-native: text commit was refused: {error}");
+            self.refuse("The text was refused", &error, cx);
             return;
         }
         self.marked_text.clear();
@@ -1750,6 +1948,7 @@ impl gpui_kit::Focusable for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::MAX_PASTE_BYTES;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{EntityInputHandler, InputEvent};
 
@@ -1889,6 +2088,200 @@ mod tests {
     /// child would be a test about scheduling.
     fn echo_session() -> TerminalSession {
         script_session("printf selection-text; cat")
+    }
+
+    /// A view whose refusals are being listened for.
+    ///
+    /// The sink is the same shape the window installs: a sentence and the app to
+    /// give it to. These tests are about the sentence.
+    fn watched_view(
+        cx: &mut gpui_kit::TestAppContext,
+        session: TerminalSession,
+    ) -> (
+        gpui_kit::Entity<TerminalView>,
+        &mut gpui_kit::VisualTestContext,
+        Rc<RefCell<Vec<String>>>,
+    ) {
+        let heard: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&heard);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        view.update(cx, |_, cx| {
+            cx.subscribe(&view, move |_, _, event: &InputRefused, _| {
+                recorder.borrow_mut().push(event.0.clone());
+            })
+            .detach();
+        });
+        (view, cx, heard)
+    }
+
+    /// Put the pointer on the grid, the way a person does before typing.
+    ///
+    /// The view refuses every keystroke it is not focused for, so a test that
+    /// skips this would be testing a view that is not listening at all.
+    fn focus_grid(cx: &mut gpui_kit::VisualTestContext, view: &gpui_kit::Entity<TerminalView>) {
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        // A click first, because that is what focuses the grid: shortcuts
+        // belong to the focused element, and a test that skipped it would be
+        // testing a window nobody is typing into.
+        cx.simulate_click(gpui_kit::point(px(4.), px(4.)), Default::default());
+        let _ = view;
+    }
+
+    /// A paste the terminal will not take is an operational fact, so it reaches
+    /// the window rather than only the log.
+    ///
+    /// Through the same method the clipboard path calls, because that is the
+    /// wiring under test: a refusal that only a direct call to `refuse` could
+    /// reach would be a refusal no keystroke could ever produce.
+    #[gpui_kit::test]
+    fn a_refused_paste_is_reported_to_the_window(cx: &mut gpui_kit::TestAppContext) {
+        let (view, cx, heard) = watched_view(cx, echo_session());
+        focus_grid(cx, &view);
+        // One byte over the limit, so the refusal is the size and not the shape
+        // of the text.
+        let text = format!("muster-paste-marker{}", "x".repeat(MAX_PASTE_BYTES));
+        assert!(text.len() > MAX_PASTE_BYTES);
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        cx.simulate_keystrokes("cmd-v");
+        let heard = heard.borrow().clone();
+        assert_eq!(heard.len(), 1, "the window was told: {heard:?}");
+        assert!(
+            heard[0].contains("clipboard paste") || heard[0].contains("paste was refused"),
+            "the message does not say what was refused: {heard:?}"
+        );
+    }
+
+    /// The message says what happened and never what was refused.
+    ///
+    /// A refused paste is often a secret: a password, a token, a line of a
+    /// `.env`. Logging or showing it would defeat the refusal.
+    #[gpui_kit::test]
+    fn a_refusal_never_quotes_what_it_refused(cx: &mut gpui_kit::TestAppContext) {
+        let (view, cx, heard) = watched_view(cx, echo_session());
+        focus_grid(cx, &view);
+        let secret = "muster-".repeat(64) + "marker";
+        let text = format!("{secret}{}", "x".repeat(MAX_PASTE_BYTES));
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        cx.simulate_keystrokes("cmd-v");
+        let heard = heard.borrow().clone();
+        assert_eq!(heard.len(), 1);
+        assert!(
+            !heard[0].contains(secret.as_str()),
+            "the refusal quoted the text it refused: {heard:?}"
+        );
+        assert!(
+            !heard[0].contains("x".repeat(16).as_str()),
+            "the refusal quoted a run of the text it refused: {heard:?}"
+        );
+    }
+
+    /// A keystroke the terminal will not take reaches the window too.
+    ///
+    /// A closing session is the ordinary way this happens: the window closes
+    /// while the caret is still being typed into, and the person is left typing
+    /// into a terminal that has already answered.
+    ///
+    /// A shortcut and not a character, because a printable character is the
+    /// platform's to deliver: this view deliberately lets it past, and the
+    /// refusal ordinary typing meets is the text commit's.
+    /// character, because a printable character is the platform's to deliver
+    /// and this view deliberately does not claim it.
+    #[gpui_kit::test]
+    fn a_refused_keystroke_is_reported_to_the_window(cx: &mut gpui_kit::TestAppContext) {
+        let session = echo_session();
+        let (view, cx, heard) = watched_view(cx, session.clone());
+        assert!(
+            wait_for_char(&session, 's'),
+            "the child never drew its text"
+        );
+        focus_grid(cx, &view);
+        session.begin_close().expect("the close begins");
+        assert!(session.is_closing(), "the session did not begin closing");
+        cx.simulate_keystrokes("ctrl-a");
+
+        let heard = heard.borrow().clone();
+        assert_eq!(heard.len(), 1, "the window was told: {heard:?}");
+        assert!(
+            heard[0].contains("keystroke"),
+            "the message does not say what was refused: {heard:?}"
+        );
+        assert!(
+            heard[0].contains("closing"),
+            "the message does not say why: {heard:?}"
+        );
+    }
+    /// A view with nobody listening still refuses: the message is not lost, it
+    /// is only not delivered.
+    #[gpui_kit::test]
+    fn a_view_without_a_listener_does_not_panic_on_a_refusal(cx: &mut gpui_kit::TestAppContext) {
+        let session = echo_session();
+        let (_view, _cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        _cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "x".repeat(MAX_PASTE_BYTES + 1),
+        ));
+        _cx.simulate_keystrokes("cmd-v");
+    }
+
+    #[gpui_kit::test]
+    fn an_unmounted_view_coalesces_output_and_does_not_retain_its_session(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext;
+
+        let session = echo_session();
+        assert!(wait_for_char(&session, 's'));
+        let handle = session.clone();
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let weak = view.read_with(cx, |view, _| Arc::downgrade(&view.session));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.repaint.borrow().pending);
+            assert!(view.repaint.borrow().waker.is_some());
+            assert!(view.blink_task.is_none());
+        });
+        handle.send_text("more-output\n").unwrap();
+        assert!(wait_for_char(&handle, 'm'));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.repaint.borrow().pending);
+            assert!(view.repaint.borrow().waker.is_some());
+            assert!(view.blink_task.is_none());
+        });
+        drop(view);
+        cx.update(|_| ());
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "wake task retained the session");
+        handle.close().wait().unwrap();
     }
 
     fn script_session(script: &str) -> TerminalSession {
@@ -2462,7 +2855,7 @@ mod tests {
         );
         assert_eq!(
             palette.background,
-            (0x16, 0x18, 0x1c),
+            (0x22, 0x24, 0x36),
             "legacy default content background"
         );
 
@@ -2498,6 +2891,118 @@ mod tests {
                     )
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_default_is_the_legacy_dark_token_named_beside_it() {
+        // Transcribed from `legacy/src/muster.css`, `:root` without
+        // `data-theme="light"`, because legacy built xterm.js' theme by reading
+        // exactly these names out of that block. If a value here is edited it is
+        // the CSS that has to move with it, in both apps.
+        const LEGACY_DARK: [(&str, (u8, u8, u8)); 19] = [
+            ("--muster-content-text", (0xdc, 0xe0, 0xe5)),
+            ("--muster-content-bg-0", (0x22, 0x24, 0x36)),
+            ("--muster-cursor", (0xc2, 0xc9, 0xf1)),
+            ("--muster-ansi-black", (0x28, 0x2c, 0x34)),
+            ("--muster-ansi-red", (0xe0, 0x6c, 0x75)),
+            ("--muster-ansi-green", (0x98, 0xc3, 0x79)),
+            ("--muster-ansi-yellow", (0xe5, 0xc0, 0x7b)),
+            ("--muster-ansi-blue", (0x61, 0xaf, 0xef)),
+            ("--muster-ansi-magenta", (0xc6, 0x78, 0xdd)),
+            ("--muster-ansi-cyan", (0x56, 0xb6, 0xc2)),
+            ("--muster-ansi-white", (0xab, 0xb2, 0xbf)),
+            ("--muster-ansi-bright-black", (0x63, 0x6d, 0x83)),
+            ("--muster-ansi-bright-red", (0xea, 0x85, 0x8b)),
+            ("--muster-ansi-bright-green", (0xaa, 0xd5, 0x81)),
+            ("--muster-ansi-bright-yellow", (0xff, 0xd8, 0x85)),
+            ("--muster-ansi-bright-blue", (0x85, 0xc1, 0xff)),
+            ("--muster-ansi-bright-magenta", (0xd3, 0x98, 0xeb)),
+            ("--muster-ansi-bright-cyan", (0x6e, 0xd5, 0xde)),
+            ("--muster-ansi-bright-white", (0xfa, 0xfa, 0xfa)),
+        ];
+
+        let palette = Palette::default();
+        assert_eq!(palette.foreground, LEGACY_DARK[0].1, "{}", LEGACY_DARK[0].0);
+        assert_eq!(palette.background, LEGACY_DARK[1].1, "{}", LEGACY_DARK[1].0);
+        assert_eq!(palette.cursor, LEGACY_DARK[2].1, "{}", LEGACY_DARK[2].0);
+        for (index, (token, expected)) in LEGACY_DARK.iter().skip(3).enumerate() {
+            assert_eq!(xterm_256(index as u8), *expected, "{token}");
+        }
+    }
+
+    /// The thumb says how much scrollback there is and where in it the viewport
+    /// is, so both ends of the scrollback and a terminal that cannot scroll at
+    /// all are the cases that decide whether the arithmetic is legacy's.
+    #[test]
+    fn the_scrollbar_thumb_says_where_the_viewport_is() {
+        assert!(
+            !scrollbar_geometry(0, 0, 24, 480.).scrollable,
+            "a terminal with no scrollback has nothing to say"
+        );
+        let bottom = scrollbar_geometry(1000, 0, 24, 480.);
+        assert!(bottom.scrollable);
+        assert!(
+            (bottom.top - (480. - bottom.height)).abs() < 0.01,
+            "an unscrolled viewport sits at the end of the scrollback: {}",
+            bottom.top
+        );
+        let oldest = scrollbar_geometry(1000, 1000, 24, 480.);
+        assert!(
+            oldest.top.abs() < 0.01,
+            "the oldest line is the top of the track: {}",
+            oldest.top
+        );
+        let half = scrollbar_geometry(1000, 500, 24, 480.);
+        assert!((half.top - (oldest.top + bottom.top) / 2.).abs() < 0.01);
+        assert!(bottom.height >= MIN_SCROLLBAR_THUMB);
+        // An offset past the end of a scrollback that just shrank is clamped
+        // rather than drawn off the bottom of its own track.
+        let shrunk = scrollbar_geometry(0, 1000, 24, 480.);
+        assert!(!shrunk.scrollable && shrunk.height == 480.);
+        assert_eq!(
+            scrollbar_geometry(1000, 0, 24, 0.),
+            ScrollbarGeometry {
+                top: 0.,
+                height: 0.,
+                scrollable: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_selection_is_a_band_over_the_cell_rather_than_a_fill() {
+        // `--muster-selection` is `#74ade83d`: the content accent, `#74ade8`, at
+        // an alpha of `0x3d`. Legacy drew that into xterm.js' background layer,
+        // so what it covered still reads through it, and a block cursor drawn
+        // over a selected cell still inverts against the cell rather than
+        // against the band. `#364561` is this band over `#222436`.
+        assert_eq!(
+            (SELECTION_COLOR.0, SELECTION_COLOR.1, SELECTION_COLOR.2),
+            (0x74, 0xad, 0xe8),
+            "the content accent, not a colour of its own"
+        );
+        assert_eq!(SELECTION_COLOR.3, 0x3d, "the accent at a quarter");
+
+        let band = rgba(SELECTION_COLOR).to_rgb();
+        let alpha = rgba(SELECTION_COLOR).a;
+        assert!(
+            alpha > 0.0 && alpha < 1.0,
+            "a selection is a band over the cell, not a fill: {alpha}"
+        );
+        let background = Palette::default().background;
+        for (channel, behind, composited) in [
+            (band.r, background.0, 0x36u8),
+            (band.g, background.1, 0x45),
+            (band.b, background.2, 0x61),
+        ] {
+            let expected = f32::from(behind) / 255.0;
+            assert!(
+                (channel * alpha + expected * (1.0 - alpha) - f32::from(composited) / 255.0)
+                    .abs()
+                    <= 1.0 / 255.0,
+                "the band over the surface is not #{composited:02x}{composited:02x}{composited:02x}"
+            );
         }
     }
 

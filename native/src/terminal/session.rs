@@ -545,7 +545,7 @@ pub struct CloseReport {
 /// 64 KiB reads, and one UI task per read is one UI task per 64 KiB for as long
 /// as the person keeps it running.
 #[derive(Debug)]
-pub struct TerminalWake(mpsc::Receiver<()>);
+pub struct TerminalWake(mpsc::Receiver<()>, Arc<Mutex<Option<std::task::Waker>>>);
 
 impl TerminalWake {
     /// Wait up to `timeout` for the reader to say something changed.
@@ -560,6 +560,28 @@ impl TerminalWake {
     pub fn take(&self) -> bool {
         matches!(self.0.try_recv(), Ok(()))
     }
+
+    /// Await a change without occupying a worker or polling an idle terminal.
+    pub async fn recv(&self) -> bool {
+        std::future::poll_fn(|cx| {
+            let mut waker = self.1.lock().expect("terminal wake poisoned");
+            match self.0.try_recv() {
+                Ok(()) => std::task::Poll::Ready(true),
+                Err(mpsc::TryRecvError::Disconnected) => std::task::Poll::Ready(false),
+                Err(mpsc::TryRecvError::Empty) => {
+                    *waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+}
+
+impl Drop for TerminalWake {
+    fn drop(&mut self) {
+        self.1.lock().expect("terminal wake poisoned").take();
+    }
 }
 
 /// The producer's end.
@@ -571,6 +593,7 @@ impl TerminalWake {
 #[derive(Debug)]
 struct Wake {
     sender: Mutex<Option<mpsc::SyncSender<()>>>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
     released: AtomicBool,
     /// Wakes that found a token already pending. Diagnostic, and the number
     /// that says whether coalescing is doing anything at all.
@@ -580,13 +603,15 @@ struct Wake {
 impl Wake {
     fn new() -> (Self, TerminalWake) {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let waker = Arc::new(Mutex::new(None));
         (
             Self {
                 sender: Mutex::new(Some(sender)),
+                waker: Arc::clone(&waker),
                 released: AtomicBool::new(false),
                 coalesced: AtomicU64::new(0),
             },
-            TerminalWake(receiver),
+            TerminalWake(receiver, waker),
         )
     }
 
@@ -596,8 +621,8 @@ impl Wake {
         if self.released.load(Ordering::Acquire) {
             return;
         }
-        let sender = self.sender.lock().expect("terminal wake poisoned");
-        let Some(sender) = sender.as_ref() else {
+        let held = self.sender.lock().expect("terminal wake poisoned");
+        let Some(sender) = held.as_ref() else {
             return;
         };
         match sender.try_send(()) {
@@ -608,6 +633,11 @@ impl Wake {
             // The view is gone. Nobody to wake, and nothing to report: a
             // session whose window closed must still drain its PTY.
             Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
+        drop(held);
+        let waker = self.waker.lock().expect("terminal wake poisoned").take();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 
@@ -620,6 +650,10 @@ impl Wake {
     fn release(&self) {
         self.released.store(true, Ordering::Release);
         self.sender.lock().expect("terminal wake poisoned").take();
+        let waker = self.waker.lock().expect("terminal wake poisoned").take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -830,17 +864,17 @@ impl Control {
         }
     }
 
-    fn spawn_worker(&self, name: &str, worker: impl FnOnce() + Send + 'static) {
-        let handle = thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(worker)
-            .unwrap_or_else(|error| {
-                panic!("the terminal {name} thread could not be spawned: {error}")
-            });
+    fn spawn_worker(
+        &self,
+        name: &str,
+        worker: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        let handle = thread::Builder::new().name(name.to_owned()).spawn(worker)?;
         self.workers
             .lock()
             .expect("terminal control poisoned")
             .push(handle);
+        Ok(())
     }
 
     /// Tell every worker to end and wait for it.
@@ -1054,7 +1088,12 @@ impl Inner {
             .expect("terminal status poisoned");
         // The child is not "idle" and the foreground is not "empty" because a
         // read failed; the last reading stands and the failure is kept beside it.
+        let changed = stored.poll_error.as_ref() != Some(&error);
         stored.poll_error = Some(error);
+        drop(stored);
+        if changed {
+            self.side.wake.signal();
+        }
     }
 
     /// Steps 1 to 4 of a close. Nothing has been killed when this returns.
@@ -1271,6 +1310,16 @@ fn push_reply(side: &ReaderSide, reply: Vec<u8>) -> Result<(), String> {
 /// or pushes onto a queue, and nothing here blocks on a child, a pipe or the OS.
 pub struct TerminalSession {
     inner: Arc<Inner>,
+    lifetime: Arc<WorkerLifetime>,
+}
+
+/// Workers own `Inner`, but never this external-handle lifetime.
+struct WorkerLifetime(Arc<Inner>);
+
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        self.0.control.stop();
+    }
 }
 
 /// Two handles on one shell, not two shells.
@@ -1283,6 +1332,7 @@ impl Clone for TerminalSession {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            lifetime: Arc::clone(&self.lifetime),
         }
     }
 }
@@ -1328,28 +1378,31 @@ impl TerminalSession {
             shared: Arc::clone(&shared),
             // One writer for the whole session, whatever produced the bytes.
             // The sink owns a copy of the id because it outlives this call.
-            queue: Arc::new(WriteQueue::spawn({
-                let backend = Arc::clone(&backend);
-                let id = id.clone();
-                let shared = Arc::clone(&shared);
-                let wake = Arc::clone(&wake);
-                move |bytes| {
-                    let result = backend.write(&id, bytes);
-                    if let Err(error) = &result {
-                        if !shared.closing.load(Ordering::Acquire) {
-                            shared
-                                .protocol_error
-                                .lock()
-                                .expect("terminal protocol error poisoned")
-                                .get_or_insert_with(|| {
-                                    format!("terminal PTY write failed: {error}")
-                                });
-                            wake.signal();
+            queue: Arc::new(
+                WriteQueue::spawn({
+                    let backend = Arc::clone(&backend);
+                    let id = id.clone();
+                    let shared = Arc::clone(&shared);
+                    let wake = Arc::clone(&wake);
+                    move |bytes| {
+                        let result = backend.write(&id, bytes);
+                        if let Err(error) = &result {
+                            if !shared.closing.load(Ordering::Acquire) {
+                                shared
+                                    .protocol_error
+                                    .lock()
+                                    .expect("terminal protocol error poisoned")
+                                    .get_or_insert_with(|| {
+                                        format!("terminal PTY write failed: {error}")
+                                    });
+                                wake.signal();
+                            }
                         }
+                        result
                     }
-                    result
-                }
-            })),
+                })
+                .map_err(|error| SessionError::Spawn(error.to_string()))?,
+            ),
             host,
             wake,
         };
@@ -1385,26 +1438,40 @@ impl TerminalSession {
         // Both workers start only once the child exists: a resize or a status
         // read for a session that never spawned has nothing to talk to.
         let resizer = Arc::clone(&inner);
-        control.spawn_worker("terminal-resize", move || {
-            while resizer.control.wait_for_resize() {
-                match resizer.control.take_resize() {
-                    Some(request) => apply_resize(&resizer, request),
-                    // Nothing left to take: another wake for a request already
-                    // applied, and applying nothing is the whole answer.
-                    None => continue,
+        let workers = (|| {
+            control.spawn_worker("terminal-resize", move || {
+                while resizer.control.wait_for_resize() {
+                    match resizer.control.take_resize() {
+                        Some(request) => apply_resize(&resizer, request),
+                        // Nothing left to take: another wake for a request already
+                        // applied, and applying nothing is the whole answer.
+                        None => continue,
+                    }
                 }
-            }
-        });
+            })?;
 
-        let poller = Arc::clone(&inner);
-        control.spawn_worker("terminal-status", move || loop {
-            let _ = poller.poll_and_record();
-            if !poller.control.keep_going(poller.status_interval) {
-                return;
+            let poller = Arc::clone(&inner);
+            control.spawn_worker("terminal-status", move || loop {
+                let _ = poller.poll_and_record();
+                if !poller.control.keep_going(poller.status_interval) {
+                    return;
+                }
+            })
+        })();
+        if let Err(error) = workers {
+            control.stop();
+            inner.side.wake.release();
+            inner.side.queue.stop();
+            if let Err(close_error) = backend.close(&inner.id) {
+                log::error!("terminal startup cleanup failed: {close_error}");
             }
-        });
+            return Err(SessionError::Spawn(error.to_string()));
+        }
 
-        Ok(Self { inner })
+        Ok(Self {
+            lifetime: Arc::new(WorkerLifetime(Arc::clone(&inner))),
+            inner,
+        })
     }
 
     pub fn id(&self) -> &str {
@@ -1441,10 +1508,28 @@ impl TerminalSession {
 
     /// What the view draws. One lock, one frame.
     pub fn snapshot(&self) -> TerminalSnapshot {
+        self.snapshot_inner(true)
+    }
+
+    pub(crate) fn painting_snapshot(&self) -> TerminalSnapshot {
+        self.snapshot_inner(false)
+    }
+
+    /// Read the current title without copying the grid.
+    pub fn title(&self) -> Option<String> {
+        self.inner.shared().core().title().map(str::to_owned)
+    }
+
+    /// Extract selected text only when a caller needs to copy it.
+    pub fn selection_text(&self) -> Option<String> {
+        self.inner.shared().core().selection_text()
+    }
+
+    fn snapshot_inner(&self, selection: bool) -> TerminalSnapshot {
         let core = self.inner.shared().core();
         TerminalSnapshot {
             rows: core.visible_rows(),
-            selection: core.selection_text(),
+            selection: selection.then(|| core.selection_text()).flatten(),
             selection_range: core.selection_range().and_then(|range| {
                 let offset = core.display_offset() as i32;
                 let start_row = range.start.line.0 + offset;
@@ -1717,11 +1802,13 @@ impl TerminalSession {
         let inner = Arc::clone(&self.inner);
         let worker = thread::Builder::new()
             .name("terminal-close".to_owned())
-            .spawn(move || inner.close_sequence())
-            .expect("the terminal close thread could not be spawned");
-        CloseHandle {
-            worker: Some(worker),
-        }
+            .spawn(move || inner.close_sequence());
+        let (worker, result) = match worker {
+            Ok(worker) => (Some(worker), None),
+            // An explicit close must still close if its helper cannot start.
+            Err(_) => (None, Some(self.inner.close_sequence())),
+        };
+        CloseHandle { worker, result }
     }
 }
 
@@ -1744,11 +1831,15 @@ impl Drop for Inner {
 /// The close, running somewhere else. Wait for it, or let it finish on its own.
 pub struct CloseHandle {
     worker: Option<JoinHandle<Result<CloseReport, SessionError>>>,
+    result: Option<Result<CloseReport, SessionError>>,
 }
 
 impl CloseHandle {
     /// Wait for the close to finish.
     pub fn wait(mut self) -> Result<CloseReport, SessionError> {
+        if let Some(result) = self.result.take() {
+            return result;
+        }
         let Some(worker) = self.worker.take() else {
             return Err(SessionError::Backend(
                 "the terminal close thread was already waited on".into(),
@@ -2068,6 +2159,103 @@ mod tests {
     }
 
     #[test]
+    fn last_external_handle_releases_workers_without_closing_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, session, wake) = start(config(dir.path(), "sleep 30"));
+        let id = session.id().to_owned();
+        let inner = Arc::downgrade(&session.inner);
+        let control = Arc::clone(&session.inner.control);
+        let queue = Arc::clone(&session.inner.side.queue);
+        let clone = session.clone();
+        drop(session);
+        assert!(inner.upgrade().is_some());
+        assert!(!control.state.lock().unwrap().stopping);
+        drop(clone);
+        assert!(inner.upgrade().is_none(), "workers retained the session");
+        assert!(control.state.lock().unwrap().stopping);
+        assert!(control.workers.lock().unwrap().is_empty());
+        assert_eq!(queue.push(vec![b'x']), Err(EnqueueError::Stopped));
+        while wake.take() {}
+        assert!(matches!(
+            wake.0.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            backend.status(&id).unwrap().state,
+            TerminalProcessState::Running
+        );
+        shutdown(&backend);
+    }
+
+    #[test]
+    fn lightweight_metadata_and_selection_do_not_extract_text_for_painting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, session, _) = start(config(dir.path(), "sleep 30"));
+        assert_eq!(session.title(), None);
+        assert_eq!(session.selection_text(), None);
+        session
+            .inner
+            .shared()
+            .core()
+            .feed(b"\x1b]2;editor\x07hello");
+        session.select((0, 0), (0, 4));
+        assert_eq!(session.title().as_deref(), Some("editor"));
+        assert_eq!(session.selection_text().as_deref(), Some("hello"));
+        let painted = session.painting_snapshot();
+        assert!(painted.selection.is_none());
+        assert!(painted.selection_range.is_some());
+        assert_eq!(session.snapshot().selection.as_deref(), Some("hello"));
+        session.clear_selection();
+        assert_eq!(session.selection_text(), None);
+        session.close().wait().unwrap();
+        shutdown(&backend);
+    }
+
+    #[test]
+    fn async_wakes_coalesce_disconnect_and_release_the_consumer() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        #[derive(Default)]
+        struct Count(AtomicU64);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let (producer, receiver) = Wake::new();
+        {
+            let mut recv = std::pin::pin!(receiver.recv());
+            assert_eq!(recv.as_mut().poll(&mut cx), Poll::Pending);
+            for _ in 0..100 {
+                producer.signal();
+            }
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            assert_eq!(producer.coalesced.load(Ordering::Relaxed), 99);
+            assert_eq!(recv.as_mut().poll(&mut cx), Poll::Ready(true));
+        }
+        {
+            let mut recv = std::pin::pin!(receiver.recv());
+            assert_eq!(recv.as_mut().poll(&mut cx), Poll::Pending);
+            producer.release();
+            assert_eq!(count.0.load(Ordering::Relaxed), 2);
+            assert_eq!(recv.as_mut().poll(&mut cx), Poll::Ready(false));
+        }
+        let (producer, receiver) = Wake::new();
+        {
+            let mut recv = std::pin::pin!(receiver.recv());
+            assert_eq!(recv.as_mut().poll(&mut cx), Poll::Pending);
+        }
+        drop(receiver);
+        producer.signal();
+        assert_eq!(count.0.load(Ordering::Relaxed), 2);
+        assert!(producer.waker.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn host_callbacks_can_read_the_parser_and_events_keep_their_order() {
         let shared = Arc::new(Shared::new(80, 24, TEST_SCROLLBACK));
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2088,7 +2276,7 @@ mod tests {
         let (wake, _) = Wake::new();
         let side = ReaderSide {
             shared,
-            queue: Arc::new(WriteQueue::spawn(|_| Ok(()))),
+            queue: Arc::new(WriteQueue::spawn(|_| Ok(())).unwrap()),
             host: Arc::new(TerminalHost {
                 store_clipboard: Box::new(move |_| clipboard()),
                 resolve_color: Box::new(move |_| {
@@ -2119,14 +2307,17 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut first = true;
-        let queue = Arc::new(WriteQueue::spawn(move |_| {
-            if first {
-                first = false;
-                started_tx.send(()).unwrap();
-                let _ = release_rx.recv();
-            }
-            Ok(())
-        }));
+        let queue = Arc::new(
+            WriteQueue::spawn(move |_| {
+                if first {
+                    first = false;
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                }
+                Ok(())
+            })
+            .unwrap(),
+        );
         queue.push(vec![b'x']).unwrap();
         started_rx.recv_timeout(PATIENCE).unwrap();
         for _ in 0..super::super::write_queue::MAX_QUEUED_REQUESTS {

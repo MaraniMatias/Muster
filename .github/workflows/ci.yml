@@ -37,15 +37,21 @@ jobs:
       - run: cargo build --locked --release -p muster-native
 
   # macOS never compiles the Linux branches of the code, so nothing above would notice them
-  # rotting. GPUI Kit has real Linux targets; building them is the point of this job.
+  # rotting. GPUI Kit has real Linux targets; building them is the point of this job. The core
+  # suite runs here too, because half of it is POSIX behaviour the macOS runner cannot exercise:
+  # the instance lock, symlink and O_NOFOLLOW refusals, process groups, signals. git is already on
+  # the runner image and these tests create their own repositories.
   linux-build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
       # The Vulkan, X11 and Wayland development packages GPUI links against.
       - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev
       - run: cargo build --locked -p muster-native
+      - run: cargo test --locked -p muster-core

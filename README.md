@@ -23,23 +23,41 @@ Requires the Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) and,
 for the security audit only, Node 22.
 
 ```sh
-cargo run -p muster-native                 # a window and a shell in this directory
-cargo run -p muster-native -- /some/dir    # a window and a shell in that one
-cargo build --release -p muster-native     # target/release/muster-native
+rustup run 1.97.1 cargo run --locked -p muster-native
+rustup run 1.97.1 cargo run --locked -p muster-native -- /some/dir
+rustup run 1.97.1 cargo build --locked --release -p muster-native
 
-cargo test --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo fmt --all --check
+rustup run 1.97.1 cargo test --locked --workspace
+rustup run 1.97.1 cargo clippy --locked --workspace --all-targets -- -D warnings
+rustup run 1.97.1 cargo fmt --all --check
 node scripts/audit-rust.mjs                # RustSec over the locked graph
+
+scripts/perf-native.sh                      # the terminal hot-path cost table
 ```
+
+`MUSTER_LOG=debug cargo run -p muster-native` prints what the terminal refuses
+and what it could not do. Without a sink installed every one of those records
+would be discarded, so the app installs one before anything that can log.
 
 ## State
 
-The native app is a **terminal**. The workspace UI the shipped Tauri app has --
-repositories and worktrees in a sidebar, diffs, review notes on diff lines,
-delivery to an agent -- is not ported yet. That is the next milestone, and
+The native app is a **terminal with the workspace panel around it**:
+repositories and worktrees in a sidebar, live terminals grouped under them,
+line counts counted against Git, a searchable worktree picker in the title bar,
+worktree creation and archive-or-delete dialogs, drag to reorder or move a
+terminal between worktrees, and a window state file.
+
+**Not ported yet:** review notes on diff lines, delivery to an agent, live
+preferences, OSC 8 links, file activation and terminal search. Those are the next milestone, and
 [`docs/native-rust-migration/interface-parity.md`](docs/native-rust-migration/interface-parity.md)
-is the specification for it.
+is the specification for them.
+
+[`Terminal implementation status`](docs/native-rust-migration/ghostty-reference.md)
+records the implemented behavior, remaining parity work, and measured costs (§12).
+The app uses one dark appearance. Native state lives in
+`~/.muster/native-workspace.json`, independently of Legacy SQLite; a single-instance
+lock protects it and shutdown flushes the latest accepted navigation snapshot.
+Git discovery/counting stays active at a slower cadence in hidden windows.
 
 `legacy/` keeps the last shipped version (v0.21.1) for reference and for its
 users until the native app covers it.

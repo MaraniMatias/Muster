@@ -250,6 +250,85 @@ fn protected_checkouts_have_no_lifecycle_controls(cx: &mut TestAppContext) {
     dispose(&fixture, cx);
 }
 
+/// Theming a row must not move it, nor take its controls with it.
+///
+/// The row's own geometry and the position of the control that acts on it are
+/// the hitbox contract the drag gesture and the keyboard order both rely on.
+/// A wash that changes the row's padding, or a font that changes its measure,
+/// breaks both silently, so this is asserted against the drawn frame rather
+/// than against the style that produced it.
+#[gpui_kit::test]
+fn the_pointer_states_do_not_move_a_row_or_its_controls(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let open_row = format!("select-session-{}", fixture.sessions[0]);
+    let other_row = format!("select-session-{}", fixture.sessions[1]);
+    let close = format!("close-session-{}", fixture.sessions[0]);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
+        let (rest_row, rest_close) = (
+            window.find(open_row.clone()).bounds(),
+            window.find(close.clone()).bounds(),
+        );
+        for row in [&open_row, &other_row] {
+            window.hover(row.clone(), cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(open_row.clone()).bounds(),
+                rest_row,
+                "hovering {row} moved a row"
+            );
+            assert_eq!(
+                window.find(close.clone()).bounds(),
+                rest_close,
+                "hovering {row} moved its close control"
+            );
+            assert!(
+                window.find(open_row.clone()).visible(),
+                "hovering {row} took the open row off the panel"
+            );
+        }
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// The open row stays the open row while the pointer is on it.
+///
+/// Selection is announced and is what the keyboard order follows, so the one
+/// thing a pointer must not do is talk the window out of it.
+#[gpui_kit::test]
+fn the_open_row_stays_selected_while_the_pointer_is_on_it(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let open_row = format!("select-session-{}", fixture.sessions[0]);
+    let other_row = format!("select-session-{}", fixture.sessions[1]);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(open_row.clone(), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(open_row.clone()).selected(),
+            Some(true),
+            "the row was clicked, so it is the open one"
+        );
+        for row in [&open_row, &other_row] {
+            window.hover(row.clone(), cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(open_row.clone()).selected(),
+                Some(true),
+                "hovering {row} stopped the open row reading as open"
+            );
+            assert_eq!(
+                window.find(other_row.clone()).selected(),
+                Some(false),
+                "hovering {row} opened the row it is not on"
+            );
+        }
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
 #[gpui_kit::test]
 fn insertion_row_does_not_change_a_stationary_drag_target(cx: &mut TestAppContext) {
     let fixture = open(cx);
@@ -292,6 +371,39 @@ fn insertion_row_does_not_change_a_stationary_drag_target(cx: &mut TestAppContex
         );
     });
     dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn a_count_sweep_answers_every_batch_and_never_turns_a_failure_into_zero(
+    cx: &mut TestAppContext,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = git_repository(directory.path());
+    let opened = navigation::open_directory(&root).unwrap();
+    std::fs::write(root.join("untracked"), "one\ntwo\n").unwrap();
+    let checkout = opened.repo.checkouts[0].clone();
+    let mut invalid = checkout.clone();
+    invalid.is_missing = true;
+    let mut work = vec![("invalid".into(), opened.repo.clone(), invalid)];
+    for index in 0..SWEEP_CONCURRENCY + 1 {
+        work.push((index.to_string(), opened.repo.clone(), checkout.clone()));
+    }
+    let executor = cx.update(|cx| cx.background_executor().clone());
+    executor.allow_parking();
+    let results = count_sweep(work, executor).await;
+    assert_eq!(results.len(), SWEEP_CONCURRENCY + 2);
+    assert!(results[0].2.is_err());
+    for (index, (_, path, total)) in results.into_iter().skip(1).enumerate() {
+        assert_eq!(path, checkout.path);
+        assert_eq!(
+            total.unwrap(),
+            DiffTotals {
+                additions: 2,
+                deletions: 0
+            },
+            "{index}"
+        );
+    }
 }
 
 #[gpui_kit::test]
@@ -585,7 +697,7 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
     cx.update(|cx| {
         gpui_kit::init(cx);
         load_fonts(cx);
-        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        crate::theme::install(cx);
     });
     let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(window_bounds(cx), cx, |window, cx| {
@@ -1244,7 +1356,7 @@ pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
     cx.update(|cx| {
         gpui_kit::init(cx);
         load_fonts(cx);
-        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        crate::theme::install(cx);
     });
     let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(window_bounds(cx), cx, |_window, cx| {
@@ -2095,7 +2207,8 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         .update(cx, |app, _| app.navigation.merge(opened, false));
     let state_path = fixture._directory.path().join("native-workspace.json");
     fixture.view.update(cx, |app, _| {
-        *app.owner.writer.lock().unwrap() = Some(StateWriter::new(state_path.clone()).unwrap());
+        app.owner
+            .install_writer(Some(StateWriter::new(state_path.clone()).unwrap()));
     });
 
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2292,6 +2405,41 @@ fn ownership_closes_only_requested_session_and_shutdown_refuses_late_spawn() {
     assert!(backend.status("owner-two").is_err());
     assert!(owner.spawn(create("owner-late")).is_err());
     owner.stop();
+}
+
+#[test]
+fn closing_a_terminal_racing_window_shutdown_closes_it_once() {
+    let backend = Arc::new(TerminalBackend::default());
+    let owner = SessionOwner::new(backend.clone(), true);
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = TerminalSessionConfig::new(
+        "owner-race".into(),
+        directory.path().to_owned(),
+        80,
+        24,
+        Some(PathBuf::from("/bin/sh")),
+    );
+    config.args = Some(vec!["-c".into(), "sleep 30".into()]);
+    owner.spawn(config).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let close_owner = owner.clone();
+    let close_barrier = barrier.clone();
+    let closer = std::thread::spawn(move || {
+        close_barrier.wait();
+        close_owner.close_one("owner-race")
+    });
+    let stop_owner = owner.clone();
+    let stop_barrier = barrier.clone();
+    let stopper = std::thread::spawn(move || {
+        stop_barrier.wait();
+        stop_owner.stop();
+    });
+    barrier.wait();
+
+    closer.join().unwrap().unwrap();
+    stopper.join().unwrap();
+    assert!(backend.status("owner-race").is_err());
 }
 
 #[test]
@@ -2512,23 +2660,4 @@ async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut 
     })
     .unwrap();
     dispose(&fixture, cx);
-}
-
-#[test]
-fn serial_writer_flushes_the_last_snapshot_before_shutdown() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("native-workspace.json");
-    let writer = StateWriter::new(path.clone()).unwrap();
-    writer.send(NavigationState {
-        sidebar_width: 300.,
-        ..NavigationState::default()
-    });
-    writer.send(NavigationState {
-        sidebar_width: 410.,
-        ..NavigationState::default()
-    });
-    let errors = writer.error.clone();
-    drop(writer);
-    assert_eq!(navigation::load(&path).unwrap().sidebar_width, 410.);
-    assert!(errors.lock().unwrap().is_none());
 }

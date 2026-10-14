@@ -11,11 +11,23 @@ use gpui_kit::{App, AppContext, Window};
 use muster_native::app::{self, TerminalWindow};
 
 fn main() {
+    // This stack guard outlives GPUI's quit callbacks and their final writer
+    // flush. OS process death also releases it, without stale PID recovery.
+    // Before anything that can log: without a sink installed, every record
+    // the terminal and the window emit is discarded.
+    muster_native::logging::install();
+    let _instance = match muster_core::navigation::NativeInstanceLock::acquire() {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("muster-native: {error}");
+            std::process::exit(1);
+        }
+    };
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
-            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            muster_native::theme::install(cx);
             // Before any window exists: the sidebar's family has to be registered
             // before the first frame asks for it, or GPUI answers with a fallback.
             app::load_fonts(cx);

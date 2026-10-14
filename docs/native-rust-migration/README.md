@@ -1,6 +1,14 @@
 # Muster: native Rust migration feasibility and implementation strategy
 
-**Status:** research and proposed implementation plan; no application code changed.  
+**Status:** original feasibility research, followed by an implemented native terminal and workspace shell. The historical plan below is not a claim of full parity.
+
+**Current implementation (2026-10-14):** the root Cargo workspace builds `core`
+and `native`; Tauri/Vue is parked in `legacy/`. Native Git discovery, worktree
+mutations, sidebar/titlebar navigation, terminal ownership, dark-theme roles,
+single-instance locking and coalesced state writes are implemented. Review notes,
+agent delivery, live preferences, file/link activation and terminal search remain
+unimplemented. See [current verification and measurement](ghostty-reference.md#11-chrome-pass-theme-state-writer-refusals-and-the-read-cadence).
+Real OS IME, GPU rendering and Linux runtime acceptance remain manual gates.
 **Application baseline:** Muster `v0.21.1`, commit `4412f63bd385bdb3b9eb12b829858578a2009f81`.  
 **Research snapshots:** retrieved on 2026-10-11 UTC; exact upstream revisions are recorded below.  
 **Worktree:** `.worktrees/docs-native-rust-gpui`, branch `docs/native-rust-gpui`.  

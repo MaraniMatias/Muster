@@ -21,7 +21,9 @@ docs/             the migration plan, and what the port has to satisfy
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 71 tests and `native` holds 178. The PTY tests are `core`'s: they
+- `core` holds 77 tests (73 inline plus the four-process instance-lock suite in
+  `core/tests/`) and `native` holds 210 default tests plus two ignored
+  performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
 - A focused test: `cargo test --locked -p muster-core pty::`.
@@ -30,13 +32,56 @@ docs/             the migration plan, and what the port has to satisfy
   `native/src/sidebar_tests.rs` for the sidebar rows, the worktree dialog and
   the directory picker, and `native/src/titlebar_tests.rs` for the title bar:
   its crumbs, its menus and the window it belongs to.
+- `native/src/theme.rs` carries its own tests, so the roles are checked without
+  a window. `native/src/state_writer.rs` carries its own too: what the slot
+  keeps, drops and flushes is decided without one.
 - The native workspace lives in `~/.muster/native-workspace.json`, written by
   `core::navigation`. It is **not** the Legacy SQLite database and nothing reads
   the old one. It holds roots, archived checkout ids, the active checkout and
   the sidebar width. Live sessions and terminal layouts are never written, so a
-  restart begins with no terminals rather than reviving processes that are gone.
+  restart creates a fresh shell in the selected checkout; it never revives
+  processes that are gone.
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
   `linux-build` job in `.github/workflows/ci.yml` for the current list.
+
+## Colour: roles, not values
+
+`native/src/theme.rs` is the only place this app names a chrome colour. Its
+`install` function applies Legacy's dark tokens to GPUI Kit with `Theme::update`
+before the first window opens; it must not use the toolkit's default dark
+palette. Every surface, ink, hairline and state wash is a `Roles` field, so
+application drawing and toolkit widgets share that installed palette.
+`docs/native-rust-migration/dark-colors.md` records the token equivalence and
+remaining component-level differences. Adding a `rgb(0x...)` anywhere
+else is the thing to catch in review.
+
+The states the roles have to cover, and what each one is for:
+
+| role | state it paints |
+| --- | --- |
+| `surface_base`, `surface`, `surface_raised`, `surface_inset` | application/field, panel, overlay, recessed well |
+| `text`, `text_muted`, `text_disabled` | primary, secondary, not actionable |
+| `border`, `border_strong` | hairline, overlay edge |
+| `hover`, `pressed` | pointer on, control held |
+| `selected`, `selected_hover` | this window's open row, and the same row with the pointer on it |
+| `focus` | the ring a focused control wears |
+| `disabled_surface` | a row that cannot be chosen |
+| `accent`, `drag` | the selection bar and a chosen crumb; a slot being dropped into |
+| `status.*` | added, removed, waiting, failed, done, worth reading |
+
+`Roles::row_rest` and `Roles::row_hover` are the one place a row's
+state-to-colour combination is decided, because GPUI refines a hover style
+after the rest style: a drawing that answers both in its own closure will paint
+the open row's hover over its selection for exactly as long as the pointer is
+resting on it.
+
+### Not the terminal's palette
+
+`crate::terminal::Palette` is a separate contract and is not themed. It is what
+a VT sequence asked for: ANSI indices, OSC colours, an explicit background. The
+application draws it verbatim, and no role here reaches `TerminalHost::resolve_color`.
+There is no terminal preference, no theme preference and no switcher: one
+appearance, dark, chosen by `main.rs` before the first window opens.
 
 ## The vendored parser
 

@@ -8,8 +8,36 @@
 /// The workspace window, retained terminal registry, and native sidebar.
 pub mod app;
 
+/// The left panel: repositories, their worktrees, and the terminals in them.
+pub mod sidebar;
+
 /// Navigation projection and selection/merge rules for the native sidebar.
 mod navigation;
+
+/// The worktree creation and removal dialogs.
+pub mod worktree_dialog;
+
+/// The crumb line and the searchable menu each crumb opens.
+pub mod titlebar;
+
+/// Who owns a PTY, and the window's end of it.
+pub mod session_owner;
+
+/// The serial, bounded writer behind `core::navigation`'s state file.
+pub mod state_writer;
+
+/// The application's semantic colour roles, read from the toolkit theme.
+pub mod theme;
+
+/// Where this crate's log records go.
+pub mod logging;
+
+/// A finite, reproducible cost check for the terminal's hot paths.
+///
+/// Not part of the suite: every case is ignored and prints rather than
+/// asserts. `scripts/perf-native.sh` is how it is run.
+#[cfg(test)]
+mod perf;
 
 /// `muster_core::workspace`, re-exported so a host-side module can reach the
 /// status shapes through one path.

@@ -90,7 +90,7 @@ impl WriteQueue {
     ///
     /// `sink` runs on the writer thread, so it must not push to this queue or
     /// stop it; a closure that did either would be waiting on itself.
-    pub fn spawn<S>(mut sink: S) -> Self
+    pub fn spawn<S>(mut sink: S) -> std::io::Result<Self>
     where
         S: FnMut(&[u8]) -> Result<(), String> + Send + 'static,
     {
@@ -102,13 +102,12 @@ impl WriteQueue {
 
         let handle = thread::Builder::new()
             .name("terminal-write-queue".to_owned())
-            .spawn(move || writer_loop(&mut sink, &writer))
-            .expect("the terminal write queue thread could not be spawned");
+            .spawn(move || writer_loop(&mut sink, &writer))?;
 
-        Self {
+        Ok(Self {
             shared,
             writer: Mutex::new(Some(handle)),
-        }
+        })
     }
 
     /// Queue one request, or refuse it whole.
@@ -335,6 +334,7 @@ mod tests {
         /// Hand the sink to a queue and keep the gate.
         fn spawn(&mut self) -> WriteQueue {
             WriteQueue::spawn(self.sink.take().expect("a sink is only taken once"))
+                .expect("writer starts")
         }
 
         /// Let the writer go for good.

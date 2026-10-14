@@ -342,10 +342,10 @@ live PTYs, and no goal here requires doing so.
 
 ### Status after the implementation pass
 
-Stages 1–5 are implemented and covered by tests on this branch. They landed as one
-commit because the parser snapshot, session API, input routing and view gestures do
-not compile apart from each other; the sequence above is the review order, not the
-commit order.
+The earlier adapter pass implemented the behavior below with automated coverage.
+This is not full stage-5 acceptance: live preferences and real OS/GPU checks remain
+outstanding. The sequence above is the review order for the coupled parser,
+session, input and view changes.
 
 | Stage | Implemented as |
 | --- | --- |
@@ -354,8 +354,10 @@ commit order.
 | 4 | `prompt_caret_move` returns an ordered arrow count and direction from one authoritative read, follows soft-wrapped rows, refuses tabs, combining clusters, wide spacers, alternate screens, mouse-tracking apps and hard multiline input. |
 | 5 | The block cursor uses the program's color or the theme cursor color on an empty cell, stays visible when the sidebar holds focus, follows `DECSCUSR`/blink state, and the grid paints the program's dynamic background. `ElementInputHandler` owns only the uncommitted composition buffer. |
 
-Stages 6 and 7 are untouched. Live preferences, OSC 8 links, file/URL activation and
-search remain proposals, not claims.
+Stage 6 remains deferred: OSC 8 links, file/URL activation and search are not
+implemented. Live preferences also remain deferred. Stage 7 now has the finite
+snapshot/title/selection harness in §12, but no before/after GPU or flood-latency
+profile and no speculative dirty-row cache.
 
 ## 9. Acceptance matrix
 
@@ -415,7 +417,135 @@ OSC 8 links, file activation and search are still unimplemented rather than unte
 No new engine was compiled, no Ghostty application was launched, and no GPU benchmark
 was run.
 
-## 11. Pinned upstream evidence
+## 11. Chrome pass: theme, state writer, refusals and the read cadence
+
+Four things landed together, because they are one question asked four ways: what
+does this window do when it is not drawing a terminal?
+
+### Colour is roles, not values
+
+`native/src/theme.rs` names every surface, ink, hairline and state wash once and
+reads each from GPUI Kit's theme, so a hand-drawn row and a toolkit menu are
+the same colour. `Roles::row_rest`/`row_hover` are the single place a row's
+state-to-colour combination is decided: GPUI refines a hover after the rest
+style, and the previous drawing answered both inside its own closure, so a
+selected row lost its selection for exactly as long as the pointer rested on
+it. `terminal::Palette` is a different contract and is untouched — an ANSI
+index or an OSC colour is what a remote program asked for and is drawn as asked.
+
+### The state file is a slot, not a queue
+
+`native/src/state_writer.rs` replaced an unbounded channel with one slot holding
+the latest accepted `NavigationState`. Repeated equal states are suppressed even
+after a successful write; identical re-offers after failure retry. Intermediate
+pending states are replaced, and a failed in-flight write cannot discard them,
+and `Drop` closes the slot under the same lock `offer` takes and joins, so the
+newest snapshot is on disk before the window's `Drop` returns.
+
+### A refused keystroke reaches the banner
+
+`TerminalView` emits `InputRefused` through GPUI and logs the explanation. The
+window subscribes once per terminal and
+puts the sentence in the banner it already draws. The message describes the
+refusal and never quotes the input — a test pastes a megabyte with a marker in
+it and asserts the marker is absent from what the window was told. Mouse
+reports, focus reports and resizes stay in the log: they are the terminal
+speaking on its own account, and a banner offering nothing to do trains people
+to dismiss it.
+
+`native/src/logging.rs` installs a stderr sink, because until something did, every
+one of those records was discarded. `MUSTER_LOG` chooses the level and defaults
+to `info`.
+
+### Git reads are budgeted, and the hidden window reads less
+
+The maintenance loop wakes every two seconds. Each pass carries one
+`GitReadBudget` for the whole pass and a shorter per-checkout slice inside it, so
+one repository on a network mount can be cut off without taking the rest of the
+workspace with it. Counts come from `diff_totals_for_checkout` against the
+repository and checkout the window already discovered — one Git read per
+checkout, not a fresh discovery per checkout first — at most four at a time. A
+discovery pass also runs at most four repositories concurrently. A
+pass that runs out of time says so; it never reports a count it did not finish,
+because an absent total means not counted, and a zero would be a claim.
+
+A hidden window keeps both passes, on a minute instead of two and ten seconds,
+so the figures still catch up with Git while unwatched rather than going stale
+the moment nobody is looking. Membership revisions and checkout paths reject
+stale results; mutations still trigger immediate counting. Git subprocesses are
+bounded by shared deadlines, but filesystem operations on a stalled network mount
+cannot be forcibly interrupted by these deadlines.
+
+### Consolidated verification (2026-10-14)
+
+- Pinned-toolchain `cargo test --locked --workspace`: core 73 unit + 4 instance-lock
+  integration tests, native 211 passed + 2 ignored measurement checks.
+- Locked all-target Clippy with `-D warnings`, format check, native release build
+  and `git diff --check`: clean.
+- `node --test scripts/audit-rust.test.mjs`: 18 passed.
+- `node scripts/audit-rust.mjs`: queried 841 locked package versions through OSV;
+  completed with five informational/low advisories (`instant`, `paste`,
+  `rustls-pemfile`, `rustybuzz`, `ttf-parser`), no blocking findings.
+- The release measurement script passed both ignored cases and the unmounted
+  view's output-coalescing/worker-lifetime regression.
+
+The existing `block v0.1.6` future-incompatibility warning remains. Linux core
+tests were added to CI, but were not executed locally on this macOS machine.
+
+## 12. Measurement, and what was not measured
+
+`native/src/perf.rs` is a finite, reproducible check: fixed sizes, fixed loop
+counts and a printed table. Setup and teardown assert their prerequisites; timing
+has no machine-specific threshold. It is ignored by the suite
+so it cannot become a budget written on one machine, and `scripts/perf-native.sh`
+is the command that runs it.
+
+Run on 2026-10-14 with this toolchain on this working tree. Each child starts at
+the measured grid size; a final OSC title confirms output has been parsed before
+measurement. The output cases select populated rows, not an empty selection.
+The script also runs the unmounted-view wake/worker-lifetime regression.
+
+```
+toolchain : rustc 1.97.1 (8bab26f4f 2026-07-14)
+profile   : release
+machine   : Apple M1 Pro / 27.0.0 arm64
+memory    : 32 GiB
+
+== 80x24 ==
+operation                                 total         each
+session.title()                        0.055 ms     0.027 us
+session.selection_text()              12.707 ms     6.353 us
+session.snapshot()                    41.076 ms    20.537 us
+session.painting_snapshot()           28.364 ms    14.182 us
+
+== 300x100 ==
+operation                                 total         each
+session.title()                        0.057 ms     0.028 us
+session.selection_text()              72.282 ms    36.141 us
+session.snapshot()                   492.621 ms   246.310 us
+session.painting_snapshot()          426.116 ms   213.057 us
+
+== 300x100, idle (nothing written since the resize) ==
+operation                                 total         each
+idle session.title()                   0.092 ms     0.045 us
+idle session.snapshot()              433.681 ms   216.840 us
+close().wait()                        15.437 ms 15437.208 us
+```
+
+2000 iterations per read, one measured idle close. `title()` reads one field;
+selection extraction scales with selected content. `painting_snapshot()` omits
+selected-text extraction while retaining the selection range, and scales with
+visible cells. These are current-build measurements, not before/after speedups.
+The prior draft measured unset titles and empty selections and returned before
+output was ready; that table was replaced rather than used as a baseline.
+
+These are **not** frame, input, lock-under-flood or GPU numbers. Headless
+shaping has no GPU, no font rasteriser and no compositor, so nothing here says
+anything about real rendering latency, real macOS keyboard or IME sessions, or
+Linux TUI behaviour. Those remain unverified, as above. OSC 8 links, file
+activation and search are still unimplemented rather than untested.
+
+## 13. Pinned upstream evidence
 
 - **G1 — architecture, embedding and API maturity:** [README](https://github.com/ghostty-org/ghostty/blob/adbcb3da673407ab79254620536c909b23e32419/README.md#L111-L170).
 - **G2 — cursor, click and clipboard configuration:** [Config cursor options](https://github.com/ghostty-org/ghostty/blob/adbcb3da673407ab79254620536c909b23e32419/src/config/Config.zig#L846-L924), [paste protection](https://github.com/ghostty-org/ghostty/blob/adbcb3da673407ab79254620536c909b23e32419/src/config/Config.zig#L2446-L2502), [copy targets/default](https://github.com/ghostty-org/ghostty/blob/adbcb3da673407ab79254620536c909b23e32419/src/config/Config.zig#L2524-L2546).
