@@ -642,20 +642,30 @@ fn figures_right_of(window: &mut Window, checkout: &str) -> f32 {
 }
 
 #[gpui_kit::test]
-fn the_row_that_adds_a_terminal_shares_the_terminal_glyph_axis(cx: &mut TestAppContext) {
+fn the_row_that_adds_a_terminal_is_centred_across_the_panel(cx: &mut TestAppContext) {
     let fixture = open(cx);
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         let action = window
             .find(format!("new-terminal-content-{}", fixture.checkout))
             .bounds();
+        let row = window
+            .find(format!("new-terminal-{}", fixture.checkout))
+            .bounds();
+        // A session row is the panel's own width, indented on the left only,
+        // so it is what says how wide the panel is from here.
         let terminal = window
             .find(format!("select-session-{}", fixture.sessions[0]))
             .bounds();
         assert!(
-            (action.left().as_f32() - terminal.left().as_f32() - 12.).abs() <= 1.,
-            "New terminal content starts {}px from the terminal glyph axis",
-            action.left().as_f32() - terminal.left().as_f32() - 12.
+            (row.right().as_f32() - terminal.right().as_f32()).abs() <= 1.,
+            "the row is {}px narrower than the panel's rows",
+            terminal.right().as_f32() - row.right().as_f32()
+        );
+        let offset = action.center().x.as_f32() - row.center().x.as_f32();
+        assert!(
+            offset.abs() <= 1.,
+            "New terminal content sits {offset}px off the row's middle"
         );
     })
     .unwrap();

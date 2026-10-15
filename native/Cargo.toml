@@ -38,6 +38,7 @@ gpui-kit = { version = "0.7.3", features = [
     "tree-sitter-elixir",
     "tree-sitter-erb",
     "tree-sitter-go",
+    "tree-sitter-graphql",
     "tree-sitter-html",
     "tree-sitter-java",
     "tree-sitter-javascript",
@@ -48,6 +49,7 @@ gpui-kit = { version = "0.7.3", features = [
     "tree-sitter-markdown",
     "tree-sitter-markdown-inline",
     "tree-sitter-php",
+    "tree-sitter-proto",
     "tree-sitter-python",
     "tree-sitter-ruby",
     "tree-sitter-rust",
@@ -66,6 +68,12 @@ gpui-kit = { version = "0.7.3", features = [
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cmake = "0.7.5"
 tree-sitter-swift = "0.7.4"
+# The toolkit has no Vue grammar at all and no feature to turn one on, and
+# Legacy highlighted Vue. `theme::install` registers this one in the toolkit's
+# own registry with the queries it ships, the same mechanism the three above
+# use for an empty query. Nothing else depends on it and it adds no new
+# highlighter.
+tree-sitter-vue-updated = "0.1.0"
 # Already in the graph through the toolkit. Needed because a toolkit
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by
 # deserializing the theme literal rather than by assigning fields.

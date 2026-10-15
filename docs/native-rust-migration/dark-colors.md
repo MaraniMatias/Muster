@@ -50,7 +50,7 @@ chrome. Runtime VT/OSC colours and explicitly coloured cells still take priority
 
 | Legacy token | Dark value | Native equivalent |
 | --- | --- | --- |
-| `bg-0` | `#16181d` | `Palette::background`; also the default OSC 11 reply. Legacy used `content-bg-0` `#222436` here — a violet content well, kept for its editor and diff; the grid is the body of this window and wears the surface the chrome around it already has |
+| `bg-0` | `#16181d` | `Palette::background`; also the default OSC 11 reply, and the editor's and the diff's background (`highlight_theme.editor.background`). Legacy used `content-bg-0` `#222436` here — a violet content well; the grid is the body of this window, and so are the document and the diff, so all three wear the surface the chrome around them already has |
 | `content-text` | `#dce0e5` | `Palette::foreground` |
 | `cursor` | `#c2c9f1` | Default cursor colour; also toolkit text caret |
 | `selection` | `#74ade83d` | Translucent selection band; glyph colours are preserved |
@@ -77,11 +77,32 @@ ANSI 16–255 retain the standard xterm colour cube and greyscale ramp.
 
 Do not substitute these for the application's chrome or add unused native
 constants. The native app now has a read-only syntax preview, a unified diff
-and Legacy's own file icons. Content background/foreground, gutter ink and syntax
+and Legacy's own file icons. Content foreground, gutter ink and syntax
 colors are installed in `theme.rs::content_highlight_theme`; the file icon inks
 are `theme::Ink`, answered by `Roles::ink`, one per ink a drawing names rather
 than one per extension a name has. The syntax values and the icon values below
 are therefore implemented, not pending. Full editor behavior remains open.
+
+`content-bg-0 #222436` is the one content token with no role left: it is a
+violet well for a document drawn inside a page, and this window has no page.
+
+### Syntax captures, and the two tables they are answered from
+
+A grammar's capture is a meaning spelled its own way, and `theme.rs` joins that
+vocabulary to Legacy's in two tables rather than one:
+
+- `SYNTAX_TOKENS` — every capture the toolkit's highlight theme *has a key for*,
+  and the Legacy token it wears. `theme::tests::every_capture_a_grammar_can_emit_wears_a_legacy_token`
+  states the same contract from the grammar's side and reads the answer back.
+- `CAPTURE_ALIASES` — every capture the toolkit has **no** key for (`@escape`,
+  `@namespace`, `@parameter`, `@module`, `@delimiter`, `@method`, `@float`,
+  `@field`, and Make's and SQL's directives), renamed in each registered query
+  at install time to the key that carries the same meaning. Without this a
+  `\n` in a Rust string, a `io.Reader` qualifier and a Makefile's `ifeq` all fall
+  back to the editor's own ink.
+
+The names neither table answers are the ones that carry no colour by design:
+`none`, `spell`, `nospell` and `text.*`.
 
 | Legacy group | Tokens and dark values |
 | --- | --- |

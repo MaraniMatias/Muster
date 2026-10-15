@@ -40,7 +40,7 @@ answered `"plaintext"` for everything else, so `Cargo.toml`, `.py`, `.sh`, `.go`
 | `native/src/document.rs` | `syntax_language` answers from an extension table derived from Legacy's, plus a filename table for `Makefile`, `CMakeLists.txt` and the shell/JSON dotfiles. Unknown formats still open as plain text. |
 | `native/src/diff.rs` | Names the diff chrome's face and size (11px), restores the status letter before the path at 10px, and moves the counts to Legacy's `--success-fg`/`--danger-fg` inks. |
 | `native/src/inspector.rs` | Rows are hand-drawn: Legacy's columns, the 16px fold slot, 13px names, 10px status, 13px counts, the accent bar, and hover/selection/press ink. Tabs carry the accent underline instead of a wash. |
-| `native/Cargo.toml`, `Cargo.lock` | 22 grammar crates, plus three direct dependencies for the queries the toolkit omits. |
+| `native/Cargo.toml`, `Cargo.lock` | 34 grammar crates: 31 the toolkit compiles in, the Vue grammar it does not ship, and the GraphQL and Protobuf features it registers empty, plus three direct dependencies for the queries the toolkit omits. |
 | `docs/native-rust-migration/{interface-parity,dark-colors}.md` | The delivered slice and the differences that remain. |
 
 ### The grammar set
@@ -50,14 +50,44 @@ languages in all: JSON, Rust, JavaScript, TypeScript, TSX, YAML, HTML, CSS/SCSS,
 Markdown, TOML, Python, Bash, Go, C, C++, C#, CMake, Diff, EJS, ERB, Elixir,
 Java, Kotlin, Lua, Make, PHP, Ruby, Scala, SQL, Svelte, Swift and Zig.
 
+Vue is the thirty-third and the only one the toolkit does not ship: it has no
+Vue grammar and no feature to turn one on, so `theme::install` registers
+`tree-sitter-vue-updated` in the toolkit's own `LanguageRegistry` with the
+queries that crate exports — the same registry the thirty-two live in, reached
+by the same name `syntax_language` answers. Its one capture the theme cannot
+name, `@props`, is the attribute inside a directive (`v-if`, `@click`), so it
+is renamed to `attribute`, and the pass that renames captures now walks every
+*registered* grammar rather than the toolkit's enum, which is what lets it
+reach a grammar the enum never heard of. That pass also now requires every name
+a query emits to be paintable, which is what says a grammar is finished rather
+than merely compiled.
+
+Mermaid is the one Legacy highlighted that stays plain, and not for want of a
+grammar: `tree-sitter-mermaid` needs `cc ^1.8`, and every `tree-sitter-sequel`
+0.3.x — which is the toolkit's SQL grammar — pins `cc ~1.2.1`, so the two cannot
+be resolved into one graph. Its older 0.1/0.2 releases pin `tree-sitter-language`
+to `=0.1.7` while the graph runs 0.1.9, and the `LanguageFn` those releases
+export would not convert.
+
 Two of those needed work beyond enabling a feature. The toolkit registers C++
 with only the rules C++ *adds* to C, so `install` prepends C's query; and it
 registers C#, CMake and Swift with empty queries, so their upstream queries are
 taken from their own crates through three direct dependencies that add nothing
 new to the graph.
 
+GraphQL and Protobuf are the thirty-fourth and thirty-fifth, and each needed a
+query written here rather than lifted: the toolkit registers both empty, and
+neither grammar crate exports a query constant. Protobuf's crate does ship a
+`queries/highlights.scm`, but it names `returns`, `repeated` and `to`, which its
+own grammar no longer declares, so copying it would not compile. `GRAPHQL_
+HIGHLIGHTS` and `PROTO_HIGHLIGHTS` are written against the node names each
+grammar does declare, in the capture vocabulary `SYNTAX_TOKENS` answers — which
+is why every name either of them emits is paintable by construction rather than
+by a rename after the fact.
+
 `cc` moved from 1.8.0 to 1.2.67 in the lockfile. That is not churn:
-`tree-sitter-sequel` 0.3.11 declares `cc = "~1.2.1"`, and SQL is in the set.
+`tree-sitter-sequel` 0.3.11 declares `cc = "~1.2.1"`, and SQL is in the set. It
+is also why Mermaid is out: `tree-sitter-mermaid` wants `cc ^1.8`.
 
 ## How it is verified
 
@@ -99,9 +129,13 @@ pixels. That gap is stated rather than closed.
 - The diff's change wash comes from `theme.success`/`theme.danger`, where Legacy
   mixes its content-added and content-removed tokens.
 - Inspector names truncate; Legacy's rows are `max-content` and scroll sideways.
-- Vue, XML, GraphQL, Protobuf, INI and Dockerfile still open as plain text, and
-  there is no manual language picker. GraphQL and Protobuf are excluded on
-  purpose: the toolkit registers both with empty queries.
+  **Fixed later:** both panels measure their widest row and scroll sideways. See
+  [opening, reading and scrolling](opening-reading-and-scrolling.md).
+- XML, INI and Dockerfile still open as plain text, and there is no manual
+  language picker. So do the other forty-odd formats Legacy highlighted and no
+  grammar here reaches: `.gitignore` and every other dotfile Legacy read as INI,
+  `.ps1`, `.less`, `.sass`, `.tf`, `.tex`, `.pl`, `.r` and the rest. Each one
+  would need a grammar crate of its own.
 
 ## Security note
 
@@ -110,3 +144,200 @@ four advisories against `rustls` 0.23.45 (RUSTSEC-2026-0346/0347/0348/0349).
 That version is pre-existing and untouched by this work; no grammar crate is
 flagged. The gate is therefore red for a reason outside this change, and the
 resolution belongs in its own change rather than here.
+---
+
+# One surface, every capture, and the whole header row
+
+Three reports, one pass: the document and the diff were painted on a violet
+well the terminal does not share, several tokens fell back to plain ink, and a
+file in the change set could only be opened by clicking sixteen pixels of
+chevron.
+
+Presentation only. No stored shape, IPC contract or preference key changed.
+
+## The violet was Legacy's, and this window is not a page
+
+Legacy's `--muster-content-bg-0`, `#222436`, is the well a document sits in
+inside a page. The terminal grid already refused it — see `terminal/view.rs`,
+which wears `--muster-bg-0` and says why — and the editor and the diff kept it.
+One background now serves all three: `highlight_theme.editor.background` is
+`theme.background`, so `Roles::content` is the base the chrome is painted on
+and the constant `CONTENT_SURFACE` is gone. Every syntax token reads better on
+it than it did on `#222436` (the comment is 5.4:1 rather than 4.6:1), and
+`theme::tests::content_surfaces_and_syntax_tokens_come_from_legacy` pins the
+equality against the terminal's own palette rather than against a CSS file.
+
+## A capture the toolkit cannot name is a token nobody painted
+
+The mapping was already right for the names the toolkit's highlight theme holds
+a key for. The gap was the other kind: `@escape` (Rust, Python, Ruby),
+`@namespace` (Go), `@parameter`, `@method`, `@module`, `@delimiter`, `@float`,
+`@field`, and Make's and SQL's directives are capture names that fall through
+the theme entirely and land in the editor's own ink. A `\n` in the middle of a
+green string was a different colour from the string.
+
+A missing key cannot be added — `ThemeStyle`'s fields are private — so
+`CAPTURE_ALIASES` renames those captures in each registered grammar's query at
+install time, to the name that carries the same meaning (`@escape` →
+`@string.escape`, `@namespace` → `@punctuation`). `@character.special` is the one
+whole name answered before its segment: Swift spells its wildcard that way, and
+a wildcard is punctuation where a Zig character literal is a string.
+
+`every_grammar_has_had_its_captures_renamed` runs the rename over every
+registered query and requires it to be a fixed point, so a grammar the pass
+never reached fails. `a_renamed_capture_is_painted_as_legacy_paints_its_meaning`
+checks five real sources through the highlighter, and reads every colour run
+that touches the token rather than the run that starts on it — a run of its own
+with no colour in it is exactly what the failure looked like.
+
+## The row is the control
+
+`Diff::render_header` replaces the toolkit's header content but keeps its shell
+and its chevron, which is the only part of the row that answered a click. The
+content is now one target across the row: `diff-file-<path>` carries the click,
+the pointer, and `toggle_file_collapsed` plus the two state transitions the
+window already had, extracted as `expand_diff_file`/`collapse_diff_file` so the
+chevron and the row are one transition rather than two.
+
+## How it is verified
+
+`cargo test --locked --workspace`, `cargo clippy --locked --workspace
+--all-targets -- -D warnings` and `cargo fmt --all --check`. Four new tests: the
+three above, and `the_whole_diff_header_row_opens_and_closes_its_file`, which
+clicks the row twice through a real pointer and reads the change set's own state
+rather than the drawn frame.
+
+## What is still different
+
+- The toolkit paints the change wash from `theme.success`/`theme.danger`, where
+  Legacy mixes its content-added and content-removed tokens; the two are the
+  same *kind* of decision made from the chrome palette rather than the content
+  one, and the toolkit offers no token for it.
+- Inspector names no longer truncate and the panel scrolls sideways, which
+  removes the last line of this file's own "what is still different" from the
+  earlier pass. It is recorded in
+  [opening, reading and scrolling](opening-reading-and-scrolling.md).
+- A Markdown heading is Legacy's `function` ink in bold and emphasis is the font
+  alone, which the theme now says; strikethrough, which Legacy also draws, has
+  no expression in the toolkit's `HighlightStyle`.
+
+## A third pass: the size of the letter, and a stack that answers for itself
+
+Two more defects from the same kind of report: the code read smaller than the
+terminal beside it, and the folder stack did not work.
+
+**The size.** The terminal draws at `FONT_SIZE` = 16px and the document and the
+diff were reading `mono_font_size` = 13px, Legacy's editor size, so the same
+code was a size smaller in this window than in the Legacy one it was ported
+from. `theme::mono_font_size` is now `crate::terminal::FONT_SIZE`: the grid, a
+file and a diff are one size of letter, and moving the grid moves all three
+with it. The diff's *chrome* — the header at 11px and the status letter at
+10px — is untouched, because it is metadata about the code and not the code.
+The inspector's rows and the sidebar stay at 13px for the same reason they
+always did: a 280px panel is not the place for the grid's size.
+
+This is the one deliberate divergence from Legacy in this file. It is not a
+token, so `dark-colors.md` has nothing to say about it.
+
+**The stack.** The sticky ancestor rows were drawn over the rows they name with
+no hitbox of their own, so a click on a stacked folder's name went *through*
+the stack to the tree row hidden underneath: measured, it opened
+`src/nested/f12.txt` while the tree was scrolled such that the file's own row
+sat at y = −207, above the top of the tree. Only the small "Show in tree"
+button worked, and Legacy has no such button.
+
+A stacked row is now the tree's own folder row: the same 26px, the same 16px
+fold slot, the name starting on the column the tree starts that folder's name
+on. The fold closes the folder and the row brings it into view, and each stops
+its click on the way out — the row because the rows it covers are still under
+the pointer, the fold because the row would otherwise answer it too. The
+"Show in tree" button is gone with the click it was carrying.
+
+`stack_room` also stopped measuring the window. The stack is laid inside the
+tree's box and clipped by it, so what it may cover is that box's height, and
+the window's is taller: a stack sized to the window hides more of the tree
+than it has room for. It reads the scroller's own bounds now, which is the
+tree as it was a frame ago — the same one-frame-old reading its offset already
+was.
+
+### How it is verified
+
+Two new tests in `inspector_tests.rs`, plus one in `theme.rs`:
+
+- `a_stacked_folder_keeps_its_own_click` — the defect, measured the same way:
+  it asserts the stacked name is drawn over a real row, clicks it, and reads
+  that no file was selected and the tree came to the folder. It also clicks
+  the fold and reads that the folder closed and its subtree was forgotten.
+- `the_folder_stack_appears_over_a_scrolled_tree` — now also pins the stacked
+  row's columns to the tree's.
+- `the_document_and_the_diff_read_at_the_terminals_own_size`.
+
+The gate is the same three commands, and they are clean.
+
+---
+
+# A single-file component, and the one place a diff cannot follow it
+
+Two reports of the same kind: Vue highlighting "isn't working", and the file
+viewer shows a `.vue` file "like HTML, not like Vue", with things missing.
+
+Presentation only. No stored shape, IPC contract or preference key changed.
+
+## Neither the theme nor the grammar was wrong
+
+A probe against the installed `muster-content` theme resolves 2–7 distinct
+colours for each of the 35 registered grammars, and `syntax_language` answers
+`"vue"` for `component.vue`. The theme and the registration were both already
+right; so was `document::tests::additional_grammars_produce_legacy_token_colors`,
+except for one row: **Vue was monochrome**, and it had been failing that way
+with a debug probe left in the test.
+
+A Vue SFC is three languages in one file. `<template>` is the Vue grammar's own
+markup query — a tag is a tag, an attribute is an attribute — so it is *meant*
+to read like HTML. `<script>` is reached through the grammar's **injections**,
+and so is `<style>`. That is where the file was coming apart.
+
+## The stylesheet had no language
+
+`theme::install` registers the Vue grammar with
+`tree_sitter_vue_updated::INJECTIONS_QUERY`, which injects into `<script>` and
+into a `<style>` that **names** one — `lang="ts"`, `lang="tsx"`, `lang="css"`,
+`lang="scss"`. A bare `<style>`, which is what most components write, matched
+no rule: the whole block opened in the editor's own ink. `VUE_INJECTIONS` adds
+the one rule that was missing, and CSS is what that block is without a `lang`.
+
+The rule also matches the two blocks that do name one, and that is a harmless
+overlap rather than a precedence question: `scss` and `css` resolve to the same
+registered grammar, so either rule colours the block as CSS.
+
+## The diff applies no injections at all
+
+This is the half that is **not** fixed, because it is not ours to fix.
+`gpui-component`'s `SyntaxHighlighter::capture_names` is the diff's only entry
+point, and it takes the injections query out before parsing:
+
+> Injected languages are skipped: building their layers compiles a query on
+> every parse, which dominates the cost of many short fragments.
+
+A diff parses each hunk as a short fragment, so the cost argument holds — and
+the consequence is that **every embedded language is blank in a diff**: a Vue
+`<script>` or `<style>`, an HTML `<script>` or `<style>`, a Svelte `<script>`,
+a Markdown fence. The host language itself is highlighted normally; a `.vue`
+file in the diff is tags in colour and everything else in plain ink, which is
+exactly the "it's HTML, not Vue" report. The document viewer does not have this
+problem, because it goes through `styles()`, which keeps its layers.
+
+Closing it needs an upstream change in `gpui-component` (or a vendored patch of
+it), not a line here. It is recorded rather than worked around.
+
+### How it is verified
+
+`cargo test --locked --workspace`, `cargo clippy --locked --workspace
+--all-targets -- -D warnings` and `cargo fmt --all --check`.
+
+One new test, `document::tests::a_vue_component_is_coloured_in_its_script_its_template_and_its_style`:
+it opens a real SFC through the real editor and asks each of the three blocks
+for its colours separately, because a component whose `<style>` is uncoloured
+still passes a check that only asks whether the file is coloured *somewhere*.
+`additional_grammars_produce_legacy_token_colors` stops failing on
+`component.vue`, and its two leftover `eprintln!` probes are gone.

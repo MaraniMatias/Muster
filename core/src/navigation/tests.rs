@@ -1231,6 +1231,59 @@ fn a_binary_change_is_listed_and_counted_by_nothing() {
     assert!(diff.is_binary);
     assert!(diff.patch.is_empty());
     assert!(!diff.revision.is_empty());
+    // Three bytes with no name that claims otherwise are not a picture, and the
+    // diff says nothing about one.
+    assert_eq!(diff.image, None);
+}
+
+/// A change with no text is named by what its bytes are, so a reviewer is told
+/// that a picture arrived rather than that a file stopped being readable.
+#[test]
+fn an_image_change_names_the_picture_rather_than_the_encoding() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+    // Added: the picture is new and untracked.
+    fs::write(root.join("added.png"), png).unwrap();
+    let added = file_diff(
+        &repo,
+        &repo.checkouts[0],
+        "added.png",
+        GitReadBudget::default(),
+    )
+    .expect("the new picture is diffable");
+    assert!(added.is_binary);
+    assert_eq!(added.image, Some(ImageFormat::Png));
+
+    // The bytes decide, not the name: a JPEG called `.png` is a JPEG, and saying
+    // otherwise would tell a reader to look for a picture that is not there.
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+    jpeg.extend_from_slice(&[0u8; 32]);
+    fs::write(root.join("picture.png"), &jpeg).unwrap();
+    let misnamed = file_diff(
+        &repo,
+        &repo.checkouts[0],
+        "picture.png",
+        GitReadBudget::default(),
+    )
+    .expect("the picture is diffable whatever it is called");
+    assert_eq!(misnamed.image, Some(ImageFormat::Jpeg));
+
+    // Removed: there are no bytes left to read, so the name is the only answer
+    // there is, and it is believed only for a name it could be naming.
+    git(root, &["add", "."]);
+    commit(root, "pictures");
+    fs::remove_file(root.join("picture.png")).unwrap();
+    let removed = file_diff(
+        &repo,
+        &repo.checkouts[0],
+        "picture.png",
+        GitReadBudget::default(),
+    )
+    .expect("the removed picture is diffable");
+    assert_eq!(removed.image, Some(ImageFormat::Png));
+    assert!(removed.is_binary);
 }
 
 #[test]

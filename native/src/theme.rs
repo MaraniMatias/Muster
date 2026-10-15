@@ -20,20 +20,26 @@
 
 use std::sync::Arc;
 
-use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle};
+use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle, LanguageConfig};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{px, rgb, rgba, App, Hsla};
+use gpui_kit::{rgb, rgba, App, Hsla};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
 const CONTENT_ADDED: u32 = 0xa1c181;
 const CONTENT_REMOVED: u32 = 0xd97f84;
 
-// The content surfaces and syntax tokens, `--muster-content-*` and
-// `--muster-syntax-*` in `legacy/src/muster.css`. A document reads as its own
-// well rather than as a hole in the window, and the tokens that colour it are
-// named per meaning there, not per colour.
-const CONTENT_SURFACE: u32 = 0x222436;
+// The content ink and the syntax tokens, `--muster-content-*` and
+// `--muster-syntax-*` in `legacy/src/muster.css`. The tokens are named per
+// meaning there, not per colour, and a grammar's capture is one of those
+// meanings spelled its own way.
+//
+// The content *surface* is deliberately not one of them. Legacy's
+// `--muster-content-bg-0`, `#222436`, is a violet-tinted well for a document
+// drawn inside a page; this window's body is the terminal's grid, which Legacy
+// already paints in `--muster-bg-0`. The document and the diff are that body
+// too, so all three share the base the chrome is painted on rather than
+// carrying a second background of their own.
 const CONTENT_TEXT: u32 = 0xdce0e5;
 const CONTENT_TEXT_FAINT: u32 = 0x767d8d;
 const CONTENT_ACCENT: u32 = 0x74ade8;
@@ -46,6 +52,144 @@ const SYNTAX_FUNCTION: u32 = 0x73ade9;
 const SYNTAX_PUNCTUATION: u32 = 0xb2b9c6;
 const SYNTAX_LINK: u32 = 0x74ade8;
 const SYNTAX_STRING_EXPRESSION: u32 = 0xdfc184;
+
+/// The highlight query for GraphQL, and the one for Protobuf.
+///
+/// The toolkit registers both grammars with empty queries and neither grammar
+/// crate exports its query as a constant, so there is nothing to lift: these
+/// are written here, against the node names each grammar declares, in the
+/// capture vocabulary [`SYNTAX_TOKENS`] answers. That is the point of writing
+/// them here rather than copying a query that would carry capture names this
+/// theme cannot paint.
+const GRAPHQL_HIGHLIGHTS: &str = r#"
+; A keyword is an anonymous node named after itself in this grammar.
+[
+  "query"
+  "mutation"
+  "subscription"
+  "fragment"
+  "on"
+  "schema"
+  "scalar"
+  "type"
+  "interface"
+  "union"
+  "enum"
+  "input"
+  "implements"
+  "extend"
+  "directive"
+  "repeatable"
+] @keyword
+
+; What a definition is called is the name the thing it defines is known by.
+[
+  (object_type_definition (name) @type)
+  (interface_type_definition (name) @type)
+  (union_type_definition (name) @type)
+  (enum_type_definition (name) @type)
+  (input_object_type_definition (name) @type)
+  (scalar_type_definition (name) @type)
+  (named_type (name) @type)
+]
+
+[
+  (fragment_definition (fragment_name) @function)
+  (directive_definition (name) @function)
+]
+
+; What the file names a thing: the field it selects, the argument it passes.
+[
+  (field (name) @property)
+  (argument (name) @property)
+  (object_field (name) @property)
+]
+
+(variable (name) @variable)
+
+(directive (name) @keyword.directive)
+
+(string_value) @string
+
+[
+  (int_value)
+  (float_value)
+] @number
+
+[
+  (boolean_value)
+  (null_value)
+] @constant.builtin
+
+(enum_value) @constant
+
+(comment) @comment
+"#;
+
+const PROTO_HIGHLIGHTS: &str = r#"
+; Keywords are named nodes in this grammar rather than anonymous tokens.
+[
+  (syntax)
+  (edition)
+  (package)
+  (option)
+  (import)
+  (service)
+  (rpc)
+  (message)
+  (enum)
+  (oneof)
+  (extend)
+  (reserved)
+] @keyword
+
+[
+  (type)
+  (key_type)
+  (message_name)
+  (enum_name)
+  (service_name)
+  (rpc_name)
+  (message_or_enum_type)
+] @type
+
+(string) @string
+
+[
+  (int_lit)
+  (float_lit)
+] @number
+
+[
+  (true)
+  (false)
+] @constant.builtin
+
+(comment) @comment
+"#;
+
+/// The injections for Vue, which are the crate's own plus the one it is missing.
+///
+/// `tree_sitter_vue_updated` injects a language into `<script>` and into a
+/// `<style>` that names one — `lang="ts"`, `lang="tsx"`, `lang="css"`,
+/// `lang="scss"` — and a bare `<style>`, which is what most single-file
+/// components write, gets nothing at all: the whole stylesheet opens in the
+/// editor's own ink. CSS is what that block is without a `lang`, so this rule
+/// says so. It also matches the two blocks that do name one, and that is a
+/// harmless overlap rather than a precedence question: `scss` and `css` resolve
+/// to the same registered grammar, so either rule colours the block as CSS.
+const VUE_INJECTIONS: &str = r#"
+(component
+  (style_element
+    (start_tag
+      (tag_name))
+    (raw_text) @injection.content
+    (end_tag
+      (tag_name))
+  )
+  (#set! injection.language "css")
+)
+"#;
 
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
@@ -63,10 +207,42 @@ pub fn install(cx: &mut App) {
             ("csharp", tree_sitter_c_sharp::HIGHLIGHTS_QUERY),
             ("cmake", tree_sitter_cmake::HIGHLIGHTS_QUERY),
             ("swift", tree_sitter_swift::HIGHLIGHTS_QUERY),
+            // Two more the toolkit registers empty, and here the query is ours.
+            ("graphql", GRAPHQL_HIGHLIGHTS),
+            ("proto", PROTO_HIGHLIGHTS),
         ] {
             let mut config = registry.language(name).expect("grammar enabled");
             config.highlights = query.to_owned().into();
             registry.register(name, &config);
+        }
+        // Legacy highlighted Vue and the toolkit ships a grammar for it with
+        // no feature to turn one on, so it carries its grammar and its queries
+        // in from the crate that owns them. It is the toolkit's own registry
+        // either way, so `syntax_language` reaches it by the name it already
+        // answers and the rename pass below covers it like any other.
+        registry.register(
+            "vue",
+            &LanguageConfig::new(
+                "vue",
+                tree_sitter_vue_updated::language(),
+                Vec::new(),
+                tree_sitter_vue_updated::HIGHLIGHTS_QUERY,
+                &format!(
+                    "{}\n{VUE_INJECTIONS}",
+                    tree_sitter_vue_updated::INJECTIONS_QUERY
+                ),
+                "",
+            ),
+        );
+        // And then one rule for every grammar there is, so a name none of them
+        // can be painted in is never emitted in the first place.
+        for name in registry.languages() {
+            let mut config = registry.language(&name).expect("a registered grammar");
+            let renamed = rename_captures(&config.highlights);
+            if renamed != config.highlights {
+                config.highlights = renamed.into();
+                registry.register(&name, &config);
+            }
         }
     });
     Theme::change(ThemeMode::Dark, None, cx);
@@ -184,22 +360,160 @@ pub fn install(cx: &mut App) {
         // it is drawn.
         theme.font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
         // The read-only document and the diff are the app's code, and Legacy
-        // drew them in this app's face rather than the toolkit's default. The
-        // size is Legacy's editor size, which the diff reads at too, so it is
-        // named here rather than inherited from the toolkit's default.
+        // drew them in this app's face rather than the toolkit's default.
+        //
+        // The size is not Legacy's: Legacy's editor read at 13px and its code
+        // looked smaller than the terminal beside it, which is the first thing
+        // a reader of both in one window notices. This is the terminal's own
+        // `FONT_SIZE`, so the grid, the document and the diff are one size of
+        // letter, and moving the grid moves all three with it.
         theme.mono_font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
-        theme.mono_font_size = px(13.);
+        theme.mono_font_size = crate::terminal::FONT_SIZE;
         theme.highlight_theme = Arc::new(content_highlight_theme(theme));
     });
 }
 
-/// Legacy's content surfaces and syntax tokens as the toolkit's highlight theme.
+/// Every capture name a grammar this app compiles in can emit, and the Legacy
+/// token it wears.
+///
+/// A name the toolkit's theme holds no key for is not here: those are answered
+/// by renaming the capture itself, which [`CAPTURE_ALIASES`] does.
+///
+/// The rule is Legacy's: a capture naming a meaning Legacy's tables name takes
+/// that token, and one Legacy leaves as plain text takes the foreground. The
+/// names absent from here are the ones that carry no colour by design —
+/// `none`, `spell`, `nospell` and `text.*`, which are markdown prose and a
+/// Makefile's own diagnostics.
+const SYNTAX_TOKENS: &[(&str, u32)] = &[
+    ("primary", SYNTAX_FOREGROUND),
+    ("comment", SYNTAX_COMMENT),
+    ("comment.doc", SYNTAX_COMMENT),
+    ("keyword", SYNTAX_KEYWORD),
+    // Legacy sends `operatorKeyword` with the keywords.
+    ("operator", SYNTAX_KEYWORD),
+    ("string", SYNTAX_STRING),
+    ("string.escape", SYNTAX_STRING),
+    ("string.regex", SYNTAX_STRING),
+    ("string.special", SYNTAX_STRING),
+    ("string.special.symbol", SYNTAX_STRING),
+    ("constant", SYNTAX_CONSTANT),
+    ("number", SYNTAX_CONSTANT),
+    ("boolean", SYNTAX_CONSTANT),
+    ("property", SYNTAX_CONSTANT),
+    ("function", SYNTAX_FUNCTION),
+    ("constructor", SYNTAX_FUNCTION),
+    // Legacy's `string-expression`: a name the file gives something.
+    ("tag", SYNTAX_STRING_EXPRESSION),
+    ("attribute", SYNTAX_STRING_EXPRESSION),
+    ("type", SYNTAX_STRING_EXPRESSION),
+    ("punctuation", SYNTAX_PUNCTUATION),
+    ("punctuation.bracket", SYNTAX_PUNCTUATION),
+    ("punctuation.delimiter", SYNTAX_PUNCTUATION),
+    ("punctuation.list_marker", SYNTAX_PUNCTUATION),
+    ("punctuation.special", SYNTAX_PUNCTUATION),
+    ("link_text", SYNTAX_LINK),
+    ("link_uri", SYNTAX_LINK),
+    // Legacy sends an identifier and a label to the plain foreground, and an
+    // interpolated expression along with them.
+    ("variable", SYNTAX_FOREGROUND),
+    ("variable.special", SYNTAX_FOREGROUND),
+    ("embedded", SYNTAX_FOREGROUND),
+    ("label", SYNTAX_FOREGROUND),
+];
+
+/// Every capture name a grammar here emits that the toolkit's highlight theme
+/// holds no key for, and the name that carries the same meaning in it.
+///
+/// The toolkit answers a name it does not hold by falling back to the segment
+/// before the first dot, so renaming that segment is enough: Go's
+/// `@namespace` becomes `@punctuation` and Scala's `@method.call` becomes
+/// `@function.call`, each painted by [`SYNTAX_TOKENS`] as Legacy paints it.
+/// The right-hand column names the same meaning as the left one and nothing
+/// else: an escape sequence is the string it is written in, a parameter is an
+/// identifier, and a directive is a keyword where the grammar calls one.
+const CAPTURE_ALIASES: &[(&str, &str)] = &[
+    // Three grammars name an escape sequence this way, so a `\n` in the middle
+    // of a green string was painted in the editor's own ink.
+    ("escape", "string.escape"),
+    // A character literal is a string literal one character long. Swift spells
+    // its wildcard this way too, and a wildcard is punctuation, which is the
+    // one place a whole name is answered before the segment before the dot.
+    ("character", "string"),
+    ("character.special", "punctuation.special"),
+    ("float", "number"),
+    ("field", "property"),
+    ("method", "function"),
+    ("parameter", "variable"),
+    // Legacy sends a namespace, a module path and C's own `.` and `;` with the
+    // punctuation.
+    ("namespace", "punctuation"),
+    ("module", "punctuation"),
+    ("delimiter", "punctuation.delimiter"),
+    // Make's and SQL's directives are keywords where they are written as words.
+    ("conditional", "keyword.conditional"),
+    ("include", "keyword.include"),
+    ("storageclass", "keyword.storageclass"),
+    ("exception", "keyword.exception"),
+    ("repeat", "keyword.repeat"),
+    ("clean", "keyword.clean"),
+    ("error", "keyword.error"),
+    // Vue names the attribute inside a directive — the `if` in `v-if`, the
+    // `click` in `@click` — as the directive's own name, and it is an
+    // attribute the file gives a thing, which is Legacy's `string-expression`.
+    ("props", "attribute"),
+];
+
+/// The name [`CAPTURE_ALIASES`] answers `name` with, if it answers it at all.
+///
+/// A whole name is asked before the segment before its dot, because a grammar
+/// may use one spelling for one thing and another for a different one.
+fn capture_alias(name: &str) -> Option<&'static str> {
+    CAPTURE_ALIASES
+        .iter()
+        .find(|(from, _)| *from == name)
+        .or_else(|| {
+            name.split_once('.')
+                .and_then(|(base, _)| CAPTURE_ALIASES.iter().find(|(from, _)| *from == base))
+        })
+        .map(|(_, to)| *to)
+}
+
+/// One grammar's highlight query with every capture in [`CAPTURE_ALIASES`]
+/// renamed to the one the toolkit can paint.
+///
+/// A capture is an `@` and the name after it; the name is the whole run of
+/// letters, digits, `_`, `.` and `-`, so `@module.builtin` is answered in one
+/// piece. A `"` in front of the `@` means the text is a literal inside a
+/// predicate — CSS writes its at-rules as `"@namespace"` — and is left as it is.
+fn rename_captures(query: &str) -> String {
+    let mut renamed = String::with_capacity(query.len());
+    let mut rest = query;
+    while let Some(at) = rest.find('@') {
+        let (before, after) = rest.split_at(at);
+        let name: String = after[1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            .collect();
+        let literal = before.ends_with('"') && !before.ends_with("\\\"");
+        renamed.push_str(before);
+        renamed.push('@');
+        match capture_alias(&name).filter(|_| !literal) {
+            Some(to) => renamed.push_str(to),
+            None => renamed.push_str(&name),
+        }
+        rest = &after[1 + name.len()..];
+    }
+    renamed.push_str(rest);
+    renamed
+}
+
+/// Legacy's content ink and syntax tokens as the toolkit's highlight theme.
 ///
 /// The toolkit paints both the read-only editor and the diff from this one
 /// theme, so a file keeps its colours when it stops being a document. A token
 /// name comes from a grammar query; Legacy names the same meaning with a
-/// `--muster-syntax-token-*`, and the two vocabularies are joined here rather
-/// than anywhere that draws.
+/// `--muster-syntax-token-*`, and the two vocabularies are joined by
+/// [`SYNTAX_TOKENS`] rather than anywhere that draws.
 ///
 /// The colours are reached through serde because a `ThemeStyle`'s fields are
 /// private to the toolkit: this is the toolkit's own route in, not a
@@ -207,10 +521,38 @@ pub fn install(cx: &mut App) {
 /// rather than a float crossing, so a token arrives as the colour Legacy wrote.
 fn content_highlight_theme(theme: &Theme) -> HighlightTheme {
     let token = |value: u32| format!("#{value:06x}");
+    let ink = |value: u32| serde_json::Value::String(token(value));
     let installed =
         |color: Hsla| serde_json::to_value(color).expect("the toolkit spells a colour as a string");
+    let mut syntax = serde_json::Map::new();
+    for (name, value) in SYNTAX_TOKENS {
+        syntax.insert(
+            (*name).to_owned(),
+            serde_json::json!({ "color": ink(*value) }),
+        );
+    }
+    // The three Legacy names a weight or a slant rather than a colour of its
+    // own: a Markdown heading is its `function` ink in bold, and emphasis is
+    // the font alone, which is what Legacy's editor asks for.
+    for (name, value, weight, slant) in [
+        ("title", SYNTAX_FUNCTION, Some(700), None),
+        ("emphasis", SYNTAX_FOREGROUND, None, Some("italic")),
+        ("emphasis.strong", SYNTAX_FOREGROUND, Some(700), None),
+    ] {
+        let mut style = serde_json::Map::new();
+        style.insert("color".into(), ink(value));
+        if let Some(weight) = weight {
+            style.insert("font_weight".into(), weight.into());
+        }
+        if let Some(slant) = slant {
+            style.insert("font_style".into(), slant.into());
+        }
+        syntax.insert(name.into(), style.into());
+    }
     let style = serde_json::from_value::<HighlightThemeStyle>(serde_json::json!({
-        "editor.background": token(CONTENT_SURFACE),
+        // The document, the diff and the terminal grid are the window's body,
+        // so they are one surface: the base the chrome is painted on.
+        "editor.background": installed(theme.background),
         "editor.foreground": token(CONTENT_TEXT),
         // Legacy paints the gutter as the document it numbers rather than as
         // a well of its own, which is what leaving the gutter unset asks for.
@@ -222,32 +564,7 @@ fn content_highlight_theme(theme: &Theme) -> HighlightTheme {
         "info": installed(theme.info),
         "hint": token(CONTENT_ACCENT),
         "success": installed(theme.success),
-        "syntax": {
-            "primary": {"color": token(SYNTAX_FOREGROUND)},
-            "comment": {"color": token(SYNTAX_COMMENT)},
-            "keyword": {"color": token(SYNTAX_KEYWORD)},
-            "operator": {"color": token(SYNTAX_KEYWORD)},
-            "string": {"color": token(SYNTAX_STRING)},
-            "string.escape": {"color": token(SYNTAX_STRING)},
-            "string.regex": {"color": token(SYNTAX_STRING)},
-            "constant": {"color": token(SYNTAX_CONSTANT)},
-            "number": {"color": token(SYNTAX_CONSTANT)},
-            "boolean": {"color": token(SYNTAX_CONSTANT)},
-            "property": {"color": token(SYNTAX_CONSTANT)},
-            "function": {"color": token(SYNTAX_FUNCTION)},
-            "constructor": {"color": token(SYNTAX_FUNCTION)},
-            "tag": {"color": token(SYNTAX_STRING_EXPRESSION)},
-            "attribute": {"color": token(SYNTAX_STRING_EXPRESSION)},
-            "type": {"color": token(SYNTAX_STRING_EXPRESSION)},
-            "punctuation": {"color": token(SYNTAX_PUNCTUATION)},
-            "punctuation.bracket": {"color": token(SYNTAX_PUNCTUATION)},
-            "punctuation.delimiter": {"color": token(SYNTAX_PUNCTUATION)},
-            "punctuation.special": {"color": token(SYNTAX_PUNCTUATION)},
-            "link_text": {"color": token(SYNTAX_LINK)},
-            "link_uri": {"color": token(SYNTAX_LINK)},
-            "variable": {"color": token(SYNTAX_FOREGROUND)},
-            "label": {"color": token(SYNTAX_FOREGROUND)},
-        },
+        "syntax": syntax,
     }))
     .expect("the content highlight theme is this crate's own literal");
     HighlightTheme {
@@ -522,7 +839,50 @@ fn channel(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::TestAppContext;
+    use gpui_kit::component::highlighter::{FontStyle, FontWeightContent};
+    use gpui_kit::{px, TestAppContext};
+
+    /// The capture names a grammar emits on purpose for the theme to leave
+    /// alone: markdown's own prose, a spell hint that rides beside a real
+    /// token, and Makefile's own diagnostics.
+    const UNCOLOURED: &[&str] = &[
+        "none",
+        "spell",
+        "nospell",
+        "text.code.span",
+        "text.literal",
+        "text.reference",
+        "text.uri",
+        "text.danger",
+        "text.note",
+        "text.warning",
+    ];
+
+    /// The three names Legacy paints with a weight or a slant rather than with
+    /// a colour of their own, so they are answered outside [`SYNTAX_TOKENS`].
+    const STYLED: &[&str] = &["title", "emphasis", "emphasis.strong"];
+
+    /// Every capture name in a highlight query, under the same rule
+    /// [`rename_captures`] reads them by: the whole run of letters, digits,
+    /// `_`, `.` and `-` after an `@`, and not a literal inside a predicate.
+    fn captures(query: &str) -> impl Iterator<Item = &str> {
+        query.lines().flat_map(|line| {
+            // `;` opens a comment in a query, and a credit line is nothing but
+            // an `@handle` that no grammar emits.
+            let line = line.split_once(';').map_or(line, |(before, _)| before);
+            line.match_indices('@').filter_map(|(at, _)| {
+                let before = &line[..at];
+                if before.ends_with('"') && !before.ends_with("\\\"") {
+                    return None;
+                }
+                let after = &line[at + 1..];
+                let end = after
+                    .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '-')))
+                    .unwrap_or(after.len());
+                (end > 0).then(|| &after[..end])
+            })
+        })
+    }
 
     fn dark(cx: &mut TestAppContext) -> Roles {
         cx.update(|cx| {
@@ -585,7 +945,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_whole_app_is_drawn_in_legacy_face_and_the_code_at_legacy_size(cx: &mut TestAppContext) {
+    fn the_whole_app_is_drawn_in_legacy_face_and_the_code_at_the_terminals_size(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install(cx);
@@ -597,11 +959,38 @@ mod tests {
             // with — the same one face `--muster-font` is in Legacy.
             assert_eq!(theme.font_family, crate::app::SIDEBAR_FONT_FAMILY);
             assert_eq!(theme.mono_font_family, crate::app::SIDEBAR_FONT_FAMILY);
-            // Legacy's editor size, which the diff reads at as well.
-            assert_eq!(theme.mono_font_size, px(13.));
+            // The terminal's size, which the document and the diff read at as
+            // well: one size of letter in one window. Legacy's editor was
+            // 13px, and the grid is 16px.
+            assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
             // Not changed on purpose: the toolkit derives the window's `rem`
             // from it, so every `text_*` in the app would move with it.
             assert_eq!(theme.font_size, px(16.));
+        });
+    }
+
+    /// The document and the diff are drawn at the grid's own size.
+    ///
+    /// Both are the app's code, and both are read next to a terminal in the
+    /// same window. Legacy drew its editor at 13px against a 16px grid, which
+    /// is why the file pane looked like it was set in a smaller type than the
+    /// terminal it sits beside: the value here is the terminal's, and the
+    /// editor and the toolkit's diff both read it from this one place.
+    #[gpui_kit::test]
+    fn the_document_and_the_diff_read_at_the_terminals_own_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx);
+        });
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            // The grid's own size, and not a number that happens to match it.
+            assert_eq!(crate::terminal::FONT_SIZE, px(16.));
+            // What the toolkit's editor and diff paint with: the same value.
+            assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
+            // The chrome around the code stays where it was: a header is a
+            // header, and the code is what is being read.
+            assert!(theme.mono_font_size > px(13.));
         });
     }
 
@@ -698,6 +1087,21 @@ mod tests {
         color.unwrap_or_else(|| panic!("no highlight style for {name}"))
     }
 
+    /// Whether the installed highlight theme paints a capture at all.
+    fn paints(cx: &mut TestAppContext, name: &str) -> Option<gpui_kit::HighlightStyle> {
+        cx.update(|cx| Theme::global(cx).highlight_theme.style(name))
+    }
+
+    /// The colour a grammar's capture named `name` is painted with, once the
+    /// renames `install` applies to the queries have been accounted for.
+    ///
+    /// A name the toolkit's theme holds a key for answers itself; one it does
+    /// not is only ever emitted under its alias, which is what this resolves.
+    fn painted(cx: &mut TestAppContext, name: &str) -> Option<Hsla> {
+        let renamed = capture_alias(name).unwrap_or(name);
+        paints(cx, renamed).and_then(|style| style.color)
+    }
+
     /// Assert that a content colour is Legacy's token, exactly.
     ///
     /// A highlight theme is installed by deserializing the toolkit's own
@@ -709,25 +1113,33 @@ mod tests {
 
     #[gpui_kit::test]
     fn content_surfaces_and_syntax_tokens_come_from_legacy(cx: &mut TestAppContext) {
-        dark(cx);
+        let roles = dark(cx);
         cx.update(|cx| {
             let theme = Theme::global(cx);
             assert_eq!(theme.mode, ThemeMode::Dark);
-            let surface = theme.highlight_theme.style.editor_background;
             let ink = theme.highlight_theme.style.editor_foreground;
             let numbers = theme.highlight_theme.style.editor_line_number;
             // The diff paints an added and a removed line with the toolkit's own
             // status colours, which are these two chrome tokens.
             assert_eq!(theme.danger, legacy("danger"));
             assert_eq!(theme.success, legacy("success"));
-            for (color, token) in [
-                (surface, "content-bg-0"),
-                (ink, "content-text"),
-                (numbers, "content-text-faint"),
-            ] {
+            for (color, token) in [(ink, "content-text"), (numbers, "content-text-faint")] {
                 assert_token(color, legacy(token));
             }
         });
+        // The document, the diff and the terminal grid are one surface: the body
+        // of the window, which is the base the chrome is painted on. Legacy's
+        // `--muster-content-bg-0` is a well for a document drawn inside a page,
+        // and this window has no page.
+        let grid = crate::terminal::Palette::default().background;
+        let grid = Hsla::from(rgb((grid.0 as u32) << 16
+            | (grid.1 as u32) << 8
+            | grid.2 as u32));
+        assert_eq!(roles.content, roles.surface_base);
+        assert_eq!(
+            roles.content, grid,
+            "the grid and the document share a background"
+        );
         for (name, token) in [
             ("primary", "syntax-foreground"),
             ("comment", "syntax-token-comment"),
@@ -747,6 +1159,253 @@ mod tests {
         ] {
             assert_token(Some(syntax(cx, name)), legacy(token));
         }
+    }
+
+    /// Every capture name a grammar this app compiles in can emit, and the
+    /// Legacy token it wears.
+    ///
+    /// This is the compatibility contract, stated once and read off Legacy's own
+    /// table: a capture naming a meaning Legacy names takes that token, and the
+    /// whole of them stays readable on the surface they are drawn on. Every row
+    /// is a name a grammar here emits, so a capture missing from this list is
+    /// either one no grammar emits or one the two tables still fail to answer.
+    #[gpui_kit::test]
+    fn every_capture_a_grammar_can_emit_wears_a_legacy_token(cx: &mut TestAppContext) {
+        let roles = dark(cx);
+        for (capture, token) in [
+            // An identifier, a label and an interpolated expression are all
+            // plain text in Legacy.
+            ("primary", "syntax-foreground"),
+            ("variable", "syntax-foreground"),
+            ("variable.builtin", "syntax-foreground"),
+            ("variable.member", "syntax-foreground"),
+            ("variable.parameter", "syntax-foreground"),
+            ("variable.special", "syntax-foreground"),
+            ("embedded", "syntax-foreground"),
+            ("label", "syntax-foreground"),
+            // Legacy names a parameter beside the foreground it equals, so the
+            // capture is renamed to an identifier rather than given a colour of
+            // its own.
+            ("parameter", "syntax-foreground"),
+            ("emphasis", "syntax-foreground"),
+            ("emphasis.strong", "syntax-foreground"),
+            // Comments, including the doc and the unused spellings.
+            ("comment", "syntax-token-comment"),
+            ("comment.doc", "syntax-token-comment"),
+            ("comment.documentation", "syntax-token-comment"),
+            ("comment.unused", "syntax-token-comment"),
+            // Keywords, the operators Legacy sends with them, and the
+            // directives Make, SQL and Zig spell as words of their own.
+            ("keyword", "syntax-token-keyword"),
+            ("keyword.conditional", "syntax-token-keyword"),
+            ("keyword.coroutine", "syntax-token-keyword"),
+            ("keyword.directive", "syntax-token-keyword"),
+            ("keyword.function", "syntax-token-keyword"),
+            ("keyword.import", "syntax-token-keyword"),
+            ("keyword.modifier", "syntax-token-keyword"),
+            ("keyword.operator", "syntax-token-keyword"),
+            ("keyword.repeat", "syntax-token-keyword"),
+            ("keyword.return", "syntax-token-keyword"),
+            ("keyword.type", "syntax-token-keyword"),
+            ("operator", "syntax-token-keyword"),
+            ("conditional", "syntax-token-keyword"),
+            ("include", "syntax-token-keyword"),
+            ("storageclass", "syntax-token-keyword"),
+            ("exception", "syntax-token-keyword"),
+            ("repeat", "syntax-token-keyword"),
+            ("clean", "syntax-token-keyword"),
+            ("error", "syntax-token-keyword"),
+            // A string and everything the grammars capture inside one.
+            ("string", "syntax-token-string"),
+            ("string.escape", "syntax-token-string"),
+            ("string.regex", "syntax-token-string"),
+            ("string.regexp", "syntax-token-string"),
+            ("string.special", "syntax-token-string"),
+            ("string.special.regex", "syntax-token-string"),
+            ("string.special.symbol", "syntax-token-string"),
+            ("character", "syntax-token-string"),
+            // Swift's wildcard is the one name that means the opposite.
+            ("character.special", "syntax-token-punctuation"),
+            // An escape sequence is the string it is written in.
+            ("escape", "syntax-token-string"),
+            // Literals and the names a file gives a thing.
+            ("constant", "syntax-token-constant"),
+            ("constant.builtin", "syntax-token-constant"),
+            ("constant.macro", "syntax-token-constant"),
+            ("number", "syntax-token-constant"),
+            ("number.float", "syntax-token-constant"),
+            ("boolean", "syntax-token-constant"),
+            ("float", "syntax-token-constant"),
+            ("field", "syntax-token-constant"),
+            ("property", "syntax-token-constant"),
+            ("property.definition", "syntax-token-constant"),
+            // Calls, definitions and a heading.
+            ("function", "syntax-token-function"),
+            ("function.builtin", "syntax-token-function"),
+            ("function.call", "syntax-token-function"),
+            ("function.macro", "syntax-token-function"),
+            ("function.method", "syntax-token-function"),
+            ("function.method.builtin", "syntax-token-function"),
+            ("function.special", "syntax-token-function"),
+            ("constructor", "syntax-token-function"),
+            ("method", "syntax-token-function"),
+            ("method.call", "syntax-token-function"),
+            ("title", "syntax-token-function"),
+            // Tags, attributes and types.
+            ("attribute", "syntax-token-string-expression"),
+            ("tag", "syntax-token-string-expression"),
+            ("tag.attribute", "syntax-token-string-expression"),
+            ("tag.delimiter", "syntax-token-string-expression"),
+            ("tag.doctype", "syntax-token-string-expression"),
+            ("tag.error", "syntax-token-string-expression"),
+            ("type", "syntax-token-string-expression"),
+            ("type.builtin", "syntax-token-string-expression"),
+            ("type.definition", "syntax-token-string-expression"),
+            ("type.qualifier", "syntax-token-string-expression"),
+            // Punctuation, C's own delimiter and the namespaces.
+            ("punctuation", "syntax-token-punctuation"),
+            ("punctuation.bracket", "syntax-token-punctuation"),
+            ("punctuation.delimiter", "syntax-token-punctuation"),
+            ("punctuation.list_marker", "syntax-token-punctuation"),
+            ("punctuation.special", "syntax-token-punctuation"),
+            ("delimiter", "syntax-token-punctuation"),
+            ("namespace", "syntax-token-punctuation"),
+            ("module", "syntax-token-punctuation"),
+            ("module.builtin", "syntax-token-punctuation"),
+            // Links.
+            ("link_text", "syntax-token-link"),
+            ("link_uri", "syntax-token-link"),
+        ] {
+            let color = painted(cx, capture).unwrap_or_else(|| panic!("{capture} is uncoloured"));
+            assert_eq!(color, legacy(token), "{capture}");
+            assert!(
+                contrast(color, roles.content) >= 4.5,
+                "{capture} is unreadable on the content surface"
+            );
+        }
+        // Legacy names a weight or a slant rather than a colour for these three,
+        // and the toolkit can say both, so it does.
+        for (capture, weight, slant) in [
+            ("title", Some(FontWeightContent::Bold), None),
+            ("emphasis", None, Some(FontStyle::Italic)),
+            ("emphasis.strong", Some(FontWeightContent::Bold), None),
+        ] {
+            let style = paints(cx, capture).unwrap_or_else(|| panic!("{capture} is unstyled"));
+            assert_eq!(style.font_weight, weight.map(Into::into), "{capture}");
+            assert_eq!(style.font_style, slant.map(Into::into), "{capture}");
+        }
+        // The names that carry no colour by design, in Legacy and here: a
+        // "leave this alone" capture, a spelling hint that rides beside a real
+        // token, and markdown's own prose.
+        for capture in UNCOLOURED {
+            assert_eq!(paints(cx, capture), None, "{capture} is coloured");
+        }
+    }
+
+    /// A capture the theme cannot hold is renamed before it is ever emitted.
+    ///
+    /// Rust, Python and Ruby capture an escape sequence as `@escape` and Go
+    /// captures a package qualifier as `@namespace`; neither is a name the
+    /// toolkit's theme has a key for, so without the rename `install` does the
+    /// token falls back to the editor's own ink. The range is compared exactly,
+    /// because a style that merely covers the capture is the surrounding token
+    /// and would pass either way.
+    #[gpui_kit::test]
+    fn a_renamed_capture_is_painted_as_legacy_paints_its_meaning(cx: &mut TestAppContext) {
+        dark(cx);
+        for (language, source, needle, name) in [
+            (
+                "rust",
+                "fn main() {\n    let s = \"a\\nb\";\n}\n",
+                "\\n",
+                "string",
+            ),
+            ("python", "s = \"a\\nb\"\n", "\\n", "string"),
+            ("ruby", "s = \"a\\nb\"\n", "\\n", "string"),
+            (
+                "go",
+                "package main\n\nvar r io.Reader\n\nfunc main() {}\n",
+                "io",
+                "punctuation",
+            ),
+            ("c", "int main(void) { return 0; }\n", ";", "punctuation"),
+        ] {
+            cx.update(|cx| {
+                let mut highlighter =
+                    gpui_kit::component::highlighter::SyntaxHighlighter::new(language);
+                let text = gpui_kit::component::Rope::from_str(source);
+                assert!(highlighter.update(None, &text, None), "{language}");
+                let theme = Theme::global(cx);
+                let expected = theme
+                    .highlight_theme
+                    .style(name)
+                    .and_then(|style| style.color);
+                let at = source.find(needle).expect("the source has the capture");
+                let span = at..at + needle.len();
+                let painted =
+                    highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+                // Every run the token sits in, not just the run that starts on
+                // it: a capture the theme cannot answer becomes a run of its
+                // own with no colour in it, which is what an escape inside a
+                // green string used to look like.
+                let runs = painted
+                    .iter()
+                    .filter(|(range, _)| range.start < span.end && range.end > span.start)
+                    .collect::<Vec<_>>();
+                assert!(!runs.is_empty(), "{language} leaves {needle} uncoloured");
+                for (range, style) in runs {
+                    assert_eq!(
+                        style.color, expected,
+                        "{language} paints {}..{} as {name}",
+                        range.start, range.end
+                    );
+                }
+            });
+        }
+    }
+
+    /// Every grammar carries the toolkit's own capture names.
+    ///
+    /// The renames are what let the theme answer a capture at all, so a grammar
+    /// the pass never reached is a token silently back to the editor's ink.
+    /// Running the rename over an already-renamed query changes nothing, and
+    /// that is what says it reached all of them. What it leaves behind is then
+    /// required to be paintable, which is what says a grammar is *done*: a name
+    /// neither table answers would be a file opening with half its tokens in
+    /// the editor's own ink. Vue's own `@props` is the one this caught.
+    #[gpui_kit::test]
+    fn every_grammar_has_had_its_captures_renamed(cx: &mut TestAppContext) {
+        dark(cx);
+        cx.read(|_cx| {
+            let registry = gpui_kit::component::highlighter::LanguageRegistry::singleton();
+            for name in registry.languages() {
+                let query = registry
+                    .language(&name)
+                    .expect("a registered grammar")
+                    .highlights;
+                assert_eq!(
+                    rename_captures(&query),
+                    query,
+                    "{name} still captures a name the theme cannot paint"
+                );
+                for capture in captures(&query) {
+                    let themed = |token: &&str| SYNTAX_TOKENS.iter().any(|(name, _)| name == token);
+                    assert!(
+                        // A leading `_` is the grammar's own scratch capture:
+                        // CMake holds `set` in `@_function` to match it in a
+                        // predicate and never paints it.
+                        capture.starts_with('_')
+                            || themed(&capture)
+                            || capture
+                                .split_once('.')
+                                .is_some_and(|(base, _)| themed(&base))
+                            || STYLED.contains(&capture)
+                            || UNCOLOURED.contains(&capture),
+                        "{name} emits @{capture}, which neither table answers"
+                    );
+                }
+            }
+        });
     }
 
     /// JSON's own grammar, so the tokens compared are the ones a `.json`

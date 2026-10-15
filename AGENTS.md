@@ -21,8 +21,8 @@ docs/             the migration plan, and what the port has to satisfy
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 100 tests (96 inline plus the four-process instance-lock suite in
-  `core/tests/`) and `native` holds 265 default tests plus two ignored
+- `core` holds 106 tests (102 inline plus the four-process instance-lock suite in
+  `core/tests/`) and `native` holds 285 default tests plus two ignored
   performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
@@ -82,6 +82,25 @@ a VT sequence asked for: ANSI indices, OSC colours, an explicit background. The
 application draws it verbatim, and no role here reaches `TerminalHost::resolve_color`.
 There is no terminal preference, no theme preference and no switcher: one
 appearance, dark, chosen by `main.rs` before the first window opens.
+
+The grid is the window's body, so the document and the diff share its
+background: `highlight_theme.editor.background` is `theme.background`, and
+Legacy's `--muster-content-bg-0` (`#222436`, a violet well for a document drawn
+inside a page) has no role. One background for the terminal, the editor and the
+diff is `theme::tests::content_surfaces_and_syntax_tokens_come_from_legacy`.
+
+### Syntax: two tables, and why there are two
+
+A grammar's capture is a Legacy meaning spelled its own way. `SYNTAX_TOKENS`
+answers the names the toolkit's highlight theme holds a key for;
+`CAPTURE_ALIASES` renames the ones it holds **no** key for (`@escape`,
+`@namespace`, `@parameter`, `@module`, …) in each registered query at install
+time. A capture that reaches neither table is painted in the editor's own ink,
+so a new grammar's query is not done when it compiles — it is done when every
+name it emits is in one of the two.
+`theme::tests::every_capture_a_grammar_can_emit_wears_a_legacy_token` states the
+contract from the grammar's side, and
+`every_grammar_has_had_its_captures_renamed` fails if the pass missed one.
 
 ### File icons: their own palette, and their own generator
 

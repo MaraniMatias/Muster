@@ -1228,8 +1228,10 @@ impl TerminalWindow {
                         drag_rows.clone(),
                     ));
                 }
-                // Match the terminal rows' glyph axis: the guide's 14px margin,
-                // 1px border, and 12px child inset put it 27px into the sidebar.
+                // Centred across the panel rather than on the terminal rows'
+                // glyph axis: it is the one row in a group that is not about one
+                // terminal, so it reads as the group's last line instead of as
+                // another terminal.
                 let new_terminal_row = div()
                     .relative()
                     .w_full()
@@ -1244,8 +1246,8 @@ impl TerminalWindow {
                         ))
                     })
                     .child(
-                        // Keep the full row clickable while the glyph group stays
-                        // on the terminal rows' shared axis.
+                        // Keep the full row clickable while the label group is
+                        // centred in it.
                         BaseButton::new(SharedString::from(format!(
                             "new-terminal-{}",
                             checkout.id
@@ -1253,8 +1255,7 @@ impl TerminalWindow {
                         .h(px(26.))
                         .w_full()
                         .p_0()
-                        .pl(px(27.))
-                        .justify_start()
+                        .justify_center()
                         .when(dragging, |button| {
                             button.cursor(gpui_kit::CursorStyle::ClosedHand)
                         })

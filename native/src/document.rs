@@ -3,11 +3,15 @@ use crate::{app::TerminalWindow, theme::Roles};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState};
 use gpui_kit::component::Sizable;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Styled, Window,
+    div, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Styled, TestSupportExt, Window,
 };
+
+mod media;
 
 /// The document's editor, kept between renders.
 ///
@@ -18,6 +22,13 @@ use gpui_kit::{
 /// no editing and no persistence.
 pub(crate) struct DocumentView {
     pub(crate) state: Entity<EditorState>,
+    /// The reading view of a Markdown file, built when the document is opened and
+    /// kept beside the editor so the two views are one toggle rather than a second
+    /// read of the file.
+    pub(crate) preview: Option<Entity<TextViewState>>,
+    /// Whether this document is being read as a document or as its source. True
+    /// for a Markdown file that opens rendered, false for everything else.
+    rendered: bool,
     /// The document this state was built for. A different path replaces it: a
     /// selection or an offset carried over from another file would describe a
     /// position in a file that is not on screen.
@@ -39,10 +50,22 @@ impl DocumentView {
                 .soft_wrap(false)
                 .default_value(text)
         });
+        let markdown = is_markdown(path);
+        let preview = markdown.then(|| cx.new(|cx| TextViewState::markdown(text, cx)));
         Self {
             state,
+            preview,
+            rendered: markdown,
             path: identity.to_owned(),
         }
+    }
+
+    /// Whether this document is being read as a document rather than as source.
+    ///
+    /// A file that is not Markdown has no second reading, so the question only has
+    /// two answers where there are two views to choose between.
+    fn is_rendered(&self) -> bool {
+        self.rendered && self.preview.is_some()
     }
 }
 
@@ -64,6 +87,21 @@ fn document_state(
         .expect("just installed")
 }
 
+/// Whether a path names a Markdown file.
+///
+/// Legacy's own set (`legacy/src/lib/markdown-preview.ts:20`), which is the same
+/// four names `syntax_language` answers `markdown` for: a file whose whole point
+/// is to be read, rather than one whose point is that something runs it.
+pub(crate) fn is_markdown(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.').is_some_and(|(_, extension)| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "mdown" | "mkd"
+        )
+    })
+}
+
 /// The toolkit language name a path asks for.
 ///
 /// The same list Legacy chose its mode by, reduced to the languages the
@@ -79,7 +117,8 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "makefile" | "gnumakefile" => return "make",
         "cmakelists.txt" => return "cmake",
         ".bash_login" | ".bash_logout" | ".bash_profile" | ".bashrc" | ".profile" | ".shrc"
-        | ".zlogin" | ".zlogout" | ".zprofile" | ".zshenv" | ".zshrc" => return "bash",
+        | ".cshrc" | ".kshrc" | ".login" | ".tcshrc" | ".zlogin" | ".zlogout" | ".zprofile"
+        | ".zshenv" | ".zshrc" => return "bash",
         ".babelrc" | ".eslintrc" | ".jshintrc" | ".prettierrc" | ".swcrc" | ".watchmanconfig" => {
             return "json"
         }
@@ -106,11 +145,13 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "erb" => "erb",
         "ex" | "exs" => "elixir",
         "go" => "go",
+        "gql" | "graphql" => "graphql",
         "java" => "java",
         "kt" | "kts" => "kotlin",
         "lua" => "lua",
         "make" | "makefile" | "mk" => "make",
         "php" => "php",
+        "proto" => "proto",
         "py" | "pyw" | "pyi" => "python",
         "rb" => "ruby",
         "scala" => "scala",
@@ -118,9 +159,77 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "svelte" => "svelte",
         "swift" => "swift",
         "toml" => "toml",
+        "vue" => "vue",
         "zig" => "zig",
         _ => "plaintext",
     }
+}
+
+/// The document's body: the reading, or the source.
+///
+/// Both fill the pane and scroll themselves, because a document taller than the
+/// pane has to be readable from the middle of it. A scrollable text view keeps
+/// its own scrollbar; the editor keeps the one it draws over its own viewport.
+/// Neither scrolls inside a container here: a container whose only child fills
+/// it has nothing to scroll, which is what a Markdown preview without a
+/// `scrollable` view is.
+///
+/// The margin is the pane's, not either reading's, so a document is read the
+/// same way whichever of the two is on screen.
+fn document_body(
+    state: &Entity<EditorState>,
+    rendered: Option<Entity<TextViewState>>,
+    media: Option<media::DocumentMedia>,
+    link_handler: impl Fn(&gpui_kit::SharedString, &gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)
+        + Send
+        + Sync
+        + 'static,
+) -> AnyElement {
+    let reading = match rendered {
+        Some(preview) => {
+            let mut extensions = MarkdownExtensions::default()
+                .frontmatter()
+                .plugin(FrontmatterPlugin::new());
+            // A document's own pictures are answered through the checkout it was
+            // read from, and everything it names that is not a picture is said in
+            // words instead: see `document::media`.
+            if let Some(media) = media {
+                extensions = extensions.plugin(media);
+            }
+            div()
+                .id("document-markdown")
+                .test_support()
+                .size_full()
+                .child(
+                    TextView::new(&preview)
+                        // Scrolling its own content is the text view's, and the
+                        // only thing that has the height of the document to
+                        // measure it against.
+                        .scrollable(true)
+                        .size_full()
+                        // Legacy's front matter was a collapsible tree above
+                        // the document, drawn from the YAML rather than shown
+                        // as a wall of keys. This is the toolkit's rendering
+                        // of the same node.
+                        .markdown_extensions(extensions)
+                        .on_link_click(link_handler),
+                )
+                .into_any_element()
+        }
+        None => Editor::new(state)
+            .readonly(true)
+            .bordered(false)
+            .size_full()
+            .into_any_element(),
+    };
+    div()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .px_6()
+        .py_5()
+        .child(reading)
+        .into_any_element()
 }
 
 impl TerminalWindow {
@@ -139,6 +248,18 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        // Links clicked in a rendered document arrive as a queue, because the
+        // text view's own handler may only hold what is `Send`. Opening one here
+        // is the same work a tree row's ctrl-click does, on the same terms.
+        let clicked = std::mem::take(
+            &mut *self
+                .link_queue
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for url in clicked {
+            self.open_link(url, window, cx);
+        }
         let target = self.document_target.clone().or_else(|| {
             self.open_document
                 .as_ref()
@@ -153,6 +274,19 @@ impl TerminalWindow {
         }
         let roles = Roles::of(cx);
         let key = (checkout_id.clone(), path.clone());
+        // A link is clicked inside the toolkit's own text view, whose handler may only
+        // hold what is `Send`. A queue both sides can name is such a thing, and it
+        // is all this needs: the window takes the link from it on the next frame,
+        // where the opener and the notice that says it did not open both live.
+        let link_queue = self.link_queue.clone();
+        let link_handler = move |url: &gpui_kit::SharedString,
+                                 _: &gpui_kit::ClickEvent,
+                                 _: &mut Window,
+                                 _: &mut gpui_kit::App| {
+            if let Ok(mut queue) = link_queue.lock() {
+                queue.push(url.to_string());
+            }
+        };
         let body = if let Some((_, preview)) = self
             .open_document
             .as_ref()
@@ -174,14 +308,44 @@ impl TerminalWindow {
             if new_view {
                 state.read(cx).focus_handle(cx).focus(window, cx);
             }
-            Editor::new(&state)
-                .readonly(true)
-                .bordered(false)
-                .size_full()
-                .into_any_element()
+            // A Markdown file is read as a document and can be read as its source;
+            // everything else is its source and only its source.
+            let rendered = self
+                .document_view
+                .as_ref()
+                .filter(|view| view.is_rendered())
+                .and_then(|view| view.preview.clone());
+            // The pictures a rendered document names are reached through the same
+            // checkout the document itself was read from, so a `../` that would
+            // leave it is refused where every other path out of it is refused.
+            let media = rendered.as_ref().and_then(|_| {
+                let repo = self
+                    .navigation
+                    .repos
+                    .iter()
+                    .find(|repo| repo.checkouts.iter().any(|one| one.id == checkout_id))?;
+                let checkout = self.navigation.checkout(&checkout_id)?;
+                Some(media::DocumentMedia::new(
+                    repo.clone(),
+                    checkout.clone(),
+                    &path,
+                ))
+            });
+            document_body(&state, rendered, media, link_handler)
         } else if let Some(error) = self.document_errors.get(&key) {
             let retry_path = path.clone();
             let retry_checkout = checkout_id.clone();
+            // A file the pane cannot draw is not a file nobody can open: this is the one
+            // place a refusal has something to offer instead. What it cannot be
+            // is a file outside the checkout — the opener resolves the path
+            // through the checkout again, and refuses it there if it is not there.
+            let open_repo = self
+                .navigation
+                .repos
+                .iter()
+                .find(|repo| repo.checkouts.iter().any(|c| c.id == checkout_id))
+                .cloned();
+            let open_checkout = self.navigation.checkout(&checkout_id).cloned();
             div()
                 .p_3()
                 .flex()
@@ -213,6 +377,27 @@ impl TerminalWindow {
                             }
                         })),
                 )
+                .when(open_repo.is_some() && open_checkout.is_some(), |pane| {
+                    let repo = open_repo.clone().expect("asked for");
+                    let checkout = open_checkout.clone().expect("asked for");
+                    let opened = path.clone();
+                    pane.child(
+                        Button::new(format!("open-externally-{path}"))
+                            .ghost()
+                            .small()
+                            .label("Open externally")
+                            .accessibility_label(format!("Open {path} in another application"))
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.open_externally(
+                                    repo.clone(),
+                                    checkout.clone(),
+                                    opened.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                })
                 .into_any_element()
         } else {
             div()
@@ -222,6 +407,19 @@ impl TerminalWindow {
                 .child("Loading file…")
                 .into_any_element()
         };
+        // A Markdown document is rendered by the toolkit's own text view and not
+        // by the editor: the toolkit's view draws headings, lists, tables and
+        // fences the way Legacy's preview did, and its fences are coloured by the
+        // `muster-content` theme this window already installed. The header says
+        // which reading is on the screen and offers the other one.
+        let markdown = self
+            .document_view
+            .as_ref()
+            .is_some_and(|view| view.preview.is_some());
+        let rendered = self
+            .document_view
+            .as_ref()
+            .is_some_and(DocumentView::is_rendered);
         Some(
             div()
                 .id("document-pane")
@@ -248,8 +446,47 @@ impl TerminalWindow {
                                 .truncate()
                                 .text_xs()
                                 .text_color(roles.text_muted)
-                                .child(path),
+                                .child(path.clone()),
                         )
+                        .when(markdown, |header| {
+                            header.child(
+                                Button::new("document-toggle-reading")
+                                    .text()
+                                    .small()
+                                    .compact()
+                                    .rounded(px(0.))
+                                    .label(if rendered { "Source" } else { "Rendered" })
+                                    .accessibility_label(if rendered {
+                                        "Read this document as its source"
+                                    } else {
+                                        "Read this document rendered"
+                                    })
+                                    .tooltip(if rendered {
+                                        "Read the Markdown source"
+                                    } else {
+                                        "Read the rendered document"
+                                    })
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        let Some(view) = app.document_view.as_mut() else {
+                                            return;
+                                        };
+                                        if view.preview.is_some() {
+                                            view.rendered = !view.rendered;
+                                            // The view that just went away takes the
+                                            // focus with it, and the other one has to
+                                            // have it: focus left on nothing reads as
+                                            // a window that stopped listening.
+                                            if view.rendered {
+                                                view.state
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window, cx);
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("close-document")
                                 .custom(crate::app::sidebar_action_style(cx))
@@ -296,18 +533,21 @@ mod tests {
                 window,
                 cx,
             );
+            let rendered = self
+                .view
+                .as_ref()
+                .filter(|view| view.is_rendered())
+                .and_then(|view| view.preview.clone());
             div()
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(
-                    div().flex_1().min_w_0().min_h_0().child(
-                        Editor::new(&state)
-                            .readonly(true)
-                            .bordered(false)
-                            .size_full(),
-                    ),
-                )
+                .child(div().flex_1().min_w_0().min_h_0().child(document_body(
+                    &state,
+                    rendered,
+                    None,
+                    |_, _, _, _| {},
+                )))
                 .into_any_element()
         }
     }
@@ -354,6 +594,86 @@ mod tests {
         ("input", state.entity_id())
     }
 
+    /// Frames until a Markdown parse has landed and the view measured itself.
+    fn settle(cx: &mut TestAppContext, window: gpui_kit::AnyWindowHandle) {
+        for _ in 0..8 {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+    }
+
+    /// A document taller than the pane is read from the middle of it, whichever
+    /// reading is on screen.
+    #[gpui_kit::test]
+    fn a_document_taller_than_the_pane_scrolls_in_both_readings(cx: &mut TestAppContext) {
+        let (window, harness) = open(cx);
+        // Its source: the editor keeps a viewport onto a file taller than the pane.
+        let source = (0..400)
+            .map(|line| format!("let line_{line} = {line};\n"))
+            .collect::<String>();
+        harness.update(cx, |harness, cx| {
+            harness.document = Some(("src/main.rs".into(), source));
+            cx.notify();
+        });
+        settle(cx, window);
+        let state = editor(cx, &harness);
+        let id = at(&state);
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                id,
+                // A negative delta is down: the offset is the content's own
+                // displacement, so scrolling down moves it away from zero.
+                gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -5.)),
+                cx,
+            );
+        })
+        .unwrap();
+        assert!(
+            state.read_with(cx, |state, _| state.scroll_offset().y) < gpui_kit::px(0.),
+            "the source did not scroll"
+        );
+
+        // Its reading: the same content as a document, which scrolls itself.
+        let rendered = (0..60)
+            .map(|block| format!("Block {block}: {}\n\n", "lorem ipsum dolor ".repeat(20)))
+            .collect::<String>();
+        harness.update(cx, |harness, cx| {
+            harness.document = Some(("README.md".into(), rendered));
+            cx.notify();
+        });
+        settle(cx, window);
+        let preview = harness.read_with(cx, |harness, _| {
+            harness
+                .view
+                .as_ref()
+                .expect("a document is open")
+                .preview
+                .clone()
+                .expect("a Markdown file has a reading")
+        });
+        assert!(
+            preview.read_with(cx, |preview, _| {
+                preview.list_state().max_offset_for_scrollbar().y
+            }) > gpui_kit::px(0.),
+            "the reading has nothing to scroll"
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.scroll(
+                "document-markdown",
+                gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., -5.)),
+                cx,
+            );
+        })
+        .unwrap();
+        assert!(
+            preview.read_with(cx, |preview, _| {
+                preview.list_state().scroll_px_offset_for_scrollbar().y
+            }) < gpui_kit::px(0.),
+            "the reading did not scroll"
+        );
+    }
+
     #[test]
     fn the_language_comes_from_the_path_and_falls_back_to_plain_text() {
         for (path, language) in [
@@ -376,9 +696,15 @@ mod tests {
             ("CMakeLists.txt", "cmake"),
             ("scripts/build.sh", "bash"),
             ("home/.bashrc", "bash"),
+            ("home/.kshrc", "bash"),
+            ("home/.login", "bash"),
             ("src/main.cpp", "cpp"),
             ("query.sql", "sql"),
-            ("component.vue", "plaintext"),
+            ("api.proto", "proto"),
+            ("schema.graphql", "graphql"),
+            ("types.gql", "graphql"),
+            ("component.vue", "vue"),
+            ("diagram.mmd", "plaintext"),
             ("document.xml", "plaintext"),
             ("notes.rst", "plaintext"),
             ("src/main.rs.bak", "plaintext"),
@@ -509,6 +835,18 @@ mod tests {
             ),
             ("view.ejs", "<p><%= name %></p>"),
             ("view.erb", "<p><%= name %></p>"),
+            (
+                "component.vue",
+                "<template><p>{{ name }}</p></template>\n<script>const n = 1;</script>\n",
+            ),
+            (
+                "api.proto",
+                "// a service\nsyntax = \"proto3\";\n\nmessage User {\n  string name = 1;\n}\n",
+            ),
+            (
+                "schema.graphql",
+                "# a query\nquery Hello($id: ID!) {\n  user(id: $id) { name }\n}\n",
+            ),
             ("main.py", "# comment\ndef run():\n    return \"hello\"\n"),
             ("run.sh", "# comment\nif true; then echo \"hello\"; fi\n"),
             (
@@ -563,6 +901,55 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// A single-file component is coloured in all three of its blocks.
+    ///
+    /// The Vue grammar's own query is the markup one — a tag is a tag and an
+    /// attribute is an attribute — so `<template>` reads as what it is, and the
+    /// two blocks that are *not* markup are reached through the grammar's
+    /// injections. Each is asked for separately, because a component whose
+    /// `<style>` opens in the editor's own ink still passes a check that only
+    /// asks whether the file is coloured somewhere.
+    #[gpui_kit::test]
+    fn a_vue_component_is_coloured_in_its_script_its_template_and_its_style(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, harness) = open(cx);
+        let source = "<script setup lang=\"ts\">\nconst name = 'muster';\n</script>\n\n\
+             <template>\n  <p :title=\"name\">{{ name }}</p>\n</template>\n\n\
+             <style scoped>\n.name {\n  color: red;\n}\n</style>\n";
+        harness.update(cx, |h, cx| {
+            h.document = Some(("component.vue".into(), source.into()));
+            cx.notify();
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        let state = editor(cx, &harness);
+        cx.update(|cx| {
+            let mut highlighter = gpui_kit::component::highlighter::SyntaxHighlighter::new("vue");
+            let text = state.read(cx).text().clone();
+            assert!(highlighter.update(None, &text, None), "vue");
+            let theme = gpui_kit::component::Theme::global(cx);
+            let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+            let coloured = |block: &str| {
+                let range = source
+                    .find(block)
+                    .map(|at| at..at + block.len())
+                    .unwrap_or_else(|| panic!("the component has a {block} block"));
+                let mut runs = styles
+                    .iter()
+                    .filter(|(span, _)| span.start < range.end && span.end > range.start)
+                    .filter_map(|(_, style)| style.color)
+                    .collect::<Vec<_>>();
+                runs.sort_by_key(|color| format!("{color:?}"));
+                runs.dedup();
+                assert!(runs.len() > 1, "the {block} block is one colour: {runs:?}");
+            };
+            coloured("const name = 'muster';");
+            coloured("<p :title=\"name\">");
+            coloured("color: red;");
+        });
     }
 
     #[gpui_kit::test]

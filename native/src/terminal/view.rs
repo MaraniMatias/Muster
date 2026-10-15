@@ -38,7 +38,11 @@ use super::{
 };
 
 /// The terminal's font size and line spacing, matching the legacy terminal defaults.
-const FONT_SIZE: Pixels = px(16.0);
+///
+/// Published so the document and the diff can be drawn at this same size: the
+/// grid, a file and a diff are read in one window, and code three pixels
+/// smaller than the terminal beside it is the first thing anybody notices.
+pub(crate) const FONT_SIZE: Pixels = px(16.0);
 const LINE_HEIGHT: f32 = 1.2;
 /// `--muster-cursor` from the legacy dark theme, which is also the editor's caret.
 const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);

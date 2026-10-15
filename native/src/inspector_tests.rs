@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::sidebar_tests::{close, open_git, GitFixture};
-use crate::inspector::{sticky_ancestors, tree_window, within, Ancestor, TreeRow};
+use crate::inspector::{opens_elsewhere, sticky_ancestors, tree_window, within, Ancestor, TreeRow};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{px, TestAppContext};
 use std::rc::Rc;
@@ -463,9 +463,9 @@ async fn the_folder_stack_appears_over_a_scrolled_tree(cx: &mut TestAppContext) 
         assert!(window.try_find("file-stack-name-src").is_some());
         assert!(window.try_find("file-stack-name-src/nested").is_some());
         assert_eq!(
-            window.find("file-stack:src/nested").label(),
-            Some("Show nested in tree"),
-            "a stacked folder is a way back to it"
+            window.find("file-stack-fold:src/nested").label(),
+            Some("Collapse nested"),
+            "a stacked folder closes from the stack too"
         );
         assert_eq!(
             stack.bounds().size.height,
@@ -476,13 +476,25 @@ async fn the_folder_stack_appears_over_a_scrolled_tree(cx: &mut TestAppContext) 
             window.find("file-icon-src").bounds().origin.y < stack.bounds().origin.y,
             "the folders it names have scrolled above the tree: that is why it is there"
         );
+        // A stacked folder is the tree's own row, columns and all: its name
+        // starting where the tree starts that folder's name, one 14px step in
+        // for its depth. A stack drawn to any other shape is a legend above the
+        // tree rather than the tree's rows carried.
+        assert_eq!(
+            window.find("file-stack-name-src/nested").bounds().origin.x - stack.bounds().origin.x,
+            px(8. + 14. + 16. + 7. + 14. + 7.),
+            "its name sits on the same column the tree draws it on"
+        );
     })
     .unwrap();
 
-    // Clicking one brings the tree back to where that folder's own row is.
+    // Clicking one brings the tree back to where that folder's own row is. It is the
+    // name that is clicked, not a separate button on the right of the row: the name is
+    // what Legacy makes the way back, and it is the only part of a stacked row a
+    // pointer is ever resting on.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        window.click("file-stack:src/nested", cx);
+        window.click("file-stack-name-src/nested", cx);
     })
     .unwrap();
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -499,6 +511,125 @@ async fn the_folder_stack_appears_over_a_scrolled_tree(cx: &mut TestAppContext) 
         );
     })
     .unwrap();
+    close(&fixture, cx);
+}
+
+/// A stacked folder answers for itself, and not for the row it is drawn over.
+///
+/// The defect this pins: the stack was drawn over the rows it names and had no hitbox
+/// of its own, so a click on a stacked folder's name went through it to the tree row
+/// hidden underneath. Measured, it opened `src/nested/f12.txt` — a file whose own row
+/// sat at y = -207, above the top of the tree and nowhere near the pointer.
+#[gpui_kit::test]
+async fn a_stacked_folder_keeps_its_own_click(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("src/nested")).unwrap();
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("src/nested/f{index:02}.txt")),
+            "x",
+        )
+        .unwrap();
+    }
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).file_entries.contains_key(&key(""))
+    })
+    .await;
+    for path in ["src", "src/nested"] {
+        let control = gpui_kit::ElementId::from(format!("file-control:{path}"));
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.click(control, cx);
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).file_entries.contains_key(&key(path))
+        })
+        .await;
+    }
+    cx.update(|cx| {
+        fixture
+            .view
+            .read(cx)
+            .files_scroll
+            .set_offset(gpui_kit::point(px(0.), px(-30. * 26.)))
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The row the stack is drawn over, and where it sits: a click on the
+        // stacked name lands on this row's box, which is the whole defect.
+        let stack = window.find("file-stack-name-src/nested").bounds();
+        let hidden = window.find("file-slot-src/nested/f12.txt").bounds();
+        assert!(
+            stack.origin.y < hidden.bottom() && stack.bottom() > hidden.origin.y,
+            "the stacked name is drawn over a real tree row"
+        );
+        window.click("file-stack-name-src/nested", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.read(|cx| {
+        let app = fixture.view.read(cx);
+        assert!(
+            app.selected_file.is_empty(),
+            "a stacked folder is not a file row: the row underneath it was never clicked"
+        );
+        assert_eq!(
+            app.files_scroll.offset().y,
+            px(0.),
+            "and the click brought the folder to the top of the tree instead"
+        );
+    });
+
+    // And its fold is the other gesture: it closes the folder, and it does not
+    // also scroll, because a stacked row that answered both would close the
+    // folder and then bring it straight back into view.
+    cx.update(|cx| {
+        fixture
+            .view
+            .read(cx)
+            .files_scroll
+            .set_offset(gpui_kit::point(px(0.), px(-30. * 26.)))
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("file-stack-fold:src", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.read(|cx| {
+        let app = fixture.view.read(cx);
+        assert!(
+            !app.expanded_files.contains(&key("src")),
+            "a stacked folder closes from the stack"
+        );
+        assert!(
+            !app.file_entries.contains_key(&key("src/nested")),
+            "and a closed folder forgets what was under it"
+        );
+    });
     close(&fixture, cx);
 }
 
@@ -1448,6 +1579,432 @@ async fn the_file_and_change_lists_line_up_on_legacy_columns(cx: &mut TestAppCon
         })
         .unwrap();
     }
+    close(&fixture, cx);
+}
+
+/// A Markdown document is read as a document, and its source is one click away.
+///
+/// Legacy rendered a `.md` file rather than showing it as code, with a rendered
+/// reading and its source behind a control. The rendered reading is the toolkit's
+/// own text view — which is what paints its fences with the `muster-content`
+/// tokens this window installed — and both readings are one document's two views,
+/// not two reads of the file.
+#[gpui_kit::test]
+async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    let source =
+        "---\ntitle: Muster\n---\n\n# Heading\n\n- one\n- two\n\n```rust\nlet x = 1;\n```\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("document-markdown").is_some(),
+            "a Markdown file is read as a document"
+        );
+        assert_eq!(
+            window.find("document-toggle-reading").label(),
+            Some("Read this document as its source"),
+            "and the header offers the reading it is not on"
+        );
+        // The source is still there, whole, for the other reading.
+        let state = fixture
+            .view
+            .read(cx)
+            .document_view
+            .as_ref()
+            .expect("a view")
+            .state
+            .clone();
+        assert_eq!(state.read(cx).text().to_string(), source);
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-toggle-reading", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, _cx| {
+        assert!(
+            window.try_find("document-markdown").is_none(),
+            "the source reading is the editor"
+        );
+        assert!(
+            window.try_find("document-toggle-reading").is_some(),
+            "and the header still offers the other reading"
+        );
+    })
+    .unwrap();
+
+    // And back again: the two readings are one document, not a re-read.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-toggle-reading", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("document-markdown").is_some());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A rendered document draws the picture it names and says everything else.
+///
+/// The toolkit's own image path resolves a URL against the process rather than
+/// against the document, so a README's picture arrived as an empty box; this is
+/// the reading that answers for it. The two lines with no alt text are the half
+/// that had nothing at all: a video this window cannot play, and a `../` that
+/// leaves the checkout, each of which has to say what the document put there
+/// rather than leave a blank where it was.
+#[gpui_kit::test]
+async fn a_rendered_document_draws_its_picture_and_says_what_it_cannot(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // One real pixel, so the picture is bytes the asset system can actually read.
+    const ONE_PIXEL_PNG: &[u8] = b"\
+\x89PNG\r\n\x1a\n\
+\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\
+\x00\x00\x00\rIDAT\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\
+\x00\x00\x00\x00IEND\xaeB\x60\x82";
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    let source = "# Pictures\n\n![The diagram](diagram.png)\n\n![](assets/demo.mp4)\n\n![](../outside.png)\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+
+    // The picture is read from disk by the asset system, so the reading is drawn
+    // over as many frames as it takes for those bytes to arrive.
+    let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
+    let mut drawn = false;
+    for _ in 0..16 {
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            drawn = drawn || window.try_find(picture.clone()).is_some();
+        })
+        .unwrap();
+        if drawn {
+            break;
+        }
+    }
+
+    let reading = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.preview.clone())
+            .map(|preview| {
+                preview.read_with(cx, |preview, _| preview.rendered_text().as_str().to_owned())
+            })
+            .expect("a rendered Markdown document")
+    });
+    cx.update_window(fixture.handle, |_, window, _cx| {
+        assert!(
+            window.try_find(picture.clone()).is_some(),
+            "a picture inside the checkout is drawn where the document names it"
+        );
+        assert!(
+            reading.contains("The diagram"),
+            "the alt text is the line that stands for a picture: {reading}"
+        );
+        assert!(
+            reading.contains("Video: assets/demo.mp4"),
+            "a video this window cannot play is named rather than left blank: {reading}"
+        );
+        assert!(
+            reading.contains("Image: ../outside.png"),
+            "a picture that reaches out of the checkout is named too: {reading}"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The modifier that means "open this somewhere else" is the platform's own.
+///
+/// Control on Linux and Windows, command on macOS, which is what
+/// `Modifiers::secondary_key` is in the toolkit — this asks the same question of
+/// a real click rather than naming a key. The gesture itself is not driven from a
+/// test: the row's other answer spawns the opener, and a headless run would open
+/// a real application on the machine running the suite. What the click *for*
+/// is, and what the resolution of that path refuses, are both tested without one.
+#[test]
+fn a_modifier_is_what_separates_opening_a_row_from_acting_on_it() {
+    use gpui_kit::{
+        point, px, ClickEvent, Modifiers, MouseButton, MouseClickEvent, MouseDownEvent,
+        MouseUpEvent,
+    };
+    let click = |modifiers| {
+        let event = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(0.), px(0.)),
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        };
+        ClickEvent::Mouse(MouseClickEvent {
+            up: MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(0.), px(0.)),
+                modifiers,
+                click_count: 1,
+            },
+            down: event,
+        })
+    };
+    let none = Modifiers::none();
+    assert!(
+        !opens_elsewhere(&click(none)),
+        "a plain click is the row's own"
+    );
+    assert!(
+        opens_elsewhere(&click(Modifiers {
+            control: true,
+            ..Modifiers::none()
+        })),
+        "ctrl opens it elsewhere"
+    );
+    assert!(
+        opens_elsewhere(&click(Modifiers {
+            platform: true,
+            ..Modifiers::none()
+        })),
+        "cmd opens it elsewhere too, because this app runs on both"
+    );
+    assert!(
+        !opens_elsewhere(&click(Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        })),
+        "shift is a selection, not an opening"
+    );
+}
+
+/// A name too long for the panel is reachable, not shortened.
+///
+/// Legacy's rows are `max-content` and the panel scrolls sideways; the native one
+/// truncated at the panel's edge, so a deep tree's tail was unreadable with no
+/// way to see it. The scrollbar is not asserted as pixels: what is asserted is the
+/// handle's own maximum offset, which is the number the layout derived from the
+/// widest row.
+#[gpui_kit::test]
+async fn a_name_too_long_for_the_panel_is_scrolled_to_not_cut(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let long = "a-widget-with-a-really-long-file-name-that-does-not-fit-inside-the-panel.tsx";
+    std::fs::write(fixture.root.join(long), "x").unwrap();
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&key(""))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == long))
+    })
+    .await;
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let scroll = fixture.view.read(cx).files_scroll.clone();
+        let name = window.find(format!("file-name-{long}")).bounds();
+        let slot = window.find(format!("file-slot-{long}")).bounds();
+        assert!(
+            scroll.max_offset().x > px(0.),
+            "a name wider than the panel is reachable sideways: max {:?}",
+            scroll.max_offset().x
+        );
+        assert_eq!(
+            slot.origin.x
+                - window
+                    .find(format!("file-control:{long}"))
+                    .bounds()
+                    .origin
+                    .x,
+            px(8.),
+            "and the row still starts at the panel's own gutter"
+        );
+        assert!(
+            name.size.width > px(200.),
+            "the name is drawn whole rather than shortened to fit"
+        );
+    })
+    .unwrap();
+
+    // A tree whose names all fit scrolls nowhere: the width is the panel's.
+    std::fs::remove_file(fixture.root.join(long)).unwrap();
+    std::fs::write(fixture.root.join("short.txt"), "x").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&key(""))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == "short.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let scroll = fixture.view.read(cx).files_scroll.clone();
+        assert_eq!(
+            scroll.max_offset().x,
+            px(0.),
+            "a tree that fits does not scroll sideways"
+        );
+        let row = window.find("file-control:short.txt").bounds();
+        assert_eq!(row.size.width, px(279.), "and its row fills the panel");
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The change set is read in a panel that does not scroll sideways.
+///
+/// Legacy's rows are `max-content` and the panel scrolled to follow a long path,
+/// so the Git letter and the counts scrolled off with it and the name was only
+/// readable by scrolling after it. A row is the panel's width now: the letter
+/// and the counts keep their columns, and the name takes what is left of the row
+/// and ends in an ellipsis.
+#[gpui_kit::test]
+async fn a_change_row_fits_the_panel_and_a_long_name_gives_up_its_room(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let long = "src/components/a-widget-with-a-really-long-file-name-here.tsx";
+    std::fs::create_dir_all(fixture.root.join("src/components")).unwrap();
+    std::fs::write(fixture.root.join(long), "first\n").unwrap();
+    std::fs::write(fixture.root.join("short.txt"), "first\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add files",
+    ]);
+    std::fs::write(fixture.root.join(long), "second\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+        app.inspector_tab = InspectorTab::Changes;
+        app.request_git_status(&fixture.checkout, cx);
+        cx.notify();
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| !status.files.is_empty())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The rows are the panel's width and no wider, so nothing in the panel
+        // is reachable by scrolling sideways.
+        let panel = window.find("all-changes").bounds();
+        let group = window.find("change-group-src/components").bounds();
+        let row = window.find(format!("change-control-{long}")).bounds();
+        assert!(
+            row.right() <= panel.right(),
+            "a row is the panel's width: {row:?} runs past {panel:?}"
+        );
+        assert_eq!(
+            group.size.width, row.size.width,
+            "and the heading above it is that width too"
+        );
+        let status = window.find(format!("row-{long}-status")).bounds();
+        let name = window.find(format!("change-name-{long}")).bounds();
+        let addition = window.find(format!("row-{long}-add")).bounds();
+        assert!(
+            status.right() <= name.origin.x,
+            "the letter keeps its column"
+        );
+        assert!(name.right() <= addition.origin.x, "the counts keep theirs");
+        assert!(
+            addition.right() <= row.right(),
+            "and the counts are inside the panel: {:?}",
+            addition.right() - row.right()
+        );
+        assert!(
+            name.size.width < px(200.),
+            "a name too long for the panel is shortened to fit it: {:?}",
+            name.size.width
+        );
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 

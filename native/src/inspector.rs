@@ -16,10 +16,15 @@ use gpui_kit::{
 use muster_core::workspace::{Checkout, Repo, RepoKind};
 
 use crate::{
-    app::{ButtonA11y, InspectorTab, TerminalWindow},
+    app::{measured_width, ButtonA11y, ExternalTarget, InspectorTab, TerminalWindow},
     file_icons,
     theme::Roles,
 };
+
+/// The size the panel's own rows draw their names at.
+const ROW_TEXT_PX: f32 = 13.;
+/// The size a Git status letter is drawn at, which is its own column's size.
+const STATUS_TEXT_PX: f32 = 10.;
 
 /// The letter a Git status answers with, out of both porcelain columns.
 ///
@@ -67,6 +72,36 @@ fn row_chrome(
         })
 }
 
+/// How wide one tree row wants to be, from its indent to the far end of its columns.
+///
+/// The file tree is Legacy's `max-content`: the tree scrolls sideways, so a long
+/// name is readable rather than shortened to fit. This is that width: the gutter,
+/// the fold slot, the icon, the name, and whatever Git printed after it. The
+/// control is laid over the row and takes none of this, which is why it is not
+/// here. The change set is the other rule and does not come through here: its rows
+/// are the panel's width and shorten their names instead.
+fn row_width(
+    widths: &mut HashMap<(String, u32), f32>,
+    window: &gpui_kit::Window,
+    depth: usize,
+    name: &str,
+    status: &str,
+    additions: Option<u64>,
+    deletions: Option<u64>,
+) -> f32 {
+    let mut width = 8. + depth as f32 * 14. + 16. + 7. + 14. + 7.;
+    width += measured_width(widths, window, name, ROW_TEXT_PX);
+    if !status.is_empty() {
+        width += 7. + measured_width(widths, window, status, STATUS_TEXT_PX);
+    }
+    for (sign, count) in [('+', additions), ('-', deletions)] {
+        if let Some(count) = count {
+            width += 7. + measured_width(widths, window, &format!("{sign}{count}"), ROW_TEXT_PX);
+        }
+    }
+    width + 8.
+}
+
 /// A folder's state, drawn as a row of the tree.
 ///
 /// It carries the row's chrome and nothing else: no icon, no fold, no Git marker,
@@ -77,17 +112,19 @@ fn note_row(
     path: &str,
     message: &str,
     depth: usize,
-    repo: Repo,
-    checkout: Checkout,
+    width: gpui_kit::Pixels,
+    of: (Repo, Checkout),
     weak: gpui_kit::WeakEntity<TerminalWindow>,
     roles: Roles,
 ) -> AnyElement {
+    let (repo, checkout) = of;
     let retry_path = path.to_owned();
     row_chrome(
         div()
             .id(format!("file-note-{path}"))
             .flex()
             .items_center()
+            .min_w(width)
             .gap(px(7.))
             .h(px(26.))
             .pl(px(8. + depth as f32 * 14.))
@@ -96,9 +133,8 @@ fn note_row(
                 div()
                     .id(format!("file-note-{path}-text"))
                     .test_support()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
+                    .flex_1()
+                    .whitespace_nowrap()
                     .text_color(roles.text_muted)
                     .child(message.to_owned()),
             )
@@ -149,6 +185,48 @@ fn row_control(
         .accessibility_label(label)
         .when_some(tooltip, |button, tooltip| button.tooltip(tooltip))
         .on_click(on_click)
+        .into_any_element()
+}
+
+/// Whether a click asked for the row to be opened somewhere else instead of acted on.
+///
+/// Meta is accepted beside ctrl because this app runs on both, and on macOS the
+/// muscle memory for "open it in its own window" is cmd rather than ctrl. The
+/// toolkit's own `Modifiers::secondary_key` is the same question with the
+/// platform's answer baked in, and this is where the answer is asked.
+pub(crate) fn opens_elsewhere(event: &gpui_kit::ClickEvent) -> bool {
+    let modifiers = event.modifiers();
+    modifiers.control || modifiers.platform
+}
+
+/// The fold of a stacked folder: a transparent control over the same 16px slot
+/// the tree draws a folder's fold in, so the glyph is the tree's own and the
+/// click is the fold's.
+///
+/// The click is stopped on its way out, because the stacked row answers it
+/// too: the fold closes the folder and the row brings it into view, and one
+/// gesture cannot be both.
+fn fold_control(
+    id: impl Into<gpui_kit::ElementId>,
+    label: String,
+    left: gpui_kit::Pixels,
+    on_click: impl Fn(&mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    Button::new(id)
+        .text()
+        .rounded(px(0.))
+        .absolute()
+        .left(left)
+        .top(px((ROW_HEIGHT - 16.) / 2.))
+        .w(px(16.))
+        .h(px(16.))
+        .p_0()
+        .aria_expanded(true)
+        .accessibility_label(label)
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_click(window, cx);
+        })
         .into_any_element()
 }
 
@@ -398,9 +476,10 @@ pub(crate) fn tree_window(total: usize, top: usize) -> (Range<usize>, f32, f32) 
 ///
 /// Legacy measures the tree's own viewport and keeps eight pixels clear at the top.
 /// The tree is drawn under a tab strip and its padding, neither of which is the
-/// window's height, so this is the window's: the stack is laid inside the tree's box
-/// and clipped by it, which is what keeps a deep chain from covering the rows it
-/// names rather than this number.
+/// tree's own box, and the tree's box is what the stack is laid inside and clipped by
+/// — which is what keeps a deep chain from covering the rows it names rather than this
+/// number. The caller passes the scroller's own bounds, which is where the tree was a
+/// frame ago, the same one-frame-old reading its offset is.
 pub(crate) fn stack_room(window_height: gpui_kit::Pixels) -> usize {
     ((window_height.as_f32() - 8.).max(0.) / ROW_HEIGHT).floor() as usize
 }
@@ -411,8 +490,16 @@ pub(crate) fn stack_room(window_height: gpui_kit::Pixels) -> usize {
 /// of the stack: without it a tree deep enough to need one has no way back up. The row
 /// the folder is drawn on is its own top-level ancestor, so scrolling there leaves the
 /// whole chain below it on screen — Legacy's `index - depth`.
+///
+/// The row carries its own click and its fold carries its own, which is the part that
+/// used to be missing: a stack drawn over the rows it names had no hitbox of its own, so
+/// a click on a stacked folder's name landed on the row hidden underneath it and opened
+/// that one instead — measured on `src/nested/f12.txt`, a file scrolled off the top of
+/// the tree. Legacy's own note is the rule: the sticky rows keep their own clicks.
 fn sticky_row(
     ancestor: &Ancestor,
+    checkout: &str,
+    width: gpui_kit::Pixels,
     weak: gpui_kit::WeakEntity<TerminalWindow>,
     roles: Roles,
 ) -> AnyElement {
@@ -421,15 +508,26 @@ fn sticky_row(
     let depth = ancestor.depth;
     let index = ancestor.index;
     let indent = px(8. + depth as f32 * 14.);
+    let reveal = weak.clone();
+    let fold_checkout = checkout.to_owned();
     row_chrome(
         div()
             .id(format!("file-stack-{path}"))
             .flex()
             .items_center()
+            .min_w(width)
             .gap(px(7.))
             .h(px(ROW_HEIGHT))
             .pl(indent)
             .pr(px(8.))
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .child(Icon::new(IconName::ChevronDown)),
+            )
             .child(file_icons::element(
                 format!("file-stack-icon-{path}"),
                 &name,
@@ -441,35 +539,41 @@ fn sticky_row(
                 div()
                     .id(format!("file-stack-name-{path}"))
                     .test_support()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
+                    .flex_1()
+                    .whitespace_nowrap()
                     .text_color(roles.text)
                     .child(name.clone()),
             )
-            .child(
-                Button::new(format!("file-stack:{path}"))
-                    .text()
-                    .small()
-                    .rounded(px(0.))
-                    .h(px(22.))
-                    .label("Show in tree")
-                    .tooltip(path.clone())
-                    .accessibility_label(format!("Show {name} in tree"))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        // The folder's own top-level ancestor: scrolling there leaves the
-                        // whole chain between it and the tree's root on screen. The offset
-                        // is set outright rather than aimed at a row, because a row's index
-                        // depends on the window being drawn and this does not.
-                        // The offset counts downwards, so bringing a folder to the top
-                        // of the tree is that many pixels from it.
-                        let target = index.saturating_sub(depth) as f32 * ROW_HEIGHT;
-                        let _ = weak.update(cx, |app, _| {
-                            app.files_scroll.set_offset(point(px(0.), px(-target)));
-                        });
-                    }),
-            ),
+            .child(fold_control(
+                format!("file-stack-fold:{path}"),
+                format!("Collapse {name}"),
+                indent,
+                move |_, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.collapse_directory(&fold_checkout, &path);
+                        cx.notify();
+                    });
+                },
+            ))
+            // The row itself is the way back up, so the click is the row's and not
+            // only the name's: a folder is 16 pixels of indent wide before it says
+            // anything, and that indent is part of what is being pointed at.
+            .on_click(move |_, _, cx| {
+                // This row is drawn over the rows it names, and the ones it covers
+                // are still under the pointer: without this the same click would
+                // also be answered by the file hidden underneath it.
+                cx.stop_propagation();
+                // The folder's own top-level ancestor: scrolling there leaves the
+                // whole chain between it and the tree's root on screen. The offset
+                // is set outright rather than aimed at a row, because a row's index
+                // depends on the window being drawn and this does not.
+                // The offset counts downwards, so bringing a folder to the top
+                // of the tree is that many pixels from it.
+                let target = index.saturating_sub(depth) as f32 * ROW_HEIGHT;
+                let _ = reveal.update(cx, |app, _| {
+                    app.files_scroll.set_offset(point(px(0.), px(-target)));
+                });
+            }),
         roles,
         false,
     )
@@ -852,6 +956,93 @@ impl TerminalWindow {
         self.queue_file_diff(id, path, false, cx);
     }
 
+    /// Close a folder from the tree row or from a stacked row: the same gesture.
+    ///
+    /// A collapsed directory keeps nothing but its name, and neither does anything under
+    /// it — the subtree's listings, its pending reads and its failures all go with it.
+    /// Keeping them is what made a tree walked wide and closed again stay resident, and
+    /// come back open.
+    pub(crate) fn collapse_directory(&mut self, checkout: &str, path: &str) {
+        let key = (checkout.to_owned(), path.to_owned());
+        if self.expanded_files.remove(&key) {
+            self.forget_subtree(&key);
+        }
+    }
+
+    /// Forget everything the tree is holding for one directory and everything under it.
+    ///
+    /// `within` is what keeps a sibling like `src-tauri` out of `src`'s subtree, so this
+    /// is one pass over each collection rather than a walk of the filesystem.
+    fn forget_subtree(&mut self, key: &(String, String)) {
+        let under = |other: &(String, String)| other.0 == key.0 && within(&other.1, &key.1);
+        self.expanded_files.retain(|open| !under(open));
+        self.file_entries.retain(|entry, _| !under(entry));
+        self.file_request.retain(|entry, _| !under(entry));
+        self.file_loading.retain(|entry| !under(entry));
+        self.file_errors.retain(|entry, _| !under(entry));
+    }
+
+    /// Hand a file or a folder of this checkout to the application this machine has
+    /// for it, which is the only way a `.psd`, an `.mp4` or a `.png` opens at all.
+    ///
+    /// The path is resolved through the checkout before anything is spawned, so what
+    /// is handed over is one canonical path proved to be inside the checkout, not a
+    /// name that happened to be spelled like one. The opener's exit is read either
+    /// way, because a row that stayed where it was looks exactly like one that
+    /// opened something: the person who asked is told, or told it did not open.
+    pub(crate) fn open_externally(
+        &mut self,
+        repo: Repo,
+        checkout: Checkout,
+        path: String,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notice = ExternalTarget::File(checkout.id.clone(), path.clone());
+        self.external_notices.remove(&notice);
+        let worker = cx.background_executor().spawn(async move {
+            let resolved = muster_core::files::external_path(&repo, &checkout, &path)?;
+            muster_core::opener::open_path(&resolved)
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, _, cx| {
+                if let Err(error) = result {
+                    app.external_notices.insert(notice, error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Open a link the way [`Self::open_externally`] opens a file: handed to the
+    /// opener as one argument, refused there if it is not a web address, and its
+    /// exit read either way.
+    pub(crate) fn open_link(
+        &mut self,
+        url: String,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_notices
+            .remove(&ExternalTarget::Link(url.clone()));
+        let notice = ExternalTarget::Link(url.clone());
+        let worker = cx
+            .background_executor()
+            .spawn(async move { muster_core::opener::open_url(&url) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, |app, _, cx| {
+                if let Err(error) = result {
+                    app.external_notices.insert(notice, error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn queue_file_diff(&mut self, id: &str, path: &str, refresh: bool, cx: &mut Context<Self>) {
         let key = (id.to_owned(), path.to_owned());
         if (!refresh
@@ -1123,6 +1314,13 @@ impl TerminalWindow {
                     let id = checkout_id.clone();
                     let selected = self.open_diff.clone();
                     let weak = cx.weak_entity();
+                    // The change set is read in a panel that can be resized and
+                    // is never wider than it is drawn: a row that wanted its
+                    // whole name made the panel scroll sideways to find the rest
+                    // of it. It is the panel's width now, and the row spends it
+                    // in Legacy's column order — the letter and the counts, which
+                    // answer what Git did, keep their room, and the name takes
+                    // what is left and ends in an ellipsis.
                     let list =
                         gpui_kit::uniform_list("changes-list", rows.len(), move |range, _, _cx| {
                             range
@@ -1135,10 +1333,17 @@ impl TerminalWindow {
                                         .test_support()
                                         .flex()
                                         .items_center()
+                                        .w_full()
                                         .h(px(26.))
                                         .px(px(8.))
                                         .text_color(roles.text_muted)
-                                        .child(div().min_w_0().truncate().child(directory.clone()))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(directory.clone()),
+                                        )
                                         .into_any_element(),
                                     ChangeRow::File(file) => {
                                         let path = file.path.clone();
@@ -1162,6 +1367,7 @@ impl TerminalWindow {
                                                 .flex()
                                                 .items_center()
                                                 .relative()
+                                                .w_full()
                                                 .h(px(26.))
                                                 .gap(px(7.))
                                                 // One level in from the heading
@@ -1181,6 +1387,11 @@ impl TerminalWindow {
                                                         .id(format!("change-name-{path}"))
                                                         .test_support()
                                                         .flex_1()
+                                                        // `flex_1` alone will not shrink
+                                                        // past a name's own width: the
+                                                        // row would push its counts off
+                                                        // the panel rather than shorten
+                                                        // the name.
                                                         .min_w_0()
                                                         .truncate()
                                                         .text_color(if selected {
@@ -1301,6 +1512,42 @@ impl TerminalWindow {
             &mut rows,
         );
         let total = rows.len();
+        // How wide the tree is: the panel, or the widest row in it. Legacy's rows
+        // are `max-content` and the tree scrolls sideways, so a name is readable
+        // rather than shortened to fit a panel that can be resized anyway — which
+        // is the only reason a deep tree loses its tail today.
+        let content_width = rows
+            .iter()
+            .map(|row| match row {
+                TreeRow::Entry { entry, depth, .. } => {
+                    let (status, added, removed) = statuses
+                        .get(&entry.path)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), None, None));
+                    row_width(
+                        &mut self.measured_widths,
+                        window,
+                        *depth,
+                        &entry.name,
+                        file_marker(&status),
+                        added,
+                        removed,
+                    )
+                }
+                TreeRow::Note { message, depth, .. } => row_width(
+                    &mut self.measured_widths,
+                    window,
+                    *depth,
+                    message,
+                    "",
+                    None,
+                    None,
+                ),
+            })
+            // No floor at the panel's width: a row shorter than the panel is
+            // stretched to it by the layout, so a tree that fits scrolls nowhere
+            // without this having to know how wide the panel is inside its border.
+            .fold(0., f32::max);
         let weak = cx.weak_entity();
         let stack_weak = weak.clone();
         let repo_for = repo.clone();
@@ -1314,7 +1561,10 @@ impl TerminalWindow {
         // waiting for the layout would mean drawing the tree twice.
         let scrolled = -scroll.offset().y;
         let top_row = (scrolled.as_f32() / ROW_HEIGHT).floor().max(0.) as usize;
-        let stacked = sticky_ancestors(&rows, top_row, stack_room(window.viewport_size().height));
+        // The stack is laid inside the tree's box and clipped by it, so what it may cover
+        // is that box's height: the window's is taller, and a stack sized to it hides
+        // more of the tree than it has room for.
+        let stacked = sticky_ancestors(&rows, top_row, stack_room(scroll.bounds().size.height));
         let (drawn, above, below) = tree_window(total, top_row);
         let list = div()
             .id("files-tree")
@@ -1322,7 +1572,7 @@ impl TerminalWindow {
             .min_h_0()
             .flex()
             .flex_col()
-            .overflow_y_scroll()
+            .overflow_scroll()
             .track_scroll(&scroll)
             .child(div().flex_none().h(px(above)))
             .children(drawn.map(|index| {
@@ -1337,8 +1587,8 @@ impl TerminalWindow {
                         &path,
                         &message,
                         depth,
-                        repo_for.clone(),
-                        checkout_for.clone(),
+                        px(content_width),
+                        (repo_for.clone(), checkout_for.clone()),
                         weak.clone(),
                         roles,
                     ),
@@ -1365,6 +1615,7 @@ impl TerminalWindow {
                                 .flex()
                                 .items_center()
                                 .relative()
+                                .min_w(px(content_width))
                                 .h(px(26.))
                                 .gap(px(7.))
                                 .pl(px(8. + depth as f32 * 14.))
@@ -1399,9 +1650,8 @@ impl TerminalWindow {
                                     div()
                                         .id(format!("file-name-{path}"))
                                         .test_support()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
+                                        .flex_1()
+                                        .whitespace_nowrap()
                                         .text_color(if selected || directory {
                                             roles.text
                                         } else {
@@ -1425,30 +1675,28 @@ impl TerminalWindow {
                                     Some(path.clone()),
                                     selected,
                                     directory.then_some(open),
-                                    move |_, window, cx| {
+                                    move |event, window, cx| {
                                         let _ = weak.update(cx, |app, cx| {
+                                            // Ctrl on Linux and Windows, cmd on
+                                            // macOS: the modifier that means "open
+                                            // this somewhere else". It is the row's
+                                            // only other answer, and it never is both
+                                            // at once — a row that opened somewhere
+                                            // else and also changed this view would
+                                            // be answering a gesture nobody asked.
+                                            if opens_elsewhere(event) {
+                                                app.open_externally(
+                                                    repo.clone(),
+                                                    checkout.clone(),
+                                                    path.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                return;
+                                            }
                                             if directory {
                                                 let key = (checkout.id.clone(), path.clone());
-                                                if app.expanded_files.remove(&key) {
-                                                    // A collapsed directory keeps nothing
-                                                    // but its name, and neither does anything
-                                                    // under it: the subtree's listings, its
-                                                    // pending reads and its failures all go
-                                                    // with it. Keeping them is what made a
-                                                    // tree walked wide and closed again stay
-                                                    // resident, and come back open.
-                                                    let under = |other: &(String, String)| {
-                                                        other.0 == key.0 && within(&other.1, &key.1)
-                                                    };
-                                                    app.expanded_files.retain(|open| !under(open));
-                                                    app.file_entries
-                                                        .retain(|entry, _| !under(entry));
-                                                    app.file_request
-                                                        .retain(|entry, _| !under(entry));
-                                                    app.file_loading.retain(|entry| !under(entry));
-                                                    app.file_errors
-                                                        .retain(|entry, _| !under(entry));
-                                                } else {
+                                                if !app.expanded_files.remove(&key) {
                                                     app.expanded_files.insert(key.clone());
                                                     if !app.file_entries.contains_key(&key)
                                                         && !app.file_loading.contains(&key)
@@ -1461,6 +1709,8 @@ impl TerminalWindow {
                                                             cx,
                                                         );
                                                     }
+                                                } else {
+                                                    app.forget_subtree(&key);
                                                 }
                                             } else {
                                                 app.selected_file
@@ -1492,7 +1742,15 @@ impl TerminalWindow {
         // box buys here: the tree's geometry does not move when the stack appears.
         let stacked_for = stacked
             .iter()
-            .map(|ancestor| sticky_row(ancestor, stack_weak.clone(), roles))
+            .map(|ancestor| {
+                sticky_row(
+                    ancestor,
+                    &checkout_for.id,
+                    px(content_width),
+                    stack_weak.clone(),
+                    roles,
+                )
+            })
             .collect::<Vec<_>>();
         let has_stack = !stacked.is_empty();
         body = body.child(
@@ -1566,6 +1824,42 @@ impl TerminalWindow {
             && !self.file_errors.contains_key(&root)
         {
             body = body.child(div().px_3().child("No files"));
+        }
+        // What the opener said about a file of *this* checkout that would not
+        // open. It is drawn under the tree for the same reason the root's own
+        // failure is: a row that stayed where it was looks exactly like one that
+        // opened something, so the refusal is stated where the gesture was made.
+        for (target, error) in &self.external_notices {
+            let ExternalTarget::File(checkout, path) = target else {
+                continue;
+            };
+            if checkout != &checkout_id {
+                continue;
+            }
+            let message = error.clone();
+            let dismiss = target.clone();
+            body = body.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_color(roles.status.warning)
+                    .child(div().min_w_0().truncate().child(message))
+                    .child(
+                        Button::new(format!("dismiss-external-{path}"))
+                            .text()
+                            .small()
+                            .rounded(px(0.))
+                            .label("Dismiss")
+                            .accessibility_label("Dismiss the message about this file")
+                            .on_click(cx.listener(move |app, _, _, _| {
+                                app.external_notices.remove(&dismiss);
+                            })),
+                    ),
+            );
         }
         panel.child(body).into_any_element()
     }

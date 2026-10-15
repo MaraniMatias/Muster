@@ -446,6 +446,80 @@ fn a_drag_in_the_real_window_selects_text_and_copies_it(cx: &mut TestAppContext)
     let _ = session.close().wait();
 }
 
+/// A file's header row is its collapse control, the way the chevron beside it is.
+///
+/// The pointer is placed on the path, which is the part of the row that is not a
+/// control, so the gesture has to be the row's own. Clicking opens the file's
+/// diff — the line it holds is on screen and the window has asked Git for it —
+/// and clicking again closes it and forgets the read, which is what closing a
+/// file means everywhere else in the change set.
+#[gpui_kit::test]
+fn the_whole_diff_header_row_opens_and_closes_its_file(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use std::process::Command;
+
+    let fixture = open_git(cx);
+    let tracked = fixture.root.join("main.rs");
+    std::fs::write(&tracked, "fn main() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "main.rs"]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add a file",
+    ]);
+    std::fs::write(&tracked, "fn main() {\n    let x = 1;\n}\n").unwrap();
+
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let key = (fixture.checkout.clone(), "main.rs".to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-main.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let opened = fixture.view.read_with(cx, |app, _| {
+        app.expanded_diffs.contains(&key) && app.git_diff.contains_key(&key)
+    });
+    assert!(opened, "a click on the row reads the file's diff");
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("diff-file-main.rs").visible(),
+            "the row is still there once it is open"
+        );
+        window.click("diff-file-main.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let closed = fixture
+        .view
+        .read_with(cx, |app, _| !app.expanded_diffs.contains(&key));
+    assert!(closed, "clicking the open row closes it again");
+    close(&fixture, cx);
+}
+
 /// A diff's file header is Legacy's row: the letter that says what Git did,
 /// then the path, then the counts, on one line.
 ///
@@ -511,6 +585,173 @@ fn a_diff_header_names_the_file_the_way_legacy_orders_its_columns(cx: &mut TestA
         assert!(
             letter.right() < path.right(),
             "the path is the row's long half and keeps its room"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The diff pane is the pane's width, and its header is a row in it.
+///
+/// The toolkit lays a diff out at its longest line and scrolls sideways to reach
+/// the rest, which takes the header with it: the letter, the path and the counts
+/// are the answer to "what changed", and they leave with the code they name. A
+/// line that wraps costs a wrapped row instead, and the header keeps its
+/// columns — the path shortened to the room between the letter and the counts.
+#[gpui_kit::test]
+fn a_long_diff_line_leaves_the_header_in_the_pane(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use std::process::Command;
+
+    let fixture = open_git(cx);
+    let path = format!(
+        "src/{}a-file-with-a-really-long-name-here.rs",
+        "a-directory-with-a-long-name/".repeat(3)
+    );
+    let long_line = format!("fn main() {{ let a = \"{}\"; }}\n", "x".repeat(400));
+    std::fs::create_dir_all(fixture.root.join(&path).parent().unwrap()).unwrap();
+    std::fs::write(fixture.root.join(&path), "fn main() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add a file",
+    ]);
+    std::fs::write(fixture.root.join(&path), long_line).unwrap();
+
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // The file is opened, because a collapsed file draws its header and nothing
+    // else: the line that makes the pane wide has to be on screen for the pane
+    // to be measured against it.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click(format!("diff-file-{path}"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        fixture.view.read_with(cx, |app, _| app
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), path.clone()))),
+        "the click read the file's diff"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..4 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, _| {
+        let row = window.find(format!("diff-file-{path}")).bounds();
+        // The pane's own edge: its title row wears 12 pixels of padding, so the
+        // close button's right edge plus that padding is where the pane ends.
+        let pane = window.find("close-diff").bounds().right() + px(12.);
+        assert!(
+            row.right() <= pane,
+            "a header row is the pane's width: {row:?} runs past {pane}"
+        );
+        let name = window.find(format!("diff-path-{path}")).bounds();
+        let whole = crate::app::measured_width(
+            &mut std::collections::HashMap::new(),
+            window,
+            &path,
+            crate::diff::DIFF_CHROME_PX,
+        );
+        assert!(
+            name.size.width < px(whole),
+            "and a path too long for it is shortened to fit: {} of {whole}",
+            name.size.width
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A notice is read where the change is, so it is read at the size of the code.
+///
+/// The toolkit's diff refines its own root down to the chrome size, so a notice
+/// that names no size of its own is drawn smaller than the code it stands in
+/// for — which is the opposite of what a sentence about a change should do in a
+/// pane full of 16px code. Both boxes are read off drawn rectangles in one
+/// window: the notice, and the header's path, which is the chrome size on
+/// purpose.
+#[gpui_kit::test]
+fn a_diff_notice_reads_at_the_size_of_the_code(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use std::process::Command;
+
+    let fixture = open_git(cx);
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "main.rs"]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add a file",
+    ]);
+    // A symlink is a change with no text in it, so it opens as a notice.
+    std::os::unix::fs::symlink("main.rs", fixture.root.join("link.rs")).unwrap();
+
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("diff-file-link.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let notice = window.find("diff-notice-text-link.rs").bounds();
+        let path = window.find("diff-path-link.rs").bounds();
+        assert!(
+            notice.size.height > path.size.height,
+            "the notice reads at the code's size rather than the chrome's: \
+             {} against {}",
+            notice.size.height,
+            path.size.height
         );
     })
     .unwrap();

@@ -58,6 +58,13 @@ pub struct FileDiff {
     pub hunks: Vec<DiffHunk>,
     pub total_lines: usize,
     pub is_binary: bool,
+    /// The image this file is, when its bytes say so.
+    ///
+    /// A binary diff carries no text, so the only way to say *what* changed rather
+    /// than that something did is to look at the bytes Git refused to print. The
+    /// file has already been copied into the private snapshot this diff reads, so
+    /// the answer costs a header's worth of reading and nothing else.
+    pub image: Option<ImageFormat>,
     /// A large, complete patch requiring virtualized presentation, not a refusal.
     pub large: bool,
     /// Refused outright: over a line, hunk, line-length or output cap. A refusal is an
@@ -65,6 +72,62 @@ pub struct FileDiff {
     pub too_large: bool,
     /// The link this file is, for a diff that has no text on either side.
     pub symlink_target: Option<String>,
+}
+
+/// An image format, named as the reader would name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+    Bmp,
+    Ico,
+}
+
+impl ImageFormat {
+    /// The format's own name, lower case and without a dot.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Gif => "gif",
+            Self::WebP => "webp",
+            Self::Bmp => "bmp",
+            Self::Ico => "ico",
+        }
+    }
+}
+
+/// What the first bytes of a changed file say it is, if they say anything.
+///
+/// The bytes decide, not the name: a `.png` that is a Git LFS pointer is text and a
+/// file called `logo` that starts with the PNG signature is a picture. A file that is no
+/// longer there has no bytes to ask, so its name is the only answer there is — and it is
+/// only believed when it is one of the signatures it is naming.
+fn image_format(bytes: &[u8], path: &str) -> Option<ImageFormat> {
+    let by_bytes = || match bytes {
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] => Some(ImageFormat::Png),
+        [0xff, 0xd8, 0xff, ..] => Some(ImageFormat::Jpeg),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some(ImageFormat::Gif),
+        [b'R', b'I', b'F', b'F', .., b'W', b'E', b'B', b'P'] => Some(ImageFormat::WebP),
+        [b'B', b'M', ..] => Some(ImageFormat::Bmp),
+        [0x00, 0x00, 0x01, 0x00, ..] => Some(ImageFormat::Ico),
+        _ => None,
+    };
+    if by_bytes().is_some() {
+        return by_bytes();
+    }
+    let name = path.rsplit('.').next()?.to_ascii_lowercase();
+    match name.as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "webp" => Some(ImageFormat::WebP),
+        "bmp" => Some(ImageFormat::Bmp),
+        "ico" => Some(ImageFormat::Ico),
+        _ => None,
+    }
 }
 
 /// Threshold for large-patch metadata. The native viewer virtualizes complete
@@ -161,6 +224,7 @@ pub(super) fn file_diff_before_git(
         .prefix("muster-diff-")
         .tempdir()
         .map_err(|error| format!("could not create diff snapshot: {error}"))?;
+    let mut header_bytes = Vec::new();
     match snapshot_file(&root, &relative, snapshot.path(), within)? {
         Snapshot::TooLarge => return Ok(too_large(path)),
         Snapshot::Link(target) => {
@@ -171,6 +235,7 @@ pub(super) fn file_diff_before_git(
                 hunks: Vec::new(),
                 total_lines: 0,
                 is_binary: false,
+                image: None,
                 large: false,
                 too_large: false,
                 symlink_target: Some(target),
@@ -179,7 +244,13 @@ pub(super) fn file_diff_before_git(
         Snapshot::Missing if changed.status == "??" => {
             return Err("changed file disappeared while opening it".into())
         }
-        Snapshot::Missing | Snapshot::File => {}
+        Snapshot::Missing => {}
+        Snapshot::File(header) => {
+            // Git is about to be asked for a diff of this file and will refuse to
+            // print one, because its bytes are not text. Reading the header it is
+            // about to refuse is what lets the reader be told *what* changed.
+            header_bytes = header;
+        }
     }
     let untracked = changed.status == "??";
     // Keep the real repository/index for tracked comparisons, but never let Git
@@ -224,11 +295,15 @@ pub(super) fn file_diff_before_git(
     if !(output.status.success() || untracked && output.status.code() == Some(1)) {
         return Err(git_error("Git could not diff this file", &output));
     }
-    scan(path.to_owned(), &output.stdout)
+    let mut diff = scan(path.to_owned(), &output.stdout)?;
+    diff.image = image_format(&header_bytes, path);
+    Ok(diff)
 }
 
 enum Snapshot {
-    File,
+    /// The file, and the first bytes of it: enough to say what it is to a reader
+    /// who is about to be told there is no text diff of it.
+    File(Vec<u8>),
     Missing,
     Link(String),
     TooLarge,
@@ -297,6 +372,7 @@ fn snapshot_file(
         .open(&target)
         .map_err(|e| e.to_string())?;
     let mut total = 0;
+    let mut header = Vec::with_capacity(HEADER_BYTES);
     let mut block = [0; 64 * 1024];
     loop {
         within.remaining()?;
@@ -305,6 +381,14 @@ fn snapshot_file(
         if total > MAX_DIFF_BYTES {
             return Ok(Snapshot::TooLarge);
         }
+        if header.len() < HEADER_BYTES {
+            let take = block[..count]
+                .iter()
+                .take(HEADER_BYTES - header.len())
+                .copied()
+                .collect::<Vec<u8>>();
+            header.extend_from_slice(&take);
+        }
         if count == 0 {
             break;
         }
@@ -312,8 +396,14 @@ fn snapshot_file(
     }
     copy.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))
         .map_err(|e| e.to_string())?;
-    Ok(Snapshot::File)
+    Ok(Snapshot::File(header))
 }
+
+/// How much of a changed file is read to answer "what is this".
+///
+/// Every signature [`image_format`] knows is longer than a signature and shorter
+/// than this, so the question is answered by a header rather than by a file.
+const HEADER_BYTES: usize = 16;
 
 /// A path Git is told about, spelled so Git cannot read it as a pattern.
 ///
@@ -353,6 +443,7 @@ fn too_large(path: &str) -> FileDiff {
         hunks: Vec::new(),
         total_lines: 0,
         is_binary: false,
+        image: None,
         large: false,
         too_large: true,
         symlink_target: None,
@@ -633,6 +724,7 @@ pub(crate) fn scan(path: String, bytes: &[u8]) -> Result<FileDiff, String> {
             hunks,
             total_lines: 0,
             is_binary: false,
+            image: None,
             large: false,
             too_large: true,
             symlink_target: None,
@@ -686,6 +778,7 @@ pub(crate) fn scan(path: String, bytes: &[u8]) -> Result<FileDiff, String> {
         },
         total_lines,
         is_binary,
+        image: None,
         large,
         too_large,
         symlink_target: None,

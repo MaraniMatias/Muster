@@ -53,7 +53,7 @@ use worktrees::*;
 pub(crate) use changes::contained_existing_ancestor;
 #[cfg(test)]
 pub(crate) use changes::scan;
-pub use changes::{file_diff, status, ChangedFile, DiffHunk, FileDiff, GitStatus};
+pub use changes::{file_diff, status, ChangedFile, DiffHunk, FileDiff, GitStatus, ImageFormat};
 pub use diffs::{diff_totals, diff_totals_for_checkout, DiffTotals};
 pub use discovery::{open_directory, open_directory_with_budget, OpenedDirectory};
 pub use git::GitReadBudget;

@@ -420,6 +420,42 @@ pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<File
     })
 }
 
+/// The absolute path of something inside a checkout, proved to be there.
+///
+/// This is the whole of the chain that decides what may be handed to another
+/// program, and it is the same one a preview reads through: the checkout has to
+/// be the one this workspace registered, the name has to be relative and inside
+/// it, and the last component has to still be a file or a directory under a walk
+/// that refuses a link at every step. A symlink is refused rather than resolved,
+/// which is stricter than resolving-and-checking and is the rule this module
+/// already keeps: following a link is how a checkout-relative path reaches
+/// outside the checkout without ever naming `..`.
+///
+/// What comes out is a path an application can be handed. It is not a promise
+/// about what that application does with it; this is the last place that has a
+/// say, and it has said yes to exactly this path in this checkout.
+pub fn external_path(repo: &Repo, checkout: &Checkout, path: &str) -> Result<PathBuf, String> {
+    let root = root(repo, checkout)?;
+    let relative = relative(path)?;
+    let name = match relative.file_name() {
+        Some(name) => name,
+        // The root itself, and the empty name that spells it: a folder is
+        // something to open as well as something to walk into.
+        None => return Ok(root),
+    };
+    let root_handle = open_root(&root).map_err(|error| error.to_string())?;
+    let parent = open_directory(&root_handle, relative.parent().unwrap_or(Path::new("")))
+        .map_err(|error| error.to_string())?;
+    let name = name_of(name).map_err(|error| error.to_string())?;
+    match entry_kind(&parent, &name)? {
+        // Asked through the directory handle and without following it, so an
+        // entry exchanged for a link between the walk and this question is seen
+        // as the link it is rather than as whatever it points at.
+        Some(_) => Ok(root.join(relative)),
+        None => Err(format!("{path} is not a file or a folder here")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +784,88 @@ mod tests {
             read_preview(&repo, &checkout, "hello.txt").unwrap().text,
             "hello"
         );
+    }
+
+    /// What may be handed to another program is decided before anything is
+    /// spawned, and the answer is one path: the canonical one, still inside this
+    /// checkout, or a refusal.
+    #[test]
+    fn an_external_path_is_the_canonical_one_inside_the_checkout() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/notes.txt"), "x").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let root = Path::new(&checkout.canonical_path).canonicalize().unwrap();
+
+        assert_eq!(
+            external_path(&repo, &checkout, "docs/notes.txt").expect("a file inside it"),
+            root.join("docs/notes.txt")
+        );
+        // A folder is a thing to open too, and so is the checkout itself.
+        assert_eq!(
+            external_path(&repo, &checkout, "docs").expect("a folder inside it"),
+            root.join("docs")
+        );
+        assert_eq!(
+            external_path(&repo, &checkout, "").expect("the root itself"),
+            root
+        );
+
+        // Every refusal the browser already makes, made here too: this is the
+        // step that decides, so it cannot lean on the opener.
+        assert!(
+            external_path(&repo, &checkout, "../secrets").is_err(),
+            "a path that climbs out is not handed over"
+        );
+        assert!(
+            external_path(&repo, &checkout, "/etc/passwd").is_err(),
+            "an absolute path is not a name inside this checkout"
+        );
+        assert!(
+            external_path(&repo, &checkout, ".git/config").is_err(),
+            "the object store is not browsable and is not openable either"
+        );
+        assert!(
+            external_path(&repo, &checkout, "docs/missing.txt").is_err(),
+            "a file that is not there is not handed over"
+        );
+
+        // A link is refused rather than resolved: following it is how a
+        // checkout-relative path reaches outside the checkout without a `..`.
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "x").unwrap();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+        assert!(
+            external_path(&repo, &checkout, "escape/secret.txt").is_err(),
+            "a link out of the checkout is not followed"
+        );
+
+        // And a checkout that is not the registered one is refused before any of
+        // that is asked.
+        let mut forged = checkout.clone();
+        forged.path = outside.path().display().to_string();
+        forged.canonical_path = forged.path.clone();
+        forged.id = checkout_id_for_path(&forged.canonical_path);
+        assert!(external_path(&repo, &forged, "secret.txt").is_err());
+    }
+
+    /// A FIFO is not a file to hand a desktop application: opening one would
+    /// park forever, and a refusal is a better answer than a hung window.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_not_something_to_open() {
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = unsafe {
+            libc::mkfifo(
+                std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                    .expect("a path with no NUL")
+                    .as_ptr(),
+                0o600,
+            )
+        };
+        assert_eq!(made, 0, "a FIFO to refuse");
+        let (repo, checkout) = checkout_of(&dir);
+        assert!(external_path(&repo, &checkout, "pipe").is_err());
     }
 }

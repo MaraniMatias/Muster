@@ -10,7 +10,7 @@ use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Styled, Subscription, TestSupportExt,
+    ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
 
 pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
@@ -20,8 +20,11 @@ pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 ///
 /// The toolkit draws that header at `text_sm()`, and the code below refines
 /// over it, so this is the one place the size and the face are named. The code
-/// rows and the `@@` band keep the sizes they set for themselves.
-const DIFF_CHROME_PX: f32 = 11.;
+/// rows keep the size they set for themselves, and so does a notice, which is
+/// prose about the change and reads at the code's own size rather than at the
+/// chrome's. The `@@` band is the one thing here this crate cannot reach: the
+/// toolkit sets it at `text_xs()` with no prop and no theme field behind it.
+pub(crate) const DIFF_CHROME_PX: f32 = 11.;
 
 /// One parsed viewer: individual files and All changes share the same scroll,
 /// source-coordinate, selection, folding and highlighting implementation.
@@ -34,12 +37,78 @@ pub(crate) struct DiffView {
     _events: Subscription,
 }
 
+/// What a change with no text to show says about itself.
+///
+/// "Binary file" is a fact about the encoding and nothing about the change: a
+/// picture that was added, a picture that went away and a picture that was
+/// replaced are three different things to somebody reviewing a branch. The format
+/// comes from the bytes the diff refused to print and the direction from the
+/// letter Git already put on the row, so the sentence names the change rather
+/// than the encoding. A file that is not an image keeps saying what it is.
+fn binary_notice(image: Option<muster_core::navigation::ImageFormat>, status: &str) -> String {
+    let Some(format) = image else {
+        return "Binary file; text diff is unavailable.".into();
+    };
+    match status.chars().next() {
+        Some('?') | Some('A') => format!("Image added · {}.", format.name()),
+        Some('D') => format!("Image removed · {}.", format.name()),
+        _ => format!("Image changed · {}.", format.name()),
+    }
+}
+
+impl TerminalWindow {
+    /// The Git status letter for one file of one checkout, or an empty string.
+    ///
+    /// The letter is already on the row and in the change list, so a notice that
+    /// names a change reads the same one rather than asking Git again.
+    fn git_status_status(&self, checkout: &str, path: &str) -> String {
+        self.git_status
+            .get(checkout)
+            .and_then(|status| status.files.iter().find(|file| file.path == path))
+            .map(|file| file.status.clone())
+            .unwrap_or_default()
+    }
+}
+
 fn placeholder(path: &str) -> DiffFile {
     let old = serde_json::to_string(&format!("a/{path}")).expect("a filename is JSON text");
     let new = serde_json::to_string(&format!("b/{path}")).expect("a filename is JSON text");
     DiffFile::parse(&format!("diff --git {old} {new}\n"))
         .expect("quoted file header")
         .remove(0)
+}
+
+/// The gesture a file's header row carries: open the file's diff, or close it.
+///
+/// The toolkit's `Diff` answers a click on its chevron with
+/// `toggle_file_collapsed`, which is private to the crate and emits the event
+/// the window listens for. A row of the window's own therefore folds or unfolds
+/// the same state itself and then says so, so both answers are one transition
+/// rather than two.
+struct ToggleDiffFile {
+    state: Entity<DiffState>,
+    weak: gpui_kit::WeakEntity<TerminalWindow>,
+    checkout: String,
+    path: String,
+}
+
+impl ToggleDiffFile {
+    fn apply(&self, cx: &mut gpui_kit::App) {
+        // The chevron's own gesture: whatever the file is now, the click makes
+        // it the other thing.
+        let opening = self.state.read(cx).is_file_collapsed(&self.path);
+        self.state.update(cx, |state, cx| {
+            state.set_file_collapsed(&self.path, !opening, cx)
+        });
+        let _ = self.weak.update(cx, |app, cx| {
+            if opening {
+                app.expand_diff_file(&self.checkout, &self.path, cx);
+            } else {
+                app.collapse_diff_file(&self.checkout, &self.path);
+            }
+            cx.notify();
+        });
+    }
 }
 
 impl TerminalWindow {
@@ -95,6 +164,30 @@ impl TerminalWindow {
             self.request_git_status(checkout, cx);
         }
         cx.notify();
+    }
+
+    /// A file in the change set is opened: ask Git for its diff and remember
+    /// that it is open.
+    ///
+    /// The diff's own chevron and a click anywhere on the file's header row are
+    /// the same gesture on different pixels, so they share this rather than
+    /// keeping one state transition each. A single file's diff is already read
+    /// before it is drawn, so this is the change set's path.
+    pub(crate) fn expand_diff_file(&mut self, checkout: &str, path: &str, cx: &mut Context<Self>) {
+        self.expanded_diffs
+            .insert((checkout.to_owned(), path.to_owned()));
+        self.request_file_diff(checkout, path, cx);
+    }
+
+    /// A file in the change set is closed again, which forgets its diff and the
+    /// queue slot that was reading it.
+    pub(crate) fn collapse_diff_file(&mut self, checkout: &str, path: &str) {
+        let key = (checkout.to_owned(), path.to_owned());
+        self.expanded_diffs.remove(&key);
+        self.diff_queue.forget(&key);
+        self.git_diff_request.remove(&key);
+        self.git_diff.remove(&key);
+        self.git_diff_errors.remove(&key);
     }
 
     pub(crate) fn prune_diff_cache(&mut self) {
@@ -166,7 +259,10 @@ impl TerminalWindow {
                 } else if let Some(target) = &diff.symlink_target {
                     Some(format!("Symlink target: {target}"))
                 } else if diff.is_binary {
-                    Some("Binary file; text diff is unavailable.".into())
+                    Some(binary_notice(
+                        diff.image,
+                        &self.git_status_status(checkout, path),
+                    ))
                 } else if diff.patch.is_empty() {
                     Some("No net text changes against the default branch.".into())
                 } else {
@@ -253,18 +349,8 @@ impl TerminalWindow {
                         return;
                     }
                     match event {
-                        DiffEvent::FileExpanded(path) => {
-                            app.expanded_diffs.insert((id.clone(), path.to_string()));
-                            app.request_file_diff(&id, path, cx);
-                        }
-                        DiffEvent::FileCollapsed(path) => {
-                            let key = (id.clone(), path.to_string());
-                            app.expanded_diffs.remove(&key);
-                            app.diff_queue.forget(&key);
-                            app.git_diff_request.remove(&key);
-                            app.git_diff.remove(&key);
-                            app.git_diff_errors.remove(&key);
-                        }
+                        DiffEvent::FileExpanded(path) => app.expand_diff_file(&id, path, cx),
+                        DiffEvent::FileCollapsed(path) => app.collapse_diff_file(&id, path),
                         _ => {}
                     }
                     cx.notify();
@@ -307,11 +393,17 @@ impl TerminalWindow {
             }
         });
         let weak = cx.weak_entity();
+        // Each header row and each notice row carries its own click target, so
+        // the window is reached through one clone each.
+        let header_weak = weak.clone();
         let annotations = notices
             .keys()
             .map(|path| DiffAnnotation::file(format!("diff-notice-{path}"), path.clone()))
             .collect::<Vec<_>>();
         let id = checkout.clone();
+        // The header row answers for the diff's own chevron, so it needs the
+        // checkout the change set belongs to as well as the file.
+        let header_id = checkout.clone();
         let stats = self
             .git_status
             .get(checkout)
@@ -330,6 +422,11 @@ impl TerminalWindow {
             .unwrap_or_default();
         let viewer = Diff::new(&state)
             .header_visible(selected.is_none())
+            // The pane is as wide as the pane, and no wider: a long line wraps
+            // rather than dragging a sideways scroller under the code, so the
+            // header row stays where it is — the letter, the path and the counts
+            // answer what changed without scrolling after them.
+            .soft_wrap(true)
             .font_family(SIDEBAR_FONT_FAMILY)
             .text_size(px(DIFF_CHROME_PX))
             .render_header(move |file, _, _| {
@@ -338,9 +435,25 @@ impl TerminalWindow {
                 // Legacy's column order: the letter that says what Git did,
                 // then the path, then the counts.
                 let marker = crate::inspector::change_marker(&status);
+                let path = file.path().to_string();
+                let toggle = ToggleDiffFile {
+                    state: state.clone(),
+                    weak: header_weak.clone(),
+                    checkout: header_id.clone(),
+                    path: path.clone(),
+                };
                 div()
+                    .id(format!("diff-file-{path}"))
+                    .test_support()
+                    // The row is the file's collapse control, the way the
+                    // chevron beside it is: one gesture and one meaning, on
+                    // every pixel of the row rather than on sixteen of them.
+                    .w_full()
+                    .flex_1()
                     .flex()
                     .items_center()
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| toggle.apply(cx))
                     .min_w_0()
                     .gap(px(6.))
                     .when(!marker.is_empty(), |row| {
@@ -391,11 +504,18 @@ impl TerminalWindow {
             .render_annotation(move |annotation, _, _| {
                 let path = annotation.path().to_string();
                 let (message, retry) = notices.get(&path).cloned().unwrap_or_default();
-                let mut row = div()
-                    .px_3()
-                    .py_2()
-                    .text_color(roles.text_muted)
-                    .child(message);
+                let mut row = div().px_3().py_2().child(
+                    div()
+                        .id(format!("diff-notice-text-{path}"))
+                        .test_support()
+                        // The notice is prose, but it is read where the change
+                        // is, and the diff refines its own root down to the
+                        // chrome size: a notice naming no size of its own is the
+                        // smallest letter in the window.
+                        .text_size(px(f32::from(crate::terminal::FONT_SIZE)))
+                        .text_color(roles.text_muted)
+                        .child(message),
+                );
                 if retry {
                     let weak = weak.clone();
                     let id = id.clone();
@@ -496,5 +616,39 @@ impl TerminalWindow {
                 .child(div().flex_1().min_h_0().child(body))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binary_notice;
+    use muster_core::navigation::ImageFormat;
+
+    /// A change with no text names the change, and the letter Git already put on
+    /// the row is what says which change it is.
+    #[test]
+    fn a_change_with_no_text_says_which_one_it_is() {
+        assert_eq!(
+            binary_notice(Some(ImageFormat::Png), "??"),
+            "Image added · png."
+        );
+        assert_eq!(
+            binary_notice(Some(ImageFormat::Png), "A"),
+            "Image added · png."
+        );
+        assert_eq!(
+            binary_notice(Some(ImageFormat::Jpeg), "D"),
+            "Image removed · jpeg."
+        );
+        assert_eq!(
+            binary_notice(Some(ImageFormat::WebP), "M"),
+            "Image changed · webp."
+        );
+        // Not a picture: the notice keeps saying what it is, because that is the
+        // only thing it knows.
+        assert_eq!(
+            binary_notice(None, "M"),
+            "Binary file; text diff is unavailable."
+        );
     }
 }

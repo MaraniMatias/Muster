@@ -34,3 +34,6 @@ pub mod navigation;
 
 /// Safe, bounded read-only checkout file listing and previews.
 pub mod files;
+
+/// Hands a file or a link to the application this machine has for it.
+pub mod opener;

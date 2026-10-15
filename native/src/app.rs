@@ -93,6 +93,27 @@ pub(crate) fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui
         .width()
 }
 
+/// The width a piece of text is at a size, remembered.
+///
+/// A panel that scrolls sideways has to know how wide its rows want to be, and it
+/// asks every frame it draws. A name does not change between frames, so it is
+/// measured once and read ever after: the key is the text and the size, because
+/// those are what the width is a function of.
+pub(crate) fn measured_width(
+    widths: &mut HashMap<(String, u32), f32>,
+    window: &Window,
+    text: &str,
+    size: f32,
+) -> f32 {
+    let key = (text.to_owned(), size.to_bits());
+    if let Some(width) = widths.get(&key) {
+        return *width;
+    }
+    let width = sidebar_text_width(window, text, size).as_f32();
+    widths.insert(key, width);
+    width
+}
+
 /// Keep the identifying tail of a namespaced branch or session title.
 pub(crate) fn fitted_name(window: &Window, name: &str, room: f32, size: f32) -> String {
     if sidebar_text_width(window, name, size).as_f32() <= room {
@@ -380,6 +401,18 @@ pub(crate) enum InspectorTab {
     Changes,
 }
 
+/// What an opening was asked for: a file or a folder of a checkout, or a link a
+/// document named.
+///
+/// The two are not the same question — a path has to be proved inside the
+/// checkout and a link has to be proved a web address — so a refusal is filed
+/// under whichever was asked, and a row knows its own by shape.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ExternalTarget {
+    File(String, String),
+    Link(String),
+}
+
 pub struct TerminalWindow {
     pub(crate) navigation: Navigation,
     pub(crate) terminals: HashMap<String, LiveTerminal>,
@@ -398,6 +431,20 @@ pub struct TerminalWindow {
     /// failures: one key, one owner, and Retry does what actually failed.
     pub(crate) file_errors: HashMap<(String, String), String>,
     pub(crate) document_errors: HashMap<(String, String), String>,
+    /// What the opener said about a file or a link that would not open, keyed by
+    /// the path that was asked for: a `(checkout, path)` for a file, the url
+    /// itself for a link. Kept rather than logged because the alternative is a
+    /// gesture that appears to have done nothing.
+    pub(crate) external_notices: HashMap<ExternalTarget, String>,
+    /// Links a rendered document was clicked on, waiting for this window to open
+    /// them. The text view's own click handler may only hold what is `Send`, and
+    /// an entity handle is not one; a queue both sides can name is. The handler
+    /// leaves the link here and the next frame opens it, where the opener and the
+    /// notice that says it did not both live.
+    pub(crate) link_queue: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// How wide a name is at a size, remembered: the tree is measured every
+    /// frame it draws and a name is asked once.
+    pub(crate) measured_widths: HashMap<(String, u32), f32>,
     pub(crate) selected_file: HashMap<String, String>,
     pub(crate) open_document: Option<(String, FilePreview)>,
     pub(crate) document_target: Option<(String, String)>,
@@ -472,6 +519,9 @@ impl TerminalWindow {
             file_loading: HashSet::new(),
             file_errors: HashMap::new(),
             document_errors: HashMap::new(),
+            external_notices: HashMap::new(),
+            link_queue: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            measured_widths: HashMap::new(),
             selected_file: HashMap::new(),
             open_document: None,
             document_target: None,
