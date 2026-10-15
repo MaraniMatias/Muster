@@ -3,19 +3,26 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{div, px, AnyElement, Context, IntoElement, ParentElement, Styled};
+use gpui_kit::{
+    div, px, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, TestSupportExt,
+};
 use muster_core::workspace::{Checkout, Repo, RepoKind};
 
 use crate::{
     app::{ButtonA11y, InspectorTab, TerminalWindow},
+    file_icons,
     theme::Roles,
 };
 
-fn file_marker(status: &str) -> &'static str {
+/// The letter a Git status answers with, out of both porcelain columns.
+///
+/// Map porcelain status to the deliberately limited marker shown in the file tree.
+pub(crate) fn file_marker(status: &str) -> &'static str {
     match status {
         "UU" | "AA" | "DD" | "DU" | "UD" | "AU" | "UA" => "U",
         _ if status.contains('A') => "A",
@@ -25,13 +32,185 @@ fn file_marker(status: &str) -> &'static str {
     }
 }
 
-fn inspector_row_style(cx: &gpui_kit::App, selected: bool) -> ButtonCustomVariant {
-    let roles = Roles::of(cx);
-    ButtonCustomVariant::new(cx)
-        .color(roles.row_rest(selected))
-        .foreground(roles.text)
-        .hover(roles.row_hover(selected))
-        .active(roles.pressed)
+/// The wash a row wears, and the bar the open one carries.
+///
+/// Hover refines after the rest style, so one closure has to answer both: a row
+/// that answers the pointer with the plain hover stops looking open for
+/// exactly as long as the pointer rests on it. The bar is drawn inside the
+/// row's own box rather than as a border, so opening a row does not move the
+/// name it holds.
+fn row_chrome(
+    row: gpui_kit::Stateful<gpui_kit::Div>,
+    roles: Roles,
+    selected: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    row.hover(|style| style.bg(roles.row_hover(selected)).text_color(roles.text))
+        .when(selected, |row| {
+            row.bg(roles.row_rest(true)).text_color(roles.text)
+        })
+        .when(selected, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .w(px(2.))
+                    .bg(roles.accent),
+            )
+        })
+}
+
+/// A toolkit button laid over the row with none of its own chrome. It carries
+/// the focus ring, accessible name, tooltip and key without masking row states.
+fn row_control(
+    id: impl Into<gpui_kit::ElementId>,
+    label: String,
+    tooltip: Option<String>,
+    selected: bool,
+    expanded: Option<bool>,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    Button::new(id)
+        .text()
+        .rounded(px(0.))
+        .absolute()
+        .inset_0()
+        .p_0()
+        .aria_selected(selected)
+        .when_some(expanded, |button, expanded| button.aria_expanded(expanded))
+        .accessibility_label(label)
+        .when_some(tooltip, |button, tooltip| button.tooltip(tooltip))
+        .on_click(on_click)
+        .into_any_element()
+}
+
+/// One tab of the inspector's strip.
+///
+/// Legacy's tab is a label on the strip's own hairline: 11px in the secondary
+/// ink, the open one lifted to primary ink with the accent under it, and
+/// nothing painted behind either. The negative margin puts that underline on
+/// the strip's rule, so an open tab is one line and not two.
+fn inspector_tab(
+    id: &'static str,
+    label: String,
+    count: usize,
+    selected: bool,
+    roles: Roles,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    div()
+        .group(id)
+        .relative()
+        .child(
+            div()
+                .id(format!("{id}-label"))
+                .test_support()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(6.))
+                .py(px(7.))
+                .mb(px(-1.))
+                .border_b_1()
+                .border_color(if selected {
+                    roles.accent
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .text_size(px(11.))
+                .text_color(if selected {
+                    roles.text
+                } else {
+                    roles.text_muted
+                })
+                .group_hover(id, |style| style.text_color(roles.text))
+                .group_active(id, |style| style.bg(roles.pressed).text_color(roles.text))
+                .child(label.clone())
+                .when(count > 0, |tab| {
+                    tab.child(
+                        div()
+                            .id(format!("{id}-count"))
+                            .test_support()
+                            .text_size(px(10.))
+                            .text_color(roles.text_muted)
+                            .group_active(id, |style| style.text_color(roles.text))
+                            .child(count.to_string()),
+                    )
+                }),
+        )
+        .child(
+            Button::new(id)
+                .text()
+                .rounded(px(0.))
+                .absolute()
+                .inset_0()
+                .p_0()
+                .aria_selected(selected)
+                .accessibility_label(label)
+                .on_click(on_click),
+        )
+        .into_any_element()
+}
+
+/// The ink a Git status letter wears, in Legacy's four rules: primary ink for a
+/// modified file, its success and danger inks for the two states a change
+/// creates, and the secondary ink for a conflict and for everything else.
+fn status_ink(marker: &str, roles: &Roles) -> gpui_kit::Hsla {
+    match marker {
+        "A" => roles.status.success,
+        "D" => roles.status.danger_text,
+        "M" => roles.text,
+        _ => roles.text_muted,
+    }
+}
+
+/// Show the status Changes received from Git, rather than collapsing uncommon codes.
+pub(crate) fn change_marker(status: &str) -> String {
+    status.trim().to_owned()
+}
+
+/// The letter and the counts a row ends with, in Legacy's columns and inks.
+/// The status letter a row carries, in Legacy's column, ink and size.
+///
+/// The key names the row: an element id is a window-wide identity, so a letter
+/// alone would put the same id on every modified row in the list.
+fn status_chip(key: &str, marker: &str, roles: Roles) -> impl IntoElement {
+    div()
+        .id(format!("row-{key}-status"))
+        .test_support()
+        .flex_shrink_0()
+        .text_size(px(10.))
+        .text_color(status_ink(marker, &roles))
+        .child(marker.to_owned())
+}
+
+/// The `+n` and `−n` a row ends with, at the row's own size.
+fn count_chips(
+    key: &str,
+    (added, removed): (Option<u64>, Option<u64>),
+    roles: Roles,
+) -> impl IntoElement {
+    let count = |kind: &str, text: String, ink: gpui_kit::Hsla| {
+        div()
+            .id(format!("row-{key}-{kind}"))
+            .test_support()
+            .flex_shrink_0()
+            .text_size(px(13.))
+            .text_color(ink)
+            .child(text)
+    };
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(7.))
+        .when_some(added.filter(|n| *n != 0), |tail, n| {
+            tail.child(count("add", format!("+{n}"), roles.status.success))
+        })
+        .when_some(removed.filter(|n| *n != 0), |tail, n| {
+            tail.child(count("del", format!("−{n}"), roles.status.danger_text))
+        })
 }
 
 enum ChangeRow {
@@ -467,54 +646,43 @@ impl TerminalWindow {
             .flex()
             .flex_col()
             .bg(roles.surface)
-            .text_size(px(11.))
+            .text_size(px(13.))
             .border_l_1()
             .border_color(roles.border);
         let files_tab = self.inspector_tab == InspectorTab::Files || repo.kind != RepoKind::Git;
-        panel = panel.child(
-            div()
-                .flex()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .child(
-                    Button::new("inspector-files")
-                        .custom(inspector_row_style(cx, files_tab))
-                        .small()
-                        .rounded(px(0.))
-                        .flex_1()
-                        .label("Files")
-                        .aria_selected(files_tab)
-                        .accessibility_label("Files")
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.inspector_tab = InspectorTab::Files;
-                            cx.notify();
-                        })),
-                )
-                .when(repo.kind == RepoKind::Git, |tabs| {
-                    let id = checkout_id.clone();
-                    let count = self.git_status.get(&id).map(|s| s.files.len()).unwrap_or(0);
-                    tabs.child(
-                        Button::new("inspector-changes")
-                            .custom(inspector_row_style(cx, !files_tab))
-                            .small()
-                            .rounded(px(0.))
-                            .flex_1()
-                            .label(if count == 0 {
-                                "Changes".to_owned()
-                            } else {
-                                format!("Changes {count}")
-                            })
-                            .aria_selected(!files_tab)
-                            .accessibility_label("Changes")
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                app.inspector_tab = InspectorTab::Changes;
-                                app.request_git_status(&id, cx);
-                                cx.notify();
-                            })),
-                    )
+        let mut tabs = div()
+            .flex()
+            .flex_none()
+            .border_b_1()
+            .border_color(roles.border);
+        tabs = tabs.child(inspector_tab(
+            "inspector-files",
+            "Files".to_owned(),
+            0,
+            files_tab,
+            roles,
+            cx.listener(|app, _, _, cx| {
+                app.inspector_tab = InspectorTab::Files;
+                cx.notify();
+            }),
+        ));
+        if repo.kind == RepoKind::Git {
+            let id = checkout_id.clone();
+            let count = self.git_status.get(&id).map(|s| s.files.len()).unwrap_or(0);
+            tabs = tabs.child(inspector_tab(
+                "inspector-changes",
+                "Changes".to_owned(),
+                count,
+                !files_tab,
+                roles,
+                cx.listener(move |app, _, _, cx| {
+                    app.inspector_tab = InspectorTab::Changes;
+                    app.request_git_status(&id, cx);
+                    cx.notify();
                 }),
-        );
+            ));
+        }
+        panel = panel.child(tabs);
         if !files_tab {
             if repo.kind != RepoKind::Git {
                 return panel
@@ -536,17 +704,43 @@ impl TerminalWindow {
                 .as_ref()
                 .is_some_and(|(id, path)| id == &checkout_id && path.is_none());
             let id = checkout_id.clone();
-            let mut body = div().flex_1().min_h_0().flex().flex_col().child(
-                Button::new("all-changes")
-                    .custom(inspector_row_style(cx, all_selected))
-                    .small()
-                    .rounded(px(0.))
-                    .w_full()
-                    .justify_start()
-                    .aria_selected(all_selected)
-                    .label("All changes")
-                    .on_click(cx.listener(move |app, _, _, cx| app.open_changes(&id, None, cx))),
+            let weak = cx.weak_entity();
+            let all_changes = row_chrome(
+                div()
+                    .id("all-changes")
+                    .flex()
+                    .items_center()
+                    .relative()
+                    .h(px(26.))
+                    .gap(px(7.))
+                    .px(px(8.))
+                    .text_color(if all_selected {
+                        roles.text
+                    } else {
+                        roles.text_muted
+                    })
+                    .child(Icon::new(IconName::SquareArrowOutUpRight).size(px(14.)))
+                    .child("All changes")
+                    .child(row_control(
+                        "all-changes",
+                        "All changes".to_owned(),
+                        None,
+                        all_selected,
+                        None,
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| app.open_changes(&id, None, cx));
+                        },
+                    )),
+                roles,
+                all_selected,
             );
+            let mut body = div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .py(px(2.))
+                .child(all_changes);
             if let Some(error) = self.git_status_errors.get(&checkout_id) {
                 let id = checkout_id.clone();
                 body = body
@@ -595,15 +789,21 @@ impl TerminalWindow {
                     let selected = self.open_diff.clone();
                     let weak = cx.weak_entity();
                     let list =
-                        gpui_kit::uniform_list("changes-list", rows.len(), move |range, _, cx| {
+                        gpui_kit::uniform_list("changes-list", rows.len(), move |range, _, _cx| {
                             range
                                 .map(|index| match &rows[index] {
+                                    // A heading and not a row: no surface at
+                                    // rest, nothing to choose, set apart by its
+                                    // ink rather than by a box.
                                     ChangeRow::Directory(directory) => div()
+                                        .id(format!("change-group-{directory}"))
+                                        .test_support()
+                                        .flex()
+                                        .items_center()
                                         .h(px(26.))
-                                        .px_2()
-                                        .py_1()
+                                        .px(px(8.))
                                         .text_color(roles.text_muted)
-                                        .child(directory.clone())
+                                        .child(div().min_w_0().truncate().child(directory.clone()))
                                         .into_any_element(),
                                     ChangeRow::File(file) => {
                                         let path = file.path.clone();
@@ -615,76 +815,75 @@ impl TerminalWindow {
                                             path.rsplit('/').next().unwrap_or(&path).to_owned();
                                         let id = id.clone();
                                         let weak = weak.clone();
-                                        let status_ink = match file_marker(&file.status) {
-                                            "A" => roles.status.added,
-                                            "D" => roles.status.removed,
-                                            "M" | "U" => roles.status.warning,
-                                            _ => roles.text_muted,
-                                        };
-                                        Button::new(format!("change-{path}"))
-                                            .custom(inspector_row_style(cx, selected))
-                                            .small()
-                                            .rounded(px(0.))
-                                            .h(px(26.))
-                                            .w_full()
-                                            .min_w_0()
-                                            .justify_start()
-                                            .aria_selected(selected)
-                                            .accessibility_label(path.clone())
-                                            .tooltip(
-                                                file.old_path
-                                                    .as_ref()
-                                                    .map(|old| format!("{old} → {path}"))
-                                                    .unwrap_or_else(|| path.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .w_full()
-                                                    .min_w_0()
-                                                    .child(
-                                                        div()
-                                                            .text_color(status_ink)
-                                                            .child(file.status.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .truncate()
-                                                            .child(name),
-                                                    )
-                                                    .when_some(
-                                                        file.additions.filter(|n| *n != 0),
-                                                        |row, n| {
-                                                            row.child(
-                                                                div()
-                                                                    .text_color(roles.status.added)
-                                                                    .child(format!("+{n}")),
+                                        let tooltip = file
+                                            .old_path
+                                            .as_ref()
+                                            .map(|old| format!("{old} → {path}"))
+                                            .unwrap_or_else(|| path.clone());
+                                        row_chrome(
+                                            div()
+                                                .id(format!("change-{path}"))
+                                                .group(format!("change-row-{path}"))
+                                                .flex()
+                                                .items_center()
+                                                .relative()
+                                                .h(px(26.))
+                                                .gap(px(7.))
+                                                // One level in from the heading
+                                                // above it: the panel's own 8px
+                                                // and the step the file tree
+                                                // indents by, so a change row and
+                                                // a file row sit at one depth.
+                                                .pl(px(22.))
+                                                .pr(px(8.))
+                                                .child(status_chip(
+                                                    &path,
+                                                    &change_marker(&file.status),
+                                                    roles,
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .id(format!("change-name-{path}"))
+                                                        .test_support()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_color(if selected {
+                                                            roles.text
+                                                        } else {
+                                                            roles.text_muted
+                                                        })
+                                                        .group_hover(
+                                                            format!("change-row-{path}"),
+                                                            |style| style.text_color(roles.text),
+                                                        )
+                                                        .child(name),
+                                                )
+                                                .child(count_chips(
+                                                    &path,
+                                                    (file.additions, file.deletions),
+                                                    roles,
+                                                ))
+                                                .child(row_control(
+                                                    format!("change-control-{path}"),
+                                                    tooltip.clone(),
+                                                    Some(tooltip),
+                                                    selected,
+                                                    None,
+                                                    move |_, _, cx| {
+                                                        let _ = weak.update(cx, |app, cx| {
+                                                            app.open_changes(
+                                                                &id,
+                                                                Some(path.clone()),
+                                                                cx,
                                                             )
-                                                        },
-                                                    )
-                                                    .when_some(
-                                                        file.deletions.filter(|n| *n != 0),
-                                                        |row, n| {
-                                                            row.child(
-                                                                div()
-                                                                    .text_color(
-                                                                        roles.status.removed,
-                                                                    )
-                                                                    .child(format!("−{n}")),
-                                                            )
-                                                        },
-                                                    ),
-                                            )
-                                            .on_click(move |_, _, cx| {
-                                                let _ = weak.update(cx, |app, cx| {
-                                                    app.open_changes(&id, Some(path.clone()), cx)
-                                                });
-                                            })
-                                            .into_any_element()
+                                                        });
+                                                    },
+                                                )),
+                                            roles,
+                                            selected,
+                                        )
+                                        .into_any_element()
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -692,7 +891,15 @@ impl TerminalWindow {
                         .flex_1()
                         .min_h_0()
                         .w_full();
-                    body = body.child(list);
+                    body = body.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .py(px(4.))
+                            .child(list),
+                    );
                 }
             } else if !self.git_status_errors.contains_key(&checkout_id) {
                 body = body.child(
@@ -731,7 +938,7 @@ impl TerminalWindow {
             .map(|s| {
                 s.files
                     .iter()
-                    .map(|f| (f.path.clone(), f.status.clone()))
+                    .map(|f| (f.path.clone(), (f.status.clone(), f.additions, f.deletions)))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
@@ -762,7 +969,7 @@ impl TerminalWindow {
         let loading = self.file_loading.clone();
         let repo_for = repo.clone();
         let checkout_for = checkout.clone();
-        let list = gpui_kit::uniform_list("files-list", total, move |range, _, cx| {
+        let list = gpui_kit::uniform_list("files-list", total, move |range, _, _| {
             range
                 .map(|index| {
                     let row = rows[index].clone();
@@ -770,66 +977,115 @@ impl TerminalWindow {
                     let path = entry.path.clone();
                     let directory = entry.directory;
                     let open = expanded.contains(&(checkout_for.id.clone(), path.clone()));
-                    let status = statuses.get(&path).map(String::as_str).unwrap_or("");
-                    let marker = file_marker(status);
-                    let label = if marker.is_empty() {
-                        entry.name.clone()
-                    } else {
-                        format!("{}  {marker}", entry.name)
-                    };
-                    let icon = if directory {
-                        if open {
-                            IconName::FolderOpen
-                        } else {
-                            IconName::Folder
-                        }
-                    } else {
-                        IconName::FileText
-                    };
+                    let (status, added, removed) = statuses
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), None, None));
+                    let marker = file_marker(&status);
                     let selected = selected.as_deref() == Some(path.as_str());
                     let weak = weak.clone();
                     let repo = repo_for.clone();
                     let checkout = checkout_for.clone();
-                    Button::new(format!("file:{path}"))
-                        .custom(inspector_row_style(cx, selected))
-                        .small()
-                        .rounded(px(0.))
-                        .h(px(26.))
-                        .w_full()
-                        .justify_start()
-                        .pl(px(8. + row.depth as f32 * 14.))
-                        .text_color(if entry.name.starts_with('.') {
-                            roles.text_muted
-                        } else {
-                            roles.text
-                        })
-                        .icon(Icon::new(icon).size_4().text_color(if directory {
-                            roles.text_muted
-                        } else {
-                            roles.file_icon(&path)
-                        }))
-                        .aria_selected(selected)
-                        .when(directory, |button| button.aria_expanded(open))
-                        .tooltip(path.clone())
-                        .label(label)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak.update(cx, |app, cx| {
-                                if directory {
-                                    let key = (checkout.id.clone(), path.clone());
-                                    if app.expanded_files.remove(&key) {
-                                        // A collapsed directory keeps nothing
-                                        // but its name: the listing is dropped
-                                        // with it, so a tree walked wide and
-                                        // closed again does not stay resident.
-                                        app.file_request.remove(&key);
-                                        app.file_loading.remove(&key);
-                                        app.file_entries.remove(&key);
+                    // A dotfile is quieted rather than recoloured: a colour of
+                    // its own would win over the one the row hands down.
+                    let quiet = entry.name.starts_with('.');
+                    row_chrome(
+                        div()
+                            .id(format!("file-row-{path}"))
+                            .group(format!("file-row-{path}"))
+                            .flex()
+                            .items_center()
+                            .relative()
+                            .h(px(26.))
+                            .gap(px(7.))
+                            .pl(px(8. + row.depth as f32 * 14.))
+                            .pr(px(8.))
+                            // The fold's slot, held at its width on a file so
+                            // a folder's glyph and a file's icon land on one
+                            // column and a name does not move under the
+                            // pointer.
+                            .child(
+                                div()
+                                    .id(format!("file-slot-{path}"))
+                                    .test_support()
+                                    .flex_shrink_0()
+                                    .w(px(16.))
+                                    .h(px(16.))
+                                    .when(directory, |slot| {
+                                        slot.child(Icon::new(if open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        }))
+                                    }),
+                            )
+                            .child(file_icons::element(
+                                format!("file-icon-{path}"),
+                                &entry.name,
+                                directory,
+                                px(14.),
+                                &roles,
+                            ))
+                            .child(
+                                div()
+                                    .id(format!("file-name-{path}"))
+                                    .test_support()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_color(if selected || directory {
+                                        roles.text
                                     } else {
-                                        app.expanded_files.insert(key.clone());
-                                        if !app.file_entries.contains_key(&key)
-                                            && !app.file_loading.contains(&key)
-                                        {
-                                            app.request_directory(
+                                        roles.text_muted
+                                    })
+                                    .group_hover(format!("file-row-{path}"), |style| {
+                                        style.text_color(roles.text)
+                                    })
+                                    .when(quiet, |name| name.opacity(0.72))
+                                    .child(entry.name.clone()),
+                            )
+                            // Legacy's order: the fold, the icon, the name,
+                            // then what Git did to it and what that cost.
+                            .when(!marker.is_empty(), |row| {
+                                row.child(status_chip(&path, marker, roles))
+                            })
+                            .child(count_chips(&path, (added, removed), roles))
+                            .child(row_control(
+                                format!("file-control:{path}"),
+                                path.clone(),
+                                Some(path.clone()),
+                                selected,
+                                directory.then_some(open),
+                                move |_, window, cx| {
+                                    let _ = weak.update(cx, |app, cx| {
+                                        if directory {
+                                            let key = (checkout.id.clone(), path.clone());
+                                            if app.expanded_files.remove(&key) {
+                                                // A collapsed directory keeps nothing
+                                                // but its name: the listing is dropped
+                                                // with it, so a tree walked wide and
+                                                // closed again does not stay resident.
+                                                app.file_request.remove(&key);
+                                                app.file_loading.remove(&key);
+                                                app.file_entries.remove(&key);
+                                            } else {
+                                                app.expanded_files.insert(key.clone());
+                                                if !app.file_entries.contains_key(&key)
+                                                    && !app.file_loading.contains(&key)
+                                                {
+                                                    app.request_directory(
+                                                        repo.clone(),
+                                                        checkout.clone(),
+                                                        path.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            app.selected_file
+                                                .insert(checkout.id.clone(), path.clone());
+                                            app.request_document(
                                                 repo.clone(),
                                                 checkout.clone(),
                                                 path.clone(),
@@ -837,31 +1093,28 @@ impl TerminalWindow {
                                                 cx,
                                             );
                                         }
-                                    }
-                                } else {
-                                    app.selected_file.insert(checkout.id.clone(), path.clone());
-                                    app.request_document(
-                                        repo.clone(),
-                                        checkout.clone(),
-                                        path.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .into_any_element()
+                                        cx.notify();
+                                    });
+                                },
+                            )),
+                        roles,
+                        selected,
+                    )
+                    .into_any_element()
                 })
                 .collect::<Vec<_>>()
         });
         let root = (checkout_id.clone(), String::new());
-        let mut body = div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(list.flex_1().min_h_0().w_full());
+        let mut body = div().flex_1().min_h_0().flex().flex_col();
+        body = body.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .py(px(4.))
+                .child(list.flex_1().min_h_0().w_full()),
+        );
         for (path, error, was_read) in &failures {
             let was_read = *was_read;
             let name = if path.is_empty() {

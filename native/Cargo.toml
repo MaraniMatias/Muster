@@ -22,19 +22,50 @@ path = "src/main.rs"
 # read-only document highlights; `tree-sitter` itself carries JSON. No new
 # highlighting library: the editor, the diff and the grammars are all the
 # toolkit's, and only which of its languages are compiled in is chosen here.
+# Enable the grammars selected by `document::syntax_language`, plus JSDoc for
+# JavaScript injections. Unsupported formats still open as plain text.
 gpui-kit = { version = "0.7.3", features = [
     "component",
     "tree-sitter",
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cmake",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
     "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-ejs",
+    "tree-sitter-elixir",
+    "tree-sitter-erb",
+    "tree-sitter-go",
     "tree-sitter-html",
+    "tree-sitter-java",
     "tree-sitter-javascript",
+    "tree-sitter-jsdoc",
+    "tree-sitter-kotlin",
+    "tree-sitter-lua",
+    "tree-sitter-make",
     "tree-sitter-markdown",
     "tree-sitter-markdown-inline",
+    "tree-sitter-php",
+    "tree-sitter-python",
+    "tree-sitter-ruby",
     "tree-sitter-rust",
+    "tree-sitter-scala",
+    "tree-sitter-sql",
+    "tree-sitter-svelte",
+    "tree-sitter-swift",
+    "tree-sitter-toml",
     "tree-sitter-tsx",
     "tree-sitter-typescript",
     "tree-sitter-yaml",
+    "tree-sitter-zig",
 ] }
+# Already selected by the toolkit features above; expose their upstream
+# queries because GPUI Kit registers these grammars with empty queries.
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cmake = "0.7.5"
+tree-sitter-swift = "0.7.4"
 # Already in the graph through the toolkit. Needed because a toolkit
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by
 # deserializing the theme literal rather than by assigning fields.

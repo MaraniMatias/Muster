@@ -445,3 +445,74 @@ fn a_drag_in_the_real_window_selects_text_and_copies_it(cx: &mut TestAppContext)
 
     let _ = session.close().wait();
 }
+
+/// A diff's file header is Legacy's row: the letter that says what Git did,
+/// then the path, then the counts, on one line.
+///
+/// The columns are read off the drawn bounds rather than off the markup. What
+/// draws the type is pinned elsewhere and not here: the face is the theme's
+/// (see `theme::tests`), and an absolute glyph width is not a stable thing to
+/// assert here — the bundled faces are added by the test that needs them, so
+/// the advance a run resolves to depends on the ambient font state.
+#[gpui_kit::test]
+fn a_diff_header_names_the_file_the_way_legacy_orders_its_columns(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use std::process::Command;
+
+    let fixture = open_git(cx);
+    let tracked = fixture.root.join("main.rs");
+    std::fs::write(&tracked, "fn main() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "main.rs"]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add a file",
+    ]);
+    std::fs::write(&tracked, "fn main() {\n    let x = 1;\n}\n").unwrap();
+
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, _| {
+        let letter = window.find("diff-status-main.rs").bounds();
+        let path = window.find("diff-path-main.rs").bounds();
+        assert!(
+            (letter.center().y - path.center().y).abs() <= px(1.),
+            "the letter and the path are one row"
+        );
+        assert!(
+            letter.origin.x < path.origin.x,
+            "the letter comes before the path"
+        );
+        assert!(
+            letter.right() < path.right(),
+            "the path is the row's long half and keeps its room"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}

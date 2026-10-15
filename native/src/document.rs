@@ -70,7 +70,22 @@ fn document_state(
 /// toolkit compiles in. A name it has no grammar for is plain text rather than
 /// nothing: an unknown file still opens, it just opens uncoloured.
 pub(crate) fn syntax_language(path: &str) -> &'static str {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "makefile" | "gnumakefile" => return "make",
+        "cmakelists.txt" => return "cmake",
+        ".bash_login" | ".bash_logout" | ".bash_profile" | ".bashrc" | ".profile" | ".shrc"
+        | ".zlogin" | ".zlogout" | ".zprofile" | ".zshenv" | ".zshrc" => return "bash",
+        ".babelrc" | ".eslintrc" | ".jshintrc" | ".prettierrc" | ".swcrc" | ".watchmanconfig" => {
+            return "json"
+        }
+        ".psqlrc" => return "sql",
+        _ => {}
+    }
     match name.rsplit_once('.').map_or("", |(_, extension)| extension) {
         "json" | "jsonc" => "json",
         "rs" => "rust",
@@ -80,7 +95,30 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "yaml" | "yml" => "yaml",
         "html" | "htm" => "html",
         "css" | "scss" => "css",
-        "md" | "markdown" => "markdown",
+        "md" | "mdown" | "markdown" => "markdown",
+        "bash" | "sh" | "zsh" => "bash",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "cpp",
+        "cs" => "csharp",
+        "cmake" => "cmake",
+        "diff" | "patch" => "diff",
+        "ejs" => "ejs",
+        "erb" => "erb",
+        "ex" | "exs" => "elixir",
+        "go" => "go",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "lua" => "lua",
+        "make" | "makefile" | "mk" => "make",
+        "php" => "php",
+        "py" | "pyw" | "pyi" => "python",
+        "rb" => "ruby",
+        "scala" => "scala",
+        "sql" => "sql",
+        "svelte" => "svelte",
+        "swift" => "swift",
+        "toml" => "toml",
+        "zig" => "zig",
         _ => "plaintext",
     }
 }
@@ -331,7 +369,17 @@ mod tests {
             ("site.css", "css"),
             ("README.md", "markdown"),
             ("LICENSE", "plaintext"),
-            ("Makefile", "plaintext"),
+            ("Makefile", "make"),
+            ("Cargo.toml", "toml"),
+            ("src/MAIN.PY", "python"),
+            (r"src\main.go", "go"),
+            ("CMakeLists.txt", "cmake"),
+            ("scripts/build.sh", "bash"),
+            ("home/.bashrc", "bash"),
+            ("src/main.cpp", "cpp"),
+            ("query.sql", "sql"),
+            ("component.vue", "plaintext"),
+            ("document.xml", "plaintext"),
             ("notes.rst", "plaintext"),
             ("src/main.rs.bak", "plaintext"),
         ] {
@@ -445,6 +493,78 @@ mod tests {
         .unwrap();
         cx.read(|cx| assert_eq!(state.read(cx).text().to_string(), ""));
     }
+    #[gpui_kit::test]
+    fn additional_grammars_produce_legacy_token_colors(cx: &mut TestAppContext) {
+        let (window, harness) = open(cx);
+        for (path, source) in [
+            ("Cargo.toml", "[package]\nname = \"muster\"\nversion = 42\n"),
+            ("Makefile", "# comment\nall:\n\techo hello\n"),
+            (
+                "change.patch",
+                "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n",
+            ),
+            (
+                "view.svelte",
+                "<script>const name = 'hello';</script><p>{name}</p>",
+            ),
+            ("view.ejs", "<p><%= name %></p>"),
+            ("view.erb", "<p><%= name %></p>"),
+            ("main.py", "# comment\ndef run():\n    return \"hello\"\n"),
+            ("run.sh", "# comment\nif true; then echo \"hello\"; fi\n"),
+            (
+                "main.go",
+                "package main\nfunc main() { println(\"hello\") }\n",
+            ),
+            ("main.c", "// comment\nint main() { return 42; }\n"),
+            ("main.cpp", "// comment\nint main() { return 42; }\n"),
+            (
+                "Main.java",
+                "// comment\nclass Main { String name = \"hello\"; }\n",
+            ),
+            (
+                "main.cs",
+                "// comment\nclass Main { string name = \"hello\"; }\n",
+            ),
+            (
+                "query.sql",
+                "-- comment\nSELECT 'hello' FROM users WHERE id = 42;\n",
+            ),
+            ("main.rb", "# comment\ndef run\n  puts \"hello\"\nend\n"),
+            ("main.lua", "-- comment\nlocal name = \"hello\"\n"),
+            ("main.swift", "// comment\nlet name = \"hello\"\n"),
+            ("main.kt", "// comment\nval name = \"hello\"\n"),
+            ("main.scala", "// comment\nval name = \"hello\"\n"),
+            ("main.php", "<?php // comment\n$name = \"hello\";\n"),
+            (
+                "main.ex",
+                "# comment\ndefmodule Main do\n def name, do: \"hello\"\nend\n",
+            ),
+            ("main.zig", "// comment\nconst name = \"hello\";\n"),
+            ("CMakeLists.txt", "# comment\nset(NAME \"hello\")\n"),
+        ] {
+            harness.update(cx, |h, cx| {
+                h.document = Some((path.into(), source.into()));
+                cx.notify();
+            });
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            let state = editor(cx, &harness);
+            cx.update(|cx| {
+                let mut highlighter =
+                    gpui_kit::component::highlighter::SyntaxHighlighter::new(syntax_language(path));
+                let text = state.read(cx).text().clone();
+                assert!(highlighter.update(None, &text, None), "{path}");
+                let theme = gpui_kit::component::Theme::global(cx);
+                let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+                let colors: Vec<_> = styles.iter().filter_map(|(_, style)| style.color).collect();
+                assert!(
+                    colors.iter().any(|color| Some(color) != colors.first()),
+                    "{path} is monochrome"
+                );
+            });
+        }
+    }
+
     #[gpui_kit::test]
     fn json_grammar_really_produces_different_token_styles(cx: &mut TestAppContext) {
         let (window, harness) = open(cx);

@@ -28,6 +28,7 @@ use muster_core::workspace::{Repo, RepoKind};
 use crate::app::{
     fitted_name, sidebar_faint_ink, sidebar_text_width, TerminalWindow, SIDEBAR_FONT_FAMILY,
 };
+use crate::file_icons;
 use crate::navigation::checkout_title;
 use crate::theme::Roles;
 fn crumb_separator(cx: &App) -> AnyElement {
@@ -40,16 +41,41 @@ fn crumb_separator(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// The glyph a crumb wears: the one the sidebar gives the row it names, so the
-/// line reads as that panel sideways instead of as a row of text.
+/// The glyph a crumb wears.
 ///
-/// The workdir wears none. It is the name that is always there, and a glyph on
-/// it would only repeat a word that never changes.
-pub(crate) fn crumb_icon(crumb: Crumb) -> Option<IconName> {
+/// The worktree wears the one the sidebar gives the row it names, so the line reads as that panel
+/// sideways instead of as a row of text. The workdir wears none: it is the name that is always
+/// there, and a glyph on it would only repeat a word that never changes.
+///
+/// The item wears whatever it names. A terminal is the terminal's glyph, and a file is the file's
+/// own icon, the same one its row wears in the file tree — which is Legacy's rule too, where the
+/// glyph sits on the last step of the path because that step is the one naming the file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum CrumbGlyph {
+    None,
+    Named(IconName),
+    File(String),
+}
+
+/// The glyph `crumb` wears, given the file `file` names when it names one.
+pub(crate) fn crumb_glyph(crumb: Crumb, file: Option<&str>) -> CrumbGlyph {
     match crumb {
-        Crumb::Workdir => None,
-        Crumb::Worktree => Some(IconName::GitBranch),
-        Crumb::Item => Some(IconName::SquareTerminal),
+        Crumb::Workdir => CrumbGlyph::None,
+        Crumb::Worktree => CrumbGlyph::Named(IconName::GitBranch),
+        // A whole change set names no file, and neither does a terminal, so both keep the glyph
+        // they have always had rather than reaching for an icon nothing is drawn from.
+        Crumb::Item => match file {
+            Some(name) => CrumbGlyph::File(name.to_owned()),
+            None => CrumbGlyph::Named(IconName::SquareTerminal),
+        },
+    }
+}
+
+/// The room a crumb holds its glyph in, and nothing else: what the glyph is decides what it draws,
+/// not whether it is there.
+impl CrumbGlyph {
+    fn present(&self) -> bool {
+        !matches!(self, CrumbGlyph::None)
     }
 }
 
@@ -63,11 +89,12 @@ fn titlebar_crumb(
     id: &'static str,
     label: &str,
     budget: f32,
-    icon: Option<IconName>,
+    glyph: &CrumbGlyph,
     color: gpui_kit::Hsla,
+    roles: Roles,
 ) -> Button {
-    // Account for the button's inset and icon before fitting the text.
-    let icon_width = if icon.is_some() { 20. } else { 0. };
+    // Account for the button's inset and glyph before fitting the text.
+    let icon_width = if glyph.present() { 20. } else { 0. };
     let fitted = fitted_name(window, label, (budget - 8. - icon_width).max(0.), 14.);
     let crumb = Button::new(id)
         .text()
@@ -85,18 +112,42 @@ fn titlebar_crumb(
         .tooltip(label.to_owned())
         .accessibility_label(label.to_owned())
         .cursor_pointer();
-    match icon {
-        Some(icon) => crumb.icon(Icon::new(icon).size(px(12.))).label(fitted),
-        None => crumb.label(fitted),
+    match glyph {
+        CrumbGlyph::None => crumb.label(fitted),
+        CrumbGlyph::Named(icon) => crumb.icon(Icon::new(*icon).size(px(12.))).label(fitted),
+        // A file icon is a stack of layers rather than one glyph, and a button's own icon slot
+        // holds exactly one element, so the crumb lays out its content here instead. The gap is
+        // the one a Small button puts between its icon and its label, so a crumb wearing a file
+        // and a crumb wearing a glyph hold their names the same distance from the glyph.
+        CrumbGlyph::File(name) => crumb.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(file_icons::element(
+                    format!("{id}-icon"),
+                    name,
+                    false,
+                    px(12.),
+                    &roles,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(fitted),
+                ),
+        ),
     }
 }
 
-fn titlebar_crumb_width(window: &Window, label: &str, icon: Option<IconName>) -> f32 {
-    8. + sidebar_text_width(window, label, 14.).as_f32() + if icon.is_some() { 20. } else { 0. }
+fn titlebar_crumb_width(window: &Window, label: &str, glyph: &CrumbGlyph) -> f32 {
+    8. + sidebar_text_width(window, label, 14.).as_f32() + if glyph.present() { 20. } else { 0. }
 }
 
-fn titlebar_crumb_min_width(icon: Option<IconName>) -> f32 {
-    16. + if icon.is_some() { 20. } else { 0. }
+fn titlebar_crumb_min_width(glyph: &CrumbGlyph) -> f32 {
+    16. + if glyph.present() { 20. } else { 0. }
 }
 
 fn titlebar_worktree_title(repo: &Repo, checkout: &muster_core::workspace::Checkout) -> String {
@@ -465,16 +516,34 @@ impl TerminalWindow {
                 .and_then(|id| self.navigation.session(id))
                 .map(|session| self.session_label(session))
         };
+        // A document or a single file's diff is named by its path, and the crumb wears that file's
+        // own icon. The icon resolves from the name alone, so it takes the last segment: the whole
+        // path would find no rule. A whole change set names no file at all.
+        let item_file = self
+            .open_diff
+            .as_ref()
+            .filter(|(id, _)| Some(id) == self.navigation.active_checkout.as_ref())
+            .and_then(|(_, path)| path.as_deref())
+            .or_else(|| {
+                document_checkout
+                    .filter(|id| Some(*id) == self.navigation.active_checkout.as_deref())
+                    .and(document_path)
+                    .map(|(_, path)| path.as_str())
+            })
+            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned());
+        let workdir_glyph = crumb_glyph(Crumb::Workdir, None);
+        let worktree_glyph = crumb_glyph(Crumb::Worktree, None);
+        let item_glyph = crumb_glyph(Crumb::Item, item_file.as_deref());
         let mut repo_budget = repo
-            .map(|repo| titlebar_crumb_width(window, &repo.name, crumb_icon(Crumb::Workdir)))
+            .map(|repo| titlebar_crumb_width(window, &repo.name, &workdir_glyph))
             .unwrap_or(0.);
         let mut worktree_budget = worktree_label
             .as_deref()
-            .map(|label| titlebar_crumb_width(window, label, crumb_icon(Crumb::Worktree)))
+            .map(|label| titlebar_crumb_width(window, label, &worktree_glyph))
             .unwrap_or(0.);
         let mut item_budget = item_label
             .as_deref()
-            .map(|label| titlebar_crumb_width(window, label, crumb_icon(Crumb::Item)))
+            .map(|label| titlebar_crumb_width(window, label, &item_glyph))
             .unwrap_or(0.);
         let crumb_count = usize::from(repo.is_some())
             + usize::from(worktree_label.is_some())
@@ -489,21 +558,21 @@ impl TerminalWindow {
         if worktree_label.is_some() {
             shrink_titlebar_crumb(
                 &mut worktree_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Worktree)),
+                titlebar_crumb_min_width(&worktree_glyph),
                 &mut excess,
             );
         }
         if item_label.is_some() {
             shrink_titlebar_crumb(
                 &mut item_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Item)),
+                titlebar_crumb_min_width(&item_glyph),
                 &mut excess,
             );
         }
         if repo.is_some() {
             shrink_titlebar_crumb(
                 &mut repo_budget,
-                titlebar_crumb_min_width(crumb_icon(Crumb::Workdir)),
+                titlebar_crumb_min_width(&workdir_glyph),
                 &mut excess,
             );
         }
@@ -553,8 +622,9 @@ impl TerminalWindow {
                         "repo-crumb",
                         &repo.name,
                         repo_budget,
-                        crumb_icon(Crumb::Workdir),
+                        &workdir_glyph,
                         roles.text,
+                        roles,
                     ))
                     .content({
                         let rows = workdirs.clone();
@@ -637,8 +707,9 @@ impl TerminalWindow {
                             "worktree-crumb",
                             worktree_label.as_deref().unwrap_or("Detached"),
                             worktree_budget,
-                            crumb_icon(Crumb::Worktree),
+                            &worktree_glyph,
                             sidebar_faint_ink(cx),
+                            roles,
                         ))
                         .content({
                             let rows = worktrees.clone();
@@ -711,8 +782,9 @@ impl TerminalWindow {
                             "item-crumb",
                             label,
                             item_budget,
-                            crumb_icon(Crumb::Item),
+                            &item_glyph,
                             sidebar_faint_ink(cx),
+                            roles,
                         ))
                         .content({
                             let rows = rows.clone();

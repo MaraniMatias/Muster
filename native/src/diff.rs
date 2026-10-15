@@ -1,6 +1,6 @@
 //! Retained, virtualized unified code review surface.
 use crate::{
-    app::{InspectorTab, TerminalWindow},
+    app::{InspectorTab, TerminalWindow, SIDEBAR_FONT_FAMILY},
     theme::Roles,
 };
 use gpui_kit::assets::IconName;
@@ -9,11 +9,19 @@ use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffS
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, AnyElement, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Styled,
-    Subscription,
+    div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Styled, Subscription, TestSupportExt,
 };
 
 pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// The type a diff's own chrome is drawn at: Legacy's file header, one size for
+/// the status letter, the path and the counts alike.
+///
+/// The toolkit draws that header at `text_sm()`, and the code below refines
+/// over it, so this is the one place the size and the face are named. The code
+/// rows and the `@@` band keep the sizes they set for themselves.
+const DIFF_CHROME_PX: f32 = 11.;
 
 /// One parsed viewer: individual files and All changes share the same scroll,
 /// source-coordinate, selection, folding and highlighting implementation.
@@ -311,39 +319,70 @@ impl TerminalWindow {
                 status
                     .files
                     .iter()
-                    .map(|file| (file.path.clone(), (file.additions, file.deletions)))
+                    .map(|file| {
+                        (
+                            file.path.clone(),
+                            (file.status.clone(), file.additions, file.deletions),
+                        )
+                    })
                     .collect::<std::collections::HashMap<_, _>>()
             })
             .unwrap_or_default();
         let viewer = Diff::new(&state)
             .header_visible(selected.is_none())
+            .font_family(SIDEBAR_FONT_FAMILY)
+            .text_size(px(DIFF_CHROME_PX))
             .render_header(move |file, _, _| {
-                let counts = stats.get(file.path().as_str()).copied().unwrap_or_default();
+                let (status, added, removed) =
+                    stats.get(file.path().as_str()).cloned().unwrap_or_default();
+                // Legacy's column order: the letter that says what Git did,
+                // then the path, then the counts.
+                let marker = crate::inspector::change_marker(&status);
                 div()
                     .flex()
                     .items_center()
                     .min_w_0()
-                    .gap_2()
+                    .gap(px(6.))
+                    .when(!marker.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .id(format!("diff-status-{}", file.path()))
+                                .test_support()
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(match marker.as_str() {
+                                    "A" => roles.status.success,
+                                    "D" => roles.status.danger_text,
+                                    _ => roles.text_muted,
+                                })
+                                .child(marker),
+                        )
+                    })
                     .child(
                         div()
+                            .id(format!("diff-path-{}", file.path()))
+                            .test_support()
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(px(11.))
                             .child(file.path().clone()),
                     )
-                    .when_some(counts.0.filter(|n| *n != 0), |row, n| {
+                    .when_some(added.filter(|n| *n != 0), |row, n| {
                         row.child(
                             div()
-                                .text_xs()
-                                .text_color(roles.status.added)
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(roles.status.success)
                                 .child(format!("+{n}")),
                         )
                     })
-                    .when_some(counts.1.filter(|n| *n != 0), |row, n| {
+                    .when_some(removed.filter(|n| *n != 0), |row, n| {
                         row.child(
                             div()
-                                .text_xs()
-                                .text_color(roles.status.removed)
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(roles.status.danger_text)
                                 .child(format!("−{n}")),
                         )
                     })
@@ -419,8 +458,9 @@ impl TerminalWindow {
                     div()
                         .flex()
                         .items_center()
+                        .gap_3()
                         .px_3()
-                        .py_1()
+                        .py(px(6.))
                         .flex_none()
                         .border_b_1()
                         .border_color(roles.border)
@@ -429,7 +469,7 @@ impl TerminalWindow {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_xs()
+                                .text_size(px(DIFF_CHROME_PX))
                                 .text_color(roles.text_muted)
                                 .child(selected.clone().unwrap_or_else(|| "All changes".into())),
                         )
@@ -438,6 +478,7 @@ impl TerminalWindow {
                                 .custom(crate::app::sidebar_action_style(cx))
                                 .small()
                                 .compact()
+                                .rounded(px(0.))
                                 .icon(IconName::X)
                                 .accessibility_label("Close preview")
                                 .tooltip("Close preview")

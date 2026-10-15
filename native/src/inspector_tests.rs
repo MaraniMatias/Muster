@@ -1,7 +1,126 @@
 use super::*;
 use crate::app::sidebar_tests::{close, open_git, GitFixture};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-use gpui_kit::TestAppContext;
+use gpui_kit::{px, TestAppContext};
+
+#[test]
+fn change_status_keeps_uncommon_git_codes_visible() {
+    for status in ["R", "C", "T", "??", "!!", "X"] {
+        assert_eq!(crate::inspector::change_marker(status), status);
+    }
+    assert_eq!(crate::inspector::file_marker("R "), "");
+    assert_eq!(crate::inspector::file_marker("??"), "");
+}
+
+/// A row wears the icon its own name and kind resolve to, in a box the row's metrics already
+/// name: 14 pixels, the size the whole inspector draws its icons at.
+///
+/// This is the row that used to wear one folder glyph for every directory and one page glyph for
+/// every file, so the assertion is that the two names resolve to two different drawings rather
+/// than that an icon is present.
+#[gpui_kit::test]
+async fn a_file_row_wears_the_icon_its_own_name_resolves_to(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("docs")).unwrap();
+    std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries
+                .remove(&(fixture.checkout.clone(), String::new()));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == "main.rs"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let file = window.find("file-icon-main.rs");
+        let folder = window.find("file-icon-docs");
+        assert!(file.visible(), "a file row wears an icon");
+        assert!(folder.visible(), "a directory row wears an icon too");
+        assert_eq!(file.bounds().size.width, px(14.));
+        assert_eq!(folder.bounds().size.height, px(14.));
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Two rows that agree about Git keep their own identity.
+///
+/// An element id names an element for the whole window, so an id built from the
+/// status or a count alone would be worn by every row that agrees with it. Two
+/// files modified the same way are the ordinary case, so this is the case.
+#[gpui_kit::test]
+async fn rows_agreeing_about_git_keep_distinct_identities(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(fixture.root.join(name), "tracked\n").unwrap();
+    }
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add files",
+    ]);
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(fixture.root.join(name), "changed\n").unwrap();
+    }
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+        app.inspector_tab = InspectorTab::Changes;
+        app.request_git_status(&fixture.checkout, cx);
+        cx.notify();
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| status.files.len() == 2)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        for name in ["one.txt", "two.txt"] {
+            assert!(
+                window.find(format!("row-{name}-status")).visible(),
+                "{name} keeps its own status"
+            );
+            assert!(
+                window.find(format!("row-{name}-add")).visible(),
+                "{name} keeps its own counts"
+            );
+        }
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
 
 #[gpui_kit::test]
 fn files_root_load_and_simultaneous_directory_expansions_keep_independent_results(
@@ -48,6 +167,57 @@ fn files_root_load_and_simultaneous_directory_expansions_keep_independent_result
                 .any(|entry| entry.name == "b.txt")
         );
     });
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn folder_activation_keeps_expanded_accessibility_state_in_sync(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("folder")).unwrap();
+    std::fs::write(fixture.root.join("folder/file.txt"), "content").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries
+                .remove(&(fixture.checkout.clone(), String::new()));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == "folder"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("file-control:folder").expanded(), Some(false));
+        window.click("file-control:folder", cx);
+        assert_eq!(window.find("file-control:folder").expanded(), Some(true));
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), "folder".into()))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.name == "file.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("file-control:folder/file.txt").is_some());
+        window.click("file-control:folder", cx);
+        assert_eq!(window.find("file-control:folder").expanded(), Some(false));
+        assert!(window.try_find("file-control:folder/file.txt").is_none());
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 
@@ -121,7 +291,20 @@ async fn changes_open_in_the_center_and_refresh_without_replacing_the_terminal(
             "All changes is a view, not a second toolbar action"
         );
         assert_eq!(window.find("item-crumb").label(), Some("change.txt"));
+        // The crumb naming a file wears that file's icon, at the crumb's own 12 pixels. A whole
+        // change set names no file, so it wears the terminal glyph and has no icon to find.
+        let icon = window.find("item-crumb-icon");
+        assert!(icon.visible(), "the crumb names a file and wears its icon");
+        assert_eq!(icon.bounds().size.width, px(12.));
         window.click("close-diff", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-crumb-icon").is_none(),
+            "a terminal names no file and wears the glyph it always wore"
+        );
     })
     .unwrap();
     fixture.view.read_with(cx, |app, _| {
@@ -567,5 +750,176 @@ async fn a_refresh_during_a_status_read_is_coalesced_not_lost(cx: &mut TestAppCo
             "two pending refreshes launch one fresh snapshot after the old read"
         );
     });
+    close(&fixture, cx);
+}
+
+/// The two lists stand on Legacy's columns.
+///
+/// Every distance here is a difference between two drawn bounds, so the check
+/// is about where a column starts and not about how wide a glyph is: the file
+/// tree's fold slot at the panel's own 8px and one 14px step per level, a
+/// change row one step in from the heading above it, and every row exactly as
+/// tall as the next.
+#[gpui_kit::test]
+async fn the_file_and_change_lists_line_up_on_legacy_columns(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(fixture.root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(fixture.root.join("top.txt"), "tracked\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add files",
+    ]);
+    std::fs::write(fixture.root.join("top.txt"), "changed\n").unwrap();
+
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+        app.inspector_tab = InspectorTab::Files;
+        cx.notify();
+    });
+    // The window opened before these files existed, so its first listing is
+    // already the empty one; ask again the way a reader opening a folder does.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries
+                .remove(&(fixture.checkout.clone(), String::new()));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| !entries.is_empty())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The control is laid over its row, so its bounds are the row's box:
+        // every distance below is measured from the row's own left edge.
+        let row = window.find("file-control:src").bounds();
+        let slot = window.find("file-slot-src").bounds();
+        assert_eq!(row.size.height, px(26.), "a row is one row tall");
+        assert_eq!(
+            slot.origin.x - row.origin.x,
+            px(8.),
+            "the fold slot starts at the panel's own gutter"
+        );
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.expanded_files
+                .insert((fixture.checkout.clone(), "src".into()));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, "src".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), "src".into()))
+            .is_some_and(|entries| !entries.is_empty())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let row = window.find("file-control:src/main.rs").bounds();
+        let slot = window.find("file-slot-src/main.rs").bounds();
+        assert_eq!(
+            slot.origin.x - row.origin.x,
+            px(22.),
+            "a level in is one 14px step"
+        );
+    })
+    .unwrap();
+
+    fixture.view.update(cx, |app, cx| {
+        app.inspector_tab = InspectorTab::Changes;
+        app.request_git_status(&fixture.checkout, cx);
+        cx.notify();
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| !status.files.is_empty())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let group = window.find("change-group-/").bounds();
+        let row = window.find("change-control-top.txt").bounds();
+        let status = window.find("row-top.txt-status").bounds();
+        let name = window.find("change-name-top.txt").bounds();
+        let addition = window.find("row-top.txt-add").bounds();
+        assert_eq!(row.size.height, px(26.), "a row is one row tall");
+        assert_eq!(
+            group.origin.x - row.origin.x,
+            px(0.),
+            "the heading sits on the panel's own edge"
+        );
+        assert_eq!(
+            status.origin.x - row.origin.x,
+            px(22.),
+            "status starts one step in from the heading above it"
+        );
+        assert!(status.right() <= name.origin.x, "status precedes the name");
+        assert!(name.right() <= addition.origin.x, "counts follow the name");
+    })
+    .unwrap();
+    for status in ["R", "C", "T", "??"] {
+        fixture.view.update(cx, |app, cx| {
+            app.git_status.get_mut(&fixture.checkout).unwrap().files[0].status = status.into();
+            app.open_diff = Some((fixture.checkout.clone(), None));
+            cx.notify();
+        });
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            // The chip is still there: a status the file tree's marker filter
+            // drops must not leave the change list or the header blank.
+            assert!(
+                window.find("row-top.txt-status").visible(),
+                "{status} keeps its chip in the change list"
+            );
+            assert!(
+                window.find("diff-status-top.txt").visible(),
+                "{status} keeps its letter in the diff header"
+            );
+        })
+        .unwrap();
+    }
     close(&fixture, cx);
 }

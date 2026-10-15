@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{rgb, rgba, App, Hsla};
+use gpui_kit::{px, rgb, rgba, App, Hsla};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
@@ -50,6 +50,25 @@ const SYNTAX_STRING_EXPRESSION: u32 = 0xdfc184;
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
 pub fn install(cx: &mut App) {
+    // C++'s upstream query contains only its additions to C. The toolkit
+    // registers it alone; include the base query so ordinary C++ is colored.
+    static LANGUAGES: std::sync::Once = std::sync::Once::new();
+    LANGUAGES.call_once(|| {
+        let registry = gpui_kit::component::highlighter::LanguageRegistry::singleton();
+        let c = registry.language("c").expect("C grammar enabled");
+        let mut cpp = registry.language("cpp").expect("C++ grammar enabled");
+        cpp.highlights = format!("{}\n{}", c.highlights, cpp.highlights).into();
+        registry.register("cpp", &cpp);
+        for (name, query) in [
+            ("csharp", tree_sitter_c_sharp::HIGHLIGHTS_QUERY),
+            ("cmake", tree_sitter_cmake::HIGHLIGHTS_QUERY),
+            ("swift", tree_sitter_swift::HIGHLIGHTS_QUERY),
+        ] {
+            let mut config = registry.language(name).expect("grammar enabled");
+            config.highlights = query.to_owned().into();
+            registry.register(name, &config);
+        }
+    });
     Theme::change(ThemeMode::Dark, None, cx);
     Theme::update(cx, |theme| {
         let base: Hsla = rgb(0x16181d).into();
@@ -154,9 +173,22 @@ pub fn install(cx: &mut App) {
         theme.link_hover = accent;
         theme.link_active = accent;
         theme.window_border = border;
+        // One face for the whole app, which is what `--muster-font` is in
+        // Legacy. The toolkit's root refines every window's surface with
+        // `font_family`, so this is the one line that takes Fira Code to the
+        // chrome that names no family of its own — the diff's header, the
+        // inspector's rows, the toolbars — and to the toolkit's own widgets.
+        // `font_size` is left alone on purpose: the toolkit derives the window's
+        // `rem` from it, so moving it would rescale every `text_*` in the
+        // window at once. What has to match Legacy is written in pixels where
+        // it is drawn.
+        theme.font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
         // The read-only document and the diff are the app's code, and Legacy
-        // drew them in this app's face rather than the toolkit's default.
+        // drew them in this app's face rather than the toolkit's default. The
+        // size is Legacy's editor size, which the diff reads at too, so it is
+        // named here rather than inherited from the toolkit's default.
         theme.mono_font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
+        theme.mono_font_size = px(13.);
         theme.highlight_theme = Arc::new(content_highlight_theme(theme));
     });
 }
@@ -242,6 +274,32 @@ pub struct Status {
     pub success: Hsla,
     /// Something worth reading that is neither of the three above.
     pub info: Hsla,
+}
+
+/// The inks Catppuccin's file icons paint their layers with.
+///
+/// A role name rather than a value: the drawing names the ink it wants and the window answers with
+/// [`Roles::ink`], which is what lets one set of drawings serve whatever palette the app installs.
+/// The set is exhaustive on purpose — a drawing reaching an ink that is not here is a generator
+/// failure, not a blank stroke in the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
+    Text,
+    Overlay1,
+    Red,
+    Maroon,
+    Flamingo,
+    Rosewater,
+    Pink,
+    Mauve,
+    Lavender,
+    Blue,
+    Sky,
+    Sapphire,
+    Teal,
+    Green,
+    Yellow,
+    Peach,
 }
 
 /// One colour per meaning the window can draw.
@@ -365,18 +423,36 @@ impl Roles {
 }
 
 impl Roles {
-    /// File-type ink follows Legacy's icon tokens, separate from syntax and chrome.
-    pub fn file_icon(&self, path: &str) -> Hsla {
-        let value = match path.rsplit('.').next().unwrap_or("") {
-            "json" | "jsonc" | "js" | "mjs" | "yaml" | "yml" => 0xf9e2af,
-            "rs" => 0xfab387,
-            "ts" | "tsx" => 0x89b4fa,
-            "md" | "markdown" => 0x89dceb,
-            "css" | "scss" => 0xcba6f7,
-            "html" | "htm" => 0xf38ba8,
-            _ => 0xcdd6f4,
-        };
-        rgb(value).into()
+    /// The ink one of Catppuccin's file icons paints its layer with.
+    ///
+    /// These are not chrome: a file icon is its own drawing wearing its own colours, the way the
+    /// terminal grid wears what a VT sequence asked for. They live here anyway because this is the
+    /// one place the app names a colour, and because a second table anywhere else is the drift
+    /// this module exists to prevent.
+    ///
+    /// The values are Catppuccin's Mocha palette, which is what Legacy draws file icons in under
+    /// its dark theme. There is no light palette to swap: the app has one appearance, chosen in
+    /// `main.rs` before the first window opens.
+    pub fn ink(&self, ink: Ink) -> Hsla {
+        rgb(match ink {
+            Ink::Text => 0xcdd6f4,
+            Ink::Overlay1 => 0x7f849c,
+            Ink::Red => 0xf38ba8,
+            Ink::Maroon => 0xeba0ac,
+            Ink::Flamingo => 0xf2cdcd,
+            Ink::Rosewater => 0xf5e0dc,
+            Ink::Pink => 0xf5c2e7,
+            Ink::Mauve => 0xcba6f7,
+            Ink::Lavender => 0xb4befe,
+            Ink::Blue => 0x89b4fa,
+            Ink::Sky => 0x89dceb,
+            Ink::Sapphire => 0x74c7ec,
+            Ink::Teal => 0x94e2d5,
+            Ink::Green => 0xa6e3a1,
+            Ink::Yellow => 0xf9e2af,
+            Ink::Peach => 0xfab387,
+        })
+        .into()
     }
 
     /// The background a row wears at rest.
@@ -506,6 +582,27 @@ mod tests {
             assert_eq!(role, legacy(token), "role differs from --muster-{token}");
             assert!(role.is_opaque(), "{token} must be opaque");
         }
+    }
+
+    #[gpui_kit::test]
+    fn the_whole_app_is_drawn_in_legacy_face_and_the_code_at_legacy_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx);
+        });
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            // The toolkit's root refines each window's surface with this, so
+            // it is what every element that names no family of its own draws
+            // with — the same one face `--muster-font` is in Legacy.
+            assert_eq!(theme.font_family, crate::app::SIDEBAR_FONT_FAMILY);
+            assert_eq!(theme.mono_font_family, crate::app::SIDEBAR_FONT_FAMILY);
+            // Legacy's editor size, which the diff reads at as well.
+            assert_eq!(theme.mono_font_size, px(13.));
+            // Not changed on purpose: the toolkit derives the window's `rem`
+            // from it, so every `text_*` in the app would move with it.
+            assert_eq!(theme.font_size, px(16.));
+        });
     }
 
     #[gpui_kit::test]

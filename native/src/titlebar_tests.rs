@@ -76,9 +76,25 @@ fn the_crumbs_say_what_the_sidebar_says(cx: &mut TestAppContext) {
 /// wears none: it is the name that is always there.
 #[test]
 fn a_crumb_wears_the_glyph_of_the_row_it_names() {
-    assert_eq!(crumb_icon(Crumb::Workdir), None);
-    assert_eq!(crumb_icon(Crumb::Worktree), Some(IconName::GitBranch));
-    assert_eq!(crumb_icon(Crumb::Item), Some(IconName::SquareTerminal));
+    assert_eq!(crumb_glyph(Crumb::Workdir, None), CrumbGlyph::None);
+    assert_eq!(
+        crumb_glyph(Crumb::Worktree, None),
+        CrumbGlyph::Named(IconName::GitBranch)
+    );
+    assert_eq!(
+        crumb_glyph(Crumb::Item, None),
+        CrumbGlyph::Named(IconName::SquareTerminal)
+    );
+}
+
+/// A crumb that names a file wears that file's own icon, under the last segment of its path:
+/// an icon resolves from a name alone, and a path with separators in it finds no rule.
+#[test]
+fn a_crumb_naming_a_file_wears_that_files_icon() {
+    assert_eq!(
+        crumb_glyph(Crumb::Item, Some("main.rs")),
+        CrumbGlyph::File("main.rs".into())
+    );
 }
 
 /// One open name for the whole line: opening one crumb closes the others rather

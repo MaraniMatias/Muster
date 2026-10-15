@@ -76,8 +76,12 @@ ANSI 16–255 retain the standard xterm colour cube and greyscale ramp.
 ## Reference colours without a corresponding native surface yet
 
 Do not substitute these for the application's chrome or add unused native
-constants. The native app has no file editor, syntax preview or coloured file-type
-icon set yet.
+constants. The native app now has a read-only syntax preview, a unified diff
+and Legacy's own file icons. Content background/foreground, gutter ink and syntax
+colors are installed in `theme.rs::content_highlight_theme`; the file icon inks
+are `theme::Ink`, answered by `Roles::ink`, one per ink a drawing names rather
+than one per extension a name has. The syntax values and the icon values below
+are therefore implemented, not pending. Full editor behavior remains open.
 
 | Legacy group | Tokens and dark values |
 | --- | --- |
@@ -111,6 +115,11 @@ Two behavioural differences are not colours and are left in place:
   dragged, and the native one cannot yet. It also does not widen on hover.
 - Legacy's keyboard-highlighted menu row adds a focus ring around the wash.
   Native keeps the wash and the toolkit's own focus handling, without that ring.
+
+The toolkit diff still paints change washes from `theme.success`/`theme.danger`
+at 12% rather than Legacy's content-added/content-removed mixtures, and uses
+muted chrome ink for line numbers rather than the content gutter token.
+See `interface-parity.md` for typography, geometry and grammar limitations.
 
 No interactive screenshot comparison has been performed. This map and the tests
 verify colour values and state rules, not pixel-for-pixel geometry or shadows.

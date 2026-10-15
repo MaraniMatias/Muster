@@ -93,7 +93,8 @@ The current split mode is **terminal plus preview**. A Rust domain model also su
 | `ConfirmDialog.vue` | AlertDialog/Dialog | Question identity, cancel semantics, focus return and failure persistence. |
 | `ToastStack.vue` | Notifications | Current transient error/info semantics and contextual reporting. |
 | `OverlayScrollbar.vue` | Native scroll handles/scrollbars | Theme and preference behavior; no hidden competing scroll region. |
-| `FileIcon.vue`, local UI wrappers | Kit/Lucide icons and controls | File-type mapping, state icons and accessible labels. |
+| `FileIcon.vue` | Catppuccin's drawings, generated into `native/src/file_icons/` | Ignored metadata and prominence opacity. The name rules are Legacy's own, quirks included. |
+| Local UI wrappers | Kit/Lucide icons and controls | State icons and accessible labels. |
 
 Search for the Kit component first. Custom views are justified for the terminal and Muster's dense navigation rows, not for recreating every button/menu from scratch.
 
@@ -105,6 +106,9 @@ Search for the Kit component first. Custom views are justified for the terminal 
 - Worktree/branch breadcrumb only for a Git repo; detached state remains meaningful.
 - Terminal breadcrumb is a menu when a terminal is shown.
 - Document/diff breadcrumb names the current path; it is not a terminal menu over a file.
+- That breadcrumb wears the named file's own icon on its last step, resolved from the name
+  alone, the same drawing its row wears in the file tree. A whole change set names no file and
+  wears the terminal glyph instead.
 - One open breadcrumb menu at a time.
 - Workdir/worktree choices have search where currently present.
 - Paths shorten according to available room, keeping useful identity and a full tooltip/accessibility label.
@@ -125,7 +129,8 @@ The bar in `native/src/app.rs` carries the window chrome, the three crumbs and t
 
 - The settings action: there is no native settings surface to open.
 - The focus/split layout toggle: the native window has one layout, not two.
-- The document/diff crumb and its file glyph: there is no native inspector to open a file from.
+- The document/diff crumb's *menu*: the crumb and the file glyph it wears are native now, and the
+  menu it opens is still not, because there is no terminal to offer from it.
 - The maximized-state tracking the reference kept to label its own restore button: the native controls ask the window.
 
 They arrive with the surface each one opens, not before.
@@ -287,7 +292,7 @@ the full-port completion rule in section 16 still applies to the rest of the app
 
 | Surface | Delivered natively | Still required from the live legacy UI |
 | --- | --- | --- |
-| Files | Bounded lazy listings, virtual rows, expansion/selection, subtree errors and operation-specific retry; file/folder icons with file-type ink, path tooltips, dimmed dotfiles, filtered Git markers and selected tree/tab states. | Ignored metadata, supported symlink representation, sticky ancestors/reveal, modifier external-open, horizontal/scroll stability and tree/tab keyboard parity. |
+| Files | Bounded lazy listings, virtual rows, expansion/selection, subtree errors and operation-specific retry; Legacy's own file and folder icons, each drawing painted in the inks it names, path tooltips, dimmed dotfiles, filtered Git markers and selected tree/tab states. | Ignored metadata, supported symlink representation, sticky ancestors/reveal, modifier external-open, horizontal/scroll stability and tree/tab keyboard parity. |
 | Changes | Git merge-base status and per-file optional counts, directory grouping, count badge, individual and All changes routes. Unknown counts do not hide other files or become zero. | Independent selected-change/scroll state per checkout, virtualized large change lists, and richer branch/head/ahead/rename context. |
 | Navigation | Dirty checkout rows/label/count targets share one All changes action; explicit terminal selection and preview Close retain the existing PTY. A newly requested terminal replaces the current preview without a later shell completion stealing a subsequently opened preview. | Restore each clean checkout's prior view, not always its terminal; preserve a preview beside session selection in split layout. |
 | Documents | Whole UTF-8 text up to 1 MiB in a retained read-only toolkit Editor, with source line numbers, selection/copy, horizontal scrolling and syntax highlighting. Empty files and trailing newlines remain exact. | Editor/draft Save/Cancel with expected-content conflict checks; formatting, additional grammars/settings and changed-line gutters; Markdown/links, images/SVG, review-document origins and path copy. |
@@ -295,6 +300,18 @@ the full-port completion rule in section 16 still applies to the rest of the app
 | Refresh | Git status/diff polling with either inspector tab active, manual Changes refresh and stale-result rejection. | Repository/shared-Git watchers with debounce and recovery; refresh Files listings and open documents after file activity, including ignored-file edits. |
 | Layout/state | Resizable inspector and panel visibility; existing sidebar persistence. | Inspector/preview width and focus/split layout persistence, narrow-window drawer/hover strip, per-checkout tabs, views, expansions and independent reading positions. Native workspace persistence does not currently store these. |
 | Review | Not delivered. | Line/range notes, anchor reconciliation, note lifecycle, rounds, Markdown export, OpenCode target/send/queue/acknowledgement and persistence. |
+
+### Typography and source highlighting follow-up
+
+The diff's face and size, the inspector's columns and the document's grammar
+coverage were closed in one pass. What was wrong, what changed, what the tests
+actually prove, and what remains different are recorded in
+[`typography-and-highlighting.md`](./typography-and-highlighting.md). In short:
+Fira Code for all chrome at Legacy's sizes, the diff header and the inspector on
+Legacy's columns and inks, folder controls reporting their expanded state, and
+32 grammars resolving through the installed Legacy token theme. Remaining
+differences are the toolkit's own diff geometry and its gutter and hunk bands;
+no screenshot comparison has been performed.
 
 Audit sources: `legacy/src/components/{InspectorPane,DocumentPane,FileDiff,MainPane}.vue`,
 `legacy/src/App.vue` (`showView`, `activateCheckoutTerminal`),

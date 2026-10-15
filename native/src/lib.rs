@@ -17,6 +17,9 @@ mod diff;
 /// Lazy checkout Files inspector.
 pub mod inspector;
 
+/// The icon a file or directory wears, cut into the inks it paints with.
+mod file_icons;
+
 /// The left panel: repositories, their worktrees, and the terminals in them.
 pub mod sidebar;
 

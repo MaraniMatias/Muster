@@ -42,7 +42,7 @@ use crate::pty::TerminalBackend;
 // The test suites drive these two through the window, so the parent module
 // names them rather than each suite reaching into the module that owns them.
 #[cfg(test)]
-use crate::titlebar::crumb_icon;
+use crate::titlebar::{crumb_glyph, CrumbGlyph};
 #[cfg(test)]
 use crate::worktree_dialog::close_worktree_dialog;
 
