@@ -8,6 +8,29 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **The app has its icon back on macOS.** An executable carries no icon there: the
+  icon is what the bundle around it says it is. `scripts/bundle-macos.sh` builds
+  `Muster.app` with the same bundle identifier, name, copyright and artwork the
+  Tauri build shipped, so the OS files the native shell as the same application
+  rather than as a second one that happens to look like it. Two fields differ on
+  purpose: the bundle declares macOS 15 as its floor, which is what the toolkit
+  this app is built on needs rather than what the old webview build needed, and
+  the build now enforces that floor instead of only promising it, so an API newer
+  than 15.0 is a build error rather than a crash on someone else's Mac. The
+  version is whatever `native/Cargo.toml` declares.
+
+- **There is a menu bar on macOS.** The app menu carries About, Services, Hide,
+  Hide Others and Quit, and the Edit submenu carries Undo through Select All —
+  the same two submenus the Tauri build had. Edit is not decoration there: those
+  are the key equivalents `⌘C`, `⌘V`, `⌘X`, `⌘A` and `⌘Z` are answered by, and on
+  macOS they are answered before the key reaches the window, so the terminal
+  answers them as the toolkit's copy and paste actions as well as in its own key
+  handling. Either way the grid copies its selection and pastes into the child.
+
+- **About Muster says what it always said.** The icon, the name, the version, the
+  copyright and the repository, in the order macOS shows them, in a panel of its
+  own that closes with `⌘W`.
+
 - **Where an exported review round lands is a preference.** Settings has a "Review notes" section
   with a selector for it: `Default` keeps them in `~/.muster/tmp/reviews`, and `Work directory`
   keeps them in `.muster/reviews` inside the checkout the review was made in — the repository or

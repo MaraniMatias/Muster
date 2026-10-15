@@ -1,0 +1,18 @@
+# The floor the app's bundle declares, enforced by the build instead of promised
+# by `Info.plist`.
+#
+# `scripts/bundle-macos.sh` writes `LSMinimumSystemVersion 15.0` into the bundle,
+# which is what makes macOS offer this app only on a system that can run it. This
+# is the half that makes the claim true: with the deployment target set, a call to
+# an API newer than 15.0 is a compile error rather than an app that claims a floor
+# it does not meet. 15.0 is the toolkit's documented macOS floor, recorded in
+# `docs/native-rust-migration/README.md` §4.5.
+#
+# `MACOSX_DEPLOYMENT_TARGET` and not a target rustflag because it is the one knob
+# both halves read: rustc turns it into the `-platform_version` the linker is
+# given, and clang turns it into `__MAC_OS_X_VERSION_MIN_REQUIRED`, which is what
+# marks an API unavailable to a `-sys` crate's bindings.
+#
+# Read only on Apple targets, so the Linux job in CI ignores it.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"

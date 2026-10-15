@@ -7,6 +7,10 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 description = "Muster's native GPUI shell. The terminal milestone lives here; the Tauri app stays the shipping build until cutover."
+# Read by the About panel, the same way Legacy's read it: `env!` is resolved by
+# rustc, so the URL lands in the binary, where a field read off the bundle config
+# at runtime would not.
+homepage = "https://github.com/MaraniMatias/Muster"
 
 [lib]
 name = "muster_native"

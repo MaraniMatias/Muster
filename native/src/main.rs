@@ -28,6 +28,11 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             muster_native::theme::install(cx);
+            // macOS only, and before any window exists: the menu bar is set once
+            // for the application, and the About item it carries is answered by
+            // the same `init` the window below is.
+            #[cfg(target_os = "macos")]
+            muster_native::menus::install(cx);
             // Before any window exists: the sidebar's family has to be registered
             // before the first frame asks for it, or GPUI answers with a fallback.
             app::load_fonts(cx);

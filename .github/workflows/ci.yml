@@ -35,6 +35,10 @@ jobs:
       - run: node scripts/audit-rust.mjs
 
       - run: cargo build --locked --release -p muster-native
+      # The macOS bundle is what carries the app's icon, name and version, so a
+      # release build that cannot be bundled is a release build that would ship
+      # without an identity.
+      - run: scripts/bundle-macos.sh
 
   # macOS never compiles the Linux branches of the code, so nothing above would notice them
   # rotting. GPUI Kit has real Linux targets; building them is the point of this job. The core

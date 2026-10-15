@@ -24,6 +24,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gpui_kit::component::input::{Copy as EditCopy, Paste as EditPaste};
 use gpui_kit::{
     canvas, div, point, px, quad, App, Bounds, Context, FocusHandle, FontStyle, FontWeight, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Render,
@@ -833,6 +834,21 @@ impl TerminalView {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.paste_text(text, window, cx);
         }
+    }
+
+    /// `⌘C` as the menu bar's Copy item sends it.
+    ///
+    /// A menu item with a key equivalent is answered by AppKit before the key
+    /// reaches the window, so on macOS this is the path a copy takes and
+    /// `on_key_down` is the one that serves the targets with no menu bar. Both
+    /// call the same thing, which is what keeps them one answer rather than two.
+    fn on_action_copy(&mut self, _: &EditCopy, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+    }
+
+    /// `⌘V` as the menu bar's Paste item sends it. See [`Self::on_action_copy`].
+    fn on_action_paste(&mut self, _: &EditPaste, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_clipboard(window, cx);
     }
 
     fn paste_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1715,6 +1731,8 @@ impl Render for TerminalView {
             .id("muster-terminal")
             .size_full()
             .track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_action_copy))
+            .on_action(cx.listener(Self::on_action_paste))
             // A click anywhere in the grid is a click on the terminal. There is
             // nothing inside it to click, so without this the window would take
             // focus only when the pointer happened to land on the chrome.
@@ -2090,6 +2108,59 @@ mod tests {
         let pasted = wait_for_char(&session, 'p');
         let _ = session.close().wait();
         assert!(pasted, "the clipboard never reached the child's write path");
+    }
+
+    /// The same two answers, the way the menu bar asks for them.
+    ///
+    /// A menu item with a key equivalent is answered by AppKit before the key
+    /// reaches the window, so on macOS `⌘C` and `⌘V` arrive here as
+    /// `input::Copy` and `input::Paste` rather than as keys. This is what keeps
+    /// the grid copyable and pasteable on a platform that has a menu bar.
+    #[gpui_kit::test]
+    fn the_menu_actions_copy_and_paste_the_grid(cx: &mut gpui_kit::TestAppContext) {
+        let session = script_session("printf 'alpha'; cat");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&session, 'l'));
+        let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
+        cx.simulate_click(
+            point(origin.x + cell.width * 0.2, origin.y),
+            Default::default(),
+        );
+        cx.simulate_click(
+            point(origin.x + cell.width * 0.2, origin.y),
+            Default::default(),
+        );
+        assert_eq!(session.snapshot().selection.as_deref(), Some("alpha"));
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(EditCopy), cx));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text())
+                .as_deref(),
+            Some("alpha"),
+            "the menu's Copy is the grid's copy"
+        );
+
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "pasted-text".to_owned(),
+        ));
+        cx.update(|window, cx| window.dispatch_action(Box::new(EditPaste), cx));
+        let pasted = wait_for_char(&session, 'p');
+        let _ = session.close().wait();
+        assert!(pasted, "the menu's Paste is the grid's paste");
     }
 
     /// A session whose child prints `selection-text` and then waits for input.

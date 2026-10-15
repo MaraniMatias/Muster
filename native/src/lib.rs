@@ -8,6 +8,9 @@
 /// The workspace window, retained terminal registry, and native sidebar.
 pub mod app;
 
+/// The About panel the macOS app menu's first item opens.
+pub mod about;
+
 /// Read-only central document surface.
 pub mod document;
 
@@ -16,6 +19,9 @@ mod diff;
 
 /// Lazy checkout Files inspector.
 pub mod inspector;
+
+/// The macOS menu bar, and the app-level keys its items carry.
+pub mod menus;
 
 /// The icon a file or directory wears, cut into the inks it paints with.
 mod file_icons;

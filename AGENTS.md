@@ -10,7 +10,7 @@ Cargo.toml        workspace: core + native, and the [patch.crates-io] table
 core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
 native/           muster-native the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
 legacy/           the Tauri 2 + Vue 3 app, frozen at v0.21.1. Not built here.
-scripts/          the RustSec audit and the vendored-crate hash pins
+scripts/          the RustSec audit, the macOS bundle and the vendored-crate hash pins
 docs/             the migration plan, and what the port has to satisfy
 ```
 
@@ -22,7 +22,7 @@ docs/             the migration plan, and what the port has to satisfy
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
 - `core` holds 106 tests (102 inline plus the four-process instance-lock suite in
-  `core/tests/`) and `native` holds 285 default tests plus two ignored
+  `core/tests/`) and `native` holds 293 default tests plus two ignored
   performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
@@ -119,6 +119,29 @@ tinted per layer. The generator enforces that every layer carries a paint usvg c
 parse, that every shape lands in exactly one layer, and that no rule key carries a
 dot — a key with a dot is one no file name can be asked about, which is how Legacy
 reaches a third fewer rules than the theme defines.
+
+## On macOS, the app is the bundle
+
+An executable has no icon of its own on macOS: the icon, the name Finder and
+the menu bar show, the version in Get Info and the category are what
+`Info.plist` says about the `.app` around it. `scripts/bundle-macos.sh` is that
+`.app`, and it carries Legacy's identifier, name, copyright and artwork so the
+OS files this build as the same application rather than a second one that looks
+like it. `native/assets/icon.icns` is the bundle's icon and `icon.png` is the
+same 512×512 the About panel draws; the artwork came out of `legacy/` and is not
+hand-edited.
+
+The menu bar is `native/src/menus.rs`, and it is macOS-only by call site: the
+same two submenus Legacy built in `legacy/src-tauri/src/menus.rs`. The Edit
+submenu is not decoration, and it is the one part of the menu that changes
+behaviour rather than adding it — AppKit answers a key equivalent before the key
+reaches the window, so `⌘C`/`⌘V` arrive as `input::Copy`/`input::Paste`, which is
+why `TerminalView` listens for those two as well as answering the keys itself.
+
+`LSMinimumSystemVersion 15.0` in that bundle is a claim; `.cargo/config.toml` is
+what makes the build enforce it. The two are one decision: if the floor moves,
+both move, and if a build fails with an unavailable API then that API is the real
+floor rather than the number that was written down.
 
 ## The file tree
 
