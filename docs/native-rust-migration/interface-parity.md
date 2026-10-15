@@ -292,7 +292,7 @@ the full-port completion rule in section 16 still applies to the rest of the app
 
 | Surface | Delivered natively | Still required from the live legacy UI |
 | --- | --- | --- |
-| Files | Bounded lazy listings, virtual rows, expansion/selection, subtree errors and operation-specific retry; Legacy's own file and folder icons, each drawing painted in the inks it names, path tooltips, dimmed dotfiles, filtered Git markers and selected tree/tab states. | Ignored metadata, supported symlink representation, sticky ancestors/reveal, modifier external-open, horizontal/scroll stability and tree/tab keyboard parity. |
+| Files | Bounded lazy listings, a windowed tree with padding for the rows not built, expansion/selection that keeps the folders above it open, per-folder loading and failure as rows of the tree, sticky ancestor folders drawn over it with reveal, Legacy's own file and folder icons each painted in the inks it names, path tooltips, dimmed dotfiles, filtered Git markers and selected tree/tab states. | Ignored metadata, supported symlink representation, modifier external-open, horizontal/scroll stability, focus transfer from a sticky folder onto its row, and tree/tab keyboard parity. |
 | Changes | Git merge-base status and per-file optional counts, directory grouping, count badge, individual and All changes routes. Unknown counts do not hide other files or become zero. | Independent selected-change/scroll state per checkout, virtualized large change lists, and richer branch/head/ahead/rename context. |
 | Navigation | Dirty checkout rows/label/count targets share one All changes action; explicit terminal selection and preview Close retain the existing PTY. A newly requested terminal replaces the current preview without a later shell completion stealing a subsequently opened preview. | Restore each clean checkout's prior view, not always its terminal; preserve a preview beside session selection in split layout. |
 | Documents | Whole UTF-8 text up to 1 MiB in a retained read-only toolkit Editor, with source line numbers, selection/copy, horizontal scrolling and syntax highlighting. Empty files and trailing newlines remain exact. | Editor/draft Save/Cancel with expected-content conflict checks; formatting, additional grammars/settings and changed-line gutters; Markdown/links, images/SVG, review-document origins and path copy. |
@@ -354,7 +354,9 @@ Native implementation should:
 - Preserve folder reveal/expand behavior distinct from opening a file.
 - Preserve platform-modifier external-open behavior.
 - Keep focus usable when collapsing a subtree containing the focused row.
-- Implement sticky ancestor behavior if Kit Tree does not supply the same interaction.
+- Preserve the sticky ancestor stack: the folders open above the first row on screen, drawn
+  over the rows they name and trimmed to what the panel holds, with a click bringing the
+  folder back to the top of the tree.
 
 Do not read the entire checkout recursively on each paint or use a toolkit tree's eager file-loading shortcut to bypass existing containment policy.
 

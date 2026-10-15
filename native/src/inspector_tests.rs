@@ -1,7 +1,9 @@
 use super::*;
 use crate::app::sidebar_tests::{close, open_git, GitFixture};
+use crate::inspector::{sticky_ancestors, tree_window, within, Ancestor, TreeRow};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{px, TestAppContext};
+use std::rc::Rc;
 
 #[test]
 fn change_status_keeps_uncommon_git_codes_visible() {
@@ -50,6 +52,531 @@ async fn a_file_row_wears_the_icon_its_own_name_resolves_to(cx: &mut TestAppCont
         assert!(folder.visible(), "a directory row wears an icon too");
         assert_eq!(file.bounds().size.width, px(14.));
         assert_eq!(folder.bounds().size.height, px(14.));
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Opening a folder opens it inside the tree that is already open, and not instead of it.
+///
+/// The defect this pins: a listing arriving cleared every other expansion in the same
+/// checkout, so opening a folder two levels down collapsed everything above it and the
+/// subtree being walked vanished the instant its child finished loading. One level was
+/// never enough to show it, which is why it survived a click-through.
+#[gpui_kit::test]
+async fn opening_a_nested_folder_keeps_the_folders_above_it_open(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("outer/inner")).unwrap();
+    std::fs::write(fixture.root.join("outer/inner/deep.txt"), "content").unwrap();
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    for path in ["outer", "outer/inner"] {
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            let view = fixture.view.read(cx);
+            view.file_entries.contains_key(&key("")) || view.file_entries.contains_key(&key(path))
+        })
+        .await;
+        let control = gpui_kit::ElementId::from(format!("file-control:{path}"));
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(control, cx);
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).file_entries.contains_key(&key(path))
+        })
+        .await;
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let (outer, opened) = fixture.view.read_with(cx, |app, _| {
+                (
+                    app.expanded_files.contains(&key("outer")),
+                    app.expanded_files.contains(&key(path)),
+                )
+            });
+            assert!(outer, "outer stays open whatever happens below it");
+            assert!(opened, "{path} is the folder just opened");
+        })
+        .unwrap();
+    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .try_find("file-control:outer/inner/deep.txt")
+                .is_some(),
+            "the grandchild is on screen: the tree above it did not collapse"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Collapsing a directory forgets the whole subtree, not just the directory.
+///
+/// Everything under a closed folder is unreachable by definition: leaving the
+/// descendants expanded and their listings resident is what made a tree walked
+/// wide and closed again stay in memory, and what made it come back open. The
+/// prefix has to carry the separator, so `src-tauri` survives closing `src`.
+#[gpui_kit::test]
+async fn collapsing_a_folder_forgets_everything_under_it(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("outer/inner")).unwrap();
+    std::fs::write(fixture.root.join("outer/inner/deep.txt"), "content").unwrap();
+    std::fs::create_dir_all(fixture.root.join("src-tauri")).unwrap();
+    std::fs::write(fixture.root.join("src-tauri/kept.txt"), "content").unwrap();
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&key(""))
+            .is_some_and(|entries| entries.len() == 2)
+    })
+    .await;
+    for path in ["outer", "outer/inner", "src-tauri"] {
+        let control = gpui_kit::ElementId::from(format!("file-control:{path}"));
+        cx.update_window(fixture.handle, |_, window, cx| {
+            // Two frames: the first lands the listing that made this row exist, the
+            // second is the one that has it.
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.click(control, cx);
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).file_entries.contains_key(&key(path))
+        })
+        .await;
+    }
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let close = gpui_kit::ElementId::from("file-control:outer");
+        window.click(close, cx);
+    })
+    .unwrap();
+    let checkout = fixture.checkout.clone();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        fixture.view.read_with(cx, |app, _| {
+            let under =
+                |(owner, path): &(String, String)| owner == &checkout && within(path, "outer");
+            let open: Vec<&String> = app
+                .expanded_files
+                .iter()
+                .filter(|e| under(e))
+                .map(|(_, p)| p)
+                .collect();
+            let resident: Vec<&String> = app
+                .file_entries
+                .keys()
+                .filter(|e| under(e))
+                .map(|(_, p)| p)
+                .collect();
+            assert!(open.is_empty(), "nothing under it stays open: {open:?}");
+            assert!(
+                resident.is_empty(),
+                "nothing under it stays resident: {resident:?}"
+            );
+            assert!(
+                app.expanded_files
+                    .contains(&(checkout.clone(), "src-tauri".into())),
+                "a sibling whose name merely starts the same is not under it"
+            );
+            assert!(app
+                .file_entries
+                .contains_key(&(checkout.clone(), "src-tauri".into())));
+        });
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A folder that is still answering says so inside the tree, and the rows around it
+/// stay where they were.
+///
+/// The note used to be drawn below the list, where its height came out of the list's
+/// box: opening a folder shrank the tree by one row and moved everything under it.
+/// A note is now a row like any other, at the depth its children would have been.
+#[gpui_kit::test]
+async fn a_folder_that_is_still_loading_says_so_in_place(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("outer")).unwrap();
+    std::fs::write(fixture.root.join("twin.txt"), "x").unwrap();
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).file_entries.contains_key(&key(""))
+    })
+    .await;
+
+    // Mark the folder as answering without letting it answer: this is the instant a
+    // person spends looking at a folder, which is when a moving tree is noticed.
+    fixture.view.update(cx, |app, cx| {
+        app.expanded_files.insert(key("outer"));
+        app.file_loading.insert(key("outer"));
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let before = window.find("file-icon-outer").bounds().origin.y;
+        assert!(
+            window.find("file-note-outer-text").visible(),
+            "the folder says so in the tree"
+        );
+        assert_eq!(
+            window.find("retry-list-outer").label(),
+            Some("Retry listing outer"),
+            "a note offers the one thing that can be done about it, and names what it reads"
+        );
+        assert_eq!(
+            before,
+            window.find("file-icon-outer").bounds().origin.y,
+            "the folder's own row did not move"
+        );
+        assert!(
+            window.try_find("file-icon-outer/anything").is_none(),
+            "a folder that has not answered has no children yet"
+        );
+    })
+    .unwrap();
+
+    // The rows after it keep their place: nothing below the list changed height.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("file-icon-twin.txt").visible());
+        assert!(
+            window.find("file-icon-twin.txt").bounds().origin.y
+                > window.find("file-note-outer-text").bounds().origin.y,
+            "the note is in the order of the tree, not appended under it"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Legacy's fixture: two folders open over eighty files, which is the shape its own
+/// sticky test builds.
+fn legacy_tree(files: usize) -> Vec<TreeRow> {
+    let chain: Rc<[Ancestor]> = vec![
+        Ancestor {
+            path: "src".into(),
+            name: "src".into(),
+            depth: 0,
+            index: 0,
+        },
+        Ancestor {
+            path: "src/nested".into(),
+            name: "nested".into(),
+            depth: 1,
+            index: 1,
+        },
+    ]
+    .into();
+    let mut rows = vec![
+        TreeRow::Entry {
+            entry: entry_at("src", 0, true),
+            depth: 0,
+            ancestors: vec![chain[0].clone()].into(),
+        },
+        TreeRow::Entry {
+            entry: entry_at("nested", 1, true),
+            depth: 1,
+            ancestors: chain.clone(),
+        },
+    ];
+    rows.extend((0..files).map(|index| TreeRow::Entry {
+        entry: entry_at(&format!("f{index}"), 2, false),
+        depth: 2,
+        ancestors: chain.clone(),
+    }));
+    rows
+}
+
+fn names(rows: &[TreeRow], top: usize, stack: usize) -> Vec<String> {
+    sticky_ancestors(rows, top, stack)
+        .into_iter()
+        .map(|ancestor| ancestor.name)
+        .collect()
+}
+
+/// The rule is Legacy's, so it is pinned against Legacy's own cases.
+#[test]
+fn the_folder_stack_is_the_rule_legacy_pins() {
+    let tree = legacy_tree(80);
+    // At the top of the tree the row on screen is the folder itself: nothing to stack.
+    assert_eq!(names(&tree, 0, 8), Vec::<String>::new());
+    // Everywhere else the chain above the row is the stack, and the folders the stack
+    // covers are not repeated in it — the row they are drawn on is still on screen.
+    assert_eq!(names(&tree, 1, 8), ["src", "nested"]);
+    assert_eq!(names(&tree, 40, 8), ["src", "nested"]);
+    // Past the end of the tree, the chain of the last row is what is left.
+    assert_eq!(names(&tree, 10_000, 8), ["src", "nested"]);
+    // Trimmed to what the panel holds, keeping the folders nearest the row.
+    assert_eq!(names(&tree, 40, 1), ["nested"]);
+}
+
+/// A tree of ten thousand rows must not cost a scan to stack. The chain is carried on the
+/// row, so the answer is the same whatever the tree's size — which is the whole reason it
+/// is carried rather than looked up.
+#[test]
+fn a_wide_tree_stacks_the_same_way_a_narrow_one_does() {
+    let narrow = legacy_tree(2);
+    let wide = legacy_tree(10_000);
+    for top in [0, 1, 2, 3, 9, 500, 10_000] {
+        assert_eq!(
+            names(&wide, top, 8),
+            names(&narrow, top.min(narrow.len()), 8),
+            "the size of the tree must not change what is stacked at row {top}"
+        );
+    }
+}
+
+/// A folder that has not answered has no chain: a note stands where its children would be
+/// and must not put its parent folders into the stack a second time.
+#[test]
+fn a_note_does_not_carry_a_chain() {
+    let chain: Rc<[Ancestor]> = vec![Ancestor {
+        path: "src".into(),
+        name: "src".into(),
+        depth: 0,
+        index: 0,
+    }]
+    .into();
+    let rows = vec![
+        TreeRow::Entry {
+            entry: entry_at("src", 0, true),
+            depth: 0,
+            ancestors: chain.clone(),
+        },
+        TreeRow::Note {
+            path: "src".into(),
+            message: "Loading folder…".into(),
+            depth: 1,
+            ancestors: chain,
+        },
+    ];
+    assert_eq!(names(&rows, 2, 8), ["src"]);
+    assert_eq!(names(&rows, 1, 8), ["src"]);
+}
+
+/// The stack is drawn over the tree when the tree is scrolled, and clicking a folder in
+/// it brings that folder back into view.
+///
+/// The stack is read from where the tree is scrolled to, so the only way to see it is to
+/// scroll: `UniformListScrollHandle::scroll_to_item` is what a click on a stacked folder
+/// uses, so the test uses it too.
+#[gpui_kit::test]
+async fn the_folder_stack_appears_over_a_scrolled_tree(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("src/nested")).unwrap();
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("src/nested/f{index:02}.txt")),
+            "x",
+        )
+        .unwrap();
+    }
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).file_entries.contains_key(&key(""))
+    })
+    .await;
+    for path in ["src", "src/nested"] {
+        let control = gpui_kit::ElementId::from(format!("file-control:{path}"));
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.click(control, cx);
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).file_entries.contains_key(&key(path))
+        })
+        .await;
+    }
+
+    // At the top of the tree there is nothing stacked: the row on screen is the folder.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("file-stack").is_none(),
+            "a tree at the top of itself has nothing to stack"
+        );
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        fixture.view.update(cx, |app, _| {
+            app.files_scroll
+                .set_offset(gpui_kit::point(px(0.), px(-30. * 26.)))
+        })
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let stack = window.find("file-stack");
+        assert!(
+            stack.visible(),
+            "a scrolled tree names the folders it is inside"
+        );
+        assert!(window.try_find("file-stack-name-src").is_some());
+        assert!(window.try_find("file-stack-name-src/nested").is_some());
+        assert_eq!(
+            window.find("file-stack:src/nested").label(),
+            Some("Show nested in tree"),
+            "a stacked folder is a way back to it"
+        );
+        assert_eq!(
+            stack.bounds().size.height,
+            px(26. * 2.),
+            "the stack is as tall as the folders in it, and no taller"
+        );
+        assert!(
+            window.find("file-icon-src").bounds().origin.y < stack.bounds().origin.y,
+            "the folders it names have scrolled above the tree: that is why it is there"
+        );
+    })
+    .unwrap();
+
+    // Clicking one brings the tree back to where that folder's own row is.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("file-stack:src/nested", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(
+            fixture.view.read(cx).files_scroll.offset().y,
+            px(0.),
+            "clicking a stacked folder brings it back to the top of the tree"
+        );
+        assert!(
+            window.try_find("file-stack").is_none(),
+            "back at the top, and the stack has gone with it"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The window is Legacy's: a fixed number of rows with a few spare, and the tree's real
+/// height accounted for as space above and below so the scrollbar is the tree's.
+#[test]
+fn the_window_covers_the_tree_and_leaves_the_rest_as_space() {
+    let (drawn, above, below) = tree_window(40, 0);
+    assert_eq!(
+        drawn,
+        0..40,
+        "a tree smaller than the window is built whole"
+    );
+    assert_eq!((above, below), (0., 0.), "and it needs no space around it");
+
+    let (drawn, above, below) = tree_window(1_000, 500);
+    assert_eq!(drawn.len(), 64);
+    assert_eq!(
+        above,
+        490. * 26.,
+        "the rows above the window are still there to scroll"
+    );
+    assert_eq!(
+        below,
+        (1_000 - 554) as f32 * 26.,
+        "and so are the ones below"
+    );
+    assert_eq!(above + below + drawn.len() as f32 * 26., 1_000. * 26.);
+
+    // Near the top the spare rows are spent on what is above, and near the bottom the
+    // window stops short rather than running past the end of the tree.
+    let (drawn, above, _) = tree_window(1_000, 3);
+    assert_eq!(drawn, 0..64);
+    assert_eq!(above, 0.);
+    let (drawn, _, below) = tree_window(1_000, 999);
+    assert_eq!(drawn, 936..1_000);
+    assert_eq!(below, 0.);
+}
+
+/// Every row of the tree is the height the tree says it is, whatever the tree's size.
+///
+/// The rows live in a flex column inside a scroller, and a flex column will shrink its
+/// children to fit if it can. It could: the rows then stood 21 pixels apart instead of
+/// 26, and the tree scrolled by less than it claimed.
+#[gpui_kit::test]
+async fn rows_keep_the_height_the_tree_scrolls_by(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    for index in 0..60 {
+        std::fs::write(fixture.root.join(format!("f{index:03}.txt")), "x").unwrap();
+    }
+    let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries.remove(&key(""));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&key(""))
+            .is_some_and(|entries| entries.len() == 60)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let first = window.find("file-icon-f000.txt").bounds().origin.y;
+        let tenth = window.find("file-icon-f009.txt").bounds().origin.y;
+        assert_eq!(
+            tenth - first,
+            px(9. * 26.),
+            "nine rows apart is nine rows of the tree's own height"
+        );
     })
     .unwrap();
     close(&fixture, cx);
@@ -922,4 +1449,13 @@ async fn the_file_and_change_lists_line_up_on_legacy_columns(cx: &mut TestAppCon
         .unwrap();
     }
     close(&fixture, cx);
+}
+
+/// A listed entry, for a tree built by hand rather than read from a filesystem.
+fn entry_at(name: &str, _depth: usize, directory: bool) -> muster_core::files::FileEntry {
+    muster_core::files::FileEntry {
+        name: name.into(),
+        path: name.into(),
+        directory,
+    }
 }

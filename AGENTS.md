@@ -22,7 +22,7 @@ docs/             the migration plan, and what the port has to satisfy
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
 - `core` holds 100 tests (96 inline plus the four-process instance-lock suite in
-  `core/tests/`) and `native` holds 255 default tests plus two ignored
+  `core/tests/`) and `native` holds 265 default tests plus two ignored
   performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.
@@ -100,6 +100,25 @@ tinted per layer. The generator enforces that every layer carries a paint usvg c
 parse, that every shape lands in exactly one layer, and that no rule key carries a
 dot — a key with a dot is one no file name can be asked about, which is how Legacy
 reaches a third fewer rules than the theme defines.
+
+## The file tree
+
+`native/src/inspector.rs` owns the Files tree and draws it the way Legacy does: a
+scrolling box with a window of rows built either side of the top and the rest of the tree
+accounted for as space above and below, so the scrollbar is the tree's and not the
+window's. It is deliberately **not** `gpui::uniform_list`: that does not publish where it
+is scrolled to, and the folder stack drawn over the rows it names is exactly that number.
+`ScrollHandle::offset()` is.
+
+Three rules the tree depends on, each pinned by a test:
+
+- Opening a folder opens it **inside** the tree that is already open. A listing arriving
+  used to clear every other expansion in the checkout, which collapsed everything above
+  the folder being opened.
+- Collapsing a folder forgets its **whole subtree** — listings, pending reads and
+  failures — and `within` is what keeps a sibling like `src-tauri` out of it.
+- Every row is `flex_none`. A flex column will shrink its children to fit, and the rows
+  then stood 21 pixels apart in a tree that scrolls by 26.
 
 ## The vendored parser
 

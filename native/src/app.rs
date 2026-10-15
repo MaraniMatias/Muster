@@ -438,6 +438,12 @@ pub struct TerminalWindow {
     pub(crate) suppress_sidebar_click: bool,
     pub(crate) resize: Entity<ResizableState>,
     pub(crate) scroll: ScrollHandle,
+    /// Where the file tree is scrolled to.
+    ///
+    /// Its own, apart from the sidebar's, because two things read it that nothing else
+    /// writes: the folder stack has to know which row is on screen, and a click on one
+    /// of those folders has to bring it back into view.
+    pub(crate) files_scroll: ScrollHandle,
     pub(crate) focus_pending: bool,
     /// Whether the platform is presenting this window's frames.
     ///
@@ -504,6 +510,7 @@ impl TerminalWindow {
             suppress_sidebar_click: false,
             resize: cx.new(|_| ResizableState::default()),
             scroll: ScrollHandle::new(),
+            files_scroll: ScrollHandle::new(),
             focus_pending: true,
             visible: true,
             injected: false,

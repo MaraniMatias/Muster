@@ -1,5 +1,7 @@
 //! Lazy checkout Files and Git Changes inspector.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -8,7 +10,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    div, point, px, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, TestSupportExt,
 };
 use muster_core::workspace::{Checkout, Repo, RepoKind};
@@ -44,6 +46,10 @@ fn row_chrome(
     roles: Roles,
     selected: bool,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
+    // Every row is a fixed height, and a flex column will otherwise shrink them to
+    // fit: the tree then scrolls by less than it claims and the last rows are
+    // unreachable. The height has to be the row's own.
+    let row = row.flex_none();
     row.hover(|style| style.bg(roles.row_hover(selected)).text_color(roles.text))
         .when(selected, |row| {
             row.bg(roles.row_rest(true)).text_color(roles.text)
@@ -59,6 +65,67 @@ fn row_chrome(
                     .bg(roles.accent),
             )
         })
+}
+
+/// A folder's state, drawn as a row of the tree.
+///
+/// It carries the row's chrome and nothing else: no icon, no fold, no Git marker,
+/// because none of those belong to a directory that has not answered yet. The retry
+/// is the one control a note has, and it asks for the listing again rather than the
+/// read, because a directory is what is on screen.
+fn note_row(
+    path: &str,
+    message: &str,
+    depth: usize,
+    repo: Repo,
+    checkout: Checkout,
+    weak: gpui_kit::WeakEntity<TerminalWindow>,
+    roles: Roles,
+) -> AnyElement {
+    let retry_path = path.to_owned();
+    row_chrome(
+        div()
+            .id(format!("file-note-{path}"))
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .h(px(26.))
+            .pl(px(8. + depth as f32 * 14.))
+            .pr(px(8.))
+            .child(
+                div()
+                    .id(format!("file-note-{path}-text"))
+                    .test_support()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(roles.text_muted)
+                    .child(message.to_owned()),
+            )
+            .child(
+                Button::new(format!("retry-list-{path}"))
+                    .ghost()
+                    .small()
+                    .compact()
+                    .label("Retry")
+                    .accessibility_label(format!("Retry listing {path}"))
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |app, cx| {
+                            app.request_directory(
+                                repo.clone(),
+                                checkout.clone(),
+                                retry_path.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        });
+                    }),
+            ),
+        roles,
+        false,
+    )
+    .into_any_element()
 }
 
 /// A toolkit button laid over the row with none of its own chrome. It carries
@@ -218,10 +285,195 @@ enum ChangeRow {
     File(muster_core::navigation::ChangedFile),
 }
 
+/// A folder open above a row, and how deep in the tree it sits.
+///
+/// Every row carries its own chain rather than the stack being worked out when the tree
+/// is scrolled. Legacy scans the rows above the viewport on every scroll event, which
+/// costs one pass over the tree, and a tree of ten thousand is exactly the tree where
+/// the stack matters. Carrying it makes the same rule an index lookup.
 #[derive(Clone)]
-struct FileRow {
-    entry: muster_core::files::FileEntry,
-    depth: usize,
+pub(crate) struct Ancestor {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) depth: usize,
+    /// Where the folder's own row is, so bringing it back into view is one lookup.
+    pub(crate) index: usize,
+}
+
+/// One line of the tree.
+///
+/// An entry carries its own icon, its Git markers and its controls. A note stands in
+/// for a directory that is still answering, and is a row of the same height, which is
+/// why it lives in the list: a note drawn outside the list takes its height from the
+/// box above it and moves every row under it every time a folder is opened.
+#[derive(Clone)]
+pub(crate) enum TreeRow {
+    Entry {
+        entry: muster_core::files::FileEntry,
+        depth: usize,
+        /// The folders open at and above this row, itself included when it is one.
+        ancestors: Rc<[Ancestor]>,
+    },
+    Note {
+        /// The directory the note is about, which is also what a retry reads.
+        path: String,
+        message: String,
+        depth: usize,
+        /// The folders open above it, which is its parent's chain: a note stands where
+        /// its folder's children would be, so it does not interrupt the chain.
+        ancestors: Rc<[Ancestor]>,
+    },
+}
+
+/// How tall one row of the tree is.
+///
+/// Legacy names this `TREE_ROW_HEIGHT` and builds the whole tree's geometry on it,
+/// so the folder stack divides by it too.
+const ROW_HEIGHT: f32 = 26.;
+
+/// The folders open above the first row on screen, oldest first.
+///
+/// This is Legacy's rule with its arithmetic intact. The stack is drawn over the rows it
+/// names, so those rows are hidden, and the folders *they* sit under are what belongs in
+/// the stack: repeating until the row stops moving is the fixed point Legacy's own tests
+/// pin against a reference that rescans the whole tree on every scroll.
+///
+/// Empty at the very top of the tree, which the arithmetic alone would not give: the row
+/// on screen is then the folder itself, drawn where it is, and it has nothing to say about
+/// what is above it. Legacy's test that pins this passes for the wrong reason — it runs
+/// in a DOM whose `clientHeight` is zero, so `maxStack` is zero there — and the rule it
+/// is pinning is the one written above.
+pub(crate) fn sticky_ancestors(rows: &[TreeRow], top: usize, stack: usize) -> Vec<Ancestor> {
+    let mut top = top.min(rows.len());
+    if top == 0 {
+        return Vec::new();
+    }
+    let ancestors = |at: usize| -> Vec<Ancestor> {
+        at.checked_sub(1)
+            .and_then(|row| rows.get(row))
+            .map(|row| match row {
+                TreeRow::Entry { ancestors, .. } | TreeRow::Note { ancestors, .. } => {
+                    ancestors.to_vec()
+                }
+            })
+            .unwrap_or_default()
+    };
+    let mut held = ancestors(top);
+    for _ in 0..=stack {
+        let hidden = stack.min(held.len()) + 1;
+        let next = top + hidden;
+        if next <= top || next > rows.len() {
+            break;
+        }
+        top = next;
+        held = ancestors(top);
+    }
+    // Trimmed to what the panel holds, keeping the folders nearest the row on screen.
+    held.split_off(held.len().saturating_sub(stack))
+}
+
+/// How many rows are built either side of the tree's top, and how far the ones that
+/// were not built sit from it.
+///
+/// Legacy names these `TREE_WINDOW_SIZE` and `TREE_OVERSCAN`. The rows that were not
+/// built are still there as space above and below, so the scrollbar is the whole tree's
+/// and not the window's — which is the part that matters to somebody dragging it.
+const WINDOW_ROWS: usize = 64;
+const OVERSCAN_ROWS: usize = 10;
+
+/// The rows to build, and the space the rest of the tree takes above and below them.
+pub(crate) fn tree_window(total: usize, top: usize) -> (Range<usize>, f32, f32) {
+    let start = total
+        .saturating_sub(WINDOW_ROWS)
+        .min(top.saturating_sub(OVERSCAN_ROWS));
+    let end = start.saturating_add(WINDOW_ROWS).min(total);
+    (
+        start..end,
+        start as f32 * ROW_HEIGHT,
+        total.saturating_sub(end) as f32 * ROW_HEIGHT,
+    )
+}
+
+/// How many stacked folders the tree has room for.
+///
+/// Legacy measures the tree's own viewport and keeps eight pixels clear at the top.
+/// The tree is drawn under a tab strip and its padding, neither of which is the
+/// window's height, so this is the window's: the stack is laid inside the tree's box
+/// and clipped by it, which is what keeps a deep chain from covering the rows it
+/// names rather than this number.
+pub(crate) fn stack_room(window_height: gpui_kit::Pixels) -> usize {
+    ((window_height.as_f32() - 8.).max(0.) / ROW_HEIGHT).floor() as usize
+}
+
+/// One folder of the stack drawn over the tree.
+///
+/// The name is a button that brings the folder back into view, which is the whole point
+/// of the stack: without it a tree deep enough to need one has no way back up. The row
+/// the folder is drawn on is its own top-level ancestor, so scrolling there leaves the
+/// whole chain below it on screen — Legacy's `index - depth`.
+fn sticky_row(
+    ancestor: &Ancestor,
+    weak: gpui_kit::WeakEntity<TerminalWindow>,
+    roles: Roles,
+) -> AnyElement {
+    let path = ancestor.path.clone();
+    let name = ancestor.name.clone();
+    let depth = ancestor.depth;
+    let index = ancestor.index;
+    let indent = px(8. + depth as f32 * 14.);
+    row_chrome(
+        div()
+            .id(format!("file-stack-{path}"))
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .h(px(ROW_HEIGHT))
+            .pl(indent)
+            .pr(px(8.))
+            .child(file_icons::element(
+                format!("file-stack-icon-{path}"),
+                &name,
+                true,
+                px(14.),
+                &roles,
+            ))
+            .child(
+                div()
+                    .id(format!("file-stack-name-{path}"))
+                    .test_support()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(roles.text)
+                    .child(name.clone()),
+            )
+            .child(
+                Button::new(format!("file-stack:{path}"))
+                    .text()
+                    .small()
+                    .rounded(px(0.))
+                    .h(px(22.))
+                    .label("Show in tree")
+                    .tooltip(path.clone())
+                    .accessibility_label(format!("Show {name} in tree"))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        // The folder's own top-level ancestor: scrolling there leaves the
+                        // whole chain between it and the tree's root on screen. The offset
+                        // is set outright rather than aimed at a row, because a row's index
+                        // depends on the window being drawn and this does not.
+                        // The offset counts downwards, so bringing a folder to the top
+                        // of the tree is that many pixels from it.
+                        let target = index.saturating_sub(depth) as f32 * ROW_HEIGHT;
+                        let _ = weak.update(cx, |app, _| {
+                            app.files_scroll.set_offset(point(px(0.), px(-target)));
+                        });
+                    }),
+            ),
+        roles,
+        false,
+    )
+    .into_any_element()
 }
 
 /// How many diff reads may exist at once.
@@ -312,24 +564,97 @@ impl DiffQueue {
     }
 }
 
+/// Whether a checkout-relative path is `directory` or sits under it.
+///
+/// The prefix has to carry the separator: `src` is not an ancestor of `src-tauri`,
+/// and a plain `starts_with` would collapse one when the other closed. The root
+/// is spelled as the empty path, and everything is under it.
+pub(crate) fn within(candidate: &str, directory: &str) -> bool {
+    directory.is_empty()
+        || candidate
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// What the tree is drawn from.
+///
+/// The four collections and the checkout they belong to travel together everywhere the
+/// walk goes, and passing them one at a time is how a caller ends up pairing one
+/// checkout's listings with another's expansion.
+struct TreeSource<'a> {
+    checkout: &'a str,
+    entries: &'a HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
+    loading: &'a HashSet<(String, String)>,
+    errors: &'a HashMap<(String, String), String>,
+    expanded: &'a HashSet<(String, String)>,
+}
+
+/// Every visible row of the tree, in the order it is drawn.
+///
+/// A directory that is still answering contributes a note where its children would be,
+/// at the depth it would have shown them at, and stands in for them until it answers.
+/// That is Legacy's arrangement, and it is why a folder being opened cannot move the
+/// rows around it: a note drawn outside the list takes its height from the box above it
+/// and moves everything under it every time a folder is opened.
 fn flatten(
+    source: &TreeSource<'_>,
     directory: &str,
     depth: usize,
-    checkout: &str,
-    entries: &std::collections::HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
-    expanded: &std::collections::HashSet<(String, String)>,
-    rows: &mut Vec<FileRow>,
+    ancestors: Rc<[Ancestor]>,
+    rows: &mut Vec<TreeRow>,
 ) {
-    if let Some(children) = entries.get(&(checkout.to_owned(), directory.to_owned())) {
-        for entry in children {
-            rows.push(FileRow {
-                entry: entry.clone(),
+    let children = match source
+        .entries
+        .get(&(source.checkout.to_owned(), directory.to_owned()))
+    {
+        Some(children) => children,
+        None => return,
+    };
+    for entry in children {
+        let key = (source.checkout.to_owned(), entry.path.clone());
+        let open = entry.directory && source.expanded.contains(&key);
+        // One chain per open folder, shared by every row under it, so a tree of any
+        // depth costs one allocation per folder rather than one per row.
+        let index = rows.len();
+        let chain: Rc<[Ancestor]> = if open {
+            let mut chain = ancestors.to_vec();
+            chain.push(Ancestor {
+                path: entry.path.clone(),
+                name: entry.name.clone(),
                 depth,
+                index,
             });
-            if entry.directory && expanded.contains(&(checkout.to_owned(), entry.path.clone())) {
-                flatten(&entry.path, depth + 1, checkout, entries, expanded, rows);
-            }
+            chain.into()
+        } else {
+            ancestors.clone()
+        };
+        rows.push(TreeRow::Entry {
+            entry: entry.clone(),
+            depth,
+            ancestors: chain.clone(),
+        });
+        if !open {
+            continue;
         }
+        if source.loading.contains(&key) {
+            rows.push(TreeRow::Note {
+                path: entry.path.clone(),
+                message: "Loading folder…".into(),
+                depth: depth + 1,
+                ancestors: chain.clone(),
+            });
+            continue;
+        }
+        if let Some(error) = source.errors.get(&key) {
+            rows.push(TreeRow::Note {
+                path: entry.path.clone(),
+                message: error.clone(),
+                depth: depth + 1,
+                ancestors: chain.clone(),
+            });
+            continue;
+        }
+        flatten(source, &entry.path, depth + 1, chain, rows);
     }
 }
 
@@ -362,10 +687,20 @@ impl TerminalWindow {
                 app.file_loading.remove(&key);
                 match result {
                     Ok(entries) => {
-                        app.file_entries.insert(key.clone(), entries);
-                        app.expanded_files
-                            .retain(|expanded| expanded.0 != key.0 || expanded == &key);
                         app.file_errors.remove(&key);
+                        // A directory collapsed while its listing was in flight keeps
+                        // nothing: the answer is dropped with it, so a tree walked wide
+                        // and closed again does not stay resident. The root is never
+                        // "expanded" — it is what everything else hangs from — so it
+                        // always keeps its listing.
+                        //
+                        // Only *this* directory is judged. Clearing every other expansion
+                        // on arrival is what made opening a nested folder collapse
+                        // everything above it: the subtree you were walking disappeared
+                        // the moment its child finished loading.
+                        if key.1.is_empty() || app.expanded_files.contains(&key) {
+                            app.file_entries.insert(key, entries);
+                        }
                     }
                     Err(error) => {
                         app.file_errors.insert(key.clone(), error);
@@ -944,223 +1279,277 @@ impl TerminalWindow {
             .unwrap_or_default();
         let expanded = self.expanded_files.clone();
         let selected = self.selected_file.get(&checkout_id).cloned();
+        let loading = self.file_loading.clone();
+        let errors = self
+            .file_errors
+            .iter()
+            .filter(|((owner, _), _)| *owner == checkout_id)
+            .map(|(entry, error)| (entry.clone(), error.clone()))
+            .collect::<HashMap<_, _>>();
         let mut rows = Vec::new();
         flatten(
+            &TreeSource {
+                checkout: &checkout_id,
+                entries: &self.file_entries,
+                loading: &loading,
+                errors: &errors,
+                expanded: &self.expanded_files,
+            },
             "",
             0,
-            &checkout_id,
-            &self.file_entries,
-            &self.expanded_files,
+            Rc::new([]),
             &mut rows,
         );
         let total = rows.len();
         let weak = cx.weak_entity();
-        // One row per failed read, each with the operation that failed: a
-        // directory that could not be listed is asked for again as a listing,
-        // and a file that could not be read is read again, because listing a
-        // file as a directory cannot answer either.
-        let mut failures = Vec::new();
-        for ((owner, path), error) in &self.file_errors {
-            if owner == &checkout_id {
-                failures.push((path.clone(), error.clone(), false));
-            }
-        }
-        failures.sort();
-        let loading = self.file_loading.clone();
+        let stack_weak = weak.clone();
         let repo_for = repo.clone();
         let checkout_for = checkout.clone();
-        let list = gpui_kit::uniform_list("files-list", total, move |range, _, _| {
-            range
-                .map(|index| {
-                    let row = rows[index].clone();
-                    let entry = row.entry.clone();
-                    let path = entry.path.clone();
-                    let directory = entry.directory;
-                    let open = expanded.contains(&(checkout_for.id.clone(), path.clone()));
-                    let (status, added, removed) = statuses
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or_else(|| (String::new(), None, None));
-                    let marker = file_marker(&status);
-                    let selected = selected.as_deref() == Some(path.as_str());
-                    let weak = weak.clone();
-                    let repo = repo_for.clone();
-                    let checkout = checkout_for.clone();
-                    // A dotfile is quieted rather than recoloured: a colour of
-                    // its own would win over the one the row hands down.
-                    let quiet = entry.name.starts_with('.');
-                    row_chrome(
-                        div()
-                            .id(format!("file-row-{path}"))
-                            .group(format!("file-row-{path}"))
-                            .flex()
-                            .items_center()
-                            .relative()
-                            .h(px(26.))
-                            .gap(px(7.))
-                            .pl(px(8. + row.depth as f32 * 14.))
-                            .pr(px(8.))
-                            // The fold's slot, held at its width on a file so
-                            // a folder's glyph and a file's icon land on one
-                            // column and a name does not move under the
-                            // pointer.
-                            .child(
-                                div()
-                                    .id(format!("file-slot-{path}"))
-                                    .test_support()
-                                    .flex_shrink_0()
-                                    .w(px(16.))
-                                    .h(px(16.))
-                                    .when(directory, |slot| {
-                                        slot.child(Icon::new(if open {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        }))
-                                    }),
-                            )
-                            .child(file_icons::element(
-                                format!("file-icon-{path}"),
-                                &entry.name,
-                                directory,
-                                px(14.),
-                                &roles,
-                            ))
-                            .child(
-                                div()
-                                    .id(format!("file-name-{path}"))
-                                    .test_support()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_color(if selected || directory {
-                                        roles.text
-                                    } else {
-                                        roles.text_muted
-                                    })
-                                    .group_hover(format!("file-row-{path}"), |style| {
-                                        style.text_color(roles.text)
-                                    })
-                                    .when(quiet, |name| name.opacity(0.72))
-                                    .child(entry.name.clone()),
-                            )
-                            // Legacy's order: the fold, the icon, the name,
-                            // then what Git did to it and what that cost.
-                            .when(!marker.is_empty(), |row| {
-                                row.child(status_chip(&path, marker, roles))
-                            })
-                            .child(count_chips(&path, (added, removed), roles))
-                            .child(row_control(
-                                format!("file-control:{path}"),
-                                path.clone(),
-                                Some(path.clone()),
-                                selected,
-                                directory.then_some(open),
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, |app, cx| {
-                                        if directory {
-                                            let key = (checkout.id.clone(), path.clone());
-                                            if app.expanded_files.remove(&key) {
-                                                // A collapsed directory keeps nothing
-                                                // but its name: the listing is dropped
-                                                // with it, so a tree walked wide and
-                                                // closed again does not stay resident.
-                                                app.file_request.remove(&key);
-                                                app.file_loading.remove(&key);
-                                                app.file_entries.remove(&key);
-                                            } else {
-                                                app.expanded_files.insert(key.clone());
-                                                if !app.file_entries.contains_key(&key)
-                                                    && !app.file_loading.contains(&key)
-                                                {
-                                                    app.request_directory(
-                                                        repo.clone(),
-                                                        checkout.clone(),
-                                                        path.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            app.selected_file
-                                                .insert(checkout.id.clone(), path.clone());
-                                            app.request_document(
-                                                repo.clone(),
-                                                checkout.clone(),
-                                                path.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        cx.notify();
-                                    });
-                                },
-                            )),
+        // Read before the list is laid out, so this is where the tree was a frame ago.
+        // A frame is not long enough for anyone to see the stack land on the wrong rows,
+        // and waiting for the layout would mean drawing the tree twice.
+        let scroll = self.files_scroll.clone();
+        // Read before the tree is laid out, so this is where it was a frame ago. A frame
+        // is not long enough for anyone to see the stack land on the wrong rows, and
+        // waiting for the layout would mean drawing the tree twice.
+        let scrolled = -scroll.offset().y;
+        let top_row = (scrolled.as_f32() / ROW_HEIGHT).floor().max(0.) as usize;
+        let stacked = sticky_ancestors(&rows, top_row, stack_room(window.viewport_size().height));
+        let (drawn, above, below) = tree_window(total, top_row);
+        let list = div()
+            .id("files-tree")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .child(div().flex_none().h(px(above)))
+            .children(drawn.map(|index| {
+                let row = rows[index].clone();
+                match row {
+                    TreeRow::Note {
+                        path,
+                        message,
+                        depth,
+                        ..
+                    } => note_row(
+                        &path,
+                        &message,
+                        depth,
+                        repo_for.clone(),
+                        checkout_for.clone(),
+                        weak.clone(),
                         roles,
-                        selected,
-                    )
-                    .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        });
+                    ),
+                    TreeRow::Entry { entry, depth, .. } => {
+                        let path = entry.path.clone();
+                        let directory = entry.directory;
+                        let open = expanded.contains(&(checkout_for.id.clone(), path.clone()));
+                        let (status, added, removed) = statuses
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_else(|| (String::new(), None, None));
+                        let marker = file_marker(&status);
+                        let selected = selected.as_deref() == Some(path.as_str());
+                        let weak = weak.clone();
+                        let repo = repo_for.clone();
+                        let checkout = checkout_for.clone();
+                        // A dotfile is quieted rather than recoloured: a colour of
+                        // its own would win over the one the row hands down.
+                        let quiet = entry.name.starts_with('.');
+                        row_chrome(
+                            div()
+                                .id(format!("file-row-{path}"))
+                                .group(format!("file-row-{path}"))
+                                .flex()
+                                .items_center()
+                                .relative()
+                                .h(px(26.))
+                                .gap(px(7.))
+                                .pl(px(8. + depth as f32 * 14.))
+                                .pr(px(8.))
+                                // The fold's slot, held at its width on a file so
+                                // a folder's glyph and a file's icon land on one
+                                // column and a name does not move under the
+                                // pointer.
+                                .child(
+                                    div()
+                                        .id(format!("file-slot-{path}"))
+                                        .test_support()
+                                        .flex_shrink_0()
+                                        .w(px(16.))
+                                        .h(px(16.))
+                                        .when(directory, |slot| {
+                                            slot.child(Icon::new(if open {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            }))
+                                        }),
+                                )
+                                .child(file_icons::element(
+                                    format!("file-icon-{path}"),
+                                    &entry.name,
+                                    directory,
+                                    px(14.),
+                                    &roles,
+                                ))
+                                .child(
+                                    div()
+                                        .id(format!("file-name-{path}"))
+                                        .test_support()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_color(if selected || directory {
+                                            roles.text
+                                        } else {
+                                            roles.text_muted
+                                        })
+                                        .group_hover(format!("file-row-{path}"), |style| {
+                                            style.text_color(roles.text)
+                                        })
+                                        .when(quiet, |name| name.opacity(0.72))
+                                        .child(entry.name.clone()),
+                                )
+                                // Legacy's order: the fold, the icon, the name,
+                                // then what Git did to it and what that cost.
+                                .when(!marker.is_empty(), |row| {
+                                    row.child(status_chip(&path, marker, roles))
+                                })
+                                .child(count_chips(&path, (added, removed), roles))
+                                .child(row_control(
+                                    format!("file-control:{path}"),
+                                    path.clone(),
+                                    Some(path.clone()),
+                                    selected,
+                                    directory.then_some(open),
+                                    move |_, window, cx| {
+                                        let _ = weak.update(cx, |app, cx| {
+                                            if directory {
+                                                let key = (checkout.id.clone(), path.clone());
+                                                if app.expanded_files.remove(&key) {
+                                                    // A collapsed directory keeps nothing
+                                                    // but its name, and neither does anything
+                                                    // under it: the subtree's listings, its
+                                                    // pending reads and its failures all go
+                                                    // with it. Keeping them is what made a
+                                                    // tree walked wide and closed again stay
+                                                    // resident, and come back open.
+                                                    let under = |other: &(String, String)| {
+                                                        other.0 == key.0 && within(&other.1, &key.1)
+                                                    };
+                                                    app.expanded_files.retain(|open| !under(open));
+                                                    app.file_entries
+                                                        .retain(|entry, _| !under(entry));
+                                                    app.file_request
+                                                        .retain(|entry, _| !under(entry));
+                                                    app.file_loading.retain(|entry| !under(entry));
+                                                    app.file_errors
+                                                        .retain(|entry, _| !under(entry));
+                                                } else {
+                                                    app.expanded_files.insert(key.clone());
+                                                    if !app.file_entries.contains_key(&key)
+                                                        && !app.file_loading.contains(&key)
+                                                    {
+                                                        app.request_directory(
+                                                            repo.clone(),
+                                                            checkout.clone(),
+                                                            path.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                app.selected_file
+                                                    .insert(checkout.id.clone(), path.clone());
+                                                app.request_document(
+                                                    repo.clone(),
+                                                    checkout.clone(),
+                                                    path.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                )),
+                            roles,
+                            selected,
+                        )
+                        .into_any_element()
+                    }
+                }
+            }))
+            .child(div().flex_none().h(px(below)));
         let root = (checkout_id.clone(), String::new());
         let mut body = div().flex_1().min_h_0().flex().flex_col();
+        // The stack is drawn over the rows it names rather than above them, which is
+        // what Legacy's negative margin buys in CSS and what a second child of the same
+        // box buys here: the tree's geometry does not move when the stack appears.
+        let stacked_for = stacked
+            .iter()
+            .map(|ancestor| sticky_row(ancestor, stack_weak.clone(), roles))
+            .collect::<Vec<_>>();
+        let has_stack = !stacked.is_empty();
         body = body.child(
             div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .relative()
+                .overflow_hidden()
                 .py(px(4.))
-                .child(list.flex_1().min_h_0().w_full()),
+                .child(list.flex_1().min_h_0().w_full())
+                .when(has_stack, |tree| {
+                    tree.child(
+                        div()
+                            .id("file-stack")
+                            .test_support()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .flex()
+                            .flex_col()
+                            .bg(roles.surface)
+                            .children(stacked_for),
+                    )
+                }),
         );
-        for (path, error, was_read) in &failures {
-            let was_read = *was_read;
-            let name = if path.is_empty() {
-                "root".to_owned()
-            } else {
-                path.clone()
-            };
+        // The root's own state is drawn below the tree rather than in it: there is
+        // no directory row for a note to sit under. Everything a folder below the
+        // root has to say about itself is a row inside the list, where it can be
+        // scrolled to and cannot resize the list around it.
+        if let Some(error) = self.file_errors.get(&root) {
             body = body.child(
                 div()
                     .px_3()
                     .py_1()
                     .text_color(roles.status.warning)
-                    .child(format!("{name}/: {error}")),
+                    .child(format!("root/: {error}")),
             );
-            let rp = path.clone();
             let rrepo = repo.clone();
             let rcheckout = checkout.clone();
-            let verb = if was_read { "reading" } else { "listing" };
             body = body.child(
-                Button::new(format!(
-                    "retry-{}-{name}",
-                    if was_read { "read" } else { "list" }
-                ))
-                .ghost()
-                .small()
-                .label(format!("Retry {name}/"))
-                .accessibility_label(format!("Retry {verb} {name}/"))
-                .on_click(cx.listener(move |app, _, window, cx| {
-                    if was_read {
-                        app.request_document(
-                            rrepo.clone(),
-                            rcheckout.clone(),
-                            rp.clone(),
-                            window,
-                            cx,
-                        );
-                    } else {
+                Button::new("retry-list-root")
+                    .ghost()
+                    .small()
+                    .label("Retry root/")
+                    .accessibility_label("Retry listing the checkout root")
+                    .on_click(cx.listener(move |app, _, window, cx| {
                         app.request_directory(
                             rrepo.clone(),
                             rcheckout.clone(),
-                            rp.clone(),
+                            String::new(),
                             window,
                             cx,
                         );
-                    }
-                })),
+                    })),
             );
         }
         if loading.contains(&root) {
@@ -1178,17 +1567,6 @@ impl TerminalWindow {
         {
             body = body.child(div().px_3().child("No files"));
         }
-        for (owner, path) in loading {
-            if owner == checkout_id && !path.is_empty() {
-                body = body.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_color(roles.text_muted)
-                        .child(format!("Loading {path}…")),
-                );
-            }
-        }
         panel.child(body).into_any_element()
     }
 }
@@ -1203,6 +1581,19 @@ impl TerminalWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing a directory forgets its subtree and nothing else. The separator is the whole
+    /// test: `src-tauri` shares a prefix with `src` and has nothing to do with it.
+    #[test]
+    fn within_spans_a_directory_and_its_descendants_only() {
+        assert!(within("outer", "outer"));
+        assert!(within("outer/inner", "outer"));
+        assert!(within("outer/inner/deep.txt", "outer"));
+        assert!(!within("src-tauri", "src"));
+        assert!(!within("outermost", "outer"));
+        assert!(!within("", "outer"));
+        assert!(within("outer", ""));
+    }
 
     #[test]
     fn files_show_filtered_markers_from_both_porcelain_columns() {
