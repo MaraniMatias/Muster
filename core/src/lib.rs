@@ -31,3 +31,6 @@ pub mod workspace;
 
 /// Read-only folder/worktree discovery and the native host's isolated navigation state.
 pub mod navigation;
+
+/// Safe, bounded read-only checkout file listing and previews.
+pub mod files;

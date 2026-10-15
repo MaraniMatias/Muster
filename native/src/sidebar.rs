@@ -614,14 +614,7 @@ impl TerminalWindow {
                     })
                     .on_click(cx.listener({
                         let row_select_id = select_id.clone();
-                        move |app, _, window, cx| {
-                            if app.navigation.select_checkout(&row_select_id) {
-                                app.persist();
-                                app.refresh_diff_totals(cx);
-                                app.focus_terminal(window, cx);
-                                cx.notify();
-                            }
-                        }
+                        move |app, _, window, cx| app.select_checkout_row(&row_select_id, window, cx)
                     }))
                     .child(
                         Button::new(SharedString::from(format!("fold-checkout-{id}")))
@@ -679,12 +672,7 @@ impl TerminalWindow {
                                 let click_id = select_id.clone();
                                 move |app, _, window, cx| {
                                     cx.stop_propagation();
-                                    if app.navigation.select_checkout(&click_id) {
-                                        app.persist();
-                                        app.refresh_diff_totals(cx);
-                                        app.focus_terminal(window, cx);
-                                        cx.notify();
-                                    }
+                                    app.select_checkout_row(&click_id, window, cx);
                                 }
                             })),
                     )
@@ -709,6 +697,8 @@ impl TerminalWindow {
                             Some((added, removed)) => row.child(
                                 div()
                                     .id(SharedString::from(format!("diff-{id}")))
+                                    .cursor_pointer()
+                                    .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener({ let id=id.clone(); move |app,_,window,cx| { cx.stop_propagation(); app.select_checkout_row(&id, window, cx); } }))
                                     .flex_none()
                                     .flex()
                                     .items_center()
@@ -1063,6 +1053,8 @@ impl TerminalWindow {
                                     if event.click_count() == 2 {
                                         app.start_rename(&row_click_id, window, cx);
                                     } else if app.navigation.select_session(&row_click_id) {
+                                        app.clear_document();
+                                        app.open_diff = None;
                                         app.persist();
                                         app.refresh_diff_totals(cx);
                                         app.focus_terminal(window, cx);
@@ -1116,6 +1108,8 @@ impl TerminalWindow {
                                             if event.click_count() == 2 {
                                                 app.start_rename(&click_id, window, cx);
                                             } else if app.navigation.select_session(&click_id) {
+                                                app.clear_document();
+                                                app.open_diff = None;
                                                 app.persist();
                                                 app.refresh_diff_totals(cx);
                                                 app.focus_terminal(window, cx);

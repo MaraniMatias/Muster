@@ -184,6 +184,92 @@ fn opening_the_session_menu_closes_the_previous_crumb(cx: &mut TestAppContext) {
     dispose(&fixture, cx);
 }
 
+#[gpui_kit::test]
+fn explicit_terminal_selection_closes_file_document_and_keeps_terminal(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    fixture.view.update(cx, |app, cx| {
+        let other = format!("other-checkout:{}", fixture.checkout);
+        app.open_document = Some((
+            other,
+            muster_core::files::FilePreview {
+                path: "source.rs".into(),
+                text: "fn main() {}".into(),
+                truncated: false,
+            },
+        ));
+        cx.notify();
+    });
+    let session = fixture.sessions[0].clone();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close-document").is_none());
+        window.click(format!("select-session-{session}"), cx);
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.open_document.is_none()));
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.terminals.contains_key(&session)));
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn closing_a_document_restores_the_retained_terminal(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let session = fixture.sessions[0].clone();
+    fixture.view.update(cx, |app, cx| {
+        app.open_document = Some((
+            fixture.checkout.clone(),
+            muster_core::files::FilePreview {
+                path: "source.rs".into(),
+                text: "fn main() {}".into(),
+                truncated: false,
+            },
+        ));
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("close-document", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("close-document").is_none());
+        assert!(fixture
+            .view
+            .read_with(cx, |app, _| app.terminals.contains_key(&session)));
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn checkout_change_hides_another_checkouts_document(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let other_dir = tempfile::tempdir().unwrap();
+    let opened = navigation::open_directory(other_dir.path()).unwrap();
+    let other_checkout = opened.checkout_id.clone();
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.merge(opened, false);
+        app.open_document = Some((
+            other_checkout,
+            muster_core::files::FilePreview {
+                path: "elsewhere.rs".into(),
+                text: "wrong checkout".into(),
+                truncated: false,
+            },
+        ));
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close-document").is_none());
+        assert!(window.find("repo-crumb").visible());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// Filtering changes which rows are visible, not the target of the original row.
 #[gpui_kit::test]
 fn a_filtered_worktree_selection_targets_the_matching_checkout(cx: &mut TestAppContext) {
@@ -466,6 +552,45 @@ fn a_long_name_gives_up_segments_and_keeps_saying_what_it_names(cx: &mut TestApp
     })
     .unwrap();
     close(&fixture, cx);
+}
+
+/// Hiding the panels is not a reason to take the keyboard off what is being read.
+///
+/// The shortcut and the bar's own button are the same action, and a change set
+/// in the middle owns the keyboard exactly as a preview does: both are views
+/// the terminal was replaced by.
+#[gpui_kit::test]
+fn hiding_the_panels_leaves_the_keyboard_where_the_view_left_it(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let checkout = fixture.checkout.clone();
+    fixture.view.update(cx, |app, cx| {
+        app.open_diff = Some((checkout.clone(), None));
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // Nothing holds the keyboard, so anything focused afterwards was put
+        // there by the button.
+        window.blur(cx);
+        window.click("toggle-panels", cx);
+        assert!(
+            !fixture
+                .view
+                .read_with(cx, |app, _| app.navigation.panels_visible),
+            "the button did not hide the panels"
+        );
+        assert!(
+            !fixture.view.read_with(cx, |app, cx| app
+                .terminal()
+                .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window))),
+            "hiding the panels took the keyboard off the change set"
+        );
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.open_diff, Some((checkout, None)));
+    });
+    dispose(&fixture, cx);
 }
 
 /// A worktree on a branch long enough to need shortening, added to the same

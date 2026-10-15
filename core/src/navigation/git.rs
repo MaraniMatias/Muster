@@ -107,6 +107,15 @@ pub(super) fn git_success(
     }
 }
 
+/// Whether a read failed because Git printed past the cap rather than because Git failed.
+///
+/// A diff that overflows is a change too large to show, not a broken repository, and the two
+/// answers lead to opposite places. The cap is refused rather than truncated, so this is the
+/// only way a reader can be oversized without having lost bytes it did not mean to.
+pub(super) fn is_output_overflow(error: &str) -> bool {
+    error.starts_with("Git output exceeded")
+}
+
 pub(super) fn git_error(context: &str, output: &Output) -> String {
     format!(
         "{context} ({}): {}",

@@ -31,6 +31,7 @@ use gpui_kit::{
 // this window draws for itself.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use gpui_kit::WindowDecorations;
+use muster_core::files::FilePreview;
 use muster_core::navigation::{self, DiffTotals, GitReadBudget};
 use muster_core::workspace::{
     Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
@@ -372,6 +373,13 @@ pub(crate) struct Rename {
 /// reachable from all of them. Splitting the *code* is not the same as
 /// splitting the *state*: there is one window, and it has one navigation
 /// projection, one terminal registry and one set of dialogs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InspectorTab {
+    #[default]
+    Files,
+    Changes,
+}
+
 pub struct TerminalWindow {
     pub(crate) navigation: Navigation,
     pub(crate) terminals: HashMap<String, LiveTerminal>,
@@ -382,6 +390,35 @@ pub struct TerminalWindow {
     pub(crate) diff_totals: HashMap<String, DiffTotals>,
     pub(crate) diff_refresh_running: bool,
     pub(crate) diff_refresh_again: bool,
+    pub(crate) file_entries: HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
+    pub(crate) expanded_files: HashSet<(String, String)>,
+    pub(crate) file_loading: HashSet<(String, String)>,
+    /// Failures from listing a directory. A read of a file's contents is a
+    /// different operation with a different way back, so it owns its own
+    /// failures: one key, one owner, and Retry does what actually failed.
+    pub(crate) file_errors: HashMap<(String, String), String>,
+    pub(crate) document_errors: HashMap<(String, String), String>,
+    pub(crate) selected_file: HashMap<String, String>,
+    pub(crate) open_document: Option<(String, FilePreview)>,
+    pub(crate) document_target: Option<(String, String)>,
+    pub(crate) document_view: Option<crate::document::DocumentView>,
+    pub(crate) open_diff: Option<(String, Option<String>)>,
+    pub(crate) expanded_diffs: HashSet<(String, String)>,
+    pub(crate) file_request: HashMap<(String, String), u64>,
+    pub(crate) document_request: u64,
+    pub(crate) inspector_tab: InspectorTab,
+    pub(crate) git_status: HashMap<String, navigation::GitStatus>,
+    pub(crate) git_status_errors: HashMap<String, String>,
+    pub(crate) git_status_request: HashMap<String, u64>,
+    pub(crate) git_status_running: HashSet<String>,
+    pub(crate) git_diff: HashMap<(String, String), navigation::FileDiff>,
+    pub(crate) git_diff_errors: HashMap<(String, String), String>,
+    pub(crate) git_diff_request: HashMap<(String, String), u64>,
+    pub(crate) diff_view: Option<crate::diff::DiffView>,
+    /// The diff reads this window still wants, and how many are running.
+    pub(crate) diff_queue: crate::inspector::DiffQueue,
+    pub(crate) inspector_width: f32,
+    pub(crate) next_file_request: u64,
     pub(crate) worktree: Option<WorktreeDraft>,
     pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
     pub(crate) owner: Arc<SessionOwner>,
@@ -424,6 +461,31 @@ impl TerminalWindow {
             diff_totals: HashMap::new(),
             diff_refresh_running: false,
             diff_refresh_again: false,
+            file_entries: HashMap::new(),
+            expanded_files: HashSet::new(),
+            file_loading: HashSet::new(),
+            file_errors: HashMap::new(),
+            document_errors: HashMap::new(),
+            selected_file: HashMap::new(),
+            open_document: None,
+            document_target: None,
+            document_view: None,
+            open_diff: None,
+            expanded_diffs: HashSet::new(),
+            file_request: HashMap::new(),
+            document_request: 0,
+            inspector_tab: InspectorTab::Files,
+            git_status: HashMap::new(),
+            git_status_errors: HashMap::new(),
+            git_status_request: HashMap::new(),
+            git_status_running: HashSet::new(),
+            git_diff: HashMap::new(),
+            git_diff_errors: HashMap::new(),
+            git_diff_request: HashMap::new(),
+            diff_view: None,
+            diff_queue: Default::default(),
+            inspector_width: 280.,
+            next_file_request: 0,
             worktree: None,
             worktree_removal: None,
             owner: SessionOwner::new(backend, owns_backend),
@@ -591,6 +653,12 @@ impl TerminalWindow {
         }
         let cwd = PathBuf::from(&checkout.path);
         let checkout_id = checkout_id.to_owned();
+        // Asking for a terminal is the intent to see one, so whatever central
+        // view is open now is what the person chose to replace. The token moves
+        // here rather than when the shell lands: a preview whose read is still
+        // running must not come back after the terminal has taken its place.
+        self.clear_document();
+        self.open_diff = None;
         let id = format!(
             "native-{}-{}",
             std::process::id(),
@@ -644,7 +712,15 @@ impl TerminalWindow {
                                     shell,
                                 },
                             );
-                            if app.navigation.active_session.as_deref() == Some(&id) {
+                            // Only while the terminal is still what is being
+                            // asked for. A preview opened while this shell was
+                            // spawning is what the person is looking at now, and
+                            // a late answer never takes it back.
+                            if app.navigation.active_session.as_deref() == Some(&id)
+                                && app.open_document.is_none()
+                                && app.document_target.is_none()
+                                && app.open_diff.is_none()
+                            {
                                 app.focus_terminal(window, cx);
                             }
                             app.persist();
@@ -756,6 +832,15 @@ impl TerminalWindow {
                     // this is a background refresh, not a Git watcher.
                     if ticks.is_multiple_of(cadence.count_every) {
                         app.refresh_diff_totals(cx);
+                    }
+                    if ticks.is_multiple_of(cadence.count_every) {
+                        if let Some(id) = app.navigation.active_checkout.clone() {
+                            if (app.navigation.panels_visible || app.open_diff.is_some())
+                                && !app.git_status_running.contains(&id)
+                            {
+                                app.request_git_status(&id, cx);
+                            }
+                        }
                     }
                     (
                         app.membership_revision,
@@ -2210,7 +2295,12 @@ impl TerminalWindow {
         match shortcut {
             Shortcut::Panels => {
                 self.navigation.panels_visible = !self.navigation.panels_visible;
-                self.focus_terminal(window, cx);
+                if self.open_document.is_none()
+                    && self.document_target.is_none()
+                    && self.open_diff.is_none()
+                {
+                    self.focus_terminal(window, cx);
+                }
             }
             Shortcut::Terminal => {
                 if let Some(id) = self
@@ -2289,12 +2379,20 @@ impl TerminalWindow {
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let roles = Roles::of(cx);
-        if self.focus_pending {
+        if self.focus_pending
+            && self.open_document.is_none()
+            && self.document_target.is_none()
+            && self.open_diff.is_none()
+        {
             self.focus_terminal(window, cx);
         }
         let background = roles.surface_base;
         let text = roles.text;
-        let body: AnyElement = if let Some(terminal) = self.terminal() {
+        let body: AnyElement = if let Some(diff) = self.diff_element(window, cx) {
+            diff
+        } else if let Some(document) = self.document_element(window, cx) {
+            document
+        } else if let Some(terminal) = self.terminal() {
             terminal.clone().into_any_element()
         } else {
             let available = self
@@ -2351,6 +2449,7 @@ impl Render for TerminalWindow {
             .into_any_element();
         let content = if !self.injected && self.navigation.panels_visible {
             let sidebar = self.sidebar(window, cx);
+            let inspector = self.files_inspector(window, cx);
             h_resizable("workspace-panels")
                 .with_state(&self.resize)
                 .child(
@@ -2361,12 +2460,23 @@ impl Render for TerminalWindow {
                         .child(sidebar),
                 )
                 .child(resizable_panel().child(body))
+                .child(
+                    resizable_panel()
+                        .flex_none()
+                        .size(px(self.inspector_width))
+                        .size_range(px(200.)..px(480.))
+                        .child(inspector),
+                )
                 .on_resize(cx.listener(|app, state: &Entity<ResizableState>, _, cx| {
-                    if let Some(width) = state.read(cx).sizes().first() {
+                    let sizes = state.read(cx).sizes();
+                    if let Some(width) = sizes.first() {
                         app.navigation.sidebar_width = width.as_f32().clamp(240., 500.);
                         app.persist();
-                        cx.notify();
                     }
+                    if let Some(width) = sizes.get(2) {
+                        app.inspector_width = width.as_f32().clamp(200., 480.);
+                    }
+                    cx.notify();
                 }))
                 .into_any_element()
         } else {

@@ -28,6 +28,82 @@ pub fn diff_totals_for_checkout(
     checkout: &Checkout,
     within: GitReadBudget,
 ) -> Result<DiffTotals, String> {
+    let root = validated_checkout_root(repo, checkout, within)?;
+    let primary_branch = repo
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.is_primary)
+        .and_then(|checkout| checkout.branch.as_deref());
+    let (_, reference) = default_ref_with_budget(
+        root.as_path(),
+        repo.default_branch.as_deref().or(primary_branch),
+        within,
+    )?;
+    let base = git_success(root.as_path(), &["merge-base", &reference, "HEAD"], within)?;
+    let output = git_success(
+        root.as_path(),
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            output_text(&base)?,
+            "--",
+        ],
+        within,
+    )?;
+    let mut totals = parse_numstat_totals(&output.stdout)?;
+    let untracked = git_success(
+        root.as_path(),
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        within,
+    )?;
+    if !untracked.stdout.is_empty() && !untracked.stdout.ends_with(&[0]) {
+        return Err("Git returned an incomplete untracked listing".into());
+    }
+    let deadline = within.deadline();
+    let mut budget = GIT_OUTPUT_CAP;
+    for name in untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        within.remaining()?;
+        let relative = Path::new(
+            std::str::from_utf8(name).map_err(|_| "Git returned a non-UTF-8 untracked path")?,
+        );
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err("Git returned an unsafe untracked path".into());
+        }
+        if let Some(lines) = untracked_lines(&root, relative, &mut budget, deadline)? {
+            totals.additions = totals
+                .additions
+                .checked_add(lines)
+                .ok_or("line totals overflow")?;
+        }
+    }
+    within.remaining()?;
+    Ok(totals)
+}
+
+/// The one gate every read of a checkout's own state goes through.
+///
+/// The workspace snapshot is not authority: it can name a directory that has since been
+/// replaced, a checkout that belongs to another repository now, or a root that is no longer
+/// what Git calls a top level. Counting changes and diffing a file answer the same question
+/// about the same directory, so they are asked here once rather than twice with two
+/// wordings that could drift apart.
+pub(super) fn validated_checkout_root(
+    repo: &Repo,
+    checkout: &Checkout,
+    within: GitReadBudget,
+) -> Result<PathBuf, String> {
     within.remaining()?;
     if repo.kind != RepoKind::Git
         || repo.id != repo_id_for_path(&repo.root)
@@ -62,103 +138,32 @@ pub fn diff_totals_for_checkout(
             return Err("Git checkout identity changed; refresh before counting changes".into());
         }
     }
-    let root = Path::new(&checkout.canonical_path);
-    let common = |path: &Path| -> Result<PathBuf, String> {
-        let output = git_success(path, &["rev-parse", "--git-common-dir"], within)?;
-        path.join(output_text(&output)?)
-            .canonicalize()
-            .map_err(|error| format!("could not resolve shared Git metadata: {error}"))
-    };
-    if !checkout.is_primary && common(root)? != common(Path::new(&repo.root))? {
-        return Err("Git checkout repository changed; refresh before counting changes".into());
-    }
-    let primary_branch = repo
-        .checkouts
-        .iter()
-        .find(|checkout| checkout.is_primary)
-        .and_then(|checkout| checkout.branch.as_deref());
-    let (_, reference) = default_ref_with_budget(
-        root,
-        repo.default_branch.as_deref().or(primary_branch),
-        within,
-    )?;
-    let base = git_success(root, &["merge-base", &reference, "HEAD"], within)?;
-    let output = git_success(
-        root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            "-z",
-            "--find-renames",
-            output_text(&base)?,
-            "--",
-        ],
-        within,
-    )?;
-    let mut totals = parse_numstat_totals(&output.stdout)?;
-    let untracked = git_success(
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-        within,
-    )?;
-    if !untracked.stdout.is_empty() && !untracked.stdout.ends_with(&[0]) {
-        return Err("Git returned an incomplete untracked listing".into());
-    }
-    let deadline = within.deadline();
-    let mut budget = GIT_OUTPUT_CAP;
-    for name in untracked
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-    {
-        within.remaining()?;
-        let relative = Path::new(
-            std::str::from_utf8(name).map_err(|_| "Git returned a non-UTF-8 untracked path")?,
-        );
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err("Git returned an unsafe untracked path".into());
-        }
-        let path = root.join(relative);
-        // Like Legacy, an untracked path escaping the checkout is not counted.
-        if !path
-            .canonicalize()
-            .map_err(|error| format!("could not inspect untracked file: {error}"))?
-            .starts_with(root)
-        {
-            continue;
-        }
-        if fs::symlink_metadata(&path)
-            .map_err(|error| error.to_string())?
-            .file_type()
-            .is_symlink()
-        {
-            continue;
-        }
-        if let Some(lines) = untracked_lines(&path, &mut budget, deadline)? {
-            totals.additions = totals
-                .additions
-                .checked_add(lines)
-                .ok_or("line totals overflow")?;
+    let root = PathBuf::from(&checkout.canonical_path);
+    if !checkout.is_primary {
+        let common = |path: &Path| -> Result<PathBuf, String> {
+            let output = git_success(path, &["rev-parse", "--git-common-dir"], within)?;
+            path.join(output_text(&output)?)
+                .canonicalize()
+                .map_err(|error| format!("could not resolve shared Git metadata: {error}"))
+        };
+        if common(&root)? != common(Path::new(&repo.root))? {
+            return Err("Git checkout repository changed; refresh before counting changes".into());
         }
     }
-    within.remaining()?;
-    Ok(totals)
+    Ok(root)
 }
 
-// NUL records and rename pairs follow Legacy's parse_numstat, without a map:
-// this API only folds the unique records into a checkout total.
-pub(super) fn parse_numstat_totals(bytes: &[u8]) -> Result<DiffTotals, String> {
+// NUL records and rename pairs follow Legacy's parse_numstat. The columns are
+// `Option` because Git prints `-` for both of a file it cannot measure, and a
+// binary file measured as a zero would be a number this crate never read.
+pub(super) type NumstatCounts = BTreeMap<String, (Option<u64>, Option<u64>)>;
+
+pub(super) fn parse_numstat_by_path(bytes: &[u8]) -> Result<NumstatCounts, String> {
     if !bytes.is_empty() && !bytes.ends_with(&[0]) {
         return Err("Git returned an incomplete line count record".into());
     }
     let mut fields = bytes.split(|byte| *byte == 0);
-    let mut total = DiffTotals::default();
+    let mut counts = BTreeMap::new();
     while let Some(record) = fields.next() {
         if record.is_empty() {
             continue;
@@ -167,33 +172,53 @@ pub(super) fn parse_numstat_totals(bytes: &[u8]) -> Result<DiffTotals, String> {
         let additions = columns.next().ok_or("invalid line count record")?;
         let deletions = columns.next().ok_or("invalid line count record")?;
         let path = columns.next().ok_or("invalid line count record")?;
-        if path.is_empty() {
-            for _ in 0..2 {
-                if fields.next().is_none_or(|path| path.is_empty()) {
-                    return Err("invalid rename line count record".into());
-                }
+        // A rename is one record with an empty path and the two paths after it.
+        // The counts belong to the new path, which is the file a reader opens.
+        let path = if path.is_empty() {
+            fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or("invalid rename line count record")?;
+            fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or("invalid rename line count record")?
+        } else {
+            path
+        };
+        let count = |bytes: &[u8]| -> Result<u64, String> {
+            let text = std::str::from_utf8(bytes).map_err(|_| "invalid line count")?;
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid line count".into());
             }
-        }
-        match (additions, deletions) {
-            (b"-", b"-") => {}
-            (a, d) => {
-                let count = |bytes: &[u8]| -> Result<u64, String> {
-                    let text = std::str::from_utf8(bytes).map_err(|_| "invalid line count")?;
-                    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-                        return Err("invalid line count".into());
-                    }
-                    text.parse().map_err(|_| "invalid line count".into())
-                };
-                total.additions = total
-                    .additions
-                    .checked_add(count(a)?)
-                    .ok_or("line totals overflow")?;
-                total.deletions = total
-                    .deletions
-                    .checked_add(count(d)?)
-                    .ok_or("line totals overflow")?;
-            }
-        }
+            text.parse().map_err(|_| "invalid line count".into())
+        };
+        // Git prints `-` for both columns of a file it cannot measure, and never for one.
+        // A half-printed record is a record this reader does not understand, so it is
+        // refused rather than half-counted.
+        let parsed = if additions == b"-" && deletions == b"-" {
+            (None, None)
+        } else {
+            (Some(count(additions)?), Some(count(deletions)?))
+        };
+        let name = String::from_utf8(path.to_vec()).map_err(|_| "Git returned a non-UTF-8 path")?;
+        counts.insert(name, parsed);
+    }
+    Ok(counts)
+}
+
+// This API only folds the unique records into a checkout total.
+pub(super) fn parse_numstat_totals(bytes: &[u8]) -> Result<DiffTotals, String> {
+    let mut total = DiffTotals::default();
+    for (additions, deletions) in parse_numstat_by_path(bytes)?.into_values() {
+        total.additions = total
+            .additions
+            .checked_add(additions.unwrap_or(0))
+            .ok_or("line totals overflow")?;
+        total.deletions = total
+            .deletions
+            .checked_add(deletions.unwrap_or(0))
+            .ok_or("line totals overflow")?;
     }
     Ok(total)
 }
@@ -201,26 +226,38 @@ pub(super) fn parse_numstat_totals(bytes: &[u8]) -> Result<DiffTotals, String> {
 // Legacy's 8,000-byte binary sniff and newline/trailing-line rule, with a shared
 // 16 MiB budget and deadline. Unreadable/oversized files are errors, not zero.
 pub(super) fn untracked_lines(
-    path: &Path,
+    root: &Path,
+    relative: &Path,
     budget: &mut usize,
     deadline: std::time::Instant,
 ) -> Result<Option<u64>, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let root_handle = crate::files::open_root(root).map_err(|e| e.to_string())?;
+    let parent = match crate::files::open_directory(
+        &root_handle,
+        relative.parent().unwrap_or(Path::new("")),
+    ) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let name = crate::files::name_of(relative.file_name().ok_or("untracked path is not a file")?)
+        .map_err(|e| e.to_string())?;
+    let mut file = match crate::files::open_file(&parent, &name) {
+        Ok(file) => file,
+        Err(error)
+            if error.raw_os_error() == Some(libc::ELOOP)
+                || error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Ok(None);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("could not safely read untracked file: {error}"))?;
-    if !file
-        .metadata()
-        .map_err(|error| error.to_string())?
-        .is_file()
-    {
-        return Err("untracked file is not a regular file".into());
+    if metadata.len() > *budget as u64 {
+        return Err("untracked reads exceed the shared 16 MiB limit".into());
     }
     let mut head = [0u8; 8000];
     let mut length = 0;

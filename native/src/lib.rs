@@ -8,6 +8,15 @@
 /// The workspace window, retained terminal registry, and native sidebar.
 pub mod app;
 
+/// Read-only central document surface.
+pub mod document;
+
+/// Central checkout diff previews.
+mod diff;
+
+/// Lazy checkout Files inspector.
+pub mod inspector;
+
 /// The left panel: repositories, their worktrees, and the terminals in them.
 pub mod sidebar;
 

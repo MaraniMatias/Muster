@@ -21,8 +21,8 @@ docs/             the migration plan, and what the port has to satisfy
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 77 tests (73 inline plus the four-process instance-lock suite in
-  `core/tests/`) and `native` holds 210 default tests plus two ignored
+- `core` holds 100 tests (96 inline plus the four-process instance-lock suite in
+  `core/tests/`) and `native` holds 234 default tests plus two ignored
   performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
   came from the Tauri tree with the code, so a change in the number is a change
   in what the crate owns.

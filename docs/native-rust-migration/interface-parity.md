@@ -279,6 +279,41 @@ Use resizable layout primitives for focus/split preview structure. Avoid full Do
 
 ## 7. Files and changes inspector
 
+### Delivered slice and remaining legacy work
+
+The native Files/Changes slice is **not full parity**. The following audit is
+scoped to the inspector, central previews and the sidebar routes that open them;
+the full-port completion rule in section 16 still applies to the rest of the app.
+
+| Surface | Delivered natively | Still required from the live legacy UI |
+| --- | --- | --- |
+| Files | Bounded lazy listings, virtual rows, expansion/selection, subtree errors and operation-specific retry; file/folder icons with file-type ink, path tooltips, dimmed dotfiles, filtered Git markers and selected tree/tab states. | Ignored metadata, supported symlink representation, sticky ancestors/reveal, modifier external-open, horizontal/scroll stability and tree/tab keyboard parity. |
+| Changes | Git merge-base status and per-file optional counts, directory grouping, count badge, individual and All changes routes. Unknown counts do not hide other files or become zero. | Independent selected-change/scroll state per checkout, virtualized large change lists, and richer branch/head/ahead/rename context. |
+| Navigation | Dirty checkout rows/label/count targets share one All changes action; explicit terminal selection and preview Close retain the existing PTY. A newly requested terminal replaces the current preview without a later shell completion stealing a subsequently opened preview. | Restore each clean checkout's prior view, not always its terminal; preserve a preview beside session selection in split layout. |
+| Documents | Whole UTF-8 text up to 1 MiB in a retained read-only toolkit Editor, with source line numbers, selection/copy, horizontal scrolling and syntax highlighting. Empty files and trailing newlines remain exact. | Editor/draft Save/Cancel with expected-content conflict checks; formatting, additional grammars/settings and changed-line gutters; Markdown/links, images/SVG, review-document origins and path copy. |
+| Diffs | One retained toolkit unified viewer for individual or All changes: real old/new coordinates, selection/copy, syntax and inline emphasis, horizontal scrolling, unchanged-context folding and a coherent virtualized viewport. Complete patches over 1,000 lines are displayed under the hard caps; revision-keyed parsed state, 32 MiB raw patch cache, four running reads and at most 32 queued reads. Binary/link/oversize explanations remain explicit. Working inputs are descriptor-opened and privately snapshotted before Git reads them. | Per-checkout reading-position restoration and remaining hunk/context controls. There is no pagination beyond the whole-patch safety caps; refusal is not full legacy large-file parity. |
+| Refresh | Git status/diff polling with either inspector tab active, manual Changes refresh and stale-result rejection. | Repository/shared-Git watchers with debounce and recovery; refresh Files listings and open documents after file activity, including ignored-file edits. |
+| Layout/state | Resizable inspector and panel visibility; existing sidebar persistence. | Inspector/preview width and focus/split layout persistence, narrow-window drawer/hover strip, per-checkout tabs, views, expansions and independent reading positions. Native workspace persistence does not currently store these. |
+| Review | Not delivered. | Line/range notes, anchor reconciliation, note lifecycle, rounds, Markdown export, OpenCode target/send/queue/acknowledgement and persistence. |
+
+Audit sources: `legacy/src/components/{InspectorPane,DocumentPane,FileDiff,MainPane}.vue`,
+`legacy/src/App.vue` (`showView`, `activateCheckoutTerminal`),
+`legacy/src/domain/ui-state.ts`, `legacy/src/presentation/{git-watchers,diff-loader,review-notes}.ts`
+and `legacy/src/components/use-large-diff.ts`, compared with
+`native/src/{inspector,document,diff,app}.rs` and `core/src/{files,navigation/changes}.rs`.
+The legacy Files per-file count fields are dormant, not a live feature to recreate;
+its filtered Git status markers are live. Backend viewed-file APIs with no UI caller
+are likewise not port requirements. Inline video remains explicitly deferred under
+section 8.6; this does not defer image/SVG previews or explicit external-open.
+Enabled syntax grammars are JSON, JavaScript/JSX, TypeScript/TSX, Rust, Markdown,
+HTML and CSS; unsupported languages remain readable plain text. Syntax/content
+colours are installed separately from the shared chrome palette. Source previews
+remain capped at 1 MiB. Diffs refuse whole patches above 16 MiB, 100,000 lines,
+10,000 hunks or 64 KiB per line; no truncated patch is presented as complete.
+
+Visual, screen-reader and Linux verification remain separate acceptance checks;
+headless unit/integration tests are not evidence for those gates.
+
 ### 7.1 Tabs and scope
 
 - Files is available for a plain or Git workdir.
@@ -298,7 +333,7 @@ Native implementation should:
 - Reject stale directory results after switching checkout.
 - Reuse backend limits and hidden/ignored/symlink metadata.
 - Keep tree scroll position and horizontal width stable while rows are virtualized.
-- Preserve file/folder icon mapping, Git status and counts where currently shown.
+- Preserve file/folder icon mapping and the filtered Git status markers currently shown. Per-file counts belong to Changes; the legacy Files count fields are dormant.
 - Preserve folder reveal/expand behavior distinct from opening a file.
 - Preserve platform-modifier external-open behavior.
 - Keep focus usable when collapsing a subtree containing the focused row.

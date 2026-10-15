@@ -50,7 +50,7 @@ chrome. Runtime VT/OSC colours and explicitly coloured cells still take priority
 
 | Legacy token | Dark value | Native equivalent |
 | --- | --- | --- |
-| `content-bg-0` | `#222436` | `Palette::background`; also the default OSC 11 reply |
+| `bg-0` | `#16181d` | `Palette::background`; also the default OSC 11 reply. Legacy used `content-bg-0` `#222436` here — a violet content well, kept for its editor and diff; the grid is the body of this window and wears the surface the chrome around it already has |
 | `content-text` | `#dce0e5` | `Palette::foreground` |
 | `cursor` | `#c2c9f1` | Default cursor colour; also toolkit text caret |
 | `selection` | `#74ade83d` | Translucent selection band; glyph colours are preserved |

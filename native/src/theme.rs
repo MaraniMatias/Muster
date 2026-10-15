@@ -18,6 +18,9 @@
 //! verbatim. These roles are the chrome *around* that grid. Nothing here reads
 //! or writes terminal colours, and nothing in the terminal reads these roles.
 
+use std::sync::Arc;
+
+use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{rgb, rgba, App, Hsla};
 
@@ -25,6 +28,24 @@ const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
 const CONTENT_ADDED: u32 = 0xa1c181;
 const CONTENT_REMOVED: u32 = 0xd97f84;
+
+// The content surfaces and syntax tokens, `--muster-content-*` and
+// `--muster-syntax-*` in `legacy/src/muster.css`. A document reads as its own
+// well rather than as a hole in the window, and the tokens that colour it are
+// named per meaning there, not per colour.
+const CONTENT_SURFACE: u32 = 0x222436;
+const CONTENT_TEXT: u32 = 0xdce0e5;
+const CONTENT_TEXT_FAINT: u32 = 0x767d8d;
+const CONTENT_ACCENT: u32 = 0x74ade8;
+const SYNTAX_FOREGROUND: u32 = 0xacb2be;
+const SYNTAX_COMMENT: u32 = 0x878e98;
+const SYNTAX_CONSTANT: u32 = 0xdfc184;
+const SYNTAX_KEYWORD: u32 = 0xbd81d6;
+const SYNTAX_STRING: u32 = 0xa1c181;
+const SYNTAX_FUNCTION: u32 = 0x73ade9;
+const SYNTAX_PUNCTUATION: u32 = 0xb2b9c6;
+const SYNTAX_LINK: u32 = 0x74ade8;
+const SYNTAX_STRING_EXPRESSION: u32 = 0xdfc184;
 
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
@@ -133,7 +154,75 @@ pub fn install(cx: &mut App) {
         theme.link_hover = accent;
         theme.link_active = accent;
         theme.window_border = border;
+        // The read-only document and the diff are the app's code, and Legacy
+        // drew them in this app's face rather than the toolkit's default.
+        theme.mono_font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
+        theme.highlight_theme = Arc::new(content_highlight_theme(theme));
     });
+}
+
+/// Legacy's content surfaces and syntax tokens as the toolkit's highlight theme.
+///
+/// The toolkit paints both the read-only editor and the diff from this one
+/// theme, so a file keeps its colours when it stops being a document. A token
+/// name comes from a grammar query; Legacy names the same meaning with a
+/// `--muster-syntax-token-*`, and the two vocabularies are joined here rather
+/// than anywhere that draws.
+///
+/// The colours are reached through serde because a `ThemeStyle`'s fields are
+/// private to the toolkit: this is the toolkit's own route in, not a
+/// reimplementation of it, and it takes the toolkit's own `#rrggbb` spelling
+/// rather than a float crossing, so a token arrives as the colour Legacy wrote.
+fn content_highlight_theme(theme: &Theme) -> HighlightTheme {
+    let token = |value: u32| format!("#{value:06x}");
+    let installed =
+        |color: Hsla| serde_json::to_value(color).expect("the toolkit spells a colour as a string");
+    let style = serde_json::from_value::<HighlightThemeStyle>(serde_json::json!({
+        "editor.background": token(CONTENT_SURFACE),
+        "editor.foreground": token(CONTENT_TEXT),
+        // Legacy paints the gutter as the document it numbers rather than as
+        // a well of its own, which is what leaving the gutter unset asks for.
+        "editor.line_number": token(CONTENT_TEXT_FAINT),
+        "editor.active_line_number": token(CONTENT_TEXT),
+        "editor.invisible": token(CONTENT_TEXT_FAINT),
+        "error": installed(theme.danger),
+        "warning": installed(theme.warning),
+        "info": installed(theme.info),
+        "hint": token(CONTENT_ACCENT),
+        "success": installed(theme.success),
+        "syntax": {
+            "primary": {"color": token(SYNTAX_FOREGROUND)},
+            "comment": {"color": token(SYNTAX_COMMENT)},
+            "keyword": {"color": token(SYNTAX_KEYWORD)},
+            "operator": {"color": token(SYNTAX_KEYWORD)},
+            "string": {"color": token(SYNTAX_STRING)},
+            "string.escape": {"color": token(SYNTAX_STRING)},
+            "string.regex": {"color": token(SYNTAX_STRING)},
+            "constant": {"color": token(SYNTAX_CONSTANT)},
+            "number": {"color": token(SYNTAX_CONSTANT)},
+            "boolean": {"color": token(SYNTAX_CONSTANT)},
+            "property": {"color": token(SYNTAX_CONSTANT)},
+            "function": {"color": token(SYNTAX_FUNCTION)},
+            "constructor": {"color": token(SYNTAX_FUNCTION)},
+            "tag": {"color": token(SYNTAX_STRING_EXPRESSION)},
+            "attribute": {"color": token(SYNTAX_STRING_EXPRESSION)},
+            "type": {"color": token(SYNTAX_STRING_EXPRESSION)},
+            "punctuation": {"color": token(SYNTAX_PUNCTUATION)},
+            "punctuation.bracket": {"color": token(SYNTAX_PUNCTUATION)},
+            "punctuation.delimiter": {"color": token(SYNTAX_PUNCTUATION)},
+            "punctuation.special": {"color": token(SYNTAX_PUNCTUATION)},
+            "link_text": {"color": token(SYNTAX_LINK)},
+            "link_uri": {"color": token(SYNTAX_LINK)},
+            "variable": {"color": token(SYNTAX_FOREGROUND)},
+            "label": {"color": token(SYNTAX_FOREGROUND)},
+        },
+    }))
+    .expect("the content highlight theme is this crate's own literal");
+    HighlightTheme {
+        name: "muster-content".into(),
+        appearance: ThemeMode::Dark,
+        style,
+    }
 }
 
 /// Ink the toolkit paints a state with, where a state has one meaning only.
@@ -165,6 +254,8 @@ pub struct Roles {
     // ---- surfaces -------------------------------------------------------
     /// The application background and the fill of a text field.
     pub surface_base: Hsla,
+    pub content: Hsla,
+    pub content_text: Hsla,
     /// The window's own base: the sidebar panel and the bar across the top.
     pub surface: Hsla,
     /// A surface lifted off the base: a menu, a popover, a row being dragged.
@@ -231,6 +322,16 @@ impl Roles {
         let hover = theme.secondary_hover;
         Self {
             surface_base: theme.background,
+            content: theme
+                .highlight_theme
+                .style
+                .editor_background
+                .unwrap_or(theme.background),
+            content_text: theme
+                .highlight_theme
+                .style
+                .editor_foreground
+                .unwrap_or(theme.foreground),
             surface: theme.sidebar,
             surface_raised: theme.popover,
             // Legacy's preview wells inside dialogs use bg-1.
@@ -264,6 +365,20 @@ impl Roles {
 }
 
 impl Roles {
+    /// File-type ink follows Legacy's icon tokens, separate from syntax and chrome.
+    pub fn file_icon(&self, path: &str) -> Hsla {
+        let value = match path.rsplit('.').next().unwrap_or("") {
+            "json" | "jsonc" | "js" | "mjs" | "yaml" | "yml" => 0xf9e2af,
+            "rs" => 0xfab387,
+            "ts" | "tsx" => 0x89b4fa,
+            "md" | "markdown" => 0x89dceb,
+            "css" | "scss" => 0xcba6f7,
+            "html" | "htm" => 0xf38ba8,
+            _ => 0xcdd6f4,
+        };
+        rgb(value).into()
+    }
+
     /// The background a row wears at rest.
     ///
     /// A row that is not open has no surface of its own: it inherits the
@@ -473,5 +588,89 @@ mod tests {
         // Legacy secondary text does not meet 4.5:1 on every state. Pin its
         // exact token above instead of silently replacing it with lighter ink.
         assert!(contrast(roles.text_muted, roles.surface) >= 4.5);
+    }
+
+    /// The colour the installed highlight theme paints a grammar token with.
+    fn syntax(cx: &mut TestAppContext, name: &str) -> Hsla {
+        let color = cx.update(|cx| {
+            Theme::global(cx)
+                .highlight_theme
+                .style(name)
+                .and_then(|style| style.color)
+        });
+        color.unwrap_or_else(|| panic!("no highlight style for {name}"))
+    }
+
+    /// Assert that a content colour is Legacy's token, exactly.
+    ///
+    /// A highlight theme is installed by deserializing the toolkit's own
+    /// `#rrggbb` spelling of a colour, so a token arrives as the value Legacy
+    /// wrote rather than as a float that went somewhere and came back.
+    fn assert_token(actual: Option<Hsla>, expected: Hsla) {
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[gpui_kit::test]
+    fn content_surfaces_and_syntax_tokens_come_from_legacy(cx: &mut TestAppContext) {
+        dark(cx);
+        cx.update(|cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(theme.mode, ThemeMode::Dark);
+            let surface = theme.highlight_theme.style.editor_background;
+            let ink = theme.highlight_theme.style.editor_foreground;
+            let numbers = theme.highlight_theme.style.editor_line_number;
+            // The diff paints an added and a removed line with the toolkit's own
+            // status colours, which are these two chrome tokens.
+            assert_eq!(theme.danger, legacy("danger"));
+            assert_eq!(theme.success, legacy("success"));
+            for (color, token) in [
+                (surface, "content-bg-0"),
+                (ink, "content-text"),
+                (numbers, "content-text-faint"),
+            ] {
+                assert_token(color, legacy(token));
+            }
+        });
+        for (name, token) in [
+            ("primary", "syntax-foreground"),
+            ("comment", "syntax-token-comment"),
+            ("keyword", "syntax-token-keyword"),
+            ("operator", "syntax-token-keyword"),
+            ("string", "syntax-token-string"),
+            ("string.escape", "syntax-token-string"),
+            ("number", "syntax-token-constant"),
+            ("boolean", "syntax-token-constant"),
+            ("property", "syntax-token-constant"),
+            ("function", "syntax-token-function"),
+            ("tag", "syntax-token-string-expression"),
+            ("type", "syntax-token-string-expression"),
+            ("punctuation", "syntax-token-punctuation"),
+            ("link_text", "syntax-token-link"),
+            ("variable", "syntax-foreground"),
+        ] {
+            assert_token(Some(syntax(cx, name)), legacy(token));
+        }
+    }
+
+    /// JSON's own grammar, so the tokens compared are the ones a `.json`
+    /// document actually reaches rather than names this crate chose.
+    #[gpui_kit::test]
+    fn json_tokens_are_not_all_one_colour(cx: &mut TestAppContext) {
+        dark(cx);
+        let string = syntax(cx, "string");
+        let property = syntax(cx, "property");
+        let comment = syntax(cx, "comment");
+        let number = syntax(cx, "number");
+        let boolean = syntax(cx, "boolean");
+        let null = syntax(cx, "constant.builtin");
+        let punctuation = syntax(cx, "punctuation");
+        assert_ne!(string, property, "a key and its value must not read alike");
+        assert_ne!(string, comment);
+        assert_ne!(string, punctuation);
+        assert_ne!(comment, punctuation);
+        // Legacy gives a property, a number and a boolean one constant colour.
+        assert_eq!(property, number);
+        assert_eq!(property, boolean);
+        assert_eq!(property, null);
     }
 }

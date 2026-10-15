@@ -10,7 +10,7 @@
 //! terminal layouts, compatibility readers or schema migrations are stored here.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -30,6 +30,7 @@ const STATE_CAP: u64 = 1024 * 1024;
 const SCHEMA_VERSION: u32 = 1;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+mod changes;
 mod diffs;
 mod discovery;
 mod git;
@@ -48,6 +49,11 @@ use worktrees::default_ref_with_budget;
 #[cfg(test)]
 use worktrees::*;
 
+#[cfg(test)]
+pub(crate) use changes::contained_existing_ancestor;
+#[cfg(test)]
+pub(crate) use changes::scan;
+pub use changes::{file_diff, status, ChangedFile, DiffHunk, FileDiff, GitStatus};
 pub use diffs::{diff_totals, diff_totals_for_checkout, DiffTotals};
 pub use discovery::{open_directory, open_directory_with_budget, OpenedDirectory};
 pub use git::GitReadBudget;

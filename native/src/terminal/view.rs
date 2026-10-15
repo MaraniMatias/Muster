@@ -212,14 +212,21 @@ pub fn xterm_256(index: u8) -> (u8, u8, u8) {
 /// The defaults and ANSI colors for the terminal palette. Every one of them is
 /// a `--muster-*` token out of the legacy dark theme in `legacy/src/muster.css`
 ///: legacy read that file to build xterm.js' theme, and this is the same table
-/// rather than a second one that happens to agree.
+/// rather than a second one that happens to agree — except the background,
+/// which is the surface the window is already painted, not a token legacy chose
+/// for the grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// `--muster-content-text`: what a cell with no colour of its own is drawn in.
     pub foreground: (u8, u8, u8),
-    /// `--muster-content-bg-0`: the same, behind the character.
+    /// `--muster-bg-0`: the same, behind the character.
+    ///
+    /// Legacy drew the grid on `--muster-content-bg-0`, `#222436`: a
+    /// violet-tinted well from the content palette, right for the editor and the
+    /// diff it shared it with. The grid here is the body of the window, not a
+    /// document inside one, so it takes the surface the chrome around it wears.
     pub background: (u8, u8, u8),
-    /// `--muster-cursor`, and `--muster-content-bg-0` as the block's glyph.
+    /// `--muster-cursor`, and `--muster-bg-0` as the block's glyph.
     pub cursor: (u8, u8, u8),
 }
 
@@ -227,7 +234,7 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             foreground: (0xdc, 0xe0, 0xe5),
-            background: (0x22, 0x24, 0x36),
+            background: (0x16, 0x18, 0x1d),
             cursor: CURSOR_COLOR,
         }
     }
@@ -2855,8 +2862,8 @@ mod tests {
         );
         assert_eq!(
             palette.background,
-            (0x22, 0x24, 0x36),
-            "legacy default content background"
+            (0x16, 0x18, 0x1d),
+            "the surface the window is painted, not legacy's content well"
         );
 
         // The cube: 16 is its black corner and 231 its white one.
@@ -2902,7 +2909,7 @@ mod tests {
         // the CSS that has to move with it, in both apps.
         const LEGACY_DARK: [(&str, (u8, u8, u8)); 19] = [
             ("--muster-content-text", (0xdc, 0xe0, 0xe5)),
-            ("--muster-content-bg-0", (0x22, 0x24, 0x36)),
+            ("--muster-bg-0", (0x16, 0x18, 0x1d)),
             ("--muster-cursor", (0xc2, 0xc9, 0xf1)),
             ("--muster-ansi-black", (0x28, 0x2c, 0x34)),
             ("--muster-ansi-red", (0xe0, 0x6c, 0x75)),
@@ -2976,7 +2983,7 @@ mod tests {
         // an alpha of `0x3d`. Legacy drew that into xterm.js' background layer,
         // so what it covered still reads through it, and a block cursor drawn
         // over a selected cell still inverts against the cell rather than
-        // against the band. `#364561` is this band over `#222436`.
+        // against the band. `#2c3c4e` is this band over `#16181d`.
         assert_eq!(
             (SELECTION_COLOR.0, SELECTION_COLOR.1, SELECTION_COLOR.2),
             (0x74, 0xad, 0xe8),
@@ -2992,9 +2999,9 @@ mod tests {
         );
         let background = Palette::default().background;
         for (channel, behind, composited) in [
-            (band.r, background.0, 0x36u8),
-            (band.g, background.1, 0x45),
-            (band.b, background.2, 0x61),
+            (band.r, background.0, 0x2cu8),
+            (band.g, background.1, 0x3c),
+            (band.b, background.2, 0x4e),
         ] {
             let expected = f32::from(behind) / 255.0;
             assert!(

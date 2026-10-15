@@ -402,6 +402,8 @@ impl TerminalWindow {
         if !self.navigation.select_session(target) && !self.navigation.select_checkout(target) {
             return;
         }
+        self.clear_document();
+        self.open_diff = None;
         self.persist();
         self.refresh_diff_totals(cx);
         self.focus_terminal(window, cx);
@@ -437,11 +439,32 @@ impl TerminalWindow {
             .zip(repo)
             .filter(|(_, repo)| repo.kind == RepoKind::Git)
             .map(|(checkout, repo)| titlebar_worktree_title(repo, checkout));
-        let item_label = self
-            .terminal()
-            .and(self.navigation.active_session.as_deref())
-            .and_then(|id| self.navigation.session(id))
-            .map(|session| self.session_label(session));
+        let document_path = self
+            .document_target
+            .as_ref()
+            .map(|(id, path)| (id, path))
+            .or_else(|| {
+                self.open_document
+                    .as_ref()
+                    .map(|(id, preview)| (id, &preview.path))
+            });
+        let document_checkout = document_path.map(|(checkout, _)| checkout.as_str());
+        let diff_label = self
+            .open_diff
+            .as_ref()
+            .filter(|(id, _)| Some(id) == self.navigation.active_checkout.as_ref())
+            .map(|(_, path)| path.clone().unwrap_or_else(|| "All changes".into()));
+        let document_is_active = diff_label.is_some()
+            || document_checkout
+                .is_some_and(|id| Some(id) == self.navigation.active_checkout.as_deref());
+        let item_label = if document_is_active {
+            diff_label.or_else(|| document_path.map(|(_, path)| path.clone()))
+        } else {
+            self.terminal()
+                .and(self.navigation.active_session.as_deref())
+                .and_then(|id| self.navigation.session(id))
+                .map(|session| self.session_label(session))
+        };
         let mut repo_budget = repo
             .map(|repo| titlebar_crumb_width(window, &repo.name, crumb_icon(Crumb::Workdir)))
             .unwrap_or(0.);
@@ -661,8 +684,15 @@ impl TerminalWindow {
             // Name only the terminal that is currently presented, not a saved
             // session whose process has no live terminal view.
             if let Some(label) = item_label.as_deref() {
-                crumbs.push(crumb_separator(cx));
-                let rows = self.session_rows(&checkout.id);
+                if !document_is_active {
+                    crumbs.push(crumb_separator(cx));
+                }
+                let document = document_is_active;
+                let rows = if document {
+                    Rc::new(Vec::new())
+                } else {
+                    self.session_rows(&checkout.id)
+                };
                 let session_state = titlebar_command_state(window, cx, "session");
                 let session_focus = session_state.focus_handle(cx);
                 let add = view.clone();
@@ -694,29 +724,33 @@ impl TerminalWindow {
                                     rows.clone(),
                                     "Search terminals…",
                                     "Terminals",
-                                    Some(Rc::new({
-                                        let add = add.clone();
-                                        let checkout_id = checkout_id.clone();
-                                        move || {
+                                    if document {
+                                        None
+                                    } else {
+                                        Some(Rc::new({
                                             let add = add.clone();
                                             let checkout_id = checkout_id.clone();
-                                            Button::new("item-new-terminal")
-                                                .text()
-                                                .small()
-                                                .label("New terminal")
-                                                .icon(Icon::new(IconName::Plus).size_4())
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = add.update(cx, |app, cx| {
-                                                        app.close_crumb_menu(cx);
-                                                        app.request_terminal(
-                                                            &checkout_id,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                })
-                                        }
-                                    })),
+                                            move || {
+                                                let add = add.clone();
+                                                let checkout_id = checkout_id.clone();
+                                                Button::new("item-new-terminal")
+                                                    .text()
+                                                    .small()
+                                                    .label("New terminal")
+                                                    .icon(Icon::new(IconName::Plus).size_4())
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = add.update(cx, |app, cx| {
+                                                            app.close_crumb_menu(cx);
+                                                            app.request_terminal(
+                                                                &checkout_id,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    })
+                                            }
+                                        }))
+                                    },
                                     menu.clone(),
                                     cx,
                                 )
@@ -764,7 +798,14 @@ impl TerminalWindow {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|app, _, window, cx| {
                     app.navigation.panels_visible = !app.navigation.panels_visible;
-                    app.focus_terminal(window, cx);
+                    // Same rule as the shortcut it mirrors: a central view owns
+                    // the keyboard, so hiding the panels must not take it.
+                    if app.open_document.is_none()
+                        && app.document_target.is_none()
+                        && app.open_diff.is_none()
+                    {
+                        app.focus_terminal(window, cx);
+                    }
                     cx.notify();
                 }))
                 .into_any_element(),

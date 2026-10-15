@@ -9,6 +9,8 @@ use gpui_kit::{
     MouseUpEvent, Pixels, Point, TestAppContext, Window,
 };
 use tempfile::TempDir;
+#[path = "inspector_tests.rs"]
+mod inspector_tests;
 
 fn run_git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -1018,6 +1020,135 @@ fn panels_shortcut_captures_the_focused_terminal_without_losing_it(cx: &mut Test
         .view
         .read_with(cx, |app, _| app.navigation.panels_visible));
     assert!(fixture.backend.status(&selected).is_ok());
+    dispose(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn a_worktree_row_and_the_label_on_it_do_the_same_thing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let label = format!("select-checkout-{}", fixture.checkout);
+    fixture.view.update(cx, |app, _| {
+        app.diff_totals.insert(
+            fixture.checkout.clone(),
+            DiffTotals {
+                additions: 4,
+                deletions: 2,
+            },
+        );
+    });
+    // A row advertising `+N -N` is offering its change set, so clicking it
+    // opens the change set rather than whatever the window was showing.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(label.clone(), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.open_diff,
+            Some((fixture.checkout.clone(), None)),
+            "a row advertising changes opened the terminal instead of them"
+        );
+        assert_eq!(
+            app.navigation.active_checkout.as_deref(),
+            Some(&*fixture.checkout)
+        );
+        assert_eq!(app.inspector_tab, InspectorTab::Changes);
+    });
+    // A worktree with nothing changed keeps the view it had: the terminal.
+    fixture.view.update(cx, |app, _| {
+        app.diff_totals.insert(
+            fixture.checkout.clone(),
+            DiffTotals {
+                additions: 0,
+                deletions: 0,
+            },
+        );
+        app.open_diff = Some((fixture.checkout.clone(), None));
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click(label, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.open_diff.is_none(), "a clean row invented a change set");
+        assert!(app.open_document.is_none());
+    });
+    close(&fixture, cx);
+}
+
+/// A terminal that was asked for is the view, even over a preview, and a preview
+/// opened while its shell was spawning is not taken back when that shell lands.
+#[gpui_kit::test]
+async fn a_new_terminal_takes_the_preview_and_a_later_preview_keeps_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open(cx);
+    let preview = |path: &str| FilePreview {
+        path: path.to_owned(),
+        text: "preview\n".into(),
+        truncated: false,
+    };
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_document = Some((fixture.checkout.clone(), preview("first.txt")));
+            app.request_terminal(&fixture.checkout, window, cx);
+        });
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.open_document.is_none(),
+            "the request left the preview it was meant to replace on screen"
+        );
+        assert_eq!(app.navigation.pending.len(), 1);
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).terminals.len() == 3
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        let active = app.navigation.active_session.clone().unwrap();
+        assert!(app.terminals.contains_key(&active));
+        assert!(app.open_document.is_none());
+    });
+    // Now the other half of the race: the preview is opened while that shell is
+    // still spawning, and it is still there when the shell lands.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.request_terminal(&fixture.checkout, window, cx)
+        });
+        fixture.view.update(cx, |app, cx| {
+            app.open_document = Some((fixture.checkout.clone(), preview("second.txt")));
+            app.document_request = app.document_request.wrapping_add(1);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).terminals.len() == 4
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.open_document
+                .as_ref()
+                .map(|(_, preview)| preview.path.as_str()),
+            Some("second.txt"),
+            "a terminal that finished spawning took a preview opened after it"
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        assert!(
+            !fixture
+                .view
+                .read_with(cx, |app, cx| app.terminal().is_some_and(|terminal| {
+                    terminal.read(cx).focus_handle(cx).is_focused(window)
+                })),
+            "a late terminal took the keyboard from the preview the person is reading"
+        );
+    })
+    .unwrap();
     dispose(&fixture, cx);
 }
 
