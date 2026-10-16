@@ -191,6 +191,24 @@ const VUE_INJECTIONS: &str = r#"
 )
 "#;
 
+/// The one place this grammar reads a Vue file differently from the one
+/// Legacy read it with, and it is a single attribute.
+///
+/// Legacy rendered a `.vue` with Shiki's TextMate grammar, where an attribute is
+/// an `entity.other.attribute-name` and a directive is a `meta.attribute.directive`:
+/// both reach one token, the function one, and neither of them reaches the tag.
+/// The grammar this app uses sends `(attribute_name)` to `attribute`, which is
+/// Legacy's string-expression — so `class` wore exactly the colour of `<p>`,
+/// and only an attribute with a `:` or an `@` in it read as something else.
+/// One capture says it the way Legacy painted it.
+///
+/// It comes before the grammar's own query on purpose: the highlighter takes the
+/// first pattern that matches a node, and the grammar's `(attribute_name)` is
+/// further down its file.
+const VUE_HIGHLIGHTS: &str = r#"
+(attribute_name) @function
+"#;
+
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
 pub fn install(cx: &mut App) {
@@ -220,13 +238,21 @@ pub fn install(cx: &mut App) {
         // in from the crate that owns them. It is the toolkit's own registry
         // either way, so `syntax_language` reaches it by the name it already
         // answers and the rename pass below covers it like any other.
+        // The Vue highlights are the grammar's own plus the one capture Legacy
+        // read differently, and the grammar's has to be asked for a `String`
+        // because a query that is longer than its own is built rather than
+        // borrowed.
+        let vue_highlights = format!(
+            "{VUE_HIGHLIGHTS}\n{}",
+            tree_sitter_vue_updated::HIGHLIGHTS_QUERY
+        );
         registry.register(
             "vue",
             &LanguageConfig::new(
                 "vue",
                 tree_sitter_vue_updated::language(),
                 Vec::new(),
-                tree_sitter_vue_updated::HIGHLIGHTS_QUERY,
+                &vue_highlights,
                 &format!(
                     "{}\n{VUE_INJECTIONS}",
                     tree_sitter_vue_updated::INJECTIONS_QUERY
@@ -1405,6 +1431,53 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// A Vue attribute wears the colour Legacy painted one in, and not the
+    /// colour it painted the tag beside it in.
+    ///
+    /// Legacy read a `.vue` with a TextMate grammar where an attribute and a
+    /// directive are two spellings of one thing — both reach its function token —
+    /// and neither reaches the tag's. The grammar this app uses sends the plain
+    /// attribute to `attribute`, which is the tag's colour, so `class` and `<p>`
+    /// came out identical and only an attribute with a `:` in it looked like
+    /// anything. What is compared here is what a document actually paints, not a
+    /// capture name: a capture can be answered by the wrong token, which is
+    /// exactly what happened, and a test over capture names would not have said
+    /// so.
+    #[gpui_kit::test]
+    fn a_vue_attribute_is_not_painted_like_a_tag(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::Rope;
+
+        let source = "<template>\n  <p class=\"plain\" :title=\"name\">text</p>\n</template>\n";
+        dark(cx);
+        cx.update(|cx| {
+            let mut highlighter = gpui_kit::component::highlighter::SyntaxHighlighter::new("vue");
+            assert!(
+                highlighter.update(None, &Rope::from(source), None),
+                "the Vue grammar accepted its own file"
+            );
+            let theme = gpui_kit::component::Theme::global(cx);
+            let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+            let painted = |needle: &str| {
+                styles
+                    .iter()
+                    .find(|(span, style)| {
+                        style.color.is_some()
+                            && span.start < source.len()
+                            && source.get(span.start..span.end) == Some(needle)
+                    })
+                    .map(|(_, style)| style.color)
+                    .unwrap_or_else(|| panic!("{needle} was not painted"))
+            };
+            let function = legacy("syntax-token-function");
+            let tag = legacy("syntax-token-string-expression");
+            // The three ways a template names something, and Legacy's answer:
+            // two of them are the function, one is the tag.
+            assert_eq!(painted("class"), Some(function), "a plain attribute");
+            assert_eq!(painted("title"), Some(function), "a bound attribute");
+            assert_eq!(painted("p"), Some(tag), "the tag beside them");
         });
     }
 
