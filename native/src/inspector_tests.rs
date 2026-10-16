@@ -1,9 +1,110 @@
 use super::*;
-use crate::app::sidebar_tests::{close, open_git, GitFixture};
+use crate::app::sidebar_tests::{add_worktree, close, commit_all, open_git, GitFixture};
 use crate::inspector::{opens_elsewhere, sticky_ancestors, tree_window, within, Ancestor, TreeRow};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-use gpui_kit::{px, TestAppContext};
+use gpui_kit::{point, px, TestAppContext};
+use muster_core::files::FileEntry;
 use std::rc::Rc;
+use std::sync::Arc;
+
+/// The reading of the document on screen, as its own words.
+///
+/// Which is what a picture that cannot be drawn falls back to, and what a
+/// selection of the reading copies.
+fn reading(fixture: &GitFixture, cx: &mut TestAppContext) -> String {
+    fixture.view.read_with(cx, |app, cx| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.preview.clone())
+            .map(|preview| {
+                preview.read_with(cx, |preview, _| preview.rendered_text().as_str().to_owned())
+            })
+            .expect("a rendered Markdown document")
+    })
+}
+
+/// Draw the window until the element with this id is on screen, running the
+/// workers each frame waits on. Whether it ever appears is the answer.
+fn draw_until(fixture: &GitFixture, cx: &mut TestAppContext, id: &str) -> bool {
+    let id = id.to_owned();
+    for _ in 0..32 {
+        cx.run_until_parked();
+        let drawn = cx
+            .update_window(fixture.handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(id.clone()).is_some()
+            })
+            .unwrap();
+        if drawn {
+            return true;
+        }
+    }
+    false
+}
+
+#[gpui_kit::test]
+async fn collapsed_folders_hide_cached_children_loading_and_errors(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, _| {
+            let key = |path: &str| (fixture.checkout.clone(), path.to_owned());
+            let entries = std::collections::HashMap::from([
+                (key(""), vec![FileEntry { name: "folder".into(), path: "folder".into(), directory: true }]),
+                (key("folder"), vec![FileEntry { name: "child".into(), path: "folder/child".into(), directory: false }]),
+            ]);
+            let expanded = std::collections::HashSet::new();
+            for state in 0..3 {
+                let loading = if state == 1 { std::collections::HashSet::from([key("folder")]) } else { Default::default() };
+                let errors = if state == 2 { std::collections::HashMap::from([(key("folder"), "Failed listing".into())]) } else { Default::default() };
+                let tree = crate::inspector::prepare_tree(&crate::inspector::TreeSource {
+                    checkout: &fixture.checkout, entries: &entries, loading: &loading,
+                    errors: &errors, expanded: &expanded, statuses: None,
+                }, &mut app.measured_widths, window);
+                assert_eq!(tree.rows.len(), 1, "collapsed folder, cached state {state}");
+                assert!(matches!(&tree.rows[0], TreeRow::Entry { entry, depth: 0, .. } if entry.path == "folder"));
+            }
+        });
+    }).unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn membership_removal_prunes_status_and_index_even_during_a_sweep(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .status_index
+            .contains_key(&fixture.checkout)
+    })
+    .await;
+    fixture.view.update(cx, |app, cx| {
+        let status = app.git_status[&fixture.checkout].clone();
+        let index = app.status_index[&fixture.checkout].clone();
+        app.git_status.insert("removed".into(), status);
+        app.status_index.insert("removed".into(), index);
+        app.git_status_request.insert("removed".into(), 42);
+        app.git_status_errors
+            .insert("removed".into(), "failed".into());
+        app.diff_refresh_running = true;
+        app.refresh_diff_totals(cx);
+        assert!(!app.git_status.contains_key("removed"));
+        assert!(!app.status_index.contains_key("removed"));
+        assert!(!app.git_status_request.contains_key("removed"));
+        assert!(!app.git_status_errors.contains_key("removed"));
+        assert!(app.git_status.contains_key(&fixture.checkout));
+        assert!(app.status_index.contains_key(&fixture.checkout));
+        app.navigation.repos.clear();
+        app.refresh_diff_totals(cx);
+        assert!(app.git_status.is_empty());
+        assert!(app.status_index.is_empty());
+    });
+    close(&fixture, cx);
+}
 
 #[test]
 fn change_status_keeps_uncommon_git_codes_visible() {
@@ -287,7 +388,11 @@ async fn a_folder_that_is_still_loading_says_so_in_place(cx: &mut TestAppContext
 
 /// Legacy's fixture: two folders open over eighty files, which is the shape its own
 /// sticky test builds.
-fn legacy_tree(files: usize) -> Vec<TreeRow> {
+///
+/// The entries are collected first and the rows borrow them, which is how the tree
+/// itself is walked: a tree of ten thousand rows must not own ten thousand copies of
+/// its listings to be asked what is stacked at some row of it.
+fn legacy_tree<'a>(files: usize, entries: &'a mut Vec<FileEntry>) -> Vec<TreeRow<'a>> {
     let chain: Rc<[Ancestor]> = vec![
         Ancestor {
             path: "src".into(),
@@ -303,27 +408,33 @@ fn legacy_tree(files: usize) -> Vec<TreeRow> {
         },
     ]
     .into();
+    entries.push(entry_at("src", 0, true));
+    entries.push(entry_at("nested", 1, true));
+    for index in 0..files {
+        entries.push(entry_at(&format!("f{index}"), 2, false));
+    }
+    let entries: &'a [FileEntry] = entries;
     let mut rows = vec![
         TreeRow::Entry {
-            entry: entry_at("src", 0, true),
+            entry: &entries[0],
             depth: 0,
             ancestors: vec![chain[0].clone()].into(),
         },
         TreeRow::Entry {
-            entry: entry_at("nested", 1, true),
+            entry: &entries[1],
             depth: 1,
             ancestors: chain.clone(),
         },
     ];
-    rows.extend((0..files).map(|index| TreeRow::Entry {
-        entry: entry_at(&format!("f{index}"), 2, false),
+    rows.extend(entries[2..].iter().map(|entry| TreeRow::Entry {
+        entry,
         depth: 2,
         ancestors: chain.clone(),
     }));
     rows
 }
 
-fn names(rows: &[TreeRow], top: usize, stack: usize) -> Vec<String> {
+fn names(rows: &[TreeRow<'_>], top: usize, stack: usize) -> Vec<String> {
     sticky_ancestors(rows, top, stack)
         .into_iter()
         .map(|ancestor| ancestor.name)
@@ -333,7 +444,8 @@ fn names(rows: &[TreeRow], top: usize, stack: usize) -> Vec<String> {
 /// The rule is Legacy's, so it is pinned against Legacy's own cases.
 #[test]
 fn the_folder_stack_is_the_rule_legacy_pins() {
-    let tree = legacy_tree(80);
+    let mut entries = Vec::new();
+    let tree = legacy_tree(80, &mut entries);
     // At the top of the tree the row on screen is the folder itself: nothing to stack.
     assert_eq!(names(&tree, 0, 8), Vec::<String>::new());
     // Everywhere else the chain above the row is the stack, and the folders the stack
@@ -351,8 +463,10 @@ fn the_folder_stack_is_the_rule_legacy_pins() {
 /// is carried rather than looked up.
 #[test]
 fn a_wide_tree_stacks_the_same_way_a_narrow_one_does() {
-    let narrow = legacy_tree(2);
-    let wide = legacy_tree(10_000);
+    let mut narrow_entries = Vec::new();
+    let narrow = legacy_tree(2, &mut narrow_entries);
+    let mut wide_entries = Vec::new();
+    let wide = legacy_tree(10_000, &mut wide_entries);
     for top in [0, 1, 2, 3, 9, 500, 10_000] {
         assert_eq!(
             names(&wide, top, 8),
@@ -373,15 +487,16 @@ fn a_note_does_not_carry_a_chain() {
         index: 0,
     }]
     .into();
+    let entries = [entry_at("src", 0, true)];
     let rows = vec![
         TreeRow::Entry {
-            entry: entry_at("src", 0, true),
+            entry: &entries[0],
             depth: 0,
             ancestors: chain.clone(),
         },
         TreeRow::Note {
-            path: "src".into(),
-            message: "Loading folder…".into(),
+            path: "src",
+            message: "Loading folder…",
             depth: 1,
             ancestors: chain,
         },
@@ -775,6 +890,254 @@ async fn rows_agreeing_about_git_keep_distinct_identities(cx: &mut TestAppContex
                 "{name} keeps its own counts"
             );
         }
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A row's marker is the answer the window indexed when it read that path, and the
+/// answer after that is the one the row wears.
+///
+/// The index the tree reads is built once per status read rather than once per
+/// render, so what this pins is the other half of that: a second read has to
+/// replace it, and a path the second read no longer mentions has to lose the
+/// marker rather than keep the one it was given.
+#[gpui_kit::test]
+async fn a_second_status_read_replaces_what_the_rows_wear(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(fixture.root.join(name), "tracked\n").unwrap();
+    }
+    commit_all(&fixture.root, "tracked");
+    let listing = |cx: &mut TestAppContext| {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                app.file_entries
+                    .remove(&(fixture.checkout.clone(), String::new()));
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+                app.request_directory(repo, checkout, String::new(), window, cx);
+            })
+        })
+        .unwrap();
+    };
+    // The window opened before these files existed, so its first listing is the one
+    // it took then; ask again the way a reader opening a folder does.
+    listing(cx);
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| entries.len() == 2)
+    })
+    .await;
+
+    std::fs::write(fixture.root.join("one.txt"), "changed\n").unwrap();
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .status_index
+            .get(&fixture.checkout)
+            .is_some_and(|index| index.contains_key("one.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("row-one.txt-status").visible(),
+            "the changed file wears its marker"
+        );
+        assert!(
+            window.try_find("row-two.txt-status").is_none(),
+            "a file Git said nothing about wears none"
+        );
+    })
+    .unwrap();
+
+    // The other way round: the answer this read gives is not the answer the last
+    // one gave, for either file.
+    std::fs::write(fixture.root.join("one.txt"), "tracked\n").unwrap();
+    std::fs::write(fixture.root.join("two.txt"), "changed\n").unwrap();
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .status_index
+            .get(&fixture.checkout)
+            .is_some_and(|index| index.contains_key("two.txt") && !index.contains_key("one.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("row-two.txt-status").visible(),
+            "the file this read changed wears its marker"
+        );
+        assert!(
+            window.try_find("row-one.txt-status").is_none(),
+            "a file this read no longer mentions has lost the marker the last one gave it"
+        );
+        assert!(
+            window.find("row-two.txt-add").visible(),
+            "and its counts came with it"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A checkout's failures are keyed by `(checkout, path)`, which is what keeps one
+/// checkout's note out of another checkout's tree.
+///
+/// The tree reads the window's own map rather than a copy narrowed to this
+/// checkout, so this is the check on that: the whole `(checkout, path)` is the key,
+/// and a note that belongs to another checkout must not appear here.
+#[gpui_kit::test]
+async fn a_failure_in_another_checkout_is_not_a_note_in_this_tree(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("docs")).unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+        app.file_entries.insert(
+            (fixture.checkout.clone(), String::new()),
+            vec![FileEntry {
+                name: "docs".into(),
+                path: "docs".into(),
+                directory: true,
+            }],
+        );
+        app.expanded_files
+            .insert((fixture.checkout.clone(), "docs".into()));
+        // The same directory, in another checkout, failed to be read.
+        app.file_errors.insert(
+            ("another-checkout".to_owned(), "docs".into()),
+            "Permission denied (os error 13)".into(),
+        );
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("file-control:docs").visible(),
+            "the folder is a row"
+        );
+        assert!(
+            window.try_find("file-note-docs").is_none(),
+            "another checkout's failure is not a note in this tree"
+        );
+        assert!(
+            window.try_find("file-note-docs-text").is_none(),
+            "and it is not a note drawn anywhere else either"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A row wears the answer read for its own checkout, and a checkout read with
+/// nothing changed wears no answer at all.
+///
+/// Two checkouts of one repository hold the same path, so an index keyed by path
+/// rather than by `(checkout, path)` would give them the same row and the same
+/// marker: this is the check on which of the two it is.
+#[gpui_kit::test]
+async fn a_status_read_for_one_checkout_does_not_reach_another_checkouts_rows(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("shared.txt"), "tracked\n").unwrap();
+    commit_all(&fixture.root, "tracked");
+    let (worktree, _path) = add_worktree(&fixture, cx);
+    // Changed in the checkout the window opened with, and nowhere else.
+    std::fs::write(fixture.root.join("shared.txt"), "changed\n").unwrap();
+    for checkout in [fixture.checkout.clone(), worktree.clone()] {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_git_status(&checkout, cx));
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).status_index.contains_key(&checkout)
+        })
+        .await;
+    }
+    // The window opened before this file existed, so its first listing is the one
+    // it took then; ask again the way a reader opening a folder does.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries
+                .remove(&(fixture.checkout.clone(), String::new()));
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == "shared.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("row-shared.txt-status").visible(),
+            "the checkout that changed this path wears its marker"
+        );
+    })
+    .unwrap();
+
+    // The same path in the other checkout, read after this one, with nothing
+    // changed in it.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{worktree}"), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(
+                fixture
+                    .view
+                    .read(cx)
+                    .navigation
+                    .active_checkout
+                    .clone()
+                    .unwrap(),
+                String::new(),
+            ))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == "shared.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.find("file-control:shared.txt").visible(),
+            "the other checkout's tree is on screen"
+        );
+        assert!(
+            window.try_find("row-shared.txt-status").is_none(),
+            "and the first checkout's marker is not on its row"
+        );
     })
     .unwrap();
     close(&fixture, cx);
@@ -1672,6 +2035,213 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
     close(&fixture, cx);
 }
 
+/// The keyboard belongs to the reading that is on screen.
+///
+/// The defect this pins is the direction, not the missing feature. A Markdown
+/// document opened with the editor focused while the pane drew its reading, and
+/// the header's toggle focused that same editor on the way *back* to the reading
+/// — the one direction where the editor is not mounted. So the reading was drawn
+/// with nothing focused and its source needed a click in its body before a
+/// keystroke went anywhere.
+///
+/// What is asserted is where the two presses land, not what a selection looks
+/// like: `secondary-a` then `secondary-c` are dispatched to whichever handle the
+/// window holds, so a clipboard that changed is a keystroke that arrived. The
+/// blurred case at the end is the control — the same two presses with no focus
+/// leave the clipboard alone, which is what makes the two above them mean
+/// something.
+#[gpui_kit::test]
+async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let source = "# Heading\n\n- one\n- two\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+    let (state, preview) = fixture.view.read_with(cx, |app, _| {
+        let view = app.document_view.as_ref().expect("a view");
+        (view.state.clone(), view.preview.clone().expect("a reading"))
+    });
+    let editor_id = state.entity_id();
+    let reading_id = preview.entity_id();
+
+    // It opens as a document, so the reading is what holds the keyboard and the
+    // editor behind it holds nothing.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            preview.read(cx).focus_handle().is_focused(window),
+            "a Markdown document opened with its reading on screen and the keyboard somewhere else"
+        );
+        assert!(
+            !state.read(cx).focus_handle(cx).is_focused(window),
+            "the editor behind the rendered reading kept the keyboard"
+        );
+    })
+    .unwrap();
+
+    // To the source: the keyboard follows it there, with no click in its body
+    // first, and the reading that went away lets it go.
+    let copied = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.click("document-toggle-reading", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(
+                state.read(cx).focus_handle(cx).is_focused(window),
+                "the source is on screen and the keyboard is not"
+            );
+            assert!(
+                !preview.read(cx).focus_handle().is_focused(window),
+                "the reading that went away kept the keyboard"
+            );
+            window.press("secondary-a", cx);
+            let selected = state.read(cx).selected_text().to_string();
+            window.press("secondary-c", cx);
+            selected
+        })
+        .unwrap();
+    assert_eq!(
+        copied, source,
+        "selecting and copying the source needed a click in the editor first"
+    );
+    assert_eq!(
+        cx.read_from_clipboard().map(|item| item.text()),
+        Some(Some(source.to_owned())),
+        "the source reading did not copy itself"
+    );
+
+    // And back: the reading takes the keyboard again and the editor gives it up,
+    // and the same two presses answer from the reading.
+    let copied = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.click("document-toggle-reading", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(
+                preview.read(cx).focus_handle().is_focused(window),
+                "the reading is on screen and the keyboard is not"
+            );
+            assert!(
+                !state.read(cx).focus_handle(cx).is_focused(window),
+                "the hidden editor kept the keyboard behind the reading"
+            );
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                "nothing was copied".to_owned(),
+            ));
+            window.press("secondary-a", cx);
+            window.press("secondary-c", cx);
+            cx.read_from_clipboard().map(|item| item.text())
+        })
+        .unwrap();
+    assert_ne!(
+        copied,
+        Some(Some("nothing was copied".to_owned())),
+        "the reading on screen did not answer the keyboard"
+    );
+
+    // Two readings, one document: neither entity was rebuilt to change focus,
+    // and neither of them became writable on the way.
+    assert_eq!(state.entity_id(), editor_id, "the editor was replaced");
+    assert_eq!(preview.entity_id(), reading_id, "the reading was replaced");
+    cx.read(|cx| {
+        let state = state.read(cx);
+        assert_eq!(
+            state.text().to_string(),
+            source,
+            "the document changed while the keyboard moved between its readings"
+        );
+        assert!(
+            state.presentation().is_readonly(),
+            "the source became editable because it took the keyboard"
+        );
+    });
+
+    // The control: with nothing focused the same two presses copy nothing, which
+    // is what makes the two copies above evidence of a focused handle rather
+    // than of a window that copies whatever is asked.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "nothing was copied".to_owned(),
+        ));
+        window.blur(cx);
+        window.render_frame(cx);
+        window.press("secondary-a", cx);
+        window.press("secondary-c", cx);
+        assert_eq!(
+            cx.read_from_clipboard().map(|item| item.text()),
+            Some(Some("nothing was copied".to_owned())),
+            "a copy with no focused handle on screen"
+        );
+    })
+    .unwrap();
+
+    // A file with no second reading is its editor, and the editor is what the
+    // keyboard gets.
+    std::fs::write(fixture.root.join("note.txt"), source).unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "note.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "note.txt")
+    })
+    .await;
+    let plain = fixture.view.read_with(cx, |app, _| {
+        let view = app.document_view.as_ref().expect("a view");
+        assert!(
+            view.preview.is_none(),
+            "a file that is not Markdown grew a second reading"
+        );
+        view.state.clone()
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            plain.read(cx).focus_handle(cx).is_focused(window),
+            "a document with only a source did not take the keyboard"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// One real pixel, so a picture is bytes the toolkit's asset system can decode
+/// rather than a file that merely exists.
+const ONE_PIXEL_PNG: &[u8] = b"\
+\x89PNG\r\n\x1a\n\
+\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\
+\x00\x00\x00\rIDAT\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\
+\x00\x00\x00\x00IEND\xaeB\x60\x82";
+
 /// A rendered document draws the picture it names and says everything else.
 ///
 /// The toolkit's own image path resolves a URL against the process rather than
@@ -1680,15 +2250,13 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
 /// that had nothing at all: a video this window cannot play, and a `../` that
 /// leaves the checkout, each of which has to say what the document put there
 /// rather than leave a blank where it was.
+///
+/// The picture is proved by what the toolkit decoded out of the bytes the read
+/// brought back. An element id only says the element was built, which is exactly
+/// what a picture that never arrived would also produce.
 #[gpui_kit::test]
 async fn a_rendered_document_draws_its_picture_and_says_what_it_cannot(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
-    // One real pixel, so the picture is bytes the asset system can actually read.
-    const ONE_PIXEL_PNG: &[u8] = b"\
-\x89PNG\r\n\x1a\n\
-\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\
-\x00\x00\x00\rIDAT\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\
-\x00\x00\x00\x00IEND\xaeB\x60\x82";
     std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
     let source = "# Pictures\n\n![The diagram](diagram.png)\n\n![](assets/demo.mp4)\n\n![](../outside.png)\n";
     std::fs::write(fixture.root.join("README.md"), source).unwrap();
@@ -1713,47 +2281,479 @@ async fn a_rendered_document_draws_its_picture_and_says_what_it_cannot(cx: &mut 
     })
     .await;
 
-    // The picture is read from disk by the asset system, so the reading is drawn
-    // over as many frames as it takes for those bytes to arrive.
+    // The frame that parsed the document named the picture and read nothing.
+    // This scheduler runs no worker task until the test asks it to, so a picture
+    // on this frame would mean a parse or render callback had gone to the
+    // filesystem itself rather than leaving that to a worker.
     let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
-    let mut drawn = false;
-    for _ in 0..16 {
-        cx.run_until_parked();
-        cx.update_window(fixture.handle, |_, window, cx| {
-            window.render_frame(cx);
-            drawn = drawn || window.try_find(picture.clone()).is_some();
-        })
-        .unwrap();
-        if drawn {
-            break;
-        }
-    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(picture.clone()).is_none(),
+            "the frame that parsed the document did not read the picture"
+        );
+        assert!(
+            fixture.view.read_with(cx, |app, _| {
+                app.document_view
+                    .as_ref()
+                    .is_none_or(|view| view.media.image("diagram.png").is_none())
+            }),
+            "and nothing has been prepared: the read is a worker that has not run"
+        );
+    })
+    .unwrap();
+    assert!(
+        reading(&fixture, cx).contains("The diagram"),
+        "the line stands in the picture's place while it is on its way"
+    );
+    assert!(
+        draw_until(&fixture, cx, &picture),
+        "a picture inside the checkout is drawn where the document names it"
+    );
+    assert_eq!(
+        fixture.view.read_with(cx, |app, _| app
+            .document_view
+            .as_ref()
+            .map_or(0, |view| view.media.reads())),
+        1,
+        "one picture named once is read once, however many frames were drawn"
+    );
 
-    let reading = fixture.view.read_with(cx, |app, _| {
+    // What the toolkit made of those bytes, which is the claim the element id
+    // cannot make on its own: one pixel came out, four bytes of BGRA.
+    cx.run_until_parked();
+    let prepared = fixture.view.read_with(cx, |app, _| {
         app.document_view
             .as_ref()
-            .and_then(|view| view.preview.clone())
-            .map(|preview| {
-                preview.read_with(cx, |preview, _| preview.rendered_text().as_str().to_owned())
-            })
-            .expect("a rendered Markdown document")
+            .and_then(|view| view.media.image("diagram.png"))
+            .expect("the worker read the picture into this document")
     });
-    cx.update_window(fixture.handle, |_, window, _cx| {
+    assert_eq!(
+        prepared.bytes.as_slice(),
+        ONE_PIXEL_PNG,
+        "what the document holds is the file it read, not a name it could reread"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let decoded = prepared
+            .get_render_image(window, cx)
+            .expect("the toolkit decoded the bytes the read brought back");
+        assert_eq!(
+            decoded.as_bytes(0).map(<[u8]>::len),
+            Some(4),
+            "one pixel of the picture was decoded, not merely laid out"
+        );
+    })
+    .unwrap();
+
+    let reading = reading(&fixture, cx);
+    assert!(
+        reading.contains("The diagram"),
+        "the alt text is the line that stands for a picture: {reading}"
+    );
+    assert!(
+        reading.contains("Video: assets/demo.mp4"),
+        "a video this window cannot play is named rather than left blank: {reading}"
+    );
+    assert!(
+        reading.contains("Image: ../outside.png"),
+        "a picture that reaches out of the checkout is named too: {reading}"
+    );
+    close(&fixture, cx);
+}
+
+/// Every picture the checkout will not hand over is said in words.
+///
+/// A name that climbs out of the checkout, an absolute one, one inside `.git`, a
+/// link out of the checkout, a file that is not a picture whatever its name says,
+/// one too large to hold whole and one that is not there: each of these was
+/// answered in words before, because the drawing was handed a path and the
+/// loader failed on it. They are refused here, before anything is read, and the
+/// words are what the reading shows either way.
+#[gpui_kit::test]
+async fn a_picture_the_checkout_will_not_hand_over_is_said_in_words(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("elsewhere.png"), ONE_PIXEL_PNG).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("elsewhere.png"),
+        fixture.root.join("linked.png"),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join(".git/hooks/pre-commit.png"),
+        ONE_PIXEL_PNG,
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("notes.png"), "words, not pixels\n").unwrap();
+    // Sparse, and one byte past the bound: the length is what is refused.
+    std::fs::File::create(fixture.root.join("enormous.png"))
+        .unwrap()
+        .set_len((muster_core::files::MAX_RESOURCE_BYTES + 1) as u64)
+        .unwrap();
+    let said = [
+        "The escaping one",
+        "The absolute one",
+        "The object store",
+        "The link out",
+        "The text file",
+        "The enormous one",
+        "The missing one",
+    ];
+    let urls = [
+        "../outside.png",
+        "/etc/passwd",
+        ".git/hooks/pre-commit.png",
+        "linked.png",
+        "notes.png",
+        "enormous.png",
+        "absent.png",
+    ];
+    let mut source = String::new();
+    for (said, url) in said.iter().zip(urls) {
+        source.push_str(&format!("![{said}]({url})\n\n"));
+    }
+    std::fs::write(fixture.root.join("README.md"), &source).unwrap();
+
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+    // Every worker runs, so this is what the document looks like after the reads
+    // that could have succeeded and did not.
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    assert!(
+        fixture.view.read_with(cx, |app, _| {
+            [
+                ".git/hooks/pre-commit.png",
+                "linked.png",
+                "notes.png",
+                "enormous.png",
+                "absent.png",
+            ]
+            .iter()
+            .all(|name| {
+                app.document_view
+                    .as_ref()
+                    .is_none_or(|view| view.media.image(name).is_none())
+            })
+        }),
+        "not one of those names came back with a picture to draw"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        for said in said {
+            let id = format!(
+                "document-media-{}",
+                source.find(&format!("![{said}]")).unwrap()
+            );
+            assert!(
+                window.try_find(id.clone()).is_none(),
+                "{said} is not drawn as a picture"
+            );
+        }
+    })
+    .unwrap();
+    let words = reading(&fixture, cx);
+    for said in said {
+        assert!(
+            words.contains(said),
+            "{said} is said in words instead: {words}"
+        );
+    }
+    close(&fixture, cx);
+}
+
+/// A picture read for a document that has been closed updates nothing and keeps
+/// nothing.
+///
+/// The store a read publishes into belongs to the document that named the
+/// picture, so a read that lands after the document is gone has nowhere to put
+/// its bytes and nothing to retain: the store went with the view.
+#[gpui_kit::test]
+async fn a_picture_read_after_its_document_is_closed_is_dropped(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    let source = "![The diagram](diagram.png)\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+    let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
+    // One frame: the document is parsed and its picture is on a worker that has
+    // not run, which is the window in which this read can go wrong.
+    let store = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            fixture.view.read_with(cx, |app, _| {
+                app.document_view
+                    .as_ref()
+                    .expect("a document")
+                    .media
+                    .clone()
+            })
+        })
+        .unwrap();
+    let gone = Arc::downgrade(&store);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(gpui_kit::ElementId::from("close-document"), cx);
+    })
+    .unwrap();
+    drop(store);
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    assert!(
+        gone.upgrade().is_none(),
+        "the prepared pictures and the store that held them went with the document"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(picture.clone()).is_none(),
+            "nothing of a closed document is left on screen"
+        );
+        assert!(
+            fixture
+                .view
+                .read_with(cx, |app, _| app.document_view.is_none()),
+            "and the document pane is closed rather than showing a late arrival"
+        );
+    })
+    .unwrap();
+
+    // Opening it again reads it again into a store of its own: the late read
+    // above published nothing that this document could have drawn.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+    assert!(
+        draw_until(&fixture, cx, &picture),
+        "the reopened document reads its picture afresh"
+    );
+    assert!(
+        fixture.view.read_with(cx, |app, _| {
+            app.document_view
+                .as_ref()
+                .is_some_and(|view| view.media.image("diagram.png").is_some())
+        }),
+        "into a store that belongs to this document alone"
+    );
+    close(&fixture, cx);
+}
+
+/// A picture whose bytes do not decode is said in words rather than left as the
+/// blank box a loader that failed always was.
+///
+/// This is the one failure the bytes can still fail at after the read has
+/// succeeded and the format has been decided: the header says PNG and the rest
+/// is not one. The picture has arrived, so the node is claimed, and the element
+/// that cannot paint falls back to the line that stands in for a picture.
+#[gpui_kit::test]
+async fn a_picture_that_does_not_decode_is_said_in_words(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // A real PNG header, and then nothing that is an image.
+    let mut broken = ONE_PIXEL_PNG[..8].to_vec();
+    broken.extend_from_slice(b"not the rest of a picture");
+    std::fs::write(fixture.root.join("broken.png"), &broken).unwrap();
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    let source = "![The broken one](broken.png)\n\n![The good one](diagram.png)\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "README.md")
+    })
+    .await;
+    let id = |said: &str| {
+        format!(
+            "document-media-{}",
+            source.find(&format!("![{said}]")).unwrap()
+        )
+    };
+    let said_id = |said: &str| {
+        format!(
+            "document-media-said-{}",
+            source.find(&format!("![{said}]")).unwrap()
+        )
+    };
+    assert!(
+        draw_until(&fixture, cx, &id("The good one")),
+        "the picture that does decode is drawn"
+    );
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(said_id("The broken one")).is_some(),
+            "a picture that will not decode is said in words where it was going to be"
+        );
+        assert!(
+            window.try_find(said_id("The good one")).is_none(),
+            "a picture that decoded is a picture, and says nothing in its place"
+        );
+    })
+    .unwrap();
+    let words = reading(&fixture, cx);
+    assert!(
+        words.contains("The broken one") && words.contains("The good one"),
+        "and both are still what a selection of the reading copies: {words}"
+    );
+    close(&fixture, cx);
+}
+
+/// What is drawn is the bytes that were read.
+///
+/// A picture that is prepared is not read again: the name it was read from can
+/// be gone, or can be pointing at something else entirely, and the reading keeps
+/// the copy it took. That is the whole difference between handing the toolkit
+/// bytes and handing it a path it will reopen whenever it likes.
+///
+/// The document is a nested one reaching a sibling directory, which is the name
+/// a README most often spells: `../` walked, still inside the checkout.
+#[gpui_kit::test]
+async fn a_picture_drawn_is_the_bytes_that_were_read(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::create_dir_all(fixture.root.join("docs/guide")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("docs/assets")).unwrap();
+    std::fs::write(fixture.root.join("docs/assets/diagram.png"), ONE_PIXEL_PNG).unwrap();
+    let source = "![The diagram](../assets/diagram.png)\n";
+    std::fs::write(fixture.root.join("docs/guide/README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "docs/guide/README.md".into(), window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "docs/guide/README.md")
+    })
+    .await;
+    let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
+    assert!(draw_until(&fixture, cx, &picture));
+    let prepared = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.media.image("docs/assets/diagram.png"))
+            .expect("the worker read the picture this nested document names")
+    });
+
+    // The name now leads somewhere else, and would be a picture the reader never
+    // asked for if anything reopened it.
+    std::fs::write(
+        fixture.root.join("docs/assets/diagram.png"),
+        b"not a picture any more\n",
+    )
+    .unwrap();
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    let again = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.media.image("docs/assets/diagram.png"))
+    });
+    assert!(
+        again
+            .as_ref()
+            .is_some_and(|again| Arc::ptr_eq(again, &prepared)),
+        "the picture is the one that was read, kept as it was read"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
         assert!(
             window.try_find(picture.clone()).is_some(),
-            "a picture inside the checkout is drawn where the document names it"
+            "and it is still drawn after the file behind its name changed"
         );
-        assert!(
-            reading.contains("The diagram"),
-            "the alt text is the line that stands for a picture: {reading}"
-        );
-        assert!(
-            reading.contains("Video: assets/demo.mp4"),
-            "a video this window cannot play is named rather than left blank: {reading}"
-        );
-        assert!(
-            reading.contains("Image: ../outside.png"),
-            "a picture that reaches out of the checkout is named too: {reading}"
+        let decoded = prepared
+            .get_render_image(window, cx)
+            .expect("the toolkit decoded the bytes the read brought back");
+        assert_eq!(
+            decoded.as_bytes(0).map(<[u8]>::len),
+            Some(4),
+            "the pixel is the one that was read"
         );
     })
     .unwrap();
@@ -2006,6 +3006,267 @@ async fn a_change_row_fits_the_panel_and_a_long_name_gives_up_its_room(cx: &mut 
     })
     .unwrap();
     close(&fixture, cx);
+}
+
+/// A link the opener will refuse, in a document the fixture has actually read.
+///
+/// `file:` is refused by the opener's own scheme check before anything is
+/// spawned, so the whole path is exercised and no browser is ever launched.
+const REFUSED_LINK: &str = "file:///etc/passwd";
+
+/// A document whose only content is one link the opener refuses.
+fn write_a_refused_link(root: &Path) {
+    std::fs::write(
+        root.join("README.md"),
+        format!("# Links\n\n[not a page]({REFUSED_LINK})\n"),
+    )
+    .unwrap();
+}
+
+/// The window's own work, run with no frame drawn.
+///
+/// A link used to be left in a queue that only the document pane drained while
+/// rendering, so an error that arrives only once something else draws is
+/// precisely what this pins. Nothing below renders a frame.
+async fn until_the_failure_is_stated(
+    cx: &mut TestAppContext,
+    view: &Entity<TerminalWindow>,
+) -> bool {
+    for _ in 0..200 {
+        if view.read_with(cx, |app, _| app.failure.is_some()) {
+            return true;
+        }
+        cx.background_executor.timer(Duration::from_millis(5)).await;
+        cx.run_until_parked();
+    }
+    view.read_with(cx, |app, _| app.failure.is_some())
+}
+
+/// A rendered link the opener refuses is said in the window, and dismissed.
+///
+/// The notice used to be filed under the file tree's opener key, and the only
+/// renderer of that key drew file rows and skipped links, so a link that would
+/// not open said nothing at all: a click that looked like it had opened a page.
+/// It is the window's failure banner now, which is drawn whatever the inspector
+/// is showing, and this reads it off the screen.
+#[gpui_kit::test]
+async fn a_refused_link_is_said_in_the_window_and_dismissed(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    write_a_refused_link(&fixture.root);
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // The click itself. Nothing renders between it and the error: a link that
+    // waited for a later frame to be opened was a link that opened whenever the
+    // window happened to draw next, which is the defect this pins.
+    let clicked = cx.update_window(fixture.handle, |_, window, cx| {
+        window.click_at("document-markdown", point(px(30.), px(60.)), cx)
+    });
+    clicked.expect("a click in an open window");
+    assert!(
+        until_the_failure_is_stated(cx, &fixture.view).await,
+        "the click opened the link without anything else having to draw"
+    );
+
+    // The error is on screen, in this window's own banner.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dismiss-message").is_some(),
+            "what the opener refused is said where this window already says things"
+        );
+        fixture.view.read_with(cx, |app, _| {
+            assert_eq!(
+                app.failure.as_deref(),
+                Some("only an http or https link can be opened in the browser"),
+                "the refusal is the opener's own words"
+            );
+        });
+    })
+    .unwrap();
+
+    // A link is a document's, not the tree's: saying so opened nothing else.
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.document_target.as_ref().map(|(_, path)| path.as_str()),
+            Some("README.md"),
+            "the document that was being read is still the one on screen"
+        );
+        assert!(app.open_document.is_some());
+        assert!(app.external_notices.is_empty());
+        assert!(
+            app.expanded_files.is_empty() && app.selected_file.is_empty(),
+            "a link in a document is not a row in the tree"
+        );
+    });
+
+    // And it goes away with the one control every other message uses.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("dismiss-message", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dismiss-message").is_none(),
+            "dismissing takes the message away"
+        );
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.failure.is_none());
+        assert!(
+            app.open_document.is_some(),
+            "and the document is still open"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// The same refusal is said with Files not selected, because the pane it was
+/// clicked in is not the inspector.
+///
+/// Two of the three states the inspector can be in are checked here: the tab
+/// set to Changes, and the panels hidden altogether. Neither is where a
+/// document is read, and neither may swallow what the opener said.
+#[gpui_kit::test]
+async fn a_refused_link_is_said_whatever_the_inspector_is_showing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    write_a_refused_link(&fixture.root);
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "README.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+
+    for panels_visible in [true, false] {
+        fixture.view.update(cx, |app, cx| {
+            app.inspector_tab = InspectorTab::Changes;
+            app.navigation.panels_visible = panels_visible;
+            cx.notify();
+        });
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.click_at("document-markdown", point(px(30.), px(60.)), cx);
+        })
+        .unwrap();
+        assert!(
+            until_the_failure_is_stated(cx, &fixture.view).await,
+            "a link is refused the same way with panels_visible={panels_visible}"
+        );
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("dismiss-message").is_some(),
+                "the banner is the window's, not the inspector's"
+            );
+        })
+        .unwrap();
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.click("dismiss-message", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    close(&fixture, cx);
+}
+
+/// A link clicked after its window is gone opens nothing, and says nothing.
+///
+/// The handler holds the window weakly, which is what lets the toolkit's
+/// `Send + Sync` callback carry it. The other half of that is what a click does
+/// once the window is released: the upgrade fails, the click ends, and nothing
+/// is spawned and nothing panics on the way.
+#[gpui_kit::test]
+async fn a_link_clicked_after_its_window_is_released_opens_nothing(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        ClickEvent, Modifiers, MouseButton, MouseClickEvent, MouseDownEvent, MouseUpEvent,
+    };
+
+    let fixture = open_git(cx);
+    let released = fixture.view.downgrade();
+    close(&fixture, cx);
+    drop(fixture);
+    assert!(
+        !released.is_upgradable(),
+        "the window is gone, which is the state this case is about"
+    );
+
+    // A window that has nothing in it, so the handler can be called with the
+    // `Window` and `App` the text view would have handed it.
+    let (handle, _) = cx.update(|cx| {
+        gpui_kit::open_window(crate::app::window_bounds(cx), cx, |_, cx| cx.new(|_| Empty))
+            .expect("a window to click in")
+    });
+    let click = ClickEvent::Mouse(MouseClickEvent {
+        down: MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(0.), px(0.)),
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        },
+        up: MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(0.), px(0.)),
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        },
+    });
+    let handler = crate::document::link_handler(released.clone());
+    // Reaching a released window is the failure this pins: the handler answers
+    // `Err` and stops, rather than upgrading, spawning an opener, or panicking.
+    cx.update_window(handle, |_, window, cx| {
+        handler(
+            &gpui_kit::SharedString::from(REFUSED_LINK),
+            &click,
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!released.is_upgradable());
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+}
+
+/// A window with nothing in it, for a handler that only needs somewhere to be
+/// called from.
+struct Empty;
+
+impl Render for Empty {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui_kit::IntoElement {
+        div().size_full()
+    }
 }
 
 /// A listed entry, for a tree built by hand rather than read from a filesystem.

@@ -100,9 +100,9 @@ pub struct CursorSnapshot {
     pub row: usize,
     pub col: usize,
     /// False when the program hid the cursor, or when the view is scrolled back
-    /// far enough that the cursor is not on screen. `row` and `col` are clamped
-    /// rather than wrapped in that case, so a stale position never reads as a
-    /// real one.
+    /// far enough that the cursor is not on screen. `row` is clamped to the
+    /// viewport bounds; `col` is the parser's cursor column, unchanged. Only
+    /// draw the cursor when `visible` is true.
     pub visible: bool,
     pub shape: CursorShapeSnapshot,
     pub blinking: bool,

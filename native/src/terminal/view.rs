@@ -880,10 +880,6 @@ impl TerminalView {
         }
     }
 
-    fn snapshot_range(&self) -> Option<GridRange> {
-        self.session.painting_snapshot().selection_range
-    }
-
     fn reset_blink(&mut self) {
         self.blink_visible = true;
         self.blink_deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -976,7 +972,7 @@ impl TerminalView {
                     _ => super::SelectionKind::Simple,
                 },
             );
-            self.selection_range.set(self.snapshot_range());
+            self.selection_range.set(self.session.selection_range());
         }
         self.reset_blink();
         cx.notify();
@@ -1001,7 +997,7 @@ impl TerminalView {
             self.drag_point = point;
             if self.dragging || self.click_count > 1 || self.dragged {
                 self.session.update_selection(point);
-                self.selection_range.set(self.snapshot_range());
+                self.selection_range.set(self.session.selection_range());
             }
             cx.notify();
             cx.stop_propagation();

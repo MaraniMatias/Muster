@@ -101,6 +101,13 @@ vocabulary to Legacy's in two tables rather than one:
   `\n` in a Rust string, a `io.Reader` qualifier and a Makefile's `ifeq` all fall
   back to the editor's own ink.
 
+These capture checks verify query vocabulary and normalization, not pixel
+output or every language's visible spans. See the explicit selector inventory
+and evidence distinctions in
+[typography and highlighting](typography-and-highlighting.md#current-grammar-inventory-and-evidence).
+Document highlighting does not remove the toolkit diff's injected-language
+limitation recorded there.
+
 The names neither table answers are the ones that carry no colour by design:
 `none`, `spell`, `nospell` and `text.*`.
 

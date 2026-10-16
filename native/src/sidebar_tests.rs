@@ -1033,21 +1033,719 @@ fn panels_shortcut_captures_the_focused_terminal_without_losing_it(cx: &mut Test
     dispose(&fixture, cx);
 }
 
+/// Git's own answer for a checkout whose change set is `files`.
+///
+/// The row's decision is a question about this list, so a test that pins the
+/// decision does not need a repository behind it. The reads themselves are
+/// pinned against real ones below.
+fn status_of(files: &[(&str, &str)]) -> navigation::GitStatus {
+    navigation::GitStatus {
+        branch: Some("main".into()),
+        head: Some("abc1234".into()),
+        default_branch: "main".into(),
+        ahead_count: 0,
+        files: files
+            .iter()
+            .map(|(path, status)| navigation::ChangedFile {
+                path: (*path).into(),
+                old_path: None,
+                status: (*status).into(),
+                additions: None,
+                deletions: None,
+            })
+            .collect(),
+    }
+}
+
+/// A live shell in a Git fixture's checkout, so a row that should show a
+/// terminal has one to show and one to give the keyboard to.
+fn add_terminal(fixture: &GitFixture, cx: &mut TestAppContext) -> String {
+    let id = format!(
+        "git-fixture-shell-{}-{}",
+        std::process::id(),
+        NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+    );
+    let checkout = fixture.checkout.clone();
+    fixture.view.update(cx, |app, cx| {
+        let mut config = TerminalSessionConfig::new(
+            id.clone(),
+            fixture.root.clone(),
+            80,
+            24,
+            Some(PathBuf::from("/bin/sh")),
+        );
+        config.args = Some(vec!["-c".into(), "set -m; cat; :".into()]);
+        config.status_interval = Duration::from_millis(20);
+        let shell = app.owner.spawn(config).unwrap();
+        let terminal =
+            cx.new(|cx| TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx));
+        app.terminals.insert(
+            id.clone(),
+            LiveTerminal {
+                checkout_id: checkout.clone(),
+                view: terminal,
+                shell,
+            },
+        );
+        app.navigation.add_session(
+            Session {
+                id: id.clone(),
+                checkout_id: checkout.clone(),
+                name: "sh".into(),
+                created_at: "test".into(),
+                session_type: SessionType::Shell,
+                status: SavedSessionStatus::Active,
+            },
+            Some(app.navigation.revision),
+        );
+    });
+    id
+}
+
+/// A PNG header and a NUL: bytes Git will not measure as lines.
+const PICTURE: [u8; 10] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
+
+/// Commit everything the fixture writes, under an identity of its own so the
+/// machine running the suite is not asked for one.
+pub(super) fn commit_all(root: &Path, message: &str) {
+    run_git(root, &["add", "-A"]);
+    run_git(
+        root,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+}
+
+/// Read a checkout's change list the way the Changes tab does, and wait for it.
+///
+/// The tree asks for this read as it draws, so by the time a test has changed
+/// anything the window is holding an answer from before. Asking again is what
+/// the tab's button does, and it is what makes the row's decision a question
+/// about the repository as it is now rather than as it was.
+async fn read_status(fixture: &GitFixture, checkout: &str, cx: &mut TestAppContext) {
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(checkout)
+            .is_some_and(|status| !status.files.is_empty())
+    })
+    .await;
+}
+
+/// Forget what the window knows about a checkout's changes.
+///
+/// This is the state a row click meets for a checkout the window has not read
+/// yet: the Files tree reads the active checkout as it draws, so without this a
+/// fixture would answer every click from a read taken before the test wrote
+/// anything.
+fn forget_status(fixture: &GitFixture, checkouts: &[&str], cx: &mut TestAppContext) {
+    fixture.view.update(cx, |app, _| {
+        for checkout in checkouts {
+            app.git_status.remove(*checkout);
+            // The tree's index is built with the status it indexes, so a window
+            // that has forgotten the status has forgotten the index with it.
+            app.status_index.remove(*checkout);
+            app.git_status_errors.remove(*checkout);
+        }
+    });
+}
+
+/// One binary file, one empty file and one mode change: three changes that
+/// count no lines at all, against a row that draws `+0 −0` for every one of
+/// them. The change list is what the row's click reads, so it opens the change
+/// set with the counts still at zero.
+#[gpui_kit::test]
+async fn a_row_with_no_line_counts_still_opens_its_change_set(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("tracked.txt"), "hello\n").unwrap();
+    commit_all(&fixture.root, "tracked");
+    run_git(
+        &fixture.root,
+        &["update-index", "--chmod=+x", "tracked.txt"],
+    );
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    std::fs::write(fixture.root.join("empty.txt"), "").unwrap();
+    read_status(&fixture, &fixture.checkout, cx).await;
+
+    // The counts are settled first, so the click below meets a row honestly
+    // advertising `+0 −0` and nothing else.
+    fixture
+        .view
+        .update(cx, |app, cx| app.refresh_diff_totals(cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_totals
+            .contains_key(&fixture.checkout)
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.diff_totals[&fixture.checkout]),
+        DiffTotals {
+            additions: 0,
+            deletions: 0
+        },
+        "Git can count none of these three, which is not the same as there being none"
+    );
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.open_diff,
+            Some((fixture.checkout.clone(), None)),
+            "a row whose counts are zero opened the terminal instead of its changes"
+        );
+        assert_eq!(app.inspector_tab, InspectorTab::Changes);
+        assert!(app.pending_row_choice.is_none());
+        assert_eq!(
+            app.diff_totals[&fixture.checkout],
+            DiffTotals {
+                additions: 0,
+                deletions: 0
+            },
+            "the change set was opened on the strength of a count the row does not have"
+        );
+        let status = &app.git_status[&fixture.checkout];
+        assert_eq!(status.files.len(), 3, "{status:?}");
+        assert!(
+            status
+                .files
+                .iter()
+                .find(|file| file.path == "picture.png")
+                .is_some_and(|file| file.additions.is_none()),
+            "a binary file was given a line count nobody measured: {status:?}"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A click on a checkout the window has not read yet waits for Git rather than
+/// calling it clean, and answers from what the read says.
+#[gpui_kit::test]
+async fn a_click_before_the_change_list_is_read_waits_for_it(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    forget_status(&fixture, &[&fixture.checkout], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_row_choice.is_some(),
+            "the click decided without asking Git"
+        );
+        assert!(
+            app.open_diff.is_none() && !app.focus_pending,
+            "the click answered for a checkout nobody had read"
+        );
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).pending_row_choice.is_none()
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.open_diff, Some((fixture.checkout.clone(), None)));
+        assert_eq!(app.inspector_tab, InspectorTab::Changes);
+    });
+    close(&fixture, cx);
+}
+
+/// A commit the worktree is holding above the merge base is a change even
+/// though its working tree is clean and its line counts are zero.
+#[gpui_kit::test]
+async fn a_committed_change_ahead_of_the_merge_base_opens_the_change_set(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (worktree, path) = add_worktree(&fixture, cx);
+    std::fs::write(path.join("picture.png"), PICTURE).unwrap();
+    commit_all(&path, "picture");
+    read_status(&fixture, &worktree, cx).await;
+    fixture
+        .view
+        .update(cx, |app, cx| app.refresh_diff_totals(cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).diff_totals.contains_key(&worktree)
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.diff_totals[&worktree]),
+        DiffTotals {
+            additions: 0,
+            deletions: 0
+        }
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{worktree}"), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.open_diff,
+            Some((worktree.clone(), None)),
+            "a worktree whose change is committed but uncounted showed its terminal"
+        );
+        let status = &app.git_status[&worktree];
+        assert_eq!(status.ahead_count, 1, "{status:?}");
+        assert_eq!(
+            status.files.len(),
+            1,
+            "the commit this worktree holds is not in its change set: {status:?}"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// Read the root listing again, for a fixture whose tree was drawn before the
+/// test wrote anything into the checkout.
+async fn read_root_listing(fixture: &GitFixture, path: &str, cx: &mut TestAppContext) {
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.file_entries
+                .remove(&(fixture.checkout.clone(), String::new()));
+            let repo = app
+                .navigation
+                .repos
+                .iter()
+                .find(|repo| repo.id == fixture.repo_id)
+                .unwrap()
+                .clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_directory(repo, checkout, String::new(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .file_entries
+            .get(&(fixture.checkout.clone(), String::new()))
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == path))
+    })
+    .await;
+}
+
+/// A checkout Git says is clean shows its terminal: once the read that says so
+/// has answered, and while it has not, by waiting rather than by guessing.
+#[gpui_kit::test]
+async fn a_known_clean_checkout_shows_its_terminal(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    add_terminal(&fixture, cx);
+    // The click arrives before the window knows, and is answered by the read.
+    forget_status(&fixture, &[&fixture.checkout], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).pending_row_choice.is_none()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(
+                app.open_diff.is_none(),
+                "a clean checkout opened a change set"
+            );
+            assert!(
+                app.terminal()
+                    .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window)),
+                "a clean checkout kept the keyboard away from its terminal"
+            );
+        });
+    })
+    .unwrap();
+    // The second click is answered from what the window already knows, and asks
+    // Git nothing.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(app.open_diff.is_none());
+            assert!(app.pending_row_choice.is_none());
+            assert!(!app.git_status_running.contains(&fixture.checkout));
+            assert!(app
+                .terminal()
+                .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window)));
+        });
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A read that could not be made is said in the window rather than read as a
+/// checkout with nothing in it.
+#[gpui_kit::test]
+async fn a_failed_change_read_is_said_rather_than_called_clean(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    // Without its Git metadata this checkout cannot be read at all, and the
+    // change in it is one the read would otherwise have listed.
+    std::fs::remove_dir_all(fixture.root.join(".git")).unwrap();
+    forget_status(&fixture, &[&fixture.checkout], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).failure.is_some()
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.git_status_errors.contains_key(&fixture.checkout),
+            "the read did not fail, so this is not the case it was written for"
+        );
+        assert!(
+            app.pending_row_choice.is_none(),
+            "the click is still waiting on a read that already failed"
+        );
+        assert!(app.open_diff.is_none());
+        assert!(!app.focus_pending, "a failed read took the keyboard");
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("dismiss-message").visible(),
+            "the failure is in the state and not on screen"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A change list the window is still holding is not an answer to a question
+/// asked after the read that would have confirmed it failed. A clean list is
+/// not a clean checkout.
+#[gpui_kit::test]
+async fn a_clean_list_cached_before_a_failed_read_is_not_a_clean_checkout(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    add_terminal(&fixture, cx);
+    // A real read, and the answer the window keeps: this checkout is clean.
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .contains_key(&fixture.checkout)
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.git_status[&fixture.checkout].files.is_empty(),
+            "the list this test starts from is not clean, so the rest is not this case"
+        );
+    });
+    // Git stops answering. The list above is what the panel still draws, and it
+    // is older than the failure.
+    std::fs::remove_dir_all(fixture.root.join(".git")).unwrap();
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status_errors
+            .contains_key(&fixture.checkout)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(
+                app.git_status.contains_key(&fixture.checkout),
+                "the failed read dropped the list the decision is being taken against"
+            );
+            assert!(
+                app.pending_row_choice.is_some(),
+                "the click read the cached clean list as the newest answer and took it"
+            );
+            let terminal = app.terminal().expect("the checkout's own shell");
+            assert!(
+                !terminal.read(cx).focus_handle(cx).is_focused(window),
+                "a read that failed put the keyboard where a clean answer would have put it"
+            );
+            assert!(app.open_diff.is_none());
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).failure.is_some()
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_row_choice.is_none());
+        assert!(app.open_diff.is_none());
+        assert!(!app.focus_pending, "a failed read took the keyboard");
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("dismiss-message").visible(),
+            "the failure is in the state and not on screen"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The same for a list that has changes in it: a failed read does not say the
+/// change set is still there, so the row does not open one it cannot vouch for.
+#[gpui_kit::test]
+async fn a_cached_change_list_is_not_opened_after_the_read_behind_it_failed(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    read_status(&fixture, &fixture.checkout, cx).await;
+    std::fs::remove_dir_all(fixture.root.join(".git")).unwrap();
+    fixture
+        .view
+        .update(cx, |app, cx| app.request_git_status(&fixture.checkout, cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status_errors
+            .contains_key(&fixture.checkout)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        fixture.view.read_with(cx, |app, _| {
+            assert!(
+                !app.git_status[&fixture.checkout].files.is_empty(),
+                "the list this test starts from is empty, so the rest is not this case"
+            );
+            assert!(
+                app.open_diff.is_none(),
+                "a read that failed still opened the change set it left behind"
+            );
+            assert!(
+                app.pending_row_choice.is_some(),
+                "the click took the cached list as an answer no read has confirmed"
+            );
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).failure.is_some()
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_row_choice.is_none());
+        assert!(app.open_diff.is_none());
+        assert!(!app.focus_pending);
+    });
+    close(&fixture, cx);
+}
+
+/// Two clicks, one turn: the read the first one started must not navigate back
+/// to the checkout the second one left behind.
+#[gpui_kit::test]
+async fn a_late_read_does_not_navigate_back_to_the_checkout_left_behind(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (worktree, path) = add_worktree(&fixture, cx);
+    // Both checkouts have changes, so the two answers disagree about the surface.
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    std::fs::write(path.join("picture.png"), PICTURE).unwrap();
+    forget_status(&fixture, &[&fixture.checkout, &worktree], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        // Nothing has had a chance to answer yet: both clicks are in one turn.
+        window.click(format!("select-checkout-{worktree}"), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_diff == Some((worktree.clone(), None))
+    })
+    .await;
+    // Every read has landed by now, including the one for the checkout the
+    // person left behind, and none of them navigated back to it.
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.git_status.contains_key(&fixture.checkout));
+        assert!(app.pending_row_choice.is_none());
+        assert_eq!(app.open_diff, Some((worktree.clone(), None)));
+        assert_eq!(
+            app.navigation.active_checkout.as_deref(),
+            Some(worktree.as_str())
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// The person naming a terminal while the read is on its way gets that terminal.
+#[gpui_kit::test]
+async fn a_late_read_does_not_take_the_terminal_the_person_asked_for(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let session = add_terminal(&fixture, cx);
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    forget_status(&fixture, &[&fixture.checkout], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        window.click(format!("select-session-{session}"), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| !status.files.is_empty())
+    })
+    .await;
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(app.pending_row_choice.is_none());
+            assert!(
+                app.open_diff.is_none(),
+                "a late read put a change set over the terminal the person chose"
+            );
+            assert_eq!(
+                app.navigation.active_session.as_deref(),
+                Some(session.as_str())
+            );
+            assert!(
+                app.terminal()
+                    .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window)),
+                "the terminal the person asked for did not keep the keyboard"
+            );
+        });
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The same for a document: a file opened in the tree while the read is on its
+/// way stays the surface.
+#[gpui_kit::test]
+async fn a_late_read_does_not_take_the_document_the_person_asked_for(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("note.txt"), "hello\n").unwrap();
+    std::fs::write(fixture.root.join("picture.png"), PICTURE).unwrap();
+    // The tree's own listing, so the file row below is a real target rather
+    // than a call into the window.
+    read_root_listing(&fixture, "note.txt", cx).await;
+    forget_status(&fixture, &[&fixture.checkout], cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+        window.click("file-control:note.txt", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| !status.files.is_empty())
+    })
+    .await;
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_row_choice.is_none());
+        assert!(
+            app.open_diff.is_none(),
+            "a late read put a change set over the document being read"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A plain directory has no change set to have. That is an answer, and the row
+/// does not wait for a Git read that would never come.
+#[gpui_kit::test]
+fn a_plain_directory_row_still_shows_its_terminal(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-checkout-{}", fixture.checkout), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_row_choice.is_none(),
+            "a plain folder is waiting for a Git read that will never answer"
+        );
+        assert!(app.open_diff.is_none());
+        assert!(app.open_document.is_none());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(
+                app.terminal()
+                    .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window)),
+                "a plain folder's row did not give the keyboard to its terminal"
+            );
+        });
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
 #[gpui_kit::test]
 fn a_worktree_row_and_the_label_on_it_do_the_same_thing(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     let label = format!("select-checkout-{}", fixture.checkout);
+    // A checkout with a change set opens it rather than whatever the window was
+    // showing. The line counts beside the row are presentation and play no part
+    // in that: this row's own are zero.
     fixture.view.update(cx, |app, _| {
         app.diff_totals.insert(
             fixture.checkout.clone(),
             DiffTotals {
-                additions: 4,
-                deletions: 2,
+                additions: 0,
+                deletions: 0,
             },
         );
+        app.git_status
+            .insert(fixture.checkout.clone(), status_of(&[("change.txt", "M")]));
     });
-    // A row advertising `+N -N` is offering its change set, so clicking it
-    // opens the change set rather than whatever the window was showing.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         window.click(label.clone(), cx);
@@ -1057,7 +1755,7 @@ fn a_worktree_row_and_the_label_on_it_do_the_same_thing(cx: &mut TestAppContext)
         assert_eq!(
             app.open_diff,
             Some((fixture.checkout.clone(), None)),
-            "a row advertising changes opened the terminal instead of them"
+            "a row with a change set opened the terminal instead of them"
         );
         assert_eq!(
             app.navigation.active_checkout.as_deref(),
@@ -1065,15 +1763,10 @@ fn a_worktree_row_and_the_label_on_it_do_the_same_thing(cx: &mut TestAppContext)
         );
         assert_eq!(app.inspector_tab, InspectorTab::Changes);
     });
-    // A worktree with nothing changed keeps the view it had: the terminal.
+    // A checkout Git says is clean keeps the view it had: the terminal.
     fixture.view.update(cx, |app, _| {
-        app.diff_totals.insert(
-            fixture.checkout.clone(),
-            DiffTotals {
-                additions: 0,
-                deletions: 0,
-            },
-        );
+        app.git_status
+            .insert(fixture.checkout.clone(), status_of(&[]));
         app.open_diff = Some((fixture.checkout.clone(), None));
     });
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -1083,6 +1776,44 @@ fn a_worktree_row_and_the_label_on_it_do_the_same_thing(cx: &mut TestAppContext)
     fixture.view.read_with(cx, |app, _| {
         assert!(app.open_diff.is_none(), "a clean row invented a change set");
         assert!(app.open_document.is_none());
+    });
+    close(&fixture, cx);
+}
+
+/// The count drawn on the row is a target of its own, and it is the same click
+/// as the name beside it.
+#[gpui_kit::test]
+async fn the_row_and_the_figures_on_it_make_the_same_decision(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("changed.txt"), "changed\n").unwrap();
+    read_status(&fixture, &fixture.checkout, cx).await;
+    fixture
+        .view
+        .update(cx, |app, cx| app.refresh_diff_totals(cx));
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_totals
+            .get(&fixture.checkout)
+            .is_some_and(|totals| totals.additions > 0)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // The figures answer on the pointer going down, which is the row's own
+        // gesture rather than the toolkit's click, and they are open under the
+        // pointer, which is where a person finds them.
+        window.hover(format!("select-checkout-{}", fixture.checkout), cx);
+        window.render_frame(cx);
+        let figures = window
+            .find(format!("diff-figures-{}", fixture.checkout))
+            .bounds();
+        pointer_down(window, figures.center(), cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.open_diff, Some((fixture.checkout.clone(), None)));
     });
     close(&fixture, cx);
 }
@@ -1097,7 +1828,6 @@ async fn a_new_terminal_takes_the_preview_and_a_later_preview_keeps_the_keyboard
     let preview = |path: &str| FilePreview {
         path: path.to_owned(),
         text: "preview\n".into(),
-        truncated: false,
     };
     cx.update_window(fixture.handle, |_, window, cx| {
         fixture.view.update(cx, |app, cx| {
@@ -1533,7 +2263,7 @@ pub(super) fn close(fixture: &GitFixture, cx: &mut TestAppContext) {
     fixture.view.update(cx, |app, _| app.owner.stop());
 }
 
-fn add_worktree(fixture: &GitFixture, cx: &mut TestAppContext) -> (String, PathBuf) {
+pub(super) fn add_worktree(fixture: &GitFixture, cx: &mut TestAppContext) -> (String, PathBuf) {
     let repo = fixture.view.read_with(cx, |app, _| {
         app.navigation
             .repos

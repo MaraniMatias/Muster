@@ -1270,6 +1270,31 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
     .expect("the picture is diffable whatever it is called");
     assert_eq!(misnamed.image, Some(ImageFormat::Jpeg));
 
+    // Nothing in the name: a file called `logo` that opens with the PNG signature is
+    // the picture its bytes describe.
+    fs::write(root.join("logo"), png).unwrap();
+    let extensionless = file_diff(&repo, &repo.checkouts[0], "logo", GitReadBudget::default())
+        .expect("the picture is diffable whatever it is called");
+    assert_eq!(extensionless.image, Some(ImageFormat::Png));
+
+    // WebP is a RIFF container: the form sits at bytes 8-11, behind the size field,
+    // and a chunk follows it. A name that promises nothing does not stop the bytes
+    // from being read at the offset the format puts them.
+    fs::write(
+        root.join("screenshot"),
+        b"RIFF\x1a\x00\x00\x00WEBPVP8 \x00\x00\x00\x00",
+    )
+    .unwrap();
+    let webp = file_diff(
+        &repo,
+        &repo.checkouts[0],
+        "screenshot",
+        GitReadBudget::default(),
+    )
+    .expect("the webp picture is diffable whatever it is called");
+    assert!(webp.is_binary);
+    assert_eq!(webp.image, Some(ImageFormat::WebP));
+
     // Removed: there are no bytes left to read, so the name is the only answer
     // there is, and it is believed only for a name it could be naming.
     git(root, &["add", "."]);
@@ -1284,6 +1309,68 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
     .expect("the removed picture is diffable");
     assert_eq!(removed.image, Some(ImageFormat::Png));
     assert!(removed.is_binary);
+}
+
+/// A file that is still there is named by its bytes or by nothing at all, because
+/// a name is a claim about a file rather than evidence of one. A `.png` full of
+/// Git LFS pointer text is text, an empty `.png` is an empty file rather than a
+/// missing one, and `WEBP` at the end of some other RIFF payload is a coincidence
+/// of suffixes.
+#[test]
+fn a_present_file_is_named_by_its_bytes_and_never_by_its_extension() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    let image = |name: &str| file_diff(&repo, &repo.checkouts[0], name, GitReadBudget::default());
+
+    // Bytes that are not a picture, under a name that says they are.
+    fs::write(
+        root.join("not-a-picture.png"),
+        b"\x00\x01\x02 not a picture \x00\xff",
+    )
+    .unwrap();
+    let arbitrary = image("not-a-picture.png").expect("the blob is diffable");
+    assert!(arbitrary.is_binary);
+    assert_eq!(arbitrary.image, None);
+
+    // A Git LFS pointer is text Git will print, so the change stays a text diff and
+    // never reaches the presentation that would claim a picture arrived.
+    fs::write(
+        root.join("pointer.png"),
+        "version https://git-lfs.github.com/spec/v1\n\
+         oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+         size 12345\n",
+    )
+    .unwrap();
+    let pointer = image("pointer.png").expect("the pointer is diffable");
+    assert!(!pointer.is_binary);
+    assert_eq!(pointer.image, None);
+    assert!(pointer.patch.contains("git-lfs.github.com"));
+
+    // Present but empty: there are bytes to read, there are none, and a file with no
+    // bytes is not a picture. Reading it is not the same as finding it missing, which
+    // is the only case the name is believed in.
+    fs::write(root.join("empty.png"), b"").unwrap();
+    let empty = image("empty.png").expect("an empty picture is still diffable");
+    assert_eq!(empty.image, None);
+
+    // RIFF, a size field, and then four bytes that are not the form: a `WEBP` at the
+    // end of the header is not a WebP file.
+    fs::write(
+        root.join("wave.riff"),
+        b"RIFF\x08\x00\x00\x00junkWEBP\x00\x00\x00\x00",
+    )
+    .unwrap();
+    let wave = image("wave.riff").expect("the riff payload is diffable");
+    assert!(wave.is_binary);
+    assert_eq!(wave.image, None);
+
+    // A signature cut short is a header that matched nothing, not a partial match:
+    // reading it is not a panic and not a format.
+    fs::write(root.join("truncated.png"), b"\x89PNG\r\n\x00\x00\x00\x00").unwrap();
+    let truncated = image("truncated.png").expect("the truncated picture is diffable");
+    assert!(truncated.is_binary);
+    assert_eq!(truncated.image, None);
 }
 
 #[test]

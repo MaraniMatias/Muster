@@ -93,10 +93,9 @@ cat >"$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc, with the hardened runtime on, which is the signature Legacy's bundle
-# carried: enough for the Gatekeeper to treat this build as the one it already
-# knows, and enough to keep it launchable on a machine that requires a signed
-# binary. A real identity is a release decision, not this script's.
+# Ad-hoc signing with the hardened runtime, verified below for local integrity.
+# This establishes neither Gatekeeper trust nor a Developer ID identity and does
+# not notarize the bundle. Distribution signing is a separate release decision.
 codesign --force --sign - --options runtime "$app"
 
 plutil -lint "$app/Contents/Info.plist" >/dev/null

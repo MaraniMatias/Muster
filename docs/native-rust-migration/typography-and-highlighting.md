@@ -1,6 +1,44 @@
 # Typography, inspector columns and source highlighting
 
-The record of one pass over three reported defects: the diff was drawn in the
+Historical pass records follow. Current inventory/evidence is summarized below;
+current layout and behavior are in
+[opening, reading and scrolling](opening-reading-and-scrolling.md#current-contract-after-ap-01ap-10).
+Current suite results are canonical in [AP-11](audit-action-plan.md#ap-11).
+
+## Current grammar inventory and evidence
+
+Count the distinct non-`plaintext` return values of
+`native/src/document.rs::syntax_language`, in both filename and extension arms:
+**35** — bash, c, cmake, cpp, csharp, css, diff, ejs, elixir, erb, go,
+graphql, html, java, javascript, json, kotlin, lua, make, markdown, php, proto,
+python, ruby, rust, scala, sql, svelte, swift, toml, tsx, typescript, vue, yaml,
+zig. SCSS maps to `css`; filename aliases do not add languages. This is a
+selector-output count, not a count of registry entries, Cargo features or grammar
+packages. JSDoc supports injections without being a selector output; the toolkit
+registers other names too. TypeScript/TSX can share a package. Making an existing
+grammar package a direct query dependency does not add another language/package.
+The earlier 32/33/34-crate narrative below is historical accounting, not an
+inventory rule.
+
+Evidence has distinct strengths:
+
+- The path-table test in `document.rs` checks path-to-language mapping.
+- `theme::tests::every_capture_a_grammar_can_emit_wears_a_legacy_token` and
+  `every_grammar_has_had_its_captures_renamed` check registered query capture
+  vocabulary/normalization, not visible syntax spans for every language.
+- `additional_grammars_produce_legacy_token_colors` renders an editor harness,
+  then checks standalone `SyntaxHighlighter::styles` output for its listed
+  samples. It does not inspect the editor's painted token pixels or cover every
+  selector output. JSON has a separate standalone style check.
+- `a_vue_component_is_coloured_in_its_script_its_template_and_its_style` uses
+  editor text but a standalone highlighter, asserting multiple colors separately
+  in the script, template and style ranges. It is not a rendered pixel assertion.
+- Headless UI bounds/click checks cover geometry and interaction decisions, not
+  screenshot parity. No new manual rendering observation is claimed here.
+
+The diff's injection limitation described at the end remains unchanged.
+
+The historical record of one pass over three reported defects: the diff was drawn in the
 wrong face and size, the Files/Changes panel did not stand on Legacy's columns,
 and a document opened without colours.
 
@@ -40,20 +78,20 @@ answered `"plaintext"` for everything else, so `Cargo.toml`, `.py`, `.sh`, `.go`
 | `native/src/document.rs` | `syntax_language` answers from an extension table derived from Legacy's, plus a filename table for `Makefile`, `CMakeLists.txt` and the shell/JSON dotfiles. Unknown formats still open as plain text. |
 | `native/src/diff.rs` | Names the diff chrome's face and size (11px), restores the status letter before the path at 10px, and moves the counts to Legacy's `--success-fg`/`--danger-fg` inks. |
 | `native/src/inspector.rs` | Rows are hand-drawn: Legacy's columns, the 16px fold slot, 13px names, 10px status, 13px counts, the accent bar, and hover/selection/press ink. Tabs carry the accent underline instead of a wash. |
-| `native/Cargo.toml`, `Cargo.lock` | 34 grammar crates: 31 the toolkit compiles in, the Vue grammar it does not ship, and the GraphQL and Protobuf features it registers empty, plus three direct dependencies for the queries the toolkit omits. |
+| `native/Cargo.toml`, `Cargo.lock` | Enables selected toolkit grammars and Vue; direct query dependencies reuse packages already in the graph. See the current selector-output inventory above rather than adding dependency counts. |
 | `docs/native-rust-migration/{interface-parity,dark-colors}.md` | The delivered slice and the differences that remain. |
 
 ### The grammar set
 
-Every grammar the toolkit ships and `syntax_language` names is compiled in, 32
-languages in all: JSON, Rust, JavaScript, TypeScript, TSX, YAML, HTML, CSS/SCSS,
+The initial pass enabled the following selector languages through the toolkit
+(the current inventory above includes later additions): JSON, Rust, JavaScript, TypeScript, TSX, YAML, HTML, CSS/SCSS,
 Markdown, TOML, Python, Bash, Go, C, C++, C#, CMake, Diff, EJS, ERB, Elixir,
 Java, Kotlin, Lua, Make, PHP, Ruby, Scala, SQL, Svelte, Swift and Zig.
 
-Vue is the thirty-third and the only one the toolkit does not ship: it has no
+Vue is an additional grammar the toolkit does not ship: it has no
 Vue grammar and no feature to turn one on, so `theme::install` registers
 `tree-sitter-vue-updated` in the toolkit's own `LanguageRegistry` with the
-queries that crate exports — the same registry the thirty-two live in, reached
+queries that crate exports — the same registry the toolkit grammars live in, reached
 by the same name `syntax_language` answers. Its one capture the theme cannot
 name, `@props`, is the attribute inside a directive (`v-if`, `@click`), so it
 is renamed to `attribute`, and the pass that renames captures now walks every
@@ -75,7 +113,7 @@ registers C#, CMake and Swift with empty queries, so their upstream queries are
 taken from their own crates through three direct dependencies that add nothing
 new to the graph.
 
-GraphQL and Protobuf are the thirty-fourth and thirty-fifth, and each needed a
+GraphQL and Protobuf complete the current selector set, and each needed a
 query written here rather than lifted: the toolkit registers both empty, and
 neither grammar crate exports a query constant. Protobuf's crate does ship a
 `queries/highlights.scm`, but it names `returns`, `repeated` and `to`, which its
@@ -93,7 +131,7 @@ is also why Mermaid is out: `tree-sitter-mermaid` wants `cc ^1.8`.
 
 `cargo test --locked --workspace`, `cargo clippy --locked --workspace
 --all-targets -- -D warnings` and `cargo fmt --all --check` are the gate. The
-native crate holds 241 default tests, seven of them new:
+historical pass added checks for:
 
 - the diff header's column order, read off the drawn bounds;
 - the installed theme's family and code size, and the deliberate 16px root;
@@ -129,7 +167,8 @@ pixels. That gap is stated rather than closed.
 - The diff's change wash comes from `theme.success`/`theme.danger`, where Legacy
   mixes its content-added and content-removed tokens.
 - Inspector names truncate; Legacy's rows are `max-content` and scroll sideways.
-  **Fixed later:** both panels measure their widest row and scroll sideways. See
+  **Current:** Files measures its widest row and scrolls sideways; Changes fits
+  panel-width rows and shortens names. See
   [opening, reading and scrolling](opening-reading-and-scrolling.md).
 - XML, INI and Dockerfile still open as plain text, and there is no manual
   language picker. So do the other forty-odd formats Legacy highlighted and no
@@ -137,7 +176,7 @@ pixels. That gap is stated rather than closed.
   `.ps1`, `.less`, `.sass`, `.tf`, `.tex`, `.pl`, `.r` and the rest. Each one
   would need a grammar crate of its own.
 
-## Security note
+## Historical security note (not a current vulnerability lookup)
 
 `node scripts/audit-rust.mjs` was run after the lockfile grew and **blocks** on
 four advisories against `rustls` 0.23.45 (RUSTSEC-2026-0346/0347/0348/0349).
@@ -213,9 +252,8 @@ rather than the drawn frame.
   Legacy mixes its content-added and content-removed tokens; the two are the
   same *kind* of decision made from the chrome palette rather than the content
   one, and the toolkit offers no token for it.
-- Inspector names no longer truncate and the panel scrolls sideways, which
-  removes the last line of this file's own "what is still different" from the
-  earlier pass. It is recorded in
+- Files names scroll sideways; Changes names shorten inside panel-width rows.
+  The earlier claim that both panels scroll sideways is superseded by
   [opening, reading and scrolling](opening-reading-and-scrolling.md).
 - A Markdown heading is Legacy's `function` ink in bold and emphasis is the font
   alone, which the theme now says; strikethrough, which Legacy also draws, has
@@ -286,7 +324,7 @@ Presentation only. No stored shape, IPC contract or preference key changed.
 ## Neither the theme nor the grammar was wrong
 
 A probe against the installed `muster-content` theme resolves 2–7 distinct
-colours for each of the 35 registered grammars, and `syntax_language` answers
+colours for the samples probed then (not a registry census), and `syntax_language` answers
 `"vue"` for `component.vue`. The theme and the registration were both already
 right; so was `document::tests::additional_grammars_produce_legacy_token_colors`,
 except for one row: **Vue was monochrome**, and it had been failing that way
@@ -336,8 +374,8 @@ it), not a line here. It is recorded rather than worked around.
 --all-targets -- -D warnings` and `cargo fmt --all --check`.
 
 One new test, `document::tests::a_vue_component_is_coloured_in_its_script_its_template_and_its_style`:
-it opens a real SFC through the real editor and asks each of the three blocks
-for its colours separately, because a component whose `<style>` is uncoloured
+it opens an SFC in the editor harness, then asks a standalone highlighter for
+each of the three blocks' styles separately, because a component whose `<style>` is uncoloured
 still passes a check that only asks whether the file is coloured *somewhere*.
 `additional_grammars_produce_legacy_token_colors` stops failing on
 `component.vue`, and its two leftover `eprintln!` probes are gone.

@@ -16,7 +16,7 @@ use gpui_kit::{
 use muster_core::workspace::{Checkout, Repo, RepoKind};
 
 use crate::{
-    app::{measured_width, ButtonA11y, ExternalTarget, InspectorTab, TerminalWindow},
+    app::{measured_width, ButtonA11y, InspectorTab, TerminalWindow, WidthCache},
     file_icons,
     theme::Roles,
 };
@@ -81,7 +81,7 @@ fn row_chrome(
 /// here. The change set is the other rule and does not come through here: its rows
 /// are the panel's width and shorten their names instead.
 fn row_width(
-    widths: &mut HashMap<(String, u32), f32>,
+    widths: &mut WidthCache,
     window: &gpui_kit::Window,
     depth: usize,
     name: &str,
@@ -315,7 +315,6 @@ pub(crate) fn change_marker(status: &str) -> String {
     status.trim().to_owned()
 }
 
-/// The letter and the counts a row ends with, in Legacy's columns and inks.
 /// The status letter a row carries, in Legacy's column, ink and size.
 ///
 /// The key names the row: an element id is a window-wide identity, so a letter
@@ -325,7 +324,7 @@ fn status_chip(key: &str, marker: &str, roles: Roles) -> impl IntoElement {
         .id(format!("row-{key}-status"))
         .test_support()
         .flex_shrink_0()
-        .text_size(px(10.))
+        .text_size(px(STATUS_TEXT_PX))
         .text_color(status_ink(marker, &roles))
         .child(marker.to_owned())
 }
@@ -341,7 +340,7 @@ fn count_chips(
             .id(format!("row-{key}-{kind}"))
             .test_support()
             .flex_shrink_0()
-            .text_size(px(13.))
+            .text_size(px(ROW_TEXT_PX))
             .text_color(ink)
             .child(text)
     };
@@ -384,23 +383,72 @@ pub(crate) struct Ancestor {
 /// for a directory that is still answering, and is a row of the same height, which is
 /// why it lives in the list: a note drawn outside the list takes its height from the
 /// box above it and moves every row under it every time a folder is opened.
-#[derive(Clone)]
-pub(crate) enum TreeRow {
+///
+/// A row borrows the listing it came from rather than owning a copy of it. The whole
+/// tree is walked on every render and sixty-odd rows are drawn from it, so a tree that
+/// owned its rows was copying every name in the checkout to show the ones on screen.
+pub(crate) enum TreeRow<'a> {
     Entry {
-        entry: muster_core::files::FileEntry,
+        entry: &'a muster_core::files::FileEntry,
         depth: usize,
         /// The folders open at and above this row, itself included when it is one.
         ancestors: Rc<[Ancestor]>,
     },
     Note {
         /// The directory the note is about, which is also what a retry reads.
-        path: String,
-        message: String,
+        path: &'a str,
+        message: &'a str,
         depth: usize,
         /// The folders open above it, which is its parent's chain: a note stands where
         /// its folder's children would be, so it does not interrupt the chain.
         ancestors: Rc<[Ancestor]>,
     },
+}
+
+/// What Git did to one path, as the file tree draws it.
+///
+/// The letter is already [`file_marker`]'s answer: turning a porcelain code into a
+/// letter is a drawing decision, and it is made once for an answer rather than once
+/// for every row of every render.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FileStatus {
+    /// Empty for a path Git said nothing about, which is a row with no marker.
+    pub(crate) marker: &'static str,
+    pub(crate) additions: Option<u64>,
+    pub(crate) deletions: Option<u64>,
+}
+
+/// One checkout's changed files, by path.
+///
+/// An index rather than a second copy of the status: a row reads its own answer in
+/// one hash lookup, and the window builds this once per answer instead of once per
+/// render.
+pub(crate) type StatusIndex = HashMap<String, FileStatus>;
+
+/// Every changed path of a status, with the letter each one wears.
+pub(crate) fn status_index(status: &muster_core::navigation::GitStatus) -> StatusIndex {
+    status
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.path.clone(),
+                FileStatus {
+                    marker: file_marker(&file.status),
+                    additions: file.additions,
+                    deletions: file.deletions,
+                },
+            )
+        })
+        .collect()
+}
+
+/// What Git did to `path`, or the empty answer for a path it said nothing about.
+fn status_of(index: Option<&StatusIndex>, path: &str) -> FileStatus {
+    index
+        .and_then(|index| index.get(path))
+        .copied()
+        .unwrap_or_default()
 }
 
 /// How tall one row of the tree is.
@@ -421,7 +469,7 @@ const ROW_HEIGHT: f32 = 26.;
 /// what is above it. Legacy's test that pins this passes for the wrong reason — it runs
 /// in a DOM whose `clientHeight` is zero, so `maxStack` is zero there — and the rule it
 /// is pinning is the one written above.
-pub(crate) fn sticky_ancestors(rows: &[TreeRow], top: usize, stack: usize) -> Vec<Ancestor> {
+pub(crate) fn sticky_ancestors(rows: &[TreeRow<'_>], top: usize, stack: usize) -> Vec<Ancestor> {
     let mut top = top.min(rows.len());
     if top == 0 {
         return Vec::new();
@@ -685,12 +733,14 @@ pub(crate) fn within(candidate: &str, directory: &str) -> bool {
 /// The four collections and the checkout they belong to travel together everywhere the
 /// walk goes, and passing them one at a time is how a caller ends up pairing one
 /// checkout's listings with another's expansion.
-struct TreeSource<'a> {
-    checkout: &'a str,
-    entries: &'a HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
-    loading: &'a HashSet<(String, String)>,
-    errors: &'a HashMap<(String, String), String>,
-    expanded: &'a HashSet<(String, String)>,
+pub(crate) struct TreeSource<'a> {
+    pub(crate) checkout: &'a str,
+    pub(crate) entries: &'a HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
+    pub(crate) loading: &'a HashSet<(String, String)>,
+    pub(crate) errors: &'a HashMap<(String, String), String>,
+    pub(crate) expanded: &'a HashSet<(String, String)>,
+    /// This checkout's changed files by path, or nothing while Git has not answered.
+    pub(crate) statuses: Option<&'a StatusIndex>,
 }
 
 /// Every visible row of the tree, in the order it is drawn.
@@ -700,12 +750,12 @@ struct TreeSource<'a> {
 /// That is Legacy's arrangement, and it is why a folder being opened cannot move the
 /// rows around it: a note drawn outside the list takes its height from the box above it
 /// and moves everything under it every time a folder is opened.
-fn flatten(
-    source: &TreeSource<'_>,
+fn flatten<'a>(
+    source: &TreeSource<'a>,
     directory: &str,
     depth: usize,
     ancestors: Rc<[Ancestor]>,
-    rows: &mut Vec<TreeRow>,
+    rows: &mut Vec<TreeRow<'a>>,
 ) {
     let children = match source
         .entries
@@ -715,11 +765,18 @@ fn flatten(
         None => return,
     };
     for entry in children {
-        let key = (source.checkout.to_owned(), entry.path.clone());
-        let open = entry.directory && source.expanded.contains(&key);
+        let index = rows.len();
+        // One key per folder rather than one per row. Only a folder can be open,
+        // answering or failed, so the key those three are read under is not worth
+        // building for a file, and a tree is mostly files.
+        let key = entry
+            .directory
+            .then(|| (source.checkout.to_owned(), entry.path.clone()));
+        let open = key
+            .as_ref()
+            .is_some_and(|key| source.expanded.contains(key));
         // One chain per open folder, shared by every row under it, so a tree of any
         // depth costs one allocation per folder rather than one per row.
-        let index = rows.len();
         let chain: Rc<[Ancestor]> = if open {
             let mut chain = ancestors.to_vec();
             chain.push(Ancestor {
@@ -733,17 +790,20 @@ fn flatten(
             ancestors.clone()
         };
         rows.push(TreeRow::Entry {
-            entry: entry.clone(),
+            entry,
             depth,
             ancestors: chain.clone(),
         });
         if !open {
             continue;
         }
+        let Some(key) = key else {
+            continue;
+        };
         if source.loading.contains(&key) {
             rows.push(TreeRow::Note {
-                path: entry.path.clone(),
-                message: "Loading folder…".into(),
+                path: &entry.path,
+                message: "Loading folder…",
                 depth: depth + 1,
                 ancestors: chain.clone(),
             });
@@ -751,14 +811,84 @@ fn flatten(
         }
         if let Some(error) = source.errors.get(&key) {
             rows.push(TreeRow::Note {
-                path: entry.path.clone(),
-                message: error.clone(),
+                path: &entry.path,
+                message: error,
                 depth: depth + 1,
                 ancestors: chain.clone(),
             });
             continue;
         }
         flatten(source, &entry.path, depth + 1, chain, rows);
+    }
+}
+
+/// Everything a render of the tree works out before it builds a row.
+///
+/// What Git did to each row, every visible row of the checkout's tree, and how
+/// wide the widest of them wants to be. The width is the widest row in the whole
+/// tree and not the widest row on screen: Legacy's rows are `max-content` and the
+/// tree scrolls sideways, so a name is readable rather than shortened to fit a
+/// panel that can be resized anyway — which is the only reason a deep tree loses
+/// its tail today. A tree measured by what happens to be on screen grows as it is
+/// scrolled, which moves the geometry while somebody is dragging the scrollbar
+/// that is meant to be the tree's.
+pub(crate) struct PreparedTree<'a> {
+    pub(crate) rows: Vec<TreeRow<'a>>,
+    pub(crate) widest: f32,
+    /// What Git did to each path of this checkout, which every row reads as it is
+    /// built rather than by scanning every changed file once per row.
+    pub(crate) statuses: Option<&'a StatusIndex>,
+}
+
+/// One render's whole preparation, from the window's own collections to the rows
+/// it is about to draw.
+///
+/// Nothing here is copied on the way in: the listings, the folders that are open,
+/// the ones still answering and the ones that failed are read where they already
+/// are, because a parent render repeats this on every frame the tree is on screen
+/// and none of it changes between two of them.
+///
+/// Deliberately the whole tree and not the window of it: the rows that were not
+/// built are still there as space above and below, so the scrollbar is the whole
+/// tree's and not the window's.
+pub(crate) fn prepare_tree<'a>(
+    source: &TreeSource<'a>,
+    widths: &mut WidthCache,
+    window: &gpui_kit::Window,
+) -> PreparedTree<'a> {
+    let mut rows = Vec::new();
+    flatten(source, "", 0, Rc::new([]), &mut rows);
+    // No floor at the panel's width: a row shorter than the panel is stretched to
+    // it by the layout, so a tree that fits scrolls nowhere without this having to
+    // know how wide the panel is inside its border.
+    let widest = rows
+        .iter()
+        .map(|row| match row {
+            TreeRow::Entry { entry, depth, .. } => {
+                let FileStatus {
+                    marker,
+                    additions,
+                    deletions,
+                } = status_of(source.statuses, &entry.path);
+                row_width(
+                    widths,
+                    window,
+                    *depth,
+                    &entry.name,
+                    marker,
+                    additions,
+                    deletions,
+                )
+            }
+            TreeRow::Note { message, depth, .. } => {
+                row_width(widths, window, *depth, message, "", None, None)
+            }
+        })
+        .fold(0., f32::max);
+    PreparedTree {
+        rows,
+        widest,
+        statuses: source.statuses,
     }
 }
 
@@ -913,7 +1043,7 @@ impl TerminalWindow {
                             status.files.iter().map(|f| f.path.as_str()).collect();
                         app.expanded_diffs
                             .retain(|(owner, path)| owner != &key || paths.contains(path.as_str()));
-                        app.git_status.insert(key.clone(), status);
+                        app.accept_git_status(&key, status);
                         app.prune_diff_cache();
                         if let Some((owner, Some(path))) = app.open_diff.clone() {
                             if owner == key {
@@ -943,13 +1073,33 @@ impl TerminalWindow {
                         app.git_status_errors.remove(&key);
                     }
                     Err(error) => {
+                        // The answer the window already had is the answer it keeps:
+                        // a read that failed says nothing new about the checkout, and
+                        // a tree that emptied itself because a refresh failed would be
+                        // reporting the failure as a clean checkout. The index follows
+                        // the status it was built from, so it is kept with it.
                         app.git_status_errors.insert(key.clone(), error);
                     }
                 }
+                // A checkout row may be waiting on exactly this read to learn
+                // whether it has a change set. This is the only place that
+                // answer arrives, so the decision is settled here.
+                app.settle_row_choice(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Take a checkout's Git status as the answer, and index it for the file tree.
+    ///
+    /// One place accepts an answer and one place indexes it: the tree reads the
+    /// index on every render it is on screen, and a status that arrived without one
+    /// would leave the tree answering rows from a status it no longer holds.
+    fn accept_git_status(&mut self, id: &str, status: muster_core::navigation::GitStatus) {
+        self.status_index
+            .insert(id.to_owned(), status_index(&status));
+        self.git_status.insert(id.to_owned(), status);
     }
 
     pub(crate) fn request_file_diff(&mut self, id: &str, path: &str, cx: &mut Context<Self>) {
@@ -998,7 +1148,7 @@ impl TerminalWindow {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        let notice = ExternalTarget::File(checkout.id.clone(), path.clone());
+        let notice = (checkout.id.clone(), path.clone());
         self.external_notices.remove(&notice);
         let worker = cx.background_executor().spawn(async move {
             let resolved = muster_core::files::external_path(&repo, &checkout, &path)?;
@@ -1019,15 +1169,18 @@ impl TerminalWindow {
     /// Open a link the way [`Self::open_externally`] opens a file: handed to the
     /// opener as one argument, refused there if it is not a web address, and its
     /// exit read either way.
+    ///
+    /// A refusal is stated in the window's own failure banner rather than under
+    /// the file tree: a link is read in the document pane and not in the
+    /// inspector, and the pane can be read with Files not even selected. The
+    /// opener still runs on the background executor, and only the statement of
+    /// what it said comes back to the window.
     pub(crate) fn open_link(
         &mut self,
         url: String,
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.external_notices
-            .remove(&ExternalTarget::Link(url.clone()));
-        let notice = ExternalTarget::Link(url.clone());
         let worker = cx
             .background_executor()
             .spawn(async move { muster_core::opener::open_url(&url) });
@@ -1035,7 +1188,7 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update_in(cx, |app, _, cx| {
                 if let Err(error) = result {
-                    app.external_notices.insert(notice, error);
+                    app.failure = Some(error);
                 }
                 cx.notify();
             });
@@ -1172,7 +1325,7 @@ impl TerminalWindow {
             .flex()
             .flex_col()
             .bg(roles.surface)
-            .text_size(px(13.))
+            .text_size(px(ROW_TEXT_PX))
             .border_l_1()
             .border_color(roles.border);
         let files_tab = self.inspector_tab == InspectorTab::Files || repo.kind != RepoKind::Git;
@@ -1478,87 +1631,32 @@ impl TerminalWindow {
         {
             self.request_git_status(&checkout_id, cx);
         }
-        let statuses = self
-            .git_status
-            .get(&checkout_id)
-            .map(|s| {
-                s.files
-                    .iter()
-                    .map(|f| (f.path.clone(), (f.status.clone(), f.additions, f.deletions)))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let expanded = self.expanded_files.clone();
         let selected = self.selected_file.get(&checkout_id).cloned();
-        let loading = self.file_loading.clone();
-        let errors = self
-            .file_errors
-            .iter()
-            .filter(|((owner, _), _)| *owner == checkout_id)
-            .map(|(entry, error)| (entry.clone(), error.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut rows = Vec::new();
-        flatten(
+        let PreparedTree {
+            rows,
+            widest: content_width,
+            statuses,
+        } = prepare_tree(
             &TreeSource {
                 checkout: &checkout_id,
                 entries: &self.file_entries,
-                loading: &loading,
-                errors: &errors,
+                loading: &self.file_loading,
+                errors: &self.file_errors,
                 expanded: &self.expanded_files,
+                statuses: self.status_index.get(&checkout_id),
             },
-            "",
-            0,
-            Rc::new([]),
-            &mut rows,
+            &mut self.measured_widths,
+            window,
         );
         let total = rows.len();
-        // How wide the tree is: the panel, or the widest row in it. Legacy's rows
-        // are `max-content` and the tree scrolls sideways, so a name is readable
-        // rather than shortened to fit a panel that can be resized anyway — which
-        // is the only reason a deep tree loses its tail today.
-        let content_width = rows
-            .iter()
-            .map(|row| match row {
-                TreeRow::Entry { entry, depth, .. } => {
-                    let (status, added, removed) = statuses
-                        .get(&entry.path)
-                        .cloned()
-                        .unwrap_or_else(|| (String::new(), None, None));
-                    row_width(
-                        &mut self.measured_widths,
-                        window,
-                        *depth,
-                        &entry.name,
-                        file_marker(&status),
-                        added,
-                        removed,
-                    )
-                }
-                TreeRow::Note { message, depth, .. } => row_width(
-                    &mut self.measured_widths,
-                    window,
-                    *depth,
-                    message,
-                    "",
-                    None,
-                    None,
-                ),
-            })
-            // No floor at the panel's width: a row shorter than the panel is
-            // stretched to it by the layout, so a tree that fits scrolls nowhere
-            // without this having to know how wide the panel is inside its border.
-            .fold(0., f32::max);
         let weak = cx.weak_entity();
         let stack_weak = weak.clone();
         let repo_for = repo.clone();
         let checkout_for = checkout.clone();
-        // Read before the list is laid out, so this is where the tree was a frame ago.
-        // A frame is not long enough for anyone to see the stack land on the wrong rows,
-        // and waiting for the layout would mean drawing the tree twice.
         let scroll = self.files_scroll.clone();
-        // Read before the tree is laid out, so this is where it was a frame ago. A frame
-        // is not long enough for anyone to see the stack land on the wrong rows, and
-        // waiting for the layout would mean drawing the tree twice.
+        // Before this frame's layout, the offset and bounds describe the previous
+        // frame. Use that observation for the row window and sticky stack rather
+        // than laying out the tree twice.
         let scrolled = -scroll.offset().y;
         let top_row = (scrolled.as_f32() / ROW_HEIGHT).floor().max(0.) as usize;
         // The stack is laid inside the tree's box and clipped by it, so what it may cover
@@ -1576,17 +1674,16 @@ impl TerminalWindow {
             .track_scroll(&scroll)
             .child(div().flex_none().h(px(above)))
             .children(drawn.map(|index| {
-                let row = rows[index].clone();
-                match row {
+                match &rows[index] {
                     TreeRow::Note {
                         path,
                         message,
                         depth,
                         ..
                     } => note_row(
-                        &path,
-                        &message,
-                        depth,
+                        path,
+                        message,
+                        *depth,
                         px(content_width),
                         (repo_for.clone(), checkout_for.clone()),
                         weak.clone(),
@@ -1595,12 +1692,15 @@ impl TerminalWindow {
                     TreeRow::Entry { entry, depth, .. } => {
                         let path = entry.path.clone();
                         let directory = entry.directory;
-                        let open = expanded.contains(&(checkout_for.id.clone(), path.clone()));
-                        let (status, added, removed) = statuses
-                            .get(&path)
-                            .cloned()
-                            .unwrap_or_else(|| (String::new(), None, None));
-                        let marker = file_marker(&status);
+                        let open = self
+                            .expanded_files
+                            .contains(&(checkout_for.id.clone(), path.clone()));
+                        let FileStatus {
+                            marker,
+                            additions,
+                            deletions,
+                        } = status_of(statuses, &path);
+                        let (added, removed) = (additions, deletions);
                         let selected = selected.as_deref() == Some(path.as_str());
                         let weak = weak.clone();
                         let repo = repo_for.clone();
@@ -1618,7 +1718,7 @@ impl TerminalWindow {
                                 .min_w(px(content_width))
                                 .h(px(26.))
                                 .gap(px(7.))
-                                .pl(px(8. + depth as f32 * 14.))
+                                .pl(px(8. + *depth as f32 * 14.))
                                 .pr(px(8.))
                                 // The fold's slot, held at its width on a file so
                                 // a folder's glyph and a file's icon land on one
@@ -1810,7 +1910,7 @@ impl TerminalWindow {
                     })),
             );
         }
-        if loading.contains(&root) {
+        if self.file_loading.contains(&root) {
             body = body.child(
                 div()
                     .px_3()
@@ -1820,7 +1920,7 @@ impl TerminalWindow {
             );
         }
         if self.file_entries.get(&root).is_some_and(Vec::is_empty)
-            && !loading.contains(&root)
+            && !self.file_loading.contains(&root)
             && !self.file_errors.contains_key(&root)
         {
             body = body.child(div().px_3().child("No files"));
@@ -1829,15 +1929,12 @@ impl TerminalWindow {
         // open. It is drawn under the tree for the same reason the root's own
         // failure is: a row that stayed where it was looks exactly like one that
         // opened something, so the refusal is stated where the gesture was made.
-        for (target, error) in &self.external_notices {
-            let ExternalTarget::File(checkout, path) = target else {
-                continue;
-            };
-            if checkout != &checkout_id {
+        for ((notice_checkout, path), error) in &self.external_notices {
+            if notice_checkout != &checkout_id {
                 continue;
             }
             let message = error.clone();
-            let dismiss = target.clone();
+            let dismiss = (notice_checkout.clone(), path.clone());
             body = body.child(
                 div()
                     .px_3()

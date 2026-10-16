@@ -3,9 +3,10 @@
 //! Four rules hold for everything here:
 //!
 //! * **Nothing is answered partially.** A directory with more than
-//!   [`MAX_DIRECTORY_ENTRIES`] rows and a file larger than [`MAX_PREVIEW_BYTES`]
-//!   are both errors, not a shorter list and a shorter text. A caller cannot tell
-//!   a truncated answer from a complete one, so there is no truncation to offer.
+//!   [`MAX_DIRECTORY_ENTRIES`] rows, a file larger than [`MAX_PREVIEW_BYTES`] and
+//!   a resource larger than [`MAX_RESOURCE_BYTES`] are all errors, not a shorter
+//!   list and a shorter text. A caller cannot tell a truncated answer from a
+//!   complete one, so there is no truncation to offer.
 //! * **Only what the workspace registered is reachable.** Every call re-checks the
 //!   checkout against the [`Repo`] it claims to belong to: the stored checkout of
 //!   that id, the same path in both, an id derived from that path, and a root that
@@ -45,6 +46,14 @@ use crate::workspace::{checkout_id_for_path, repo_id_for_path, Checkout, Repo};
 
 /// The largest file that can be previewed. Anything larger is refused outright.
 pub const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
+/// The largest local resource read whole for a document to show. Anything larger
+/// is refused outright rather than cut.
+///
+/// Larger than [`MAX_PREVIEW_BYTES`], because a screenshot a person wrote a
+/// document around is not a text file, and equal to the largest diff content
+/// this crate already holds in memory (`MAX_DIFF_BYTES`): the same order of
+/// magnitude of bytes arriving from an untrusted checkout.
+pub const MAX_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// The largest directory that can be listed. Anything larger is refused outright.
 pub const MAX_DIRECTORY_ENTRIES: usize = 2000;
 
@@ -63,9 +72,6 @@ pub struct FilePreview {
     /// The whole file, or no preview at all: a text that stops mid-file looks like
     /// a file that ends there.
     pub text: String,
-    /// Always false. Kept for callers that already read it; a preview this
-    /// crate cannot return whole is an error, not a partial one.
-    pub truncated: bool,
 }
 
 /// The checkout root as the filesystem currently reports it, or why it cannot be used.
@@ -371,19 +377,21 @@ fn by_name(left: &FileEntry, right: &FileEntry) -> Ordering {
         .then_with(|| left.name.cmp(&right.name))
 }
 
-/// Read a whole text file, or refuse it.
+/// Open one regular file inside a checkout and hold it by descriptor.
 ///
-/// A file over [`MAX_PREVIEW_BYTES`] is refused rather than cut: half a file and
-/// the whole file are both "some text", and only one of them is what the user
-/// thinks they are reading. So is a file with a NUL in it, one that is not UTF-8,
-/// anything that is not a regular file, and any path that leaves the checkout.
-pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<FilePreview, String> {
-    let root = root(repo, checkout)?;
-    let relative = relative(path)?;
-    let name = relative
-        .file_name()
-        .ok_or("only regular files can be previewed")?;
-    let root_handle = open_root(&root).map_err(|e| e.to_string())?;
+/// The whole of what decides whether a name may be read lives here, so a reader
+/// that opened its own handle would be a second path policy: the checkout has to
+/// be the one this workspace registered, the name has to be relative and inside
+/// it, `.git` is not reachable, every component is opened under the descriptor
+/// of the one before it with `O_NOFOLLOW`, and the entry that comes out has to
+/// still be a regular file.
+///
+/// What comes back is the handle and the length the file claimed when it was
+/// opened. Everything after this point reads *through the handle*, so a name
+/// exchanged for a link once the file is open no longer describes the bytes.
+fn open_regular(root: &Path, relative: &Path) -> Result<(File, u64), String> {
+    let name = relative.file_name().ok_or(NOT_REGULAR)?;
+    let root_handle = open_root(root).map_err(|e| e.to_string())?;
     let parent = open_directory(&root_handle, relative.parent().unwrap_or(Path::new("")))
         .map_err(|e| e.to_string())?;
     let name = name_of(name).map_err(|e| e.to_string())?;
@@ -394,21 +402,47 @@ pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<File
         .metadata()
         .map_err(|error| format!("could not inspect file: {error}"))?;
     if !opened.is_file() {
-        return Err("only regular files can be previewed".into());
+        return Err(NOT_REGULAR.into());
     }
-    let too_large = || "file is larger than the 1 MiB preview limit".to_owned();
-    if opened.len() > MAX_PREVIEW_BYTES as u64 {
-        return Err(too_large());
-    }
-    let mut bytes = Vec::with_capacity(MAX_PREVIEW_BYTES + 1);
-    file.take((MAX_PREVIEW_BYTES + 1) as u64)
+    Ok((file, opened.len()))
+}
+
+/// What every read says about a name that is not a regular file here.
+const NOT_REGULAR: &str = "only regular files can be read";
+
+/// Read a file whole, or refuse it for being longer than `limit`.
+///
+/// The limit is asked twice because a file can grow between being measured and
+/// being read: the read itself stops one byte past it, and anything that came to
+/// that byte is the same refusal as a file that was already too large. Half a
+/// file and the whole file are both "some bytes", and only one of them is the
+/// file the caller asked for.
+fn read_whole(file: impl Read, limit: usize, oversized: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("could not read file: {error}"))?;
-    if bytes.len() > MAX_PREVIEW_BYTES {
-        // It grew between the size and the read. Cutting here is the one thing a
-        // caller cannot see, so it is refused like any other oversized file.
-        return Err(too_large());
+    if bytes.len() > limit {
+        return Err(oversized.to_owned());
     }
+    Ok(bytes)
+}
+
+/// Read a whole text file, or refuse it.
+///
+/// A file over [`MAX_PREVIEW_BYTES`] is refused rather than cut: half a file and
+/// the whole file are both "some text", and only one of them is what the user
+/// thinks they are reading. So is a file with a NUL in it, one that is not UTF-8,
+/// anything that is not a regular file, and any path that leaves the checkout.
+pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<FilePreview, String> {
+    let root = root(repo, checkout)?;
+    let relative = relative(path)?;
+    let too_large = "file is larger than the 1 MiB preview limit";
+    let (file, length) = open_regular(&root, &relative)?;
+    if length > MAX_PREVIEW_BYTES as u64 {
+        return Err(too_large.into());
+    }
+    let bytes = read_whole(file, MAX_PREVIEW_BYTES, too_large)?;
     if bytes.contains(&0) {
         return Err("binary files cannot be previewed".into());
     }
@@ -416,8 +450,32 @@ pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<File
     Ok(FilePreview {
         path: path.into(),
         text,
-        truncated: false,
     })
+}
+
+/// Read a whole file out of a checkout as bytes, or refuse it.
+///
+/// The same boundary a preview is read through -- [`open_regular`] decides what
+/// may be read and [`read_whole`] bounds how much of it comes back -- with the
+/// two rules that only exist because a preview is text left out: a NUL and
+/// invalid UTF-8 are ordinary bytes here, and the bound is
+/// [`MAX_RESOURCE_BYTES`] rather than the preview's, because what comes back is
+/// something to decode rather than something to show.
+///
+/// The answer is the bytes. A caller that wanted a path to reopen itself would
+/// be asking for a name the walk has already stopped vouching for.
+pub fn read_resource(repo: &Repo, checkout: &Checkout, path: &str) -> Result<Vec<u8>, String> {
+    let root = root(repo, checkout)?;
+    let relative = relative(path)?;
+    let too_large = format!(
+        "resource is larger than the {} MiB limit",
+        MAX_RESOURCE_BYTES / (1024 * 1024)
+    );
+    let (file, length) = open_regular(&root, &relative)?;
+    if length > MAX_RESOURCE_BYTES as u64 {
+        return Err(too_large);
+    }
+    read_whole(file, MAX_RESOURCE_BYTES, &too_large)
 }
 
 /// The absolute path of something inside a checkout, proved to be there.
@@ -461,6 +519,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        io::Write,
         os::unix::{fs::symlink, net::UnixListener},
     };
     use tempfile::{tempdir, TempDir};
@@ -469,6 +528,17 @@ mod tests {
         let repo = Repo::plain(dir.path(), "now").unwrap();
         let checkout = repo.checkouts[0].clone();
         (repo, checkout)
+    }
+
+    /// The two calls both readers are made of, up to the bound: what decides
+    /// whether a name may be read, and the handle it decided it for. Only the
+    /// step between them -- the size check and the read -- is what a test has to
+    /// stand in the middle of, and standing there is the only way to reach the
+    /// handle a real read uses.
+    fn open_relative(repo: &Repo, checkout: &Checkout, path: &str) -> Result<(File, u64), String> {
+        let root = root(repo, checkout)?;
+        let relative = relative(path)?;
+        open_regular(&root, &relative)
     }
 
     #[test]
@@ -569,7 +639,6 @@ mod tests {
         let hello = read_preview(&repo, &checkout, "hello.txt").unwrap();
         assert_eq!(hello.path, "hello.txt");
         assert_eq!(hello.text, "hello");
-        assert!(!hello.truncated);
         assert_eq!(
             read_preview(&repo, &checkout, "empty.txt").unwrap().text,
             ""
@@ -587,6 +656,221 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// A picture a document names is read through the same boundary a preview
+    /// is, and what comes back is bytes rather than a name: there is no path in
+    /// the answer for a caller to reopen later.
+    #[test]
+    fn a_resource_is_read_whole_from_the_descriptor_or_not_at_all() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00,
+        ];
+        fs::create_dir_all(dir.path().join("docs/assets")).unwrap();
+        fs::write(dir.path().join("docs/assets/picture.png"), png).unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("escape.png"),
+        )
+        .unwrap();
+        UnixListener::bind(dir.path().join("socket.png")).unwrap();
+        let fifo = dir.path().join("pipe.png");
+        assert_eq!(
+            unsafe {
+                libc::mkfifo(
+                    std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                        .expect("a path with no NUL")
+                        .as_ptr(),
+                    0o600,
+                )
+            },
+            0
+        );
+        // Two sparse files: what is refused here is the length, not the content.
+        let sparse = |name: &str, length: u64| {
+            let made = dir.path().join(name);
+            fs::File::create(&made).unwrap().set_len(length).unwrap();
+        };
+        sparse("at-limit.png", MAX_RESOURCE_BYTES as u64);
+        sparse("over-limit.png", MAX_RESOURCE_BYTES as u64 + 1);
+        let (repo, checkout) = checkout_of(&dir);
+
+        // A nested document's own picture, whole, bytes and all: the NUL and the
+        // invalid UTF-8 that refuse a preview are ordinary content here.
+        assert_eq!(
+            read_resource(&repo, &checkout, "docs/assets/picture.png").unwrap(),
+            png
+        );
+        assert_eq!(
+            read_resource(&repo, &checkout, "at-limit.png")
+                .unwrap()
+                .len(),
+            MAX_RESOURCE_BYTES
+        );
+        assert!(read_resource(&repo, &checkout, "over-limit.png")
+            .unwrap_err()
+            .contains("16 MiB"));
+
+        for refused in [
+            // A path that leaves, a path that is not relative, and the store.
+            "../escape.png",
+            "/etc/passwd",
+            ".git/config",
+            // Not a regular file, or nothing at all under that name.
+            "escape.png",
+            "socket.png",
+            "pipe.png",
+            "docs",
+            "",
+            "docs/assets/missing.png",
+        ] {
+            assert!(
+                read_resource(&repo, &checkout, refused).is_err(),
+                "{refused} was read"
+            );
+        }
+
+        // The same identity rules a preview answers to, because it is the same
+        // walk: a claim about a checkout is refused before the name is walked.
+        let mut forged = checkout.clone();
+        forged.id = "checkout:forged".into();
+        assert!(read_resource(&repo, &forged, "docs/assets/picture.png").is_err());
+        let mut elsewhere = checkout.clone();
+        elsewhere.path = outside.path().canonicalize().unwrap().display().to_string();
+        elsewhere.canonical_path = elsewhere.path.clone();
+        assert!(read_resource(&repo, &elsewhere, "secret.txt").is_err());
+        assert_eq!(
+            read_resource(&repo, &checkout, "docs/assets/picture.png").unwrap(),
+            png,
+            "the genuine checkout still reads after all of that"
+        );
+    }
+
+    /// A name exchanged for a link after the walk reached it must not redirect
+    /// the read. Either the exchange is refused outright, or the bytes still come
+    /// from the file that was validated -- never from the outside marker.
+    ///
+    /// Both sides of the boundary are checked, because a single-threaded test can
+    /// only reach one answer to a race by standing on the other side of it. The
+    /// first half exchanges the names before the walk and asks the whole
+    /// production read, which has to refuse. The second half exchanges them after
+    /// [`open_regular`] has opened and classified the file, and reads through the
+    /// handle that walk handed back, which has to still hold the validated file.
+    #[test]
+    fn a_resource_read_stays_attached_to_the_file_it_validated() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let picture = dir.path().join("sub/picture.png");
+        fs::write(&picture, "inside").unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("picture.png"), "outside marker").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+
+        // Before the walk: the file itself is a link to a file outside the
+        // checkout, and `O_NOFOLLOW` is what keeps the walk out of it.
+        fs::write(dir.path().join("sub/decoy.png"), "inside").unwrap();
+        fs::remove_file(dir.path().join("sub/decoy.png")).unwrap();
+        symlink(
+            outside.path().join("picture.png"),
+            dir.path().join("sub/decoy.png"),
+        )
+        .unwrap();
+        assert!(
+            read_resource(&repo, &checkout, "sub/decoy.png").is_err(),
+            "a link exchanged for the file is refused rather than followed"
+        );
+
+        // Before the walk: the ancestor is a link to a directory outside the
+        // checkout, and the name itself now leads to the marker.
+        fs::rename(dir.path().join("sub"), dir.path().join("moved")).unwrap();
+        symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&picture).unwrap(),
+            "outside marker",
+            "the fixture is only an escape if the name leads out of the checkout"
+        );
+        assert!(
+            read_resource(&repo, &checkout, "sub/picture.png").is_err(),
+            "an ancestor exchanged for a link does not redirect the read out of the checkout"
+        );
+
+        // Across the boundary. The ancestor goes back to the directory it was, so
+        // the next open is of a real file, and then everything the name describes
+        // is exchanged while the descriptor is already in hand.
+        fs::remove_file(dir.path().join("sub")).unwrap();
+        fs::rename(dir.path().join("moved"), dir.path().join("sub")).unwrap();
+        let (file, length) = open_relative(&repo, &checkout, "sub/picture.png").unwrap();
+        assert_eq!(length, "inside".len() as u64);
+
+        fs::remove_file(&picture).unwrap();
+        symlink(outside.path().join("picture.png"), &picture).unwrap();
+        fs::rename(dir.path().join("sub"), dir.path().join("moved")).unwrap();
+        symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&picture).unwrap(),
+            "outside marker",
+            "reopening the name now would read the marker, which is the whole race"
+        );
+
+        // The read is through the handle, so what comes back is the file that was
+        // validated and the bytes it had, not the marker that answers to its name.
+        assert_eq!(
+            read_whole(file, MAX_RESOURCE_BYTES, "over").unwrap(),
+            b"inside"
+        );
+    }
+
+    /// The bound is asked of the file and of the read, because a file that grows
+    /// between the two is longer than the one that was measured. A reader that
+    /// keeps only what fits is handing back a file that ends where it does not.
+    ///
+    /// Done to a real file rather than to a reader made to misbehave: the
+    /// production [`open_regular`] returns a handle and the length the file
+    /// claimed, the file is then grown past the bound behind that handle, and the
+    /// production [`read_whole`] has to ask the read as well as the file. The
+    /// length that was recorded no longer describes what the handle reads.
+    #[test]
+    fn a_file_that_grows_between_the_size_and_the_read_is_refused() {
+        let dir = tempdir().unwrap();
+        let made = dir.path().join("growing.txt");
+        fs::write(&made, vec![b'a'; MAX_PREVIEW_BYTES]).unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        // The wording `read_preview` refuses an oversized file with.
+        let too_large = "file is larger than the 1 MiB preview limit";
+
+        // Exactly at the bound comes back whole: the boundary is the refusal, not
+        // a shorter file.
+        let (file, length) = open_relative(&repo, &checkout, "growing.txt").unwrap();
+        assert_eq!(length, MAX_PREVIEW_BYTES as u64);
+        assert_eq!(
+            read_whole(file, MAX_PREVIEW_BYTES, too_large)
+                .unwrap()
+                .len(),
+            MAX_PREVIEW_BYTES
+        );
+
+        // The same file, opened again at a length that fits, and one byte longer by
+        // the time it is read -- a growth no single measurement can see, and the
+        // one a size check alone would hand back as a complete file.
+        let (file, length) = open_relative(&repo, &checkout, "growing.txt").unwrap();
+        assert!(length <= MAX_PREVIEW_BYTES as u64);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&made)
+            .unwrap()
+            .write_all(b"a")
+            .unwrap();
+        assert_eq!(made.metadata().unwrap().len(), MAX_PREVIEW_BYTES as u64 + 1);
+        assert_eq!(
+            read_whole(file, MAX_PREVIEW_BYTES, too_large).unwrap_err(),
+            too_large,
+            "one byte past the bound is the same refusal as a file that was already too long"
+        );
     }
 
     #[test]

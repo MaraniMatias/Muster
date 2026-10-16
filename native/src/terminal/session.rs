@@ -1322,6 +1322,32 @@ impl Drop for WorkerLifetime {
     }
 }
 
+/// The selection as the viewport sees it, in grid coordinates.
+///
+/// One definition for the two callers that need it: the frame that paints the
+/// selection and the drag that updates it. They have to agree on every part of
+/// it -- the display offset that moves viewport row zero, a start above the
+/// viewport clamped onto row zero at column zero, and a selection that ended
+/// above the viewport being nothing on screen -- so the conversion lives here
+/// rather than being written out twice.
+fn viewport_selection(core: &TerminalCore) -> Option<GridRange> {
+    let range = core.selection_range()?;
+    let offset = core.display_offset() as i32;
+    let start_row = range.start.line.0 + offset;
+    let end_row = range.end.line.0 + offset;
+    (end_row >= 0).then_some((
+        (
+            start_row.max(0) as usize,
+            if start_row < 0 {
+                0
+            } else {
+                range.start.column.0
+            },
+        ),
+        (end_row.max(0) as usize, range.end.column.0),
+    ))
+}
+
 /// Two handles on one shell, not two shells.
 ///
 /// The window needs one to close the session through and another to hand to the
@@ -1525,27 +1551,21 @@ impl TerminalSession {
         self.inner.shared().core().selection_text()
     }
 
+    /// The selection the viewport sees, without copying the grid.
+    ///
+    /// The drag handler asks this on every mouse-move frame and paints nothing
+    /// from it, so it reads the selection and the scroll offset and stops: no
+    /// rows, no selected text.
+    pub fn selection_range(&self) -> Option<GridRange> {
+        viewport_selection(&self.inner.shared().core())
+    }
+
     fn snapshot_inner(&self, selection: bool) -> TerminalSnapshot {
         let core = self.inner.shared().core();
         TerminalSnapshot {
             rows: core.visible_rows(),
             selection: selection.then(|| core.selection_text()).flatten(),
-            selection_range: core.selection_range().and_then(|range| {
-                let offset = core.display_offset() as i32;
-                let start_row = range.start.line.0 + offset;
-                let end_row = range.end.line.0 + offset;
-                (end_row >= 0).then_some((
-                    (
-                        start_row.max(0) as usize,
-                        if start_row < 0 {
-                            0
-                        } else {
-                            range.start.column.0
-                        },
-                    ),
-                    (end_row.max(0) as usize, range.end.column.0),
-                ))
-            }),
+            selection_range: viewport_selection(&core),
             cursor: core.cursor(),
             modes: core.modes(),
             title: core.title().map(str::to_owned),
@@ -2209,6 +2229,113 @@ mod tests {
         assert_eq!(session.selection_text(), None);
         session.close().wait().unwrap();
         shutdown(&backend);
+    }
+
+    #[test]
+    fn the_selection_range_query_agrees_with_the_frame_it_feeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, session, _) = start(config(dir.path(), "sleep 30"));
+        session
+            .inner
+            .shared()
+            .core()
+            .feed(b"alpha beta\r\ngamma delta\r\nepsilon");
+
+        // No selection is no range, said the same way by both callers.
+        assert_eq!(session.selection_range(), None);
+        assert_eq!(session.snapshot().selection_range, None);
+
+        // A simple selection on one row.
+        session.select((0, 0), (0, 4));
+        assert_eq!(session.selection_range(), Some(((0, 0), (0, 4))));
+        assert_eq!(
+            session.selection_range(),
+            session.snapshot().selection_range
+        );
+        assert_eq!(
+            session.selection_range(),
+            session.painting_snapshot().selection_range
+        );
+
+        // The same drag across rows, and then backwards from the other corner.
+        for (start, end) in [((0, 3), (2, 3)), ((2, 3), (0, 3))] {
+            session.select(start, end);
+            assert_eq!(
+                session.selection_range(),
+                session.snapshot().selection_range,
+                "{start:?}..{end:?}"
+            );
+            assert_eq!(
+                session.selection_range(),
+                session.painting_snapshot().selection_range,
+                "{start:?}..{end:?}"
+            );
+            assert_eq!(session.selection_range(), Some(((0, 3), (2, 3))));
+        }
+        assert_eq!(
+            session.selection_text().as_deref(),
+            Some("ha beta\ngamma delta\nepsi")
+        );
+        session.close().wait().unwrap();
+        shutdown(&backend);
+    }
+
+    #[test]
+    fn a_selection_whose_start_is_above_the_viewport_is_clamped_to_its_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, session) = scrolled_session(dir.path());
+
+        // Anchored with the viewport ten lines further down the history, so the
+        // selection is where the person left it.
+        session.set_display_offset(10);
+        session.select((3, 4), (15, 8));
+        assert_eq!(session.selection_range(), Some(((3, 4), (15, 8))));
+
+        // Scrolling back to the bottom leaves the first row above the viewport:
+        // the frame paints a selection from the first visible column, so that
+        // is the start it is given.
+        session.set_display_offset(0);
+        assert_eq!(session.selection_range(), Some(((0, 0), (5, 8))));
+        assert_eq!(
+            session.selection_range(),
+            session.snapshot().selection_range
+        );
+        session.close().wait().unwrap();
+        shutdown(&backend);
+    }
+
+    #[test]
+    fn a_selection_that_ended_above_the_viewport_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, session) = scrolled_session(dir.path());
+
+        session.set_display_offset(20);
+        session.select((0, 2), (2, 6));
+        assert_eq!(session.selection_range(), Some(((0, 2), (2, 6))));
+
+        session.set_display_offset(0);
+        assert_eq!(session.selection_range(), None);
+        assert_eq!(session.snapshot().selection_range, None);
+        assert_eq!(session.painting_snapshot().selection_range, None);
+        session.close().wait().unwrap();
+        shutdown(&backend);
+    }
+
+    /// A silent shell with sixty numbered lines above a twenty-four row screen,
+    /// so a test has history to scroll back through.
+    fn scrolled_session(dir: &Path) -> (Arc<TerminalBackend>, TerminalSession) {
+        let (backend, session, _) = start(config(dir, "sleep 30"));
+        let mut core = session.inner.shared().core();
+        for row in 0..60 {
+            core.feed(format!("line {row:02}\r\n").as_bytes());
+        }
+        assert!(
+            core.history_size() >= 20,
+            "a fixture with no scrollback: {}",
+            core.history_size()
+        );
+        drop(core);
+        (backend, session)
     }
 
     #[test]

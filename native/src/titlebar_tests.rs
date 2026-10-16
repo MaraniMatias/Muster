@@ -210,7 +210,6 @@ fn explicit_terminal_selection_closes_file_document_and_keeps_terminal(cx: &mut 
             muster_core::files::FilePreview {
                 path: "source.rs".into(),
                 text: "fn main() {}".into(),
-                truncated: false,
             },
         ));
         cx.notify();
@@ -241,7 +240,6 @@ fn closing_a_document_restores_the_retained_terminal(cx: &mut TestAppContext) {
             muster_core::files::FilePreview {
                 path: "source.rs".into(),
                 text: "fn main() {}".into(),
-                truncated: false,
             },
         ));
         cx.notify();
@@ -272,7 +270,6 @@ fn checkout_change_hides_another_checkouts_document(cx: &mut TestAppContext) {
             muster_core::files::FilePreview {
                 path: "elsewhere.rs".into(),
                 text: "wrong checkout".into(),
-                truncated: false,
             },
         ));
         cx.notify();

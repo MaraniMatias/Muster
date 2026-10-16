@@ -1,12 +1,53 @@
 # Opening things elsewhere, reading Markdown, and the panels that scroll
 
-The record of one pass over five reported defects: a non-text file could not be
+The historical record of one pass over five reported defects (superseded where
+noted by the current contract below): a non-text file could not be
 opened at all, a Markdown file was only ever its source, a change with no text
 said nothing about what changed, and neither inspector panel could be read to
 the end of a long name.
 
 The scope was behaviour and presentation. No stored shape, IPC contract or
 preference key changed, so nothing here needed the `v0.*.*` migration rule.
+
+## Current contract after AP-01–AP-10
+
+The following is current; the pass narrative below records earlier behavior.
+Canonical current test counts and run results are in [AP-11](audit-action-plan.md#ap-11).
+
+- Links dispatch directly through a weak window handle, not a render-drained
+  queue. The opener runs on a worker; refusals appear in the window banner even
+  with Files hidden and are dismissible. See AP-01 and
+  `a_refused_link_is_said_in_the_window_and_dismissed` in
+  `native/src/inspector_tests.rs`; file-row opener notices remain separate.
+- Local Markdown media parsing records names only. Workers use
+  `core::files::read_resource`'s descriptor-bound, bounded read; the document
+  retains owned encoded bytes, never a pathname to reopen. AP-03 records
+  `a_resource_read_stays_attached_to_the_file_it_validated` and the headless
+  prepared-byte, refusal, decode-failure and dropped-document cases. There are
+  four concurrent read slots and a 64 MiB retained encoded-byte budget per
+  document. These are **not decoded-memory limits**: toolkit decoding/GPU caches
+  and data/remote images are outside that budget. The 720px drawing cap is not
+  a decode-size cap. Headless element/resource assertions do not verify pixels.
+- Markdown/Source toggles focus the visible TextView/editor, retaining source
+  read-only behavior; AP-05 records keyboard, scroll and late-result regressions.
+- Present diff images are identified by bytes, including WebP's RIFF/WEBP
+  signature; a filename is used only when bytes are absent, never to promote
+  present non-images. See AP-04 and
+  `a_present_file_is_named_by_its_bytes_and_never_by_its_extension` in
+  `core/src/navigation/tests.rs`.
+- Checkout row selection uses the merge-base change list, independent of line
+  totals. Unknown/failed status is not clean and late results cannot replace
+  newer intent; the AP-02 real-Git/headless regression matrix is the evidence.
+- Files retains horizontal scrolling. Changes uses panel-width rows with
+  shortened long names, not a widest-row horizontal scroller. See
+  `a_name_too_long_for_the_panel_is_scrolled_to_not_cut` and
+  `a_change_row_fits_the_panel_and_a_long_name_gives_up_its_room` in
+  `native/src/inspector_tests.rs` (bounds/scroll assertions, not screenshots).
+
+Raw HTML media and video playback remain unsupported. Data and HTTP(S) images
+are still delegated to the toolkit; tests do not fetch an external image.
+Real external-app opening, image pixels and interactive keyboard/layout acceptance
+remain manual gates, not outcomes claimed by this document.
 
 ## What was wrong, and what actually caused it
 
@@ -58,8 +99,8 @@ tree.
 ## How it is verified
 
 `cargo test --locked --workspace`, `cargo clippy --locked --workspace
---all-targets -- -D warnings` and `cargo fmt --all --check`. `core` holds 106
-tests and `native` 276. New ones, and what each is for:
+--all-targets -- -D warnings` and `cargo fmt --all --check` were the historical
+pass gates. Current results are recorded in AP-11. Tests introduced then included:
 
 - `an_external_path_is_the_canonical_one_inside_the_checkout` and
   `a_fifo_is_not_something_to_open` — the chain that decides what may be opened:
@@ -93,14 +134,15 @@ tests and `native` 276. New ones, and what each is for:
 - `a_change_with_no_text_says_which_one_it_is` — the sentence, for all three
   directions and for a file that is not a picture.
 - `a_name_too_long_for_the_panel_is_scrolled_to_not_cut` and
-  `a_change_row_fills_the_panel_and_a_long_one_is_scrolled_to` — the scroll is
+  the former `a_change_row_fills_the_panel_and_a_long_one_is_scrolled_to`
+  (replaced by the panel-width test named above) — the scroll is
   asserted as the scroll handle's own maximum offset, not as pixels: a name
   wider than the panel reaches `max_offset().x > 0`, a tree that fits reaches
   `0`, and every row of the change list is the width of the widest one.
 - `a_stacked_folder_keeps_its_own_click` — the defect, measured the way it was
   found.
 
-## What is still different
+## Differences recorded by this historical pass
 
 - **The ctrl-click's spawn is not exercised by a test.** The row's other answer
   opens a real application, and a headless run would open one on the machine
@@ -109,7 +151,8 @@ tests and `native` 276. New ones, and what each is for:
 - **A rendered Markdown file draws its pictures and says everything else.** The
   toolkit's own image path resolves a URL against the process rather than
   against the document, so this claims the image nodes and resolves them through
-  `core::files::external_path`; a picture is drawn from the canonical path and
+  `core::files::external_path` at that time (replaced by AP-03's descriptor
+  read and owned bytes above); a picture was drawn from the canonical path and
   capped at 720px on each edge, because the toolkit measures an inline element
   against `MaxContent` and an element cannot be scaled once measured. A `data:`
   picture and an `http(s)` picture are left to the toolkit, which decodes and

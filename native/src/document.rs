@@ -10,6 +10,7 @@ use gpui_kit::{
     div, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, Styled, TestSupportExt, Window,
 };
+use std::sync::Arc;
 
 mod media;
 
@@ -33,6 +34,11 @@ pub(crate) struct DocumentView {
     /// selection or an offset carried over from another file would describe a
     /// position in a file that is not on screen.
     path: String,
+    /// The pictures this document's reading has named, and the bytes that came
+    /// back for them. Owned by the document rather than by the window, so a
+    /// different document — or closing this one — drops them with the view, and
+    /// a read still in flight has nothing to publish into afterwards.
+    pub(crate) media: Arc<media::MediaStore>,
 }
 
 impl DocumentView {
@@ -57,6 +63,7 @@ impl DocumentView {
             preview,
             rendered: markdown,
             path: identity.to_owned(),
+            media: media::MediaStore::new(),
         }
     }
 
@@ -66,6 +73,25 @@ impl DocumentView {
     /// two answers where there are two views to choose between.
     fn is_rendered(&self) -> bool {
         self.rendered && self.preview.is_some()
+    }
+
+    /// The reading that is on screen, and the keyboard that goes with it.
+    ///
+    /// A document has two readings and mounts one of them, so the focus belongs to
+    /// the one mounted: on the editor while the source is what the pane draws, and
+    /// on the text view while the reading is. Focusing the editor behind a rendered
+    /// document is what made a Markdown file look like the keyboard had stopped, and
+    /// leaving focus on the reading that just went away is the other half of it. Both
+    /// handles are the toolkit's own — `EditorState` and `TextViewState` each carry
+    /// one, and the toolkit tracks them on the elements it draws.
+    fn focus_visible(&self, window: &mut Window, cx: &mut App) {
+        if self.is_rendered() {
+            if let Some(preview) = self.preview.as_ref() {
+                preview.read(cx).focus_handle().clone().focus(window, cx);
+                return;
+            }
+        }
+        self.state.read(cx).focus_handle(cx).focus(window, cx);
     }
 }
 
@@ -234,6 +260,10 @@ fn document_body(
 
 impl TerminalWindow {
     pub(crate) fn clear_document(&mut self) {
+        // Every gesture that replaces what this window shows comes through here
+        // first, so this is where a newer view selection is noted. A decision
+        // waiting on Git may only act while nothing newer has been asked for.
+        self.view_intent = self.view_intent.wrapping_add(1);
         if let Some(key) = self.document_target.take() {
             self.file_loading.remove(&key);
             self.document_errors.remove(&key);
@@ -248,18 +278,6 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // Links clicked in a rendered document arrive as a queue, because the
-        // text view's own handler may only hold what is `Send`. Opening one here
-        // is the same work a tree row's ctrl-click does, on the same terms.
-        let clicked = std::mem::take(
-            &mut *self
-                .link_queue
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
-        for url in clicked {
-            self.open_link(url, window, cx);
-        }
         let target = self.document_target.clone().or_else(|| {
             self.open_document
                 .as_ref()
@@ -274,19 +292,9 @@ impl TerminalWindow {
         }
         let roles = Roles::of(cx);
         let key = (checkout_id.clone(), path.clone());
-        // A link is clicked inside the toolkit's own text view, whose handler may only
-        // hold what is `Send`. A queue both sides can name is such a thing, and it
-        // is all this needs: the window takes the link from it on the next frame,
-        // where the opener and the notice that says it did not open both live.
-        let link_queue = self.link_queue.clone();
-        let link_handler = move |url: &gpui_kit::SharedString,
-                                 _: &gpui_kit::ClickEvent,
-                                 _: &mut Window,
-                                 _: &mut gpui_kit::App| {
-            if let Ok(mut queue) = link_queue.lock() {
-                queue.push(url.to_string());
-            }
-        };
+        // Opened where it was clicked: the handler carries this window weakly
+        // into the toolkit's text view and dispatches from the click itself.
+        let link_handler = link_handler(cx.entity().downgrade());
         let body = if let Some((_, preview)) = self
             .open_document
             .as_ref()
@@ -306,7 +314,13 @@ impl TerminalWindow {
                 cx,
             );
             if new_view {
-                state.read(cx).focus_handle(cx).focus(window, cx);
+                // Only the reading that is on screen takes the keyboard: a
+                // Markdown document opens as its reading, so the editor behind
+                // it stays unfocused until the header asks for the source.
+                self.document_view
+                    .as_ref()
+                    .expect("just installed")
+                    .focus_visible(window, cx);
             }
             // A Markdown file is read as a document and can be read as its source;
             // everything else is its source and only its source.
@@ -329,8 +343,15 @@ impl TerminalWindow {
                     repo.clone(),
                     checkout.clone(),
                     &path,
+                    Arc::downgrade(&self.document_view.as_ref()?.media),
                 ))
             });
+            if let Some(media) = media.as_ref() {
+                // This frame says what the document already holds and starts the
+                // reads its last parse asked for; the bytes arrive later, off the
+                // UI thread, and ask for a frame of their own when they do.
+                media.prepare(cx.entity().downgrade(), cx);
+            }
             document_body(&state, rendered, media, link_handler)
         } else if let Some(error) = self.document_errors.get(&key) {
             let retry_path = path.clone();
@@ -472,16 +493,14 @@ impl TerminalWindow {
                                         };
                                         if view.preview.is_some() {
                                             view.rendered = !view.rendered;
-                                            // The view that just went away takes the
-                                            // focus with it, and the other one has to
-                                            // have it: focus left on nothing reads as
-                                            // a window that stopped listening.
-                                            if view.rendered {
-                                                view.state
-                                                    .read(cx)
-                                                    .focus_handle(cx)
-                                                    .focus(window, cx);
-                                            }
+                                            // The reading that just went away takes
+                                            // the focus with it, and the one now on
+                                            // screen has to have it: focus left on
+                                            // nothing reads as a window that stopped
+                                            // listening, and focus left on the hidden
+                                            // editor is what the rendered reading
+                                            // used to do.
+                                            view.focus_visible(window, cx);
                                             cx.notify();
                                         }
                                     })),
@@ -505,6 +524,26 @@ impl TerminalWindow {
                 .child(div().flex_1().min_w_0().min_h_0().child(body))
                 .into_any_element(),
         )
+    }
+}
+
+/// A link clicked in a rendered document, opened where it was clicked.
+///
+/// The toolkit's text view hands this the `Window` and `App` of the click, and
+/// its handler is `Send + Sync`; a weak handle to this window is both of those
+/// things. So the click is dispatched from the click rather than left for a
+/// later frame to notice, and a window that has been released answers `Err` —
+/// answering nothing is what a click on a closed window should do.
+pub(crate) fn link_handler(
+    view: gpui_kit::WeakEntity<TerminalWindow>,
+) -> impl Fn(&gpui_kit::SharedString, &gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)
+       + Send
+       + Sync
+       + 'static {
+    move |url, _, window, cx| {
+        let _ = view.update(cx, |app, cx| {
+            app.open_link(url.to_string(), window, cx);
+        });
     }
 }
 

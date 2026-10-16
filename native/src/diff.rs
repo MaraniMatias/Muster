@@ -12,6 +12,7 @@ use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
+use muster_core::workspace::RepoKind;
 
 pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -54,6 +55,31 @@ fn binary_notice(image: Option<muster_core::navigation::ImageFormat>, status: &s
         Some('D') => format!("Image removed · {}.", format.name()),
         _ => format!("Image changed · {}.", format.name()),
     }
+}
+
+/// What the window knows about a checkout's change set, as far as a row's click
+/// is concerned.
+///
+/// Line counts are not part of this. A checkout whose only change is one binary
+/// file counts `+0 −0` and still has changes to read, so a figure of zero is not
+/// an answer and an absent figure is not an answer either. The change list Git
+/// was actually asked for is the answer, and it is one only once a read has
+/// returned it.
+enum ChangePresence {
+    Present,
+    Absent,
+    /// No read has answered for this checkout.
+    Unknown,
+    /// A read answered that it could not tell.
+    Failed,
+}
+
+/// A row click waiting for Git to say whether its checkout has a change set.
+#[derive(Clone)]
+pub(crate) struct RowChoice {
+    checkout: String,
+    /// The [`TerminalWindow::view_intent`] this click established.
+    intent: u64,
 }
 
 impl TerminalWindow {
@@ -112,15 +138,95 @@ impl ToggleDiffFile {
 }
 
 impl TerminalWindow {
+    /// Whether Git answers for this checkout at all.
+    ///
+    /// A plain directory has no change set to have, which the panel already says
+    /// in as many words. That is a known answer rather than a missing one, so it
+    /// is settled here instead of waiting for a read nobody will make.
+    fn is_git_checkout(&self, checkout: &str) -> bool {
+        self.navigation.repos.iter().any(|repo| {
+            repo.kind == RepoKind::Git && repo.checkouts.iter().any(|item| item.id == checkout)
+        })
+    }
+
+    /// What Git's own change list says about a checkout, and how sure the window is.
+    ///
+    /// A failed read is the newest answer the window holds about a checkout, so
+    /// it outranks the list it is still holding: a read that failed after a clean
+    /// one never said the checkout is clean, and one that failed after a dirty
+    /// one never said the change set is still there. The list is kept for what
+    /// is drawn — the panel shows it under the failure — and is not an answer to
+    /// a question asked after the failure.
+    fn change_presence(&self, checkout: &str) -> ChangePresence {
+        if !self.is_git_checkout(checkout) {
+            return ChangePresence::Absent;
+        }
+        if self.git_status_errors.contains_key(checkout) {
+            return ChangePresence::Failed;
+        }
+        match self.git_status.get(checkout) {
+            Some(status) if status.files.is_empty() => ChangePresence::Absent,
+            Some(_) => ChangePresence::Present,
+            None => ChangePresence::Unknown,
+        }
+    }
+
+    /// Apply a row click that had to wait for Git, if it is still what the person
+    /// last asked for.
+    ///
+    /// The read answers after the click, and the window does not stand still while
+    /// it runs: another row, a terminal, or a file in the tree has already said
+    /// what should be on screen. An answer that arrives after any of those is
+    /// dropped rather than allowed to put a change set, or the keyboard, over it.
+    pub(crate) fn settle_row_choice(&mut self, cx: &mut Context<Self>) {
+        let Some(choice) = self.pending_row_choice.clone() else {
+            return;
+        };
+        if choice.intent != self.view_intent {
+            self.pending_row_choice = None;
+            return;
+        }
+        match self.change_presence(&choice.checkout) {
+            ChangePresence::Present => {
+                self.pending_row_choice = None;
+                self.inspector_tab = InspectorTab::Changes;
+                self.open_changes(&choice.checkout, None, cx);
+            }
+            ChangePresence::Absent => {
+                self.pending_row_choice = None;
+                // Nothing central is open, so the next frame hands the keyboard to
+                // the terminal rather than this background answer taking it.
+                self.focus_pending = true;
+            }
+            ChangePresence::Failed => {
+                self.pending_row_choice = None;
+                let error = self
+                    .git_status_errors
+                    .get(&choice.checkout)
+                    .cloned()
+                    .unwrap_or_default();
+                self.failure = Some(format!(
+                    "Could not read the changes of this worktree: {error}"
+                ));
+            }
+            // Another checkout's read answered, or this one is still on its way.
+            ChangePresence::Unknown => {}
+        }
+    }
+}
+
+impl TerminalWindow {
     /// Open the worktree a sidebar row names.
     ///
     /// One action for the row and for the button drawn over its label, because
     /// they are the same click on different pixels: a row is one target with a
     /// focus ring, a tooltip and a count in it, not two targets that happen to
-    /// agree. A row carrying `+N -N` is advertising a diff, so a dirty worktree
-    /// opens its whole change set. A clean one currently shows its terminal;
-    /// per-checkout preview restoration remains a separate parity requirement.
-    /// Clicking a terminal always shows that terminal.
+    /// agree. Whether the checkout has changes is Git's answer and not the row's
+    /// `+N -N`, which a binary change writes as `+0 -0`; a checkout with a change
+    /// set opens it, a known-clean one shows its terminal, and clicking a terminal
+    /// always shows that terminal. When Git has not answered yet, neither answer
+    /// is available, and the click waits for that read rather than claiming a
+    /// checkout is clean because nothing has been counted.
     pub(crate) fn select_checkout_row(
         &mut self,
         checkout: &str,
@@ -134,15 +240,23 @@ impl TerminalWindow {
         self.open_diff = None;
         self.persist();
         self.refresh_diff_totals(cx);
-        let dirty = self
-            .diff_totals
-            .get(checkout)
-            .is_some_and(|totals| totals.additions > 0 || totals.deletions > 0);
-        if dirty {
-            self.inspector_tab = InspectorTab::Changes;
-            self.open_changes(checkout, None, cx);
-        } else {
-            self.focus_terminal(window, cx);
+        match self.change_presence(checkout) {
+            ChangePresence::Present => {
+                self.inspector_tab = InspectorTab::Changes;
+                self.open_changes(checkout, None, cx);
+            }
+            ChangePresence::Absent => self.focus_terminal(window, cx),
+            // Asking for the status the row decision needs is the coalesced,
+            // background read the Changes tab already asks for, so a click on a
+            // checkout nobody has read yet costs Git a read and not a process per
+            // row.
+            ChangePresence::Unknown | ChangePresence::Failed => {
+                self.pending_row_choice = Some(RowChoice {
+                    checkout: checkout.to_owned(),
+                    intent: self.view_intent,
+                });
+                self.request_git_status(checkout, cx);
+            }
         }
         cx.notify();
     }
@@ -650,5 +764,19 @@ mod tests {
             binary_notice(None, "M"),
             "Binary file; text diff is unavailable."
         );
+    }
+
+    /// A file whose bytes named no picture is not named by its extension, so the
+    /// wording that adds, removes and changes an image is reachable only for an
+    /// image, and a non-image says the same thing whichever letter Git gave it.
+    #[test]
+    fn a_file_with_no_picture_says_the_same_thing_whatever_changed() {
+        for status in ["??", "A", "D", "M", "R", "MM"] {
+            assert_eq!(
+                binary_notice(None, status),
+                "Binary file; text diff is unavailable.",
+                "{status}"
+            );
+        }
     }
 }

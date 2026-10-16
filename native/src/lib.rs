@@ -69,8 +69,7 @@ pub use muster_core::pty;
 /// on the PTY reader thread, handing the window a bounded snapshot.
 pub mod terminal;
 
-/// Test-only for now: it pins the vendored parser's keyboard-mode and title handling,
-/// and nothing in the shipping path drives the parser yet — no native window owns a
-/// `Term`, so these cases have no production caller to share with.
+/// Direct parser-level security regressions for the vendored parser, independent
+/// of PTY delivery and window timing. The shipping terminal also drives this parser.
 #[cfg(test)]
 mod terminal_parser;

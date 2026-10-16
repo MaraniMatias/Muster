@@ -101,31 +101,34 @@ impl ImageFormat {
 
 /// What the first bytes of a changed file say it is, if they say anything.
 ///
-/// The bytes decide, not the name: a `.png` that is a Git LFS pointer is text and a
-/// file called `logo` that starts with the PNG signature is a picture. A file that is no
-/// longer there has no bytes to ask, so its name is the only answer there is — and it is
-/// only believed when it is one of the signatures it is naming.
-fn image_format(bytes: &[u8], path: &str) -> Option<ImageFormat> {
-    let by_bytes = || match bytes {
+/// `bytes` is `None` only for a file that is no longer there, which has nothing to ask
+/// and whose name is therefore the only answer available; it is believed only when it is
+/// one of the names this function could have named from bytes. A file that *is* there is
+/// answered by its bytes alone: a `.png` that is a Git LFS pointer is text, an arbitrary
+/// blob named `.png` is a blob, and an empty file is not a picture however it is spelled.
+/// An empty slice is a header read from a present empty file, not an absence.
+fn image_format(bytes: Option<&[u8]>, path: &str) -> Option<ImageFormat> {
+    let Some(bytes) = bytes else {
+        let name = path.rsplit('.').next()?.to_ascii_lowercase();
+        return match name.as_str() {
+            "png" => Some(ImageFormat::Png),
+            "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+            "gif" => Some(ImageFormat::Gif),
+            "webp" => Some(ImageFormat::WebP),
+            "bmp" => Some(ImageFormat::Bmp),
+            "ico" => Some(ImageFormat::Ico),
+            _ => None,
+        };
+    };
+    match bytes {
         [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] => Some(ImageFormat::Png),
         [0xff, 0xd8, 0xff, ..] => Some(ImageFormat::Jpeg),
         [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some(ImageFormat::Gif),
-        [b'R', b'I', b'F', b'F', .., b'W', b'E', b'B', b'P'] => Some(ImageFormat::WebP),
+        // RIFF container, the four-byte size field, then the form at its fixed offset:
+        // a `WEBP` anywhere else is a suffix coincidence, not a format.
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some(ImageFormat::WebP),
         [b'B', b'M', ..] => Some(ImageFormat::Bmp),
         [0x00, 0x00, 0x01, 0x00, ..] => Some(ImageFormat::Ico),
-        _ => None,
-    };
-    if by_bytes().is_some() {
-        return by_bytes();
-    }
-    let name = path.rsplit('.').next()?.to_ascii_lowercase();
-    match name.as_str() {
-        "png" => Some(ImageFormat::Png),
-        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
-        "gif" => Some(ImageFormat::Gif),
-        "webp" => Some(ImageFormat::WebP),
-        "bmp" => Some(ImageFormat::Bmp),
-        "ico" => Some(ImageFormat::Ico),
         _ => None,
     }
 }
@@ -224,7 +227,9 @@ pub(super) fn file_diff_before_git(
         .prefix("muster-diff-")
         .tempdir()
         .map_err(|error| format!("could not create diff snapshot: {error}"))?;
-    let mut header_bytes = Vec::new();
+    // `None` is a file that is gone; `Some(empty)` is a present file with no bytes to
+    // read, and the two are told apart because only the first may be named by its path.
+    let mut header: Option<Vec<u8>> = None;
     match snapshot_file(&root, &relative, snapshot.path(), within)? {
         Snapshot::TooLarge => return Ok(too_large(path)),
         Snapshot::Link(target) => {
@@ -245,11 +250,11 @@ pub(super) fn file_diff_before_git(
             return Err("changed file disappeared while opening it".into())
         }
         Snapshot::Missing => {}
-        Snapshot::File(header) => {
+        Snapshot::File(read) => {
             // Git is about to be asked for a diff of this file and will refuse to
             // print one, because its bytes are not text. Reading the header it is
             // about to refuse is what lets the reader be told *what* changed.
-            header_bytes = header;
+            header = Some(read);
         }
     }
     let untracked = changed.status == "??";
@@ -296,7 +301,7 @@ pub(super) fn file_diff_before_git(
         return Err(git_error("Git could not diff this file", &output));
     }
     let mut diff = scan(path.to_owned(), &output.stdout)?;
-    diff.image = image_format(&header_bytes, path);
+    diff.image = image_format(header.as_deref(), path);
     Ok(diff)
 }
 

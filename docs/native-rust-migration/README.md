@@ -2,13 +2,25 @@
 
 **Status:** original feasibility research, followed by an implemented native terminal and workspace shell. The historical plan below is not a claim of full parity.
 
-**Current implementation (2026-10-14):** the root Cargo workspace builds `core`
+**Historical implementation snapshot (2026-10-14):** the root Cargo workspace builds `core`
 and `native`; Tauri/Vue is parked in `legacy/`. Native Git discovery, worktree
 mutations, sidebar/titlebar navigation, terminal ownership, dark-theme roles,
 single-instance locking and coalesced state writes are implemented. Review notes,
 agent delivery, live preferences, file/link activation and terminal search remain
 unimplemented. See [current verification and measurement](ghostty-reference.md#11-chrome-pass-theme-state-writer-refusals-and-the-read-cadence).
 Real OS IME, GPU rendering and Linux runtime acceptance remain manual gates.
+**Current audit-patch summary (AP-01–AP-11, over `69ae8ba`):** file activation,
+read-only source/Markdown readings and web-link opening are implemented. Links
+use direct weak-window dispatch and failures use the window's dismissible banner.
+Local Markdown images are prepared by bounded descriptor reads on workers;
+focus follows the visible reading. Checkout rows use change presence, not line
+totals; Files scrolls horizontally while Changes fits panel-width rows and
+shortens long names. See [current behavior and regression evidence](opening-reading-and-scrolling.md#current-contract-after-ap-01ap-10)
+and [AP-11's current suite record](audit-action-plan.md#ap-11).
+Historical research and pass records below are not current acceptance evidence.
+AP-12 integration/platform acceptance remains pending; real GPU/IME, image pixels,
+Linux runtime and release measurements are not established by headless tests.
+
 **Application baseline:** Muster `v0.21.1`, commit `4412f63bd385bdb3b9eb12b829858578a2009f81`.  
 **Research snapshots:** retrieved on 2026-10-11 UTC; exact upstream revisions are recorded below.  
 **Worktree:** `.worktrees/docs-native-rust-gpui`, branch `docs/native-rust-gpui`.  
