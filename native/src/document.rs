@@ -1,14 +1,17 @@
 //! The central document: read as a reading, edited as its source.
-use crate::{app::TerminalWindow, theme::Roles};
+use crate::app::TerminalWindow;
+use crate::theme::Roles;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState};
-use gpui_kit::component::{Disableable, Sizable};
+use gpui_kit::component::{Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Styled, TestSupportExt, Window,
+    div, point, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, TestSupportExt, Window,
 };
 use muster_core::workspace::{Checkout, Repo};
 use std::sync::Arc;
@@ -58,10 +61,17 @@ impl DocumentView {
     ///
     /// The text is set once, whole, from what `read_preview` returned: a
     /// preview that stops mid-file would look like a file that ends there.
-    fn new(identity: &str, path: &str, text: &str, window: &mut Window, cx: &mut App) -> Self {
+    fn new(
+        identity: &str,
+        path: &str,
+        text: &str,
+        language: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
         let state = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(syntax_language(path))
+                .language(language)
                 .line_number(true)
                 // No reflow: a document is shown as it is written, and the
                 // editor scrolls both ways instead of rewrapping long lines.
@@ -126,11 +136,14 @@ fn document_state(
     identity: &str,
     path: &str,
     text: &str,
+    language: &str,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<EditorState> {
     if retained.as_ref().is_none_or(|view| view.path != identity) {
-        *retained = Some(DocumentView::new(identity, path, text, window, cx));
+        *retained = Some(DocumentView::new(
+            identity, path, text, language, window, cx,
+        ));
     }
     retained
         .as_ref()
@@ -155,26 +168,28 @@ pub(crate) fn is_markdown(path: &str) -> bool {
 
 /// The toolkit language name a path asks for.
 ///
-/// The same list Legacy chose its mode by, reduced to the languages the
-/// toolkit compiles in. A name it has no grammar for is plain text rather than
-/// nothing: an unknown file still opens, it just opens uncoloured.
+/// The language a path asks the toolkit to highlight with.
+///
+/// Known dotfiles and their variants follow Legacy's filename mappings; unknown
+/// files still open, just uncoloured.
 pub(crate) fn syntax_language(path: &str) -> &'static str {
     let name = path
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(path)
         .to_ascii_lowercase();
-    match name.as_str() {
-        "makefile" | "gnumakefile" => return "make",
-        "cmakelists.txt" => return "cmake",
-        ".bash_login" | ".bash_logout" | ".bash_profile" | ".bashrc" | ".profile" | ".shrc"
-        | ".cshrc" | ".kshrc" | ".login" | ".tcshrc" | ".zlogin" | ".zlogout" | ".zprofile"
-        | ".zshenv" | ".zshrc" => return "bash",
-        ".babelrc" | ".eslintrc" | ".jshintrc" | ".prettierrc" | ".swcrc" | ".watchmanconfig" => {
-            return "json"
+    if name == ".env" || name.starts_with(".env.") {
+        return "dotenv";
+    }
+    if let Some(language) = filename_language(&name) {
+        return language;
+    }
+    if let Some(dotfile) = name.strip_prefix('.') {
+        if let Some(dot) = dotfile.find('.').map(|dot| dot + 1) {
+            if let Some(language) = filename_language(&name[..dot]) {
+                return language;
+            }
         }
-        ".psqlrc" => return "sql",
-        _ => {}
     }
     match name.rsplit_once('.').map_or("", |(_, extension)| extension) {
         "json" | "jsonc" => "json",
@@ -185,6 +200,7 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "yaml" | "yml" => "yaml",
         "html" | "htm" => "html",
         "css" | "scss" => "css",
+        "ini" => "ini",
         "md" | "mdown" | "markdown" => "markdown",
         "bash" | "sh" | "zsh" => "bash",
         "c" | "h" => "c",
@@ -213,6 +229,333 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "vue" => "vue",
         "zig" => "zig",
         _ => "plaintext",
+    }
+}
+
+fn filename_language(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "makefile" | "gnumakefile" => "make",
+        "cmakelists.txt" => "cmake",
+        ".bash_login" | ".bash_logout" | ".bash_profile" | ".bashrc" | ".profile" | ".shrc"
+        | ".cshrc" | ".kshrc" | ".login" | ".tcshrc" | ".zlogin" | ".zlogout" | ".zprofile"
+        | ".zshenv" | ".zshrc" => "bash",
+        ".babelrc" | ".eslintrc" | ".jshintrc" | ".prettierrc" | ".swcrc" | ".watchmanconfig" => {
+            "json"
+        }
+        ".curlrc" | ".dircolors" | ".editorconfig" | ".gitattributes" | ".gitconfig"
+        | ".gitmodules" | ".inputrc" | ".npmrc" | ".selected_editor" | ".tmux.conf" | ".yarnrc" => {
+            "ini"
+        }
+        ".cvsignore" | ".dockerignore" | ".eslintignore" | ".gitignore" | ".hgignore"
+        | ".npmignore" | ".prettierignore" => "gitignore",
+        ".psqlrc" => "sql",
+        _ => return None,
+    })
+}
+
+/// Identity for a language choice; native documents currently come from checkouts only.
+fn document_language_key(checkout: &str, path: &str) -> String {
+    format!("{checkout}\0checkout\0{path}")
+}
+
+fn language_label(language: &str) -> String {
+    match language {
+        "bash" => "Shell".into(),
+        "cmake" => "CMake".into(),
+        "cpp" => "C++".into(),
+        "csharp" => "C#".into(),
+        "css" => "CSS".into(),
+        "dotenv" => "Dotenv".into(),
+        "ejs" => "EJS".into(),
+        "erb" => "ERB".into(),
+        "graphql" => "GraphQL".into(),
+        "gitignore" => "Gitignore".into(),
+        "html" => "HTML".into(),
+        "ini" => "INI".into(),
+        "javascript" => "JavaScript".into(),
+        "json" => "JSON".into(),
+        "php" => "PHP".into(),
+        "proto" => "Protocol Buffers".into(),
+        "sql" => "SQL".into(),
+        "toml" => "TOML".into(),
+        "tsx" => "TSX".into(),
+        "typescript" => "TypeScript".into(),
+        "vue" => "Vue".into(),
+        "yaml" => "YAML".into(),
+        "zig" => "Zig".into(),
+        _ => language
+            .split(['-', '_'])
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn available_grammars() -> Vec<String> {
+    let mut languages = gpui_kit::component::highlighter::LanguageRegistry::singleton()
+        .languages()
+        .into_iter()
+        .map(|language| language.to_string())
+        .filter(|language| language != "plaintext")
+        .collect::<Vec<_>>();
+    languages.sort_by_key(|language| language_label(language).to_lowercase());
+    languages
+}
+
+fn document_language_label(path: &str, override_language: Option<&str>) -> String {
+    match override_language {
+        Some("plaintext") => "Plain text".into(),
+        Some(language) => language_label(language),
+        None => {
+            let detected = syntax_language(path);
+            if detected == "plaintext" {
+                "Auto (no highlighting)".into()
+            } else {
+                language_label(detected)
+            }
+        }
+    }
+}
+
+/// One row's height, and the number that scrolls the list.
+///
+/// Legacy's menu row is 5px of padding over an 18px line, and this menu draws
+/// the same row, so the height is a constant rather than something measured:
+/// the keyboard's highlight has to be scrolled into view without a frame to
+/// measure it in.
+const GRAMMAR_ROW_PX: f32 = 28.;
+
+/// Every grammar a file can wear, in the order the menu lists them.
+///
+/// `Auto` is first because it is what the file already wears, and it is a row
+/// like any other: the search above the list filters all of it, so somebody
+/// who wants plain text types for it instead of reaching past the list for a
+/// row that is not in it.
+fn grammar_choices(path: &str) -> Vec<(String, Option<String>)> {
+    let detected = syntax_language(path);
+    let auto = if detected == "plaintext" {
+        "Auto · no highlighting".to_owned()
+    } else {
+        format!("Auto · {}", language_label(detected))
+    };
+    std::iter::once((auto, None))
+        .chain(std::iter::once((
+            "Plain text".to_owned(),
+            Some("plaintext".to_owned()),
+        )))
+        .chain(
+            available_grammars()
+                .into_iter()
+                .map(|language| (language_label(&language), Some(language))),
+        )
+        .collect()
+}
+
+/// The rows of `choices` a query leaves, by index.
+///
+/// A row answers to its written name and to the name the registry holds it
+/// under, so `yml` finds YAML and `plain` finds Plain text. A query that
+/// matches nothing leaves nothing: an empty list is the answer, not every row.
+fn matching_grammar_rows(choices: &[(String, Option<String>)], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, (label, language))| {
+            query.is_empty()
+                || label.to_lowercase().contains(&query)
+                || language.as_ref().is_some_and(|name| name.contains(&query))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// What a row in the grammar menu acts on: the window that owns it, the
+/// checkout and the path of the file it is a grammar for.
+struct GrammarTarget {
+    view: gpui_kit::WeakEntity<TerminalWindow>,
+    checkout: String,
+    path: String,
+}
+
+/// The grammar picker: a search field over the grammars, drawn here.
+///
+/// The toolkit's command palette answers a query of its own, and it draws its
+/// search field above whatever a header holds, which put `Auto` and `Plain
+/// text` above the field that filters them. A menu whose search is not its first
+/// thing is not a menu anybody reads the way they expect, so the list, the
+/// rows and the search are drawn here: the search on top, `Auto` as the first
+/// row, and every row carrying the pointer, the hover and the keyboard that the
+/// rest of this window's rows carry.
+fn grammar_menu(
+    query: &Entity<InputState>,
+    scroll: &ScrollHandle,
+    override_language: Option<&str>,
+    highlighted: usize,
+    roles: Roles,
+    target: GrammarTarget,
+    cx: &mut App,
+) -> AnyElement {
+    let choices = grammar_choices(&target.path);
+    let GrammarTarget {
+        view,
+        checkout,
+        path: selected_path,
+    } = target;
+    let matched = matching_grammar_rows(&choices, &query.read(cx).value());
+    // The keyboard cannot be past what the query left, and an empty list has
+    // nothing to point at.
+    let highlighted = highlighted.min(matched.len().saturating_sub(1));
+    let chosen = override_language.map(str::to_owned);
+    let rows = matched
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            let (label, language) = &choices[*index];
+            let id = format!("document-grammar-{position}");
+            let selected = *index == highlighted;
+            let is_choice = language.as_deref() == chosen.as_deref();
+            let language = language.clone();
+            let label = label.clone();
+            let accessibility_label =
+                format!("{}{}", label, if is_choice { ", selected" } else { "" });
+            div()
+                .id(SharedString::from(id))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .h(px(GRAMMAR_ROW_PX))
+                .px_2()
+                .rounded(px(6.))
+                .font_family(crate::app::SIDEBAR_FONT_FAMILY)
+                .text_size(px(13.))
+                .line_height(px(18.))
+                .text_color(roles.text)
+                .cursor_pointer()
+                .role(Role::ListBoxOption)
+                .aria_label(accessibility_label)
+                .aria_selected(is_choice)
+                .when(selected, |row| row.bg(roles.hover))
+                .hover(|style| style.bg(roles.hover))
+                .child(div().flex_1().min_w_0().text_ellipsis().child(label))
+                .when(is_choice, |row| {
+                    row.child(Icon::new(IconName::Check).size_3().text_color(roles.accent))
+                })
+                .on_click({
+                    let view = view.clone();
+                    let checkout = checkout.clone();
+                    let selected_path = selected_path.clone();
+                    move |_, window, cx| {
+                        let _ = view.update(cx, |app, cx| {
+                            app.set_document_language(
+                                &checkout,
+                                &selected_path,
+                                language.clone(),
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .test_support()
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+    div()
+        .flex()
+        .flex_col()
+        .bg(roles.surface_raised)
+        .on_key_down({
+            let view = view.clone();
+            let query = query.clone();
+            let scroll = scroll.clone();
+            let choices = choices.clone();
+            move |event, _window, cx| {
+                let query = query.clone();
+                let scroll = scroll.clone();
+                let choices = choices.clone();
+                let _ = view.update(cx, move |app, cx| {
+                    let rows = matching_grammar_rows(&choices, &query.read(cx).value());
+                    let mut position = app
+                        .document_grammar_highlight
+                        .min(rows.len().saturating_sub(1));
+                    match event.keystroke.key.as_ref() {
+                        "down" => position = (position + 1).min(rows.len().saturating_sub(1)),
+                        "up" => position = position.saturating_sub(1),
+                        _ => {}
+                    }
+                    app.document_grammar_highlight = position;
+                    scroll_grammar_row_into_view(&scroll, position);
+                    cx.notify();
+                });
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py(px(6.))
+                .border_b_1()
+                .border_color(roles.border)
+                .child(
+                    Icon::new(IconName::Search)
+                        .size_3()
+                        .text_color(roles.text_muted),
+                )
+                .child(
+                    Input::new(query)
+                        .id("document-grammar-search")
+                        .appearance(false)
+                        .p_0()
+                        .w_full()
+                        .text_size(px(13.))
+                        .aria_label("Search grammars"),
+                ),
+        )
+        .child(
+            div()
+                .id("document-grammar-list")
+                .flex()
+                .flex_col()
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .px_1()
+                .children(rows)
+                .test_support(),
+        )
+        .into_any_element()
+}
+
+/// Keep the highlighted row inside the visible part of the list.
+///
+/// Rows are a fixed height and the list is a plain scroll container, so where
+/// the keyboard is inside the content is its row times that height, and no
+/// layout has to be read back to know it.
+fn scroll_grammar_row_into_view(scroll: &ScrollHandle, row: usize) {
+    let offset = scroll.offset();
+    let top = px(GRAMMAR_ROW_PX * row as f32);
+    let bottom = top + px(GRAMMAR_ROW_PX);
+    let visible = offset.y..offset.y + scroll.bounds().size.height;
+    let wanted = if top < visible.start {
+        top
+    } else if bottom > visible.end {
+        bottom - scroll.bounds().size.height
+    } else {
+        offset.y
+    };
+    if wanted != offset.y {
+        scroll.set_offset(point(offset.x, wanted));
     }
 }
 
@@ -395,6 +738,102 @@ impl TerminalWindow {
         .detach();
     }
 
+    /// Watch the grammar menu's search field for as long as the menu is open.
+    ///
+    /// A typed character re-filters the list, so the row the keyboard was on
+    /// is no longer a row: the highlight goes back to the top of what is left.
+    /// Return is not answered here: the window's keystroke interceptor takes it
+    /// before the field and the popover both see it, because both of those
+    /// close the menu rather than choose a row.
+    pub(crate) fn watch_document_grammar_query(
+        &mut self,
+        query: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document_grammar_query = Some(query.clone());
+        self.document_grammar_query_seen = query.read(cx).value().to_string();
+        self.document_grammar_query_watch =
+            Some(
+                cx.subscribe_in(query, window, |app, _, event, window, cx| match event {
+                    InputEvent::Change => {
+                        app.document_grammar_highlight = 0;
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter {
+                        secondary: false, ..
+                    } => {
+                        app.confirm_document_grammar(window, cx);
+                    }
+                    _ => {}
+                }),
+            );
+    }
+
+    /// Wear the grammar the keyboard is on, and close the menu.
+    ///
+    /// The rows are the ones the search left, in the same order the menu drew
+    /// them, so the row the highlight counts is the row the person sees.
+    pub(crate) fn confirm_document_grammar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A closed menu has no row to confirm, and the popover closes before
+        // its own Return reaches here when the field is not the focused one.
+        if !self.document_grammar_open {
+            return;
+        }
+        let Some((checkout, path)) = self.document_target.clone() else {
+            return;
+        };
+        let Some(query) = self.document_grammar_query.as_ref() else {
+            return;
+        };
+        let query = query.read(cx).value().to_string();
+        let choices = grammar_choices(&path);
+        let rows = matching_grammar_rows(&choices, &query);
+        let Some(language) = rows
+            .get(
+                self.document_grammar_highlight
+                    .min(rows.len().saturating_sub(1)),
+            )
+            .map(|row| choices[*row].1.clone())
+        else {
+            return;
+        };
+        self.set_document_language(&checkout, &path, language, window, cx);
+    }
+
+    fn set_document_language(
+        &mut self,
+        checkout: &str,
+        path: &str,
+        language: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = document_language_key(checkout, path);
+        if let Some(language) = language.as_ref() {
+            self.document_language_overrides
+                .insert(key, language.clone());
+        } else {
+            self.document_language_overrides.remove(&key);
+        }
+        if self
+            .document_target
+            .as_ref()
+            .is_some_and(|(active_checkout, active_path)| {
+                active_checkout == checkout && active_path == path
+            })
+        {
+            if let Some(view) = self.document_view.as_ref() {
+                let language = language.as_deref().unwrap_or_else(|| syntax_language(path));
+                view.state
+                    .update(cx, |state, cx| state.set_highlighter(language, cx));
+                view.state.read(cx).focus_handle(cx).focus(window, cx);
+            }
+        }
+        self.document_grammar_open = false;
+        cx.notify();
+    }
+
     /// Throw the draft away and put the text the file was read with back.
     ///
     /// The editor, not the file: this is what a person means by Cancel, and the
@@ -471,6 +910,7 @@ impl TerminalWindow {
         }
         self.open_document = None;
         self.document_view = None;
+        self.document_grammar_open = false;
         self.document_request = self.document_request.wrapping_add(1);
     }
 
@@ -493,6 +933,7 @@ impl TerminalWindow {
         }
         let roles = Roles::of(cx);
         let key = (checkout_id.clone(), path.clone());
+        let grammar_key = document_language_key(&checkout_id, &path);
         // What a frame draws is what the editor holds, so the draft is settled
         // before anything asks about it.
         self.refresh_document_draft(cx);
@@ -515,15 +956,22 @@ impl TerminalWindow {
                 .document_view
                 .as_ref()
                 .is_none_or(|view| view.path != identity);
+            let language = self
+                .document_language_overrides
+                .get(&grammar_key)
+                .cloned()
+                .unwrap_or_else(|| syntax_language(&path).to_owned());
             let state = document_state(
                 &mut self.document_view,
                 &identity,
                 &path,
                 &preview.text,
+                &language,
                 window,
                 cx,
             );
             if new_view {
+                self.document_grammar_open = false;
                 // The header asks whether this file has changes, and the answer is
                 // Git's rather than the maintenance tick's: the file this pane is
                 // drawing is the one that has to be asked about, and a status read
@@ -666,6 +1114,91 @@ impl TerminalWindow {
         // control that writes the file must not move away from where the person
         // is looking.
         let draft = self.document_view.as_ref().filter(|view| view.dirty);
+        let grammar_selector = if !rendered && self.document_view.is_some() {
+            let override_language = self.document_language_overrides.get(&grammar_key).cloned();
+            let trigger_label = document_language_label(&path, override_language.as_deref());
+            let query = window.use_keyed_state(
+                format!("document-grammar-query-{grammar_key}"),
+                cx,
+                InputState::new,
+            );
+            let scroll = window.use_keyed_state(
+                format!("document-grammar-scroll-{grammar_key}"),
+                cx,
+                |_, _| ScrollHandle::new(),
+            );
+            let focus = query.read(cx).focus_handle(cx);
+            let view = cx.weak_entity();
+            Some(
+                Popover::new("popover:document-grammar")
+                    .appearance(false)
+                    .open(self.document_grammar_open)
+                    .on_open_change({
+                        let view = view.clone();
+                        let query = query.clone();
+                        let focus = focus.clone();
+                        move |open, window, cx| {
+                            let _ = view.update(cx, |app, cx| {
+                                app.document_grammar_open = *open;
+                                app.document_grammar_highlight = 0;
+                                if *open {
+                                    query.update(cx, |query, cx| query.set_value("", window, cx));
+                                    app.watch_document_grammar_query(&query, window, cx);
+                                }
+                                cx.notify();
+                            });
+                            if *open {
+                                focus.focus(window, cx);
+                            }
+                        }
+                    })
+                    .track_focus(&focus)
+                    .w(px(232.))
+                    .bg(roles.surface_raised)
+                    .border_1()
+                    .border_color(roles.border_strong)
+                    .rounded(px(0.))
+                    .trigger(
+                        Button::new("document-grammar")
+                            .text()
+                            .small()
+                            .compact()
+                            .label(trigger_label.clone())
+                            .accessibility_label(format!(
+                                "Choose syntax highlighting language, currently {trigger_label}"
+                            ))
+                            .dropdown_caret(true)
+                            .tooltip("Choose syntax highlighting language"),
+                    )
+                    .content({
+                        let view = view.clone();
+                        let query = query.clone();
+                        let scroll = scroll.read(cx).clone();
+                        let checkout = checkout_id.clone();
+                        let selected_path = path.clone();
+                        let override_language = override_language.clone();
+                        let highlight = self.document_grammar_highlight;
+                        move |_, _, cx| {
+                            grammar_menu(
+                                &query,
+                                &scroll,
+                                override_language.as_deref(),
+                                highlight,
+                                roles,
+                                GrammarTarget {
+                                    view: view.clone(),
+                                    checkout: checkout.clone(),
+                                    path: selected_path.clone(),
+                                },
+                                cx,
+                            )
+                        }
+                    })
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         Some(
             div()
                 .id("document-pane")
@@ -694,6 +1227,7 @@ impl TerminalWindow {
                                 .text_color(roles.text_muted)
                                 .child(path.clone()),
                         )
+                        .when_some(grammar_selector, |header, selector| header.child(selector))
                         .when(markdown, |header| {
                             header.child(
                                 Button::new("document-toggle-reading")
@@ -717,6 +1251,7 @@ impl TerminalWindow {
                                             return;
                                         };
                                         if view.preview.is_some() {
+                                            app.document_grammar_open = false;
                                             view.rendered = !view.rendered;
                                             // The reading that just went away takes
                                             // the focus with it, and the one now on
@@ -897,6 +1432,7 @@ mod tests {
                 &format!("{path}\0{text}"),
                 &path,
                 &text,
+                syntax_language(&path),
                 window,
                 cx,
             );
@@ -1065,6 +1601,17 @@ mod tests {
             ("home/.bashrc", "bash"),
             ("home/.kshrc", "bash"),
             ("home/.login", "bash"),
+            ("home/.bashrc.local", "bash"),
+            (".gitignore", "gitignore"),
+            ("nested/.dockerignore", "gitignore"),
+            (".gitattributes", "ini"),
+            ("home/.gitconfig", "ini"),
+            (".gitmodules", "ini"),
+            ("settings.ini", "ini"),
+            ("home/.env", "dotenv"),
+            (".env.production.local", "dotenv"),
+            (".envrc", "plaintext"),
+            (".eslintrc.json", "json"),
             ("src/main.cpp", "cpp"),
             ("query.sql", "sql"),
             ("api.proto", "proto"),
@@ -1218,6 +1765,18 @@ mod tests {
             ),
             ("main.py", "# comment\ndef run():\n    return \"hello\"\n"),
             ("run.sh", "# comment\nif true; then echo \"hello\"; fi\n"),
+            (
+                ".env.local",
+                "# local settings\nAPI_URL=\"https://example.test\"\nPORT=3000\n",
+            ),
+            (
+                ".gitignore",
+                "# dependency cache\nnode_modules/\n!.env.example\n*.log\n",
+            ),
+            (
+                ".gitconfig",
+                "[user]\nname = \"Ada\"\nemail = ada@example.test\n",
+            ),
             (
                 "main.go",
                 "package main\nfunc main() { println(\"hello\") }\n",

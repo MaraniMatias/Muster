@@ -167,6 +167,7 @@ pass gates. Current results are recorded in AP-11. Tests introduced then include
 - **The Markdown header toggle is one control**, where Legacy had a view/edit
   mode. The document pane is read-only here, so the two readings are the whole
   of what it can offer.
-- **XML, INI and Dockerfile still open as plain text.** Vue, GraphQL and
-  Protobuf have grammars; those three would each need a query this crate would
-  have to carry, because the toolkit ships no grammar and no feature for them.
+- **XML and Dockerfile still open as plain text.** Gitignore files and INI
+  dotfiles now use their own grammars; `.env` files use a Dotenv-specific query
+  over the existing Bash parser. Vue, GraphQL and Protobuf keep their registered
+  grammars; XML and Dockerfile still need parsers the toolkit does not ship.

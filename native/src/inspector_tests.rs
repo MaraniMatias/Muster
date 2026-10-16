@@ -1823,6 +1823,285 @@ async fn a_json_file_is_visible_in_the_actual_workspace_editor(cx: &mut TestAppC
     close(&fixture, cx);
 }
 
+/// The menu is one search field over one list, and `Auto` is its first row.
+///
+/// The search is drawn above the rows because it is the first thing a person
+/// looks for, and `Auto` is a row rather than a heading because it is one of
+/// the choices: a menu that pins two rows above its own search asks to be read
+/// as two menus. The measurement is geometry, never a glyph advance: a row's
+/// text is rounded to whole pixels while its shaped advance is not.
+#[gpui_kit::test]
+async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let path = "notes-without-an-extension";
+    std::fs::write(fixture.root.join(path), "name: muster\ncount: 42\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, path.into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == path)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let search = window.find("document-grammar-search");
+        let auto = window.find("document-grammar-0");
+        let plain = window.find("document-grammar-1");
+        assert_eq!(
+            window.find("document-grammar-0").label(),
+            Some("Auto · no highlighting, selected"),
+            "the first row is Auto and it is what this file wears"
+        );
+        assert_eq!(
+            window.find("document-grammar-1").label(),
+            Some("Plain text"),
+            "Plain text is the second row, not a row of its own above the search"
+        );
+        assert_eq!(
+            (auto.bounds().size.height, plain.bounds().size.height),
+            (px(28.), px(28.)),
+            "every row is the height Legacy's menu row is"
+        );
+        assert_eq!(
+            auto.bounds().origin.x,
+            plain.bounds().origin.x,
+            "rows share one column"
+        );
+        assert_eq!(
+            window.find("document-grammar-1").selected(),
+            Some(false),
+            "Plain text is not the choice this file wears"
+        );
+        // The search sits above the rows: its own field, not a row of the list.
+        assert!(
+            search.bounds().bottom() <= auto.bounds().origin.y,
+            "the search is above the list it filters"
+        );
+    })
+    .unwrap();
+
+    // The keyboard walks the list, and the row it lands on is the one it wears.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.document_language_overrides
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("plaintext"),
+            "the keyboard chose the row it was on"
+        );
+    });
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn a_reader_can_force_the_grammar_a_file_wears(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let path = "notes-without-an-extension";
+    let source = "name: muster\ncount: 42\nenabled: true\n";
+    std::fs::write(fixture.root.join(path), source).unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, path.into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == path)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("document-grammar").label(),
+            Some("Choose syntax highlighting language, currently Auto (no highlighting)")
+        );
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| window.input("yaml", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let state = fixture.view.read_with(cx, |app, _| {
+        app.document_view.as_ref().unwrap().state.clone()
+    });
+    assert_eq!(
+        state.read_with(cx, |state, _| state.language_name().to_string()),
+        "yaml"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        assert!(
+            state.read(cx).focus_handle(cx).is_focused(window),
+            "choosing a grammar returns focus to the editor"
+        );
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.document_language_overrides
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("yaml")
+        );
+        assert!(
+            !app.document_grammar_open,
+            "choosing a grammar closes its menu"
+        );
+    });
+    let (yaml_colors, plain_colors) = cx.update(|cx| {
+        let text = state.read(cx).text().clone();
+        let theme = gpui_kit::component::Theme::global(cx);
+        let colors = |language: &str| {
+            let mut highlighter =
+                gpui_kit::component::highlighter::SyntaxHighlighter::new(language);
+            highlighter.update(None, &text, None);
+            highlighter
+                .styles(&(0..source.len()), theme.highlight_theme.as_ref())
+                .iter()
+                .filter_map(|(_, style)| style.color)
+                .collect::<Vec<_>>()
+        };
+        (colors("yaml"), colors("plaintext"))
+    });
+    assert!(yaml_colors
+        .iter()
+        .any(|color| Some(color) != yaml_colors.first()));
+    assert_ne!(
+        yaml_colors, plain_colors,
+        "forcing YAML changes token colours"
+    );
+
+    // A choice follows the file through another document instead of staying on the pane.
+    let other_path = "other.txt";
+    std::fs::write(fixture.root.join(other_path), "plain\n").unwrap();
+    for selected_path in [other_path, path] {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+                app.request_document(repo, checkout, selected_path.into(), window, cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+            fixture
+                .view
+                .read(cx)
+                .open_document
+                .as_ref()
+                .is_some_and(|(_, preview)| preview.path == selected_path)
+        })
+        .await;
+    }
+    let restored = fixture.view.read_with(cx, |app, _| {
+        app.document_view.as_ref().unwrap().state.clone()
+    });
+    assert_eq!(
+        restored.read_with(cx, |state, _| state.language_name().to_string()),
+        "yaml",
+        "the file keeps its forced grammar when reopened"
+    );
+
+    // The search filters the whole list, Plain text among it: a row nobody can
+    // reach is a row that does not exist, so it is typed for.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| window.input("plain", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("document-grammar-0").label(),
+            Some("Plain text"),
+            "the search leaves the row it names"
+        );
+        window.click("document-grammar-0", cx);
+    })
+    .unwrap();
+    let plain_text = fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.document_language_overrides
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("plaintext")
+        );
+        app.document_view.as_ref().unwrap().state.clone()
+    });
+    assert_eq!(
+        plain_text.read_with(cx, |state, _| state.language_name().to_string()),
+        "plaintext"
+    );
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-grammar-0", cx);
+    })
+    .unwrap();
+    let restored = fixture.view.read_with(cx, |app, _| {
+        assert!(app.document_language_overrides.is_empty());
+        app.document_view.as_ref().unwrap().state.clone()
+    });
+    assert_eq!(
+        restored.read_with(cx, |state, _| state.language_name().to_string()),
+        "plaintext",
+        "Auto restores the extension's choice"
+    );
+    close(&fixture, cx);
+}
+
 #[gpui_kit::test]
 async fn a_refresh_during_a_status_read_is_coalesced_not_lost(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -2068,6 +2347,10 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
             window.try_find("document-markdown").is_some(),
             "a Markdown file is read as a document"
         );
+        assert!(
+            window.try_find("document-grammar").is_none(),
+            "rendered Markdown has no source grammar selector"
+        );
         assert_eq!(
             window.find("document-toggle-reading").label(),
             Some("Read this document as its source"),
@@ -2100,6 +2383,10 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
         assert!(
             window.try_find("document-toggle-reading").is_some(),
             "and the header still offers the other reading"
+        );
+        assert!(
+            window.try_find("document-grammar").is_some(),
+            "the source reading offers a grammar selector"
         );
     })
     .unwrap();

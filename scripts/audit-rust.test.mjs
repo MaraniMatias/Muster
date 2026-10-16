@@ -19,6 +19,13 @@ import {
   PATCHED_ALACRITTY_TREE_SHA256,
   patchedAlacrittyTreeSha256,
 } from "./patched-alacritty.mjs";
+import {
+  auditedPatchedGitignore,
+  PATCHED_GITIGNORE_ARCHIVE_SHA256,
+  PATCHED_GITIGNORE_DIR,
+  PATCHED_GITIGNORE_TREE_SHA256,
+  patchedGitignoreTreeSha256,
+} from "./patched-gitignore.mjs";
 
 function response(results, ok = true, status = 200) {
   return { ok, status, json: async () => ({ results }) };
@@ -48,6 +55,22 @@ function patchedAlacrittyPackage() {
         id: `path+file://${manifestPath}#alacritty_terminal@0.26.0`,
         name: "alacritty_terminal",
         version: "0.26.0",
+        source: null,
+        manifest_path: manifestPath,
+      },
+    ],
+  })[0];
+}
+
+function patchedGitignorePackage() {
+  const manifestPath = join(PATCHED_GITIGNORE_DIR, "Cargo.toml");
+  return parseCargoMetadata({
+    workspace_members: [APP_ID],
+    packages: [
+      {
+        id: `path+file://${manifestPath}#konomanoasa-tree-sitter-gitignore@0.3.1`,
+        name: "konomanoasa-tree-sitter-gitignore",
+        version: "0.3.1",
         source: null,
         manifest_path: manifestPath,
       },
@@ -141,6 +164,28 @@ test("the pinned alacritty patch is accepted and its pinned digest describes the
   assert.equal(alacritty.version, "0.26.0");
   assert.equal(alacritty.source, null);
   assert.ok(isAuditedAlacritty(alacritty));
+});
+
+test("the Gitignore grammar is accepted only with its pinned source tree", () => {
+  assert.equal(patchedGitignoreTreeSha256(), PATCHED_GITIGNORE_TREE_SHA256);
+  assert.match(PATCHED_GITIGNORE_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
+
+  const grammar = patchedGitignorePackage();
+  assert.equal(grammar.name, "konomanoasa-tree-sitter-gitignore");
+  assert.equal(grammar.version, "0.3.1");
+  assert.equal(grammar.source, null);
+});
+
+test("editing the vendored Gitignore grammar breaks its pinned hash", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "muster-vendored-gitignore-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const copy = join(directory, "gitignore");
+  cpSync(PATCHED_GITIGNORE_DIR, copy, { recursive: true });
+  assert.equal(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
+
+  const patched = join(copy, "src/scanner.c");
+  writeFileSync(patched, `${readFileSync(patched, "utf8")}\n/* quiet edit */\n`);
+  assert.notEqual(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
 });
 
 test("a registry-sourced alacritty_terminal is not the patched package", () => {

@@ -221,6 +221,15 @@ const VUE_HIGHLIGHTS: &str = r#"
 (element) @none
 "#;
 
+const DOTENV_HIGHLIGHTS: &str = r#"
+(comment) @comment
+(variable_assignment name: (variable_name) @property value: (_) @string)
+(string) @string
+(raw_string) @string
+"=" @operator
+"$" @operator
+"#;
+
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
 pub fn install(cx: &mut App) {
@@ -272,6 +281,34 @@ pub fn install(cx: &mut App) {
                 "",
             ),
         );
+        registry.register(
+            "gitignore",
+            &LanguageConfig::new(
+                "gitignore",
+                tree_sitter_gitignore::LANGUAGE.into(),
+                Vec::new(),
+                tree_sitter_gitignore::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
+        );
+        registry.register(
+            "ini",
+            &LanguageConfig::new(
+                "ini",
+                tree_sitter_ini::LANGUAGE.into(),
+                Vec::new(),
+                tree_sitter_ini::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
+        );
+        // Dotenv is shell-style assignments; reuse the installed Bash parser
+        // and query under Dotenv's own selectable name.
+        let mut dotenv = registry.language("bash").expect("Bash grammar enabled");
+        dotenv.name = "dotenv".into();
+        dotenv.highlights = DOTENV_HIGHLIGHTS.into();
+        registry.register("dotenv", &dotenv);
         // And then one rule for every grammar there is, so a name none of them
         // can be painted in is never emitted in the first place.
         for name in registry.languages() {

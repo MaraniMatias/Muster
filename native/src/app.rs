@@ -448,6 +448,27 @@ pub struct TerminalWindow {
     pub(crate) open_document: Option<(String, FilePreview)>,
     pub(crate) document_target: Option<(String, String)>,
     pub(crate) document_view: Option<crate::document::DocumentView>,
+    /// File-local syntax choices, kept only for this window's lifetime.
+    pub(crate) document_language_overrides: HashMap<String, String>,
+    pub(crate) document_grammar_open: bool,
+    /// Which row of the grammar menu the keyboard is on, counted over the rows
+    /// the search left rather than over every grammar.
+    pub(crate) document_grammar_highlight: usize,
+    pub(crate) document_grammar_query_watch: Option<Subscription>,
+    /// The window's claim on the Return key while the grammar menu is open.
+    ///
+    /// A popover treats Return as "close me", and the menu's own search field
+    /// swallows it before either, so a menu that answered Return from a key
+    /// listener would be closed without a row ever being chosen. An
+    /// interceptor is the one place that runs before both. It is held here so
+    /// it lives as long as the window does.
+    _grammar_enter: Subscription,
+    /// The grammar menu's search field, held while the menu is open so the
+    /// keyboard can ask it what it says.
+    pub(crate) document_grammar_query: Option<Entity<InputState>>,
+    /// What the search field said last time it was read, so a `Change` that
+    /// changed nothing does not send the keyboard back to the top of the list.
+    pub(crate) document_grammar_query_seen: String,
     pub(crate) open_diff: Option<(String, Option<String>)>,
     pub(crate) expanded_diffs: HashSet<(String, String)>,
     pub(crate) file_request: HashMap<(String, String), u64>,
@@ -523,6 +544,20 @@ pub struct TerminalWindow {
 
 impl TerminalWindow {
     fn empty(backend: Arc<TerminalBackend>, owns_backend: bool, cx: &mut Context<Self>) -> Self {
+        let grammar_enter = {
+            let weak = cx.weak_entity();
+            cx.intercept_keystrokes(move |event, window, cx| {
+                if event.keystroke.key != "enter" {
+                    return;
+                }
+                let _ = weak.update(cx, |app, cx| {
+                    if app.document_grammar_open {
+                        app.confirm_document_grammar(window, cx);
+                        cx.stop_propagation();
+                    }
+                });
+            })
+        };
         Self {
             navigation: Navigation::new(),
             terminals: HashMap::new(),
@@ -540,6 +575,13 @@ impl TerminalWindow {
             open_document: None,
             document_target: None,
             document_view: None,
+            document_language_overrides: HashMap::new(),
+            document_grammar_open: false,
+            document_grammar_highlight: 0,
+            document_grammar_query_watch: None,
+            _grammar_enter: grammar_enter,
+            document_grammar_query: None,
+            document_grammar_query_seen: String::new(),
             open_diff: None,
             expanded_diffs: HashSet::new(),
             file_request: HashMap::new(),

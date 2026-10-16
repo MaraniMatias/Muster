@@ -9,14 +9,15 @@ Current suite results are canonical in [AP-11](audit-action-plan.md#ap-11).
 
 Count the distinct non-`plaintext` return values of
 `native/src/document.rs::syntax_language`, in both filename and extension arms:
-**35** — bash, c, cmake, cpp, csharp, css, diff, ejs, elixir, erb, go,
-graphql, html, java, javascript, json, kotlin, lua, make, markdown, php, proto,
-python, ruby, rust, scala, sql, svelte, swift, toml, tsx, typescript, vue, yaml,
-zig. SCSS maps to `css`; filename aliases do not add languages. This is a
-selector-output count, not a count of registry entries, Cargo features or grammar
-packages. JSDoc supports injections without being a selector output; the toolkit
-registers other names too. TypeScript/TSX can share a package. Making an existing
-grammar package a direct query dependency does not add another language/package.
+**38** — bash, c, cmake, cpp, csharp, css, diff, dotenv, ejs, elixir, erb,
+gitignore, go, graphql, html, ini, java, javascript, json, kotlin, lua, make,
+markdown, php, proto, python, ruby, rust, scala, sql, svelte, swift, toml, tsx,
+typescript, vue, yaml, zig. SCSS maps to `css`; filename aliases do not add
+languages. This is a selector-output count, not a count of registry entries,
+Cargo features or grammar packages. JSDoc supports injections without being a
+selector output; the toolkit registers other names too. TypeScript/TSX can share
+a package. Dotenv reuses Bash's parser with a file-specific query; Gitignore and
+INI have their own registered parsers.
 The earlier 32/33/34-crate narrative below is historical accounting, not an
 inventory rule.
 
@@ -78,7 +79,7 @@ answered `"plaintext"` for everything else, so `Cargo.toml`, `.py`, `.sh`, `.go`
 | `native/src/document.rs` | `syntax_language` answers from an extension table derived from Legacy's, plus a filename table for `Makefile`, `CMakeLists.txt` and the shell/JSON dotfiles. Unknown formats still open as plain text. |
 | `native/src/diff.rs` | Names the diff chrome's face and size (11px), restores the status letter before the path at 10px, and moves the counts to Legacy's `--success-fg`/`--danger-fg` inks. |
 | `native/src/inspector.rs` | Rows are hand-drawn: Legacy's columns, the 16px fold slot, 13px names, 10px status, 13px counts, the accent bar, and hover/selection/press ink. Tabs carry the accent underline instead of a wash. |
-| `native/Cargo.toml`, `Cargo.lock` | Enables selected toolkit grammars and Vue; direct query dependencies reuse packages already in the graph. See the current selector-output inventory above rather than adding dependency counts. |
+| `native/Cargo.toml`, `Cargo.lock` | Enables selected toolkit grammars, Vue, INI and the pinned Gitignore parser; Dotenv reuses Bash's parser. See the current selector-output inventory above rather than adding dependency counts. |
 | `docs/native-rust-migration/{interface-parity,dark-colors}.md` | The delivered slice and the differences that remain. |
 
 ### The grammar set
@@ -170,11 +171,12 @@ pixels. That gap is stated rather than closed.
   **Current:** Files measures its widest row and scrolls sideways; Changes fits
   panel-width rows and shortens names. See
   [opening, reading and scrolling](opening-reading-and-scrolling.md).
-- XML, INI and Dockerfile still open as plain text, and there is no manual
-  language picker. So do the other forty-odd formats Legacy highlighted and no
-  grammar here reaches: `.gitignore` and every other dotfile Legacy read as INI,
-  `.ps1`, `.less`, `.sass`, `.tf`, `.tex`, `.pl`, `.r` and the rest. Each one
-  would need a grammar crate of its own.
+- XML and Dockerfile still open as plain text. Git ignore files use the
+  dedicated Gitignore grammar; `.gitattributes`, `.gitconfig`, `.gitmodules` and
+  other Legacy INI dotfiles use INI. `.env` and `.env.*` use a Dotenv-specific
+  query over Bash's parser; `.envrc` remains plain text, matching Legacy. Other
+  unsupported formats such as `.ps1`, `.less`, `.sass`, `.tf`, `.tex`, `.pl` and
+  `.r` still open as plain text.
 
 ## Historical security note (not a current vulnerability lookup)
 

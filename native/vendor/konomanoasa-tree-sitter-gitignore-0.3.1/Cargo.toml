@@ -1,0 +1,27 @@
+# Muster's copy of the published manifest, with the build dependency narrowed and
+# the archive's own test target dropped. See PATCHES.md; do not edit by hand.
+
+[package]
+edition = "2024"
+name = "konomanoasa-tree-sitter-gitignore"
+version = "0.3.1"
+build = "bindings/rust/build.rs"
+links = "tree-sitter-gitignore"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Tree-sitter grammar for gitignore."
+license = "MIT"
+repository = "https://github.com/konomanoasa/tree-sitter-gitignore"
+
+[lib]
+name = "konomanoasa_tree_sitter_gitignore"
+path = "bindings/rust/lib.rs"
+
+[dependencies.tree-sitter-language]
+version = "0.1.8"
+
+[build-dependencies.cc]
+version = "~1.2.1"

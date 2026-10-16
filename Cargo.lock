@@ -3807,6 +3807,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "konomanoasa-tree-sitter-gitignore"
+version = "0.3.1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4244,7 +4252,9 @@ name = "muster"
 version = "0.0.0"
 dependencies = [
  "alacritty_terminal",
+ "gpui-component",
  "gpui-kit",
+ "konomanoasa-tree-sitter-gitignore",
  "libc",
  "log",
  "muster-core",
@@ -4253,6 +4263,7 @@ dependencies = [
  "tempfile",
  "tree-sitter-c-sharp",
  "tree-sitter-cmake",
+ "tree-sitter-ini",
  "tree-sitter-swift",
  "tree-sitter-vue-updated",
  "ttf-parser",
@@ -7362,6 +7373,16 @@ name = "tree-sitter-html"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ini"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "387f79682cd53b7c0a5777c96e601a02b9965a787984ef86dbb8952bdab2d62f"
 dependencies = [
  "cc",
  "tree-sitter-language",

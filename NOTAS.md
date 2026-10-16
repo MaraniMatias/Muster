@@ -2,95 +2,7 @@
 
 ## A · Documento, previews y diff
 
-- [x] imagees previews, svg
-      Ya andaban; faltaba comprobarlo. PNG, SVG (rasterizado, se decide por el
-      nombre porque no tiene header) y el resto de formatos se dibujan.
-      Tests: `a_rendered_document_draws_an_svg_beside_every_other_picture`.
-- [x] archivos con changes, tab/btn para ver los cambios directamtne
-      El botón está dibujado (`native/src/document.rs:728-770`, con `+n/-n` y
-      `open_changes(checkout, Some(path))`), pero en la app no salía casi nunca:
-      se dibujaba solo si `git_status` ya tenía el archivo, y nadie pedía ese
-      status al abrir un documento. El tick de mantenimiento de 2 s lo pedía cada
-      10 s y solo para el checkout activo — con la barra lateral cerrada, nunca.
-      - Arreglo: el frame que instala la vista del documento pide el status de su
-        checkout (`document.rs:530`, dentro del `new_view`). Sin guarda a propósito:
-        `git_status` cacheado significa "ya tenemos respuesta", no "la respuesta es
-        de este archivo" — con la guarda, un archivo editado después del último
-        status se quedaba sin botón hasta el tick.
-      - Test: `a_document_offers_the_changes_of_a_file_that_has_them`, sin el
-        `read_status` previo. Falla sin el arreglo y pasa con él.
-      - Efecto colateral que sí cambió: abrir un documento ahora agenda una lectura
-        de Git, así que el test de imágenes del documento ya no puede medir "el
-        primer frame no dibujó la foto" — el scheduler puede dibujar y correr una
-        lectura antes de que el test lo pida. Ese test ahora afirma lo que sigue
-        valiendo en cualquier orden: el elemento y el store coinciden, y la foto se
-        leyó una vez.
-- [x] editoar simple funcionar, con save/cancel, foramte como en legacy
-      Barra al pie con Cancel/Save (Esc y ⌘S). El save compara contra el texto leído
-      y se niega a pisar lo que otro escribió (`core::files::write_preview`).
-      Test: `an_edited_document_saves_or_throws_itself_away`.
-  - [ ] Falta el botón de formatear (Prettier) que tenía Legacy. No hay Node acá.
-- [x] espacion entre texto y imagenes en privews de md, video o archivo no prosedsa
-      mostrar el alias, y entodo caso [image: file:...]
-      El aire va dentro de la caja (el toolkit mide un inline como root: un margin
-      ahí se mide a cero) y video/audio/archivo se dibujan en su propia caja, con el
-      mismo aire que una imagen.
-      Test: `what_a_document_cannot_draw_is_said_in_a_box_of_its_own`.
-      El rótulo queda como está: con alt, el alt tal cual (`The demo`); sin alt,
-      `Video: assets/demo.mp4` / `File: docs/notes.pdf`.
-- [ ] selector de gramática en la barra del documento: Auto o forzar una
-      Lo que en Legacy decía qué gramática llevaba el archivo: en **Auto** manda la
-      extensión — que es lo que hace hoy `native` — y el lector podía forzar cualquier
-      gramática de la lista o bajar a **Plain text**
-      (`legacy/src/components/DocumentPane.vue:225-308` y el popover en
-      `1013-1072`). Ojo: es el *highlight*, no el botón de formatear con Prettier de
-      más abajo, que es otra cosa.
-      - El botón dice la verdad: en Auto muestra la gramática detectada, y si la
-        extensión no nombra ninguna, `Auto (no highlighting)` en vez de un lenguaje
-        que no se está aplicando (`DocumentPane.vue:253-260`).
-      - La elección es del archivo y no del panel, y muere con la ventana: un mapa en
-        memoria por `checkout\0origin\0path` (`DocumentPane.vue:212-224`), ni la base
-        ni `~/.muster`.
-      - La búsqueda filtra gramáticas, nunca Auto ni Plain text: son las dos formas
-        de salir de una forzada (`DocumentPane.vue:298-308`).
-      - Solo aparece cuando hay lectura de código en el pane y no toca la lectura
-        renderizada de un Markdown. Tampoco el diff, que se resalta por path igual
-        que en Legacy.
-      - Toca: `native/src/document.rs`. Hoy el idioma es `syntax_language(path)`
-        (línea 161) y se pasa una sola vez al crear el editor (línea 64): hace falta el
-        override en el estado del documento y un popover en la cabecera. No hace falta
-        recrear el editor — `EditorState::set_highlighter(name, cx)` ya existe en el
-        toolkit y conserva undo, selección y scroll, que es lo que Legacy perdía al
-        releer el archivo.
-      - La lista son las gramáticas que compila `native/Cargo.toml`, más Vue que
-        registra `theme::install`. Ofrecer una que el toolkit no tiene abre el archivo
-        sin colorear, que es lo mismo que Auto.
-      - Test: `a_reader_can_force_the_grammar_a_file_wears` — un archivo sin extensión
-        conocida, se fuerza YAML, los tokens cambian; y de vuelta a Auto.
-
-## B · Mensajes → toast
-
-- [x] mensajes y alertas globales como toast
-      Nuevo `native/src/toast.rs`, conectado al root y a todos los lugares que antes
-      escribían `failure`/`notice`. Sigue Legacy: niveles `error`/`info`, seis y tres
-      segundos, máximo tres; un mensaje idéntico al más nuevo reinicia su reloj. Cada
-      toast tiene su botón de cerrar, y la capa de ancho completo no registra eventos
-      de puntero: el espacio entre y alrededor de las tarjetas sigue siendo click-through.
-      Los errores que pertenecen a un diálogo o a una fila siguen ahí; solo los mensajes
-      globales de la ventana pasan a la pila.
-      Tests: `toast::tests::*`, `a_refused_input_reaches_the_window_toast` y
-      `a_refused_link_is_said_in_the_window_and_dismissed`.
-
-## C · Color por estado del proceso
-
-Toca: `native/src/sidebar.rs` (y `theme.rs` solo si falta un rol).
-
-- [x] colores segun se ejecuta un proceso o fallo
-      Ya estaba: `sidebar.rs:995-1004` pinta el icono de la sesión con
-      `roles.status.warning` / `danger_text` / `success` / `text_muted`. La nota decía
-      que `busy` y `failed` solo alimentaban el texto de accesibilidad — eso ya no es
-      cierto. Lo que no se pinta es el nombre de la fila, que es lo que hacía Legacy y
-      no es un bug.
+- [ ] Editor simeple agregar  footter con icon de format y btn cancel save, como en legacy
 
 ## D · Chrome de la app
 
@@ -117,23 +29,6 @@ No tocan el producto; van al final.
       analizar bien esos casos
       Necesita una decisión antes: ¿`legacy/` entra en la limpieza? AGENTS.md lo
       declara material de referencia congelado, y "obsoleto" lo alcanza.
-
-## F · Highlight de Vue — hecho
-
-- [x] mejoraar highline en vue
-      El problema no era el color: era que el atributo simple y el tag se pintaban
-      igual. Legacy leía un `.vue` con la gramática TextMate de Shiki, donde el
-      atributo y la directiva son dos escrituras de lo mismo y ambos llegan al
-      token de función; la gramática que usamos mandaba el atributo a `attribute`,
-      que es el color del tag, así que `class` salía idéntico a `<p>` y solo un
-      atributo con `:` o `@` parecía algo. Una línea de query lo arregla:
-      `(attribute_name) @function`, antes de la query de la gramática porque el
-      highlighter toma el primer patrón que matchea.
-      Test: `theme::tests::a_vue_attribute_is_not_painted_like_a_tag`, que compara
-      el color real del archivo contra `legacy/src/muster.css`.
-  - [ ] Inyectar JavaScript en los bindings (`{{ }}`, `:prop="…"`). **Decidido que
-        no**: es más grande que Legacy y Legacy tampoco lo hacía — ahí el valor
-        queda en texto normal. Si algún día se quiere, es un `VUE_INJECTIONS` más.
 
 ## G · Notas de review sobre el diff
 
