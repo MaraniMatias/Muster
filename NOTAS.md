@@ -125,30 +125,6 @@ No tocan el producto; van al final.
         no**: es más grande que Legacy y Legacy tampoco lo hacía — ahí el valor
         queda en texto normal. Si algún día se quiere, es un `VUE_INJECTIONS` más.
 
----
-
-## Preguntas abiertas
-
-Ninguna.
-
-Resuelto y cerrado:
-
-- El rótulo de lo que un documento no puede dibujar. El punto pedía «mostrar el
-  alias, y en todo caso `[image: file:...]`»; lo que ya hace es lo pedido: con alt
-  el alt tal cual, sin alt el tipo y el nombre (`Video: assets/demo.mp4`).
-- El highlight de Vue (grupo F): era el editor nativo, no la app de `legacy/`.
-
-## Diferencias que quedan contra Legacy (a propósito)
-
-Verificadas corriendo las dos gramáticas sobre el mismo `.vue`:
-
-- El valor de un binding (`:title="name"` → `name`) lo pintamos en ámbar; Legacy
-  lo dejaba en texto normal.
-- Los delimitadores de `{{ }}` los pintamos en gris; Legacy en texto normal.
-
-Las dos son Legacy pintando *menos*. Se dejan así: la paridad es el criterio del
-repo y nadie las mencionó al mirar el archivo.
-
 ## G · Notas de review sobre el diff
 
 Toca: `native/src/diff.rs`, `core/src/files.rs`, y una sesión con agente que hoy no
@@ -210,3 +186,7 @@ ReviewNoteList}.vue`, `src-tauri/src/{domain,services,commands}/review*.rs`.
         escrita. Decidir antes de escribir la primera línea.
       - Test: dos exports con el mismo timestamp producen `<stem>.md` y `<stem>-2.md`, y
         un archivo sin el marcador sobrevive a "borrar la carpeta".
+
+## Otors
+
+- [ ] Carpetas vacias, no mostrar arrow
