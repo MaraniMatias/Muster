@@ -1,4 +1,4 @@
-//! Safe, bounded, read-only access to files within a registered checkout.
+//! Safe, bounded access to files within a registered checkout.
 //!
 //! Four rules hold for everything here:
 //!
@@ -23,6 +23,11 @@
 //!   redirecting the rest of it, and a directory that moves after it was opened
 //!   keeps the handle that named it.
 //!
+//! Reading and writing share one boundary. A write adds the two rules only a
+//! writer has: the file must still hold the bytes the caller read
+//! ([`write_preview`] compares rather than overwrites), and a read-only file is
+//! refused rather than quietly made writable.
+//!
 //! What is deliberately not offered yet, so a caller is not surprised by it:
 //!
 //! * Symlinks are neither listed nor followed, so a checkout containing them shows
@@ -36,9 +41,9 @@ use std::{
     cmp::Ordering,
     ffi::{CStr, CString, OsStr},
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -453,6 +458,158 @@ pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<File
     })
 }
 
+/// The refusal a write offers when the bytes on disk are not the bytes the
+/// caller read.
+///
+/// Not a conflict to resolve: it is the reason the save did not happen, and it
+/// names the way out rather than the state.
+const CHANGED_ON_DISK: &str = "file changed on disk; reload it before saving";
+
+/// Replace one text file inside a checkout, or refuse it.
+///
+/// The same walk a read is [(`read_preview`)] answered by — the registered
+/// checkout, a relative name, no `.git`, every component opened under the
+/// descriptor of the one before it with `O_NOFOLLOW`, and an entry that has to
+/// still be a regular file — plus the two rules a writer owes on top of it:
+///
+/// - **The bytes on disk are still the bytes that were read.** `expected` is
+///   what the caller was shown, compared against the file itself rather than
+///   against anything the caller kept: an edit made in another window, or by the
+///   tool this document was opened from, is somebody else's text and is not
+///   overwritten by this save.
+/// - **A read-only file stays read-only.** The replacement is a rename into the
+///   directory, which needs write access to the *directory* rather than to the
+///   file, so a save would quietly undo the bit somebody set. It is refused
+///   instead.
+///
+/// The write itself is atomic: the bytes go to a fresh file beside it and that
+/// file is renamed over the name. A reader therefore sees the old text or the
+/// new one, never half of either, and a failure part way through leaves the
+/// original as it was.
+pub fn write_preview(
+    repo: &Repo,
+    checkout: &Checkout,
+    path: &str,
+    expected: &str,
+    content: &str,
+) -> Result<(), String> {
+    let root = root(repo, checkout)?;
+    let relative = relative(path)?;
+    let too_large = "file is larger than the 1 MiB preview limit";
+    // The bound is the preview's, because the file being written is a file that
+    // could be previewed: a save cannot make a file this app cannot open.
+    if content.len() > MAX_PREVIEW_BYTES || content.contains('\0') {
+        return Err(if content.contains('\0') {
+            "binary files cannot be previewed".into()
+        } else {
+            too_large.into()
+        });
+    }
+    let name = relative.file_name().ok_or(NOT_REGULAR)?;
+    let root_handle = open_root(&root).map_err(|e| e.to_string())?;
+    let parent = open_directory(&root_handle, relative.parent().unwrap_or(Path::new("")))
+        .map_err(|e| e.to_string())?;
+    let name = name_of(name).map_err(|e| e.to_string())?;
+    // Opened through the walk rather than by path, so a link exchanged for the
+    // file is refused instead of being written through.
+    let file = open_file(&parent, &name).map_err(|e| e.to_string())?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("could not inspect file: {error}"))?;
+    if !opened.is_file() {
+        return Err(NOT_REGULAR.into());
+    }
+    if opened.len() > MAX_PREVIEW_BYTES as u64 {
+        return Err(too_large.into());
+    }
+    // `O_NOFOLLOW` opened a real file rather than a link, so what follows reads
+    // and writes the file this walk validated.
+    let mode = opened.permissions().mode() & 0o7777;
+    if mode & 0o222 == 0 {
+        return Err("file is read-only".into());
+    }
+    let current = read_whole(file, MAX_PREVIEW_BYTES, too_large)?;
+    if current.contains(&0) {
+        return Err("binary files cannot be previewed".into());
+    }
+    let current = String::from_utf8(current).map_err(|_| "file is not valid UTF-8".to_owned())?;
+    if current != expected {
+        return Err(CHANGED_ON_DISK.into());
+    }
+    replace(&parent, &name, content.as_bytes(), mode)
+}
+
+/// What a replacement leaves behind when it cannot be finished.
+const ORPHANED: &str = "could not replace file";
+
+/// Write `bytes` beside the file and rename it over the name.
+///
+/// The temporary file is created under the directory handle the walk already
+/// validated, exclusively and without following anything, so a name that is
+/// already there is a failure rather than a file somebody else's bytes land in.
+fn replace(parent: &OwnedFd, name: &CStr, bytes: &[u8], mode: u32) -> Result<(), String> {
+    let temporary = temporary_name()?;
+    let held = name_of(OsStr::new(&temporary)).map_err(|error| error.to_string())?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            held.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | WALK_FLAGS,
+            // Private while it is being written, and given the mode the file had
+            // before the rename: `umask` may take bits off the mode a file is
+            // created with, and a replacement must not quietly change the
+            // permissions of the file it replaces.
+            0o600,
+        )
+    };
+    let mut file = match descriptor(fd) {
+        Ok(fd) => File::from(fd),
+        Err(error) => return Err(format!("could not write file: {error}")),
+    };
+    let written = (|| {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("could not write file: {error}"))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("could not write file: {error}"))
+    })();
+    // Dropped before the rename: the descriptor has to be closed for the name
+    // the file answers to to be the new one.
+    drop(file);
+    if let Err(error) = written {
+        unsafe { libc::unlinkat(parent.as_raw_fd(), held.as_ptr(), 0) };
+        return Err(error);
+    }
+    // `renameat` replaces the name itself and never follows it, so a link that
+    // replaced the file while the bytes were being written is replaced by them
+    // rather than written through.
+    if unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            held.as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        unsafe { libc::unlinkat(parent.as_raw_fd(), held.as_ptr(), 0) };
+        return Err(format!("{ORPHANED}: {error}"));
+    }
+    Ok(())
+}
+
+/// A name no replacement in this process is using.
+///
+/// `O_EXCL` makes a collision a failure rather than a corruption, and this is
+/// what keeps a collision from being somebody else's file: the pid separates two
+/// Muster windows and the counter separates two saves inside one.
+fn temporary_name() -> Result<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(format!(".muster-save-{}-{count}.tmp", std::process::id()))
+}
+
 /// Read a whole file out of a checkout as bytes, or refuse it.
 ///
 /// The same boundary a preview is read through -- [`open_regular`] decides what
@@ -520,7 +677,7 @@ mod tests {
     use std::{
         fs,
         io::Write,
-        os::unix::{fs::symlink, net::UnixListener},
+        os::unix::{fs::symlink, fs::PermissionsExt, net::UnixListener},
     };
     use tempfile::{tempdir, TempDir};
 
@@ -1151,5 +1308,166 @@ mod tests {
         assert_eq!(made, 0, "a FIFO to refuse");
         let (repo, checkout) = checkout_of(&dir);
         assert!(external_path(&repo, &checkout, "pipe").is_err());
+    }
+
+    /// A save replaces the bytes the reader was shown, and nothing else.
+    ///
+    /// The compare is the whole of what stops two writers from each saving over
+    /// the other, so it is asked in both directions: the bytes that are there
+    /// are the ones this save expected, and bytes that are not are refused
+    /// rather than overwritten.
+    #[test]
+    fn a_write_replaces_the_bytes_it_expected_and_refuses_any_others() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        fs::write(dir.path().join("other.txt"), "other").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+
+        write_preview(&repo, &checkout, "hello.txt", "hello", "hello there").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hello there"
+        );
+
+        // Somebody else wrote between the read and the save.
+        assert_eq!(
+            write_preview(&repo, &checkout, "other.txt", "what was read", "mine").unwrap_err(),
+            CHANGED_ON_DISK
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+            "other",
+            "the refused save left the file as it was"
+        );
+        // Even the empty expected value is a claim about the bytes.
+        assert_eq!(
+            write_preview(&repo, &checkout, "other.txt", "", "mine").unwrap_err(),
+            CHANGED_ON_DISK
+        );
+        // And the file that was saved can be saved again from what it now holds.
+        write_preview(&repo, &checkout, "hello.txt", "hello there", "again").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "again"
+        );
+    }
+
+    /// Everything a read refuses, a write refuses too, because the boundary that
+    /// decides what may be touched is the same walk and the same name rules.
+    #[test]
+    fn a_write_is_refused_wherever_a_read_is() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        fs::write(dir.path().join("binary.bin"), [0x00, 0x01]).unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/inner.txt"), "inner").unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/config"), "[core]").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .unwrap();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+
+        for refused in [
+            // A link, an ancestor that is one, and the store.
+            "link.txt",
+            "escape/secret.txt",
+            ".git/config",
+            // Names a checkout cannot answer for at all.
+            "../escape",
+            "/etc/passwd",
+            "sub",
+            "docs",
+            "missing.txt",
+            "",
+        ] {
+            assert!(
+                write_preview(&repo, &checkout, refused, "", "mine").is_err(),
+                "{refused} was written"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret",
+            "nothing outside the checkout was written"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+            "[core]"
+        );
+
+        // A file that is not text, a write that is not text, and a write past the
+        // bound the file it replaces is read through.
+        assert!(write_preview(&repo, &checkout, "binary.bin", "", "mine").is_err());
+        assert!(write_preview(&repo, &checkout, "hello.txt", "hello", "a\0b").is_err());
+        assert!(write_preview(
+            &repo,
+            &checkout,
+            "hello.txt",
+            "hello",
+            &"a".repeat(MAX_PREVIEW_BYTES + 1)
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hello",
+            "no refusal left anything behind"
+        );
+    }
+
+    /// A replacement is the same file as far as everything else is concerned: the
+    /// mode it had is the mode it keeps, a file somebody made read-only is
+    /// refused rather than quietly made writable, and nothing is left beside it.
+    #[test]
+    fn a_write_keeps_the_file_it_replaces() {
+        let dir = tempdir().unwrap();
+        let made = dir.path().join("script.sh");
+        fs::write(&made, "echo old").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&made, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+
+        write_preview(&repo, &checkout, "script.sh", "echo old", "echo new").unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "the replacement carries the mode the file had"
+        );
+        assert_eq!(
+            fs::read_to_string(&made).unwrap(),
+            "echo new",
+            "an executable is not written as one that cannot be run"
+        );
+
+        // Read-only is a decision somebody made outside this app: a rename into
+        // the directory would need the directory's write access rather than the
+        // file's, and the save would succeed and the bit would be gone.
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&made, std::fs::Permissions::from_mode(0o444)).unwrap();
+            assert_eq!(
+                write_preview(&repo, &checkout, "script.sh", "echo new", "echo again").unwrap_err(),
+                "file is read-only"
+            );
+            assert_eq!(fs::read_to_string(&made).unwrap(), "echo new");
+        }
+
+        // The temporary file is gone either way: the directory holds the file and
+        // nothing this app left behind.
+        let left = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            left,
+            ["script.sh"],
+            "a save left something behind: {left:?}"
+        );
     }
 }

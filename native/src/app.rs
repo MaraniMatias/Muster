@@ -2361,6 +2361,14 @@ impl TerminalWindow {
             cx.notify();
             return;
         }
+        // After the two Escapes above, because both of them are about something
+        // that is in front of the document: a drag in progress and a dialog are
+        // the person's Escape, and a draft is only what is left over.
+        if self.document_edit_key(&event.keystroke, window, cx) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let Some(shortcut) = shortcut(&event.keystroke) else {
             return;
         };

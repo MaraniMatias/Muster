@@ -469,9 +469,16 @@ const ROW_HEIGHT: f32 = 26.;
 /// what is above it. Legacy's test that pins this passes for the wrong reason — it runs
 /// in a DOM whose `clientHeight` is zero, so `maxStack` is zero there — and the rule it
 /// is pinning is the one written above.
+///
+/// Each pass measures what the stack hides from the row *on screen*, which never moves,
+/// and not from the row the last pass reached: Legacy's `nextTop` is the scroll offset
+/// plus the height of the stack, and the scroll offset is the one the tree was scrolled
+/// to. Accumulating instead walks down the tree until it runs out of rows and answers
+/// with whatever chain the last row it reached carries — nothing at all for a tree whose
+/// last row is a file at its root, which is what most trees end with.
 pub(crate) fn sticky_ancestors(rows: &[TreeRow<'_>], top: usize, stack: usize) -> Vec<Ancestor> {
-    let mut top = top.min(rows.len());
-    if top == 0 {
+    let screen = top.min(rows.len());
+    if screen == 0 {
         return Vec::new();
     }
     let ancestors = |at: usize| -> Vec<Ancestor> {
@@ -484,15 +491,16 @@ pub(crate) fn sticky_ancestors(rows: &[TreeRow<'_>], top: usize, stack: usize) -
             })
             .unwrap_or_default()
     };
-    let mut held = ancestors(top);
+    let mut at = screen;
+    let mut held = ancestors(at);
     for _ in 0..=stack {
         let hidden = stack.min(held.len()) + 1;
-        let next = top + hidden;
-        if next <= top || next > rows.len() {
+        let next = screen + hidden;
+        if next <= at || next > rows.len() {
             break;
         }
-        top = next;
-        held = ancestors(top);
+        at = next;
+        held = ancestors(at);
     }
     // Trimmed to what the panel holds, keeping the folders nearest the row on screen.
     held.split_off(held.len().saturating_sub(stack))

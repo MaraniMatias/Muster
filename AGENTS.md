@@ -17,15 +17,16 @@ docs/             the migration plan, and what the port has to satisfy
 ## Development and verification
 
 - The toolchain is pinned in `rust-toolchain.toml`. Use that `cargo`, not another
-  one that happens to be earlier in `PATH`: `rustup run 1.97.1 cargo ...`.
+  one that happens to be earlier in `PATH`. Put the directory returned by
+  `dirname "$(rustup which --toolchain 1.97.1 rustc)"` first on `PATH`, then
+  confirm both `rustc --version` and `cargo --version` are 1.97.1.
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
   --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
-- `core` holds 106 tests (102 inline plus the four-process instance-lock suite in
-  `core/tests/`) and `native` holds 293 default tests plus two ignored
-  performance checks (`scripts/perf-native.sh`). The PTY tests are `core`'s: they
-  came from the Tauri tree with the code, so a change in the number is a change
-  in what the crate owns.
+- Current test counts and exact run evidence live in
+  `docs/native-rust-migration/audit-action-plan.md` under AP-11; earlier task
+  counts are historical. Ignored performance checks use `scripts/perf-native.sh`.
+  The PTY tests belong to `core`, including its `core/tests/` instance-lock suite.
 - A focused test: `cargo test --locked -p muster-core pty::`.
 - The native app uses GPUI's `test-support` feature for headless UI coverage;
   `native/src/app.rs` uses it for the window, focus and close-path cases,
@@ -162,6 +163,29 @@ Three rules the tree depends on, each pinned by a test:
 - Every row is `flex_none`. A flex column will shrink its children to fit, and the rows
   then stood 21 pixels apart in a tree that scrolls by 26.
 
+## The document pane
+
+`native/src/document.rs` draws the file in place of the terminal, and it is an
+editor rather than a viewer: a typed character makes the document a draft, and a
+draft owns the pane's last row until it is saved or cancelled.
+
+Three rules it depends on, each pinned by a test:
+
+- A **save compares, it does not overwrite**. `core::files::write_preview` is
+  handed the text the document was opened with and refuses anything else, so an
+  edit made in another window — or by the tool this document was opened from — is
+  never written over by a save decided before it happened. A read-only file is
+  refused for the same reason Legacy refused one: the replacement is a rename into
+  the *directory*, which needs the directory's write access and would quietly undo
+  the bit somebody set.
+- **A draft is edited in its source.** The reading is a parse of the text as it
+  was read, so drawing it while the editor holds another one shows a document
+  that is no longer there. The reading is rebuilt from the saved text, which is
+  why a save and a new parse are one step rather than two.
+- **Dirty is a comparison, not an event.** `refresh_document_draft` asks the
+  editor's rope against the loaded text, so an undo back to what the file holds
+  ends the draft instead of leaving a state a draft can be stuck in.
+
 ## The vendored parser
 
 `native/vendor/alacritty_terminal-0.26.0` is a security backport, not vendored
@@ -189,6 +213,11 @@ that is not a workspace member will fail the audit closed, which is the intent.
 - A module that draws, takes a key event, or owns a widget belongs in `native`.
   The VT parser and the grid are here on purpose: nothing else parses terminal
   output, so a crate for them would have one caller.
+- Reading a checkout's files and writing one are the **same** boundary, in
+  `core::files`, for the reason above: a second path to a file on disk is a second
+  path policy. No write of a checkout's file anywhere in `native` goes around
+  `write_preview` — the workspace state in `~/.muster` is not one of them, and
+  `native/src/state_writer.rs` is its own thing.
 - `legacy/` is reference material. Reading it is expected; editing it is not, and
   nothing verifies it any more.
 

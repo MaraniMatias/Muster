@@ -1,5 +1,7 @@
 use super::*;
-use crate::app::sidebar_tests::{add_worktree, close, commit_all, open_git, GitFixture};
+use crate::app::sidebar_tests::{
+    add_worktree, close, commit_all, open_git, read_status, GitFixture,
+};
 use crate::inspector::{opens_elsewhere, sticky_ancestors, tree_window, within, Ancestor, TreeRow};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{point, px, TestAppContext};
@@ -432,6 +434,84 @@ fn legacy_tree<'a>(files: usize, entries: &'a mut Vec<FileEntry>) -> Vec<TreeRow
         ancestors: chain.clone(),
     }));
     rows
+}
+
+/// What the stack hides is measured from the row on screen on every pass, and not from the
+/// row the last pass reached.
+///
+/// The defect this pins: measured from the row the last pass reached, the walk keeps
+/// stepping down the tree and answers with the chain of whatever row it stops on — which
+/// for a tree that ends in a file at its root, as most listings do, is no folders at all.
+/// A tree deep enough to need a stack is walked all the way to that last row, so the stack
+/// it needs is the one that never appeared.
+#[test]
+fn a_narrowing_chain_is_stacked_from_the_row_on_screen() {
+    let mut entries = Vec::new();
+    // The shape of a listing: a folder open at the root, one open inside it, files
+    // under that, and then a file at the root again — which carries no folder.
+    let root: Rc<[Ancestor]> = vec![Ancestor {
+        path: "a".into(),
+        name: "a".into(),
+        depth: 0,
+        index: 0,
+    }]
+    .into();
+    let nested: Rc<[Ancestor]> = vec![
+        Ancestor {
+            path: "a".into(),
+            name: "a".into(),
+            depth: 0,
+            index: 0,
+        },
+        Ancestor {
+            path: "a/b".into(),
+            name: "b".into(),
+            depth: 1,
+            index: 1,
+        },
+    ]
+    .into();
+    entries.push(entry_at("a", 0, true));
+    entries.push(entry_at("b", 1, true));
+    for index in 0..40 {
+        entries.push(entry_at(&format!("f{index}"), 2, false));
+    }
+    entries.push(entry_at("loose.txt", 0, false));
+    let entries: &[FileEntry] = &entries;
+    let mut rows = vec![
+        TreeRow::Entry {
+            entry: &entries[0],
+            depth: 0,
+            ancestors: root.clone(),
+        },
+        TreeRow::Entry {
+            entry: &entries[1],
+            depth: 1,
+            ancestors: nested.clone(),
+        },
+    ];
+    rows.extend(entries[2..42].iter().map(|entry| TreeRow::Entry {
+        entry,
+        depth: 2,
+        ancestors: nested.clone(),
+    }));
+    rows.push(TreeRow::Entry {
+        entry: &entries[42],
+        depth: 0,
+        ancestors: Rc::from(Vec::new()),
+    });
+    // Every row under `b` names the two folders it is in: the answer is the chain
+    // of the row on screen. The last few rows of the tree are left out because a
+    // row whose own step lands on the last row answers with that row's chain —
+    // Legacy reads `stacks[min(top, rows.length) - 1]`, and its arithmetic is
+    // being kept whole.
+    for top in 3..39 {
+        assert_eq!(
+            names(&rows, top, 8),
+            ["a", "b"],
+            "the stack at row {top} is the chain of the row on screen"
+        );
+    }
 }
 
 fn names(rows: &[TreeRow<'_>], top: usize, stack: usize) -> Vec<String> {
@@ -2158,20 +2238,15 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
         "the reading on screen did not answer the keyboard"
     );
 
-    // Two readings, one document: neither entity was rebuilt to change focus,
-    // and neither of them became writable on the way.
+    // Two readings, one document: neither entity was rebuilt to change focus, and
+    // the text behind the reading is the text it was opened with.
     assert_eq!(state.entity_id(), editor_id, "the editor was replaced");
     assert_eq!(preview.entity_id(), reading_id, "the reading was replaced");
     cx.read(|cx| {
-        let state = state.read(cx);
         assert_eq!(
-            state.text().to_string(),
+            state.read(cx).text().to_string(),
             source,
             "the document changed while the keyboard moved between its readings"
-        );
-        assert!(
-            state.presentation().is_readonly(),
-            "the source became editable because it took the keyboard"
         );
     });
 
@@ -2241,6 +2316,109 @@ const ONE_PIXEL_PNG: &[u8] = b"\
 \x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\
 \x00\x00\x00\rIDAT\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\
 \x00\x00\x00\x00IEND\xaeB\x60\x82";
+
+/// What a document cannot draw is said in a box of its own.
+///
+/// A video, an audio file and a file are three words standing where a picture
+/// stands, so they stand off the text around them by the same air rather than
+/// running into it: the toolkit measures an inline element as a root box, so the
+/// air is inside the box. How much air is a drawing decision and is not pinned
+/// here; that the words are a box is what makes the two answers one answer.
+#[gpui_kit::test]
+async fn what_a_document_cannot_draw_is_said_in_a_box_of_its_own(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let source =
+        "![The demo](assets/demo.mp4)\n\n![The notes](notes.pdf)\n\n![The tone](bell.mp3)\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "README.md").await;
+
+    for said in ["The demo", "The notes", "The tone"] {
+        let at = source.find(&format!("![{said}]")).unwrap();
+        // Said, and drawn by this module rather than by the toolkit's own answer
+        // for an inline object it cannot draw.
+        assert!(
+            draw_until(&fixture, cx, &format!("document-media-said-{at}")),
+            "{said} is not said in a box"
+        );
+        assert!(
+            !draw_until(&fixture, cx, &format!("document-media-{at}")),
+            "{said} is drawn as a picture that is there"
+        );
+    }
+    // The words are still the words: the box changed where they stand, not what
+    // they say, and what they say is what a selection of the reading copies.
+    let reading = reading(&fixture, cx);
+    for said in ["The demo", "The notes", "The tone"] {
+        assert!(reading.contains(said), "{said} is not said: {reading}");
+    }
+    close(&fixture, cx);
+}
+
+/// A one-pixel SVG: the one picture a document names that is markup rather than
+/// bytes with a header, so the format is decided by the name and nothing else.
+const ONE_PIXEL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>"#;
+
+/// A document draws SVG beside every other picture.
+///
+/// The same path a PNG takes, and worth pinning because it is the one format
+/// this window cannot decide from the bytes: an SVG has no header, so a name
+/// that is not `.svg` for a file that is SVG is not a picture at all, and a name
+/// that is `.svg` for a file that is not is still tried and still refused.
+#[gpui_kit::test]
+async fn a_rendered_document_draws_an_svg_beside_every_other_picture(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    std::fs::write(fixture.root.join("logo.svg"), ONE_PIXEL_SVG).unwrap();
+    let source = "![The diagram](diagram.png)\n\n![The logo](logo.svg)\n";
+    std::fs::write(fixture.root.join("README.md"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "README.md").await;
+
+    for (said, name) in [("The diagram", "diagram.png"), ("The logo", "logo.svg")] {
+        let id = format!(
+            "document-media-{}",
+            source.find(&format!("![{said}]")).unwrap()
+        );
+        assert!(
+            draw_until(&fixture, cx, &id),
+            "{said} is not drawn as a picture"
+        );
+        assert!(
+            fixture.view.read_with(cx, |app, _| {
+                app.document_view
+                    .as_ref()
+                    .is_some_and(|view| view.media.image(name).is_some())
+            }),
+            "{said} is drawn without the bytes a read brought back"
+        );
+    }
+    // What the toolkit made of the markup, which is the claim an element id
+    // cannot make on its own: the SVG was rasterized rather than laid out as
+    // something it cannot draw.
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let svg = fixture.view.read_with(cx, |app, _| {
+            app.document_view
+                .as_ref()
+                .and_then(|view| view.media.image("logo.svg"))
+                .expect("the worker read the SVG into this document")
+        });
+        let decoded = svg
+            .get_render_image(window, cx)
+            .expect("the toolkit rasterized the SVG the read brought back");
+        assert!(
+            decoded.as_bytes(0).is_some_and(|pixels| !pixels.is_empty()),
+            "the SVG was laid out rather than rasterized"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
 
 /// A rendered document draws the picture it names and says everything else.
 ///
@@ -2482,6 +2660,204 @@ async fn a_picture_the_checkout_will_not_hand_over_is_said_in_words(cx: &mut Tes
         );
     }
     close(&fixture, cx);
+}
+
+/// The document a person is editing is a draft, and the two controls answer for
+/// the file rather than for the window.
+///
+/// Everything the bar does is a claim about bytes: a save writes what the editor
+/// holds and the file on disk is asked to say so afterwards, and a Cancel leaves
+/// both the file and the editor as they were. The keyboard is the same two
+/// controls, so each is answered by the key as well.
+#[gpui_kit::test]
+async fn an_edited_document_saves_or_throws_itself_away(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let file = fixture.root.join("notes.md");
+    std::fs::write(&file, "# Notes\n").unwrap();
+    open(cx, &fixture, "notes.md").await;
+    // A Markdown document opens as its reading, so the source is asked for.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-toggle-reading", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // Typed text, and the bar that says so.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input("edited ", cx);
+    })
+    .unwrap();
+    assert!(
+        draw_until(&fixture, cx, "save-document"),
+        "an edited document does not offer to be saved"
+    );
+    assert!(
+        draw_until(&fixture, cx, "cancel-document"),
+        "an edited document offers no way to change one's mind"
+    );
+
+    // Escape is the way out, and it leaves the file alone.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(
+            editor_text(&fixture, cx),
+            "# Notes\n",
+            "the draft was not thrown away"
+        );
+    })
+    .unwrap();
+    assert!(
+        !draw_until(&fixture, cx, "save-document"),
+        "a document nobody has edited still offers to be saved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# Notes\n",
+        "Cancel wrote the file"
+    );
+
+    // The other way round: `⌘S` saves, and the file is what says so.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input("edited ", cx);
+        window.render_frame(cx);
+        window.dispatch_keystroke(
+            gpui_kit::Keystroke::parse(if cfg!(target_os = "macos") {
+                "cmd-s"
+            } else {
+                "ctrl-s"
+            })
+            .unwrap(),
+            cx,
+        );
+    })
+    .unwrap();
+    for _ in 0..8 {
+        cx.run_until_parked();
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        if std::fs::read_to_string(&file).unwrap() == "# Notes\nedited " {
+            break;
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# Notes\nedited ",
+        "the save did not write what the editor held"
+    );
+    assert!(
+        !draw_until(&fixture, cx, "save-document"),
+        "a saved document is still a draft"
+    );
+    let saved = fixture.view.read_with(cx, |app, cx| {
+        app.document_view
+            .as_ref()
+            .expect("the document is still open")
+            .state
+            .read(cx)
+            .text()
+            .to_string()
+    });
+    assert_eq!(saved, "# Notes\nedited ", "the editor lost what was saved");
+    close(&fixture, cx);
+}
+
+/// A file with changes says so, and the button is what reads them.
+///
+/// The change list is Git's answer rather than the window's, so the button is
+/// there exactly when Git has said this file is in it — and clicking it opens
+/// that one file's diff rather than the whole change set.
+#[gpui_kit::test]
+async fn a_document_offers_the_changes_of_a_file_that_has_them(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("notes.md"), "# Notes\n").unwrap();
+    std::fs::write(fixture.root.join("quiet.md"), "quiet\n").unwrap();
+    commit_all(&fixture.root, "first");
+    std::fs::write(fixture.root.join("notes.md"), "# Notes\nedited\n").unwrap();
+
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+
+    open(cx, &fixture, "notes.md").await;
+    assert!(
+        draw_until(&fixture, cx, "document-open-changes"),
+        "a file with changes offers no way to read them"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-open-changes", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture.view.read_with(cx, |app, _| app.open_diff.clone()),
+        Some((fixture.checkout.clone(), Some("notes.md".into()))),
+        "the button did not open this file's changes"
+    );
+    assert!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.open_document.is_none()),
+        "the document and its changes are one panel, and it shows the changes"
+    );
+    close(&fixture, cx);
+}
+
+/// Open one document of the fixture's checkout and wait for the file to be read.
+async fn open(cx: &mut TestAppContext, fixture: &GitFixture, path: &str) {
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, path.into(), window, cx);
+        })
+    })
+    .unwrap();
+    let path = path.to_owned();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), move |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == path)
+    })
+    .await;
+}
+
+/// Put the caret in the open document's editor, which is where a person types.
+fn click_editor(fixture: &GitFixture, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    let state = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .expect("a document is open")
+            .state
+            .clone()
+    });
+    window.click(("input", state.entity_id()), cx);
+}
+
+/// The text the open document's editor holds.
+fn editor_text(fixture: &GitFixture, cx: &gpui_kit::App) -> String {
+    fixture.view.read_with(cx, |app, cx| {
+        app.document_view
+            .as_ref()
+            .expect("a document is open")
+            .state
+            .read(cx)
+            .text()
+            .to_string()
+    })
 }
 
 /// A picture read for a document that has been closed updates nothing and keeps

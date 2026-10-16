@@ -1130,7 +1130,7 @@ pub(super) fn commit_all(root: &Path, message: &str) {
 /// anything the window is holding an answer from before. Asking again is what
 /// the tab's button does, and it is what makes the row's decision a question
 /// about the repository as it is now rather than as it was.
-async fn read_status(fixture: &GitFixture, checkout: &str, cx: &mut TestAppContext) {
+pub(super) async fn read_status(fixture: &GitFixture, checkout: &str, cx: &mut TestAppContext) {
     fixture
         .view
         .update(cx, |app, cx| app.request_git_status(checkout, cx));

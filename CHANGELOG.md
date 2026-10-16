@@ -8,6 +8,29 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **A document can be edited, and a save says what it wrote.** The document pane
+  is its editor: type in it, and a bar appears along the bottom with Cancel and
+  Save — `Esc` and `⌘S` are the same two controls. Cancel puts the text the file
+  was read with back; Save writes what the editor holds, through the same walk
+  every read of a checkout is answered by: a path outside the checkout, a link, a
+  file somebody else wrote since it was opened, or a file that is read-only are
+  all refused in as many words rather than overwritten, and what is written is a
+  replacement rather than a rewrite, so a reader sees the old text or the new one.
+  A Markdown document opens as its reading and is edited as its source, because
+  the reading is a parse of the text as it was read.
+
+- **A file with changes offers them from its own document.** When Git has said
+  this file is in the change set, the document's header carries a **Changes**
+  button with the counts beside it, and it opens that one file's diff rather than
+  the whole set. A file Git has not answered about offers nothing, because a
+  button that appears and disappears with a read is worse than one that waits.
+
+- **A picture, a video and a file's name stand apart from the text.** The toolkit
+  measures an inline element as a box of its own, so the air above and below a
+  picture — and around the words that stand in for what cannot be drawn — is
+  inside that box. A document's SVG is drawn like any other picture: it is the
+  one format this window takes by name rather than by its bytes.
+
 - **The app has its icon back on macOS.** An executable carries no icon there: the
   icon is what the bundle around it says it is. `scripts/bundle-macos.sh` builds
   `Muster.app` with the same bundle identifier, name, copyright and artwork the

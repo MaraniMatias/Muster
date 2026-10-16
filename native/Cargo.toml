@@ -17,7 +17,12 @@ name = "muster_native"
 path = "src/lib.rs"
 
 [[bin]]
-name = "muster-native"
+# `muster`, not `muster-native`, and the package keeps the other name so
+# `cargo run -p muster-native` still names this crate: an unbundled macOS
+# executable is filed under its own filename, so the binary run from `target/`
+# and the bundle `scripts/bundle-macos.sh` wraps around it are one application
+# under one name.
+name = "muster"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,15 +1,16 @@
-//! Read-only central document displayed in place of the terminal.
+//! The central document: read as a reading, edited as its source.
 use crate::{app::TerminalWindow, theme::Roles};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState};
-use gpui_kit::component::Sizable;
+use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, Styled, TestSupportExt, Window,
 };
+use muster_core::workspace::{Checkout, Repo};
 use std::sync::Arc;
 
 mod media;
@@ -18,9 +19,8 @@ mod media;
 ///
 /// The state is one entity created when the document is opened and read from
 /// every frame after: a text selection, a scroll offset and a parse are then
-/// things the reader did rather than things the last frame threw away. Nothing
-/// here is written back — the document is a view of a file, and this slice owns
-/// no editing and no persistence.
+/// things the reader did rather than things the last frame threw away. The text
+/// is written back, and only when somebody says so.
 pub(crate) struct DocumentView {
     pub(crate) state: Entity<EditorState>,
     /// The reading view of a Markdown file, built when the document is opened and
@@ -34,6 +34,18 @@ pub(crate) struct DocumentView {
     /// selection or an offset carried over from another file would describe a
     /// position in a file that is not on screen.
     path: String,
+    /// The text as the file held it when it was read: what a draft is measured
+    /// against, what Cancel puts back, and what a save says the file must still
+    /// hold.
+    loaded: String,
+    /// Whether the editor holds another text than the one above, decided as the
+    /// text is asked for rather than as it changes: an undo back to what the file
+    /// holds is the end of a draft, and only a comparison says so.
+    dirty: bool,
+    /// A save is on its way, so the controls wait for its answer.
+    saving: bool,
+    /// What the last save said, drawn beside the bar that caused it.
+    error: Option<String>,
     /// The pictures this document's reading has named, and the bytes that came
     /// back for them. Owned by the document rather than by the window, so a
     /// different document — or closing this one — drops them with the view, and
@@ -63,6 +75,10 @@ impl DocumentView {
             preview,
             rendered: markdown,
             path: identity.to_owned(),
+            loaded: text.to_owned(),
+            dirty: false,
+            saving: false,
+            error: None,
             media: media::MediaStore::new(),
         }
     }
@@ -92,6 +108,15 @@ impl DocumentView {
             }
         }
         self.state.read(cx).focus_handle(cx).focus(window, cx);
+    }
+}
+
+/// What a draft is saved with, on this platform's keyboard.
+fn save_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘S"
+    } else {
+        "Ctrl+S"
     }
 }
 
@@ -243,7 +268,7 @@ fn document_body(
                 .into_any_element()
         }
         None => Editor::new(state)
-            .readonly(true)
+            .readonly(false)
             .bordered(false)
             .size_full()
             .into_any_element(),
@@ -259,6 +284,182 @@ fn document_body(
 }
 
 impl TerminalWindow {
+    /// The repository and checkout one document is read from and written to.
+    ///
+    /// The pair a read or a save is walked against, so it is asked once and in one
+    /// place: a document and its pictures have to reach the same checkout, and a
+    /// document that could be read through one checkout and written through another
+    /// would be a file nobody can reason about.
+    fn document_source(&self, checkout: &str) -> Option<(Repo, Checkout)> {
+        let repo = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.checkouts.iter().any(|one| one.id == checkout))?
+            .clone();
+        Some((repo, self.navigation.checkout(checkout)?.clone()))
+    }
+
+    /// Somebody typed in the open document: whether it is now a draft.
+    ///
+    /// Asked of the editor's text rather than of a change event, so an undo back
+    /// to what the file holds is the end of a draft rather than a state a draft
+    /// can be stuck in.
+    pub(crate) fn refresh_document_draft(&mut self, cx: &App) {
+        let Some(view) = self.document_view.as_mut() else {
+            return;
+        };
+        view.dirty = *view.state.read(cx).text() != view.loaded.as_str();
+    }
+
+    /// Write the open document back, or say why it cannot be written.
+    ///
+    /// What is written is the editor's own text and what is compared against the
+    /// file is the text it was opened with: a file somebody else wrote in the
+    /// meantime is not overwritten by a save that was decided before they did.
+    /// The answer is waited for off the UI thread, and lands on the document only
+    /// if that document is still the one on screen.
+    pub(crate) fn save_document(&mut self, cx: &mut Context<Self>) {
+        self.refresh_document_draft(cx);
+        let Some((checkout_id, path)) = self.document_target.clone() else {
+            return;
+        };
+        let Some((repo, checkout)) = self.document_source(&checkout_id) else {
+            return;
+        };
+        let (expected, content) = match self
+            .document_view
+            .as_ref()
+            .filter(|view| view.dirty && !view.saving)
+        {
+            Some(view) => (view.loaded.clone(), view.state.read(cx).text().to_string()),
+            None => return,
+        };
+        if let Some(view) = self.document_view.as_mut() {
+            view.saving = true;
+            view.error = None;
+        }
+        let token = self.document_request;
+        let written = (checkout_id.clone(), path.clone(), content.clone());
+        let worker = cx.background_executor().spawn(async move {
+            muster_core::files::write_preview(&repo, &checkout, &path, &expected, &content)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = worker.await;
+            let (checkout_id, path, content) = written;
+            let _ = view.update(cx, |app, cx| {
+                // The document this save was for is not the one on screen.
+                if app.document_request != token {
+                    return;
+                }
+                let Some(document) = app.document_view.as_mut() else {
+                    return;
+                };
+                document.saving = false;
+                match result {
+                    Ok(()) => {
+                        document.loaded = content.clone();
+                        document.dirty = false;
+                        document.error = None;
+                        // The reading is a parse of the text as saved, and the
+                        // saved text is the only one it can be right about.
+                        if is_markdown(&path) {
+                            document.preview =
+                                Some(cx.new(|cx| TextViewState::markdown(&content, cx)));
+                        }
+                        // What was loaded is what the pane draws, so a document
+                        // reopened from here is the one that was saved.
+                        if let Some(preview) = app
+                            .open_document
+                            .as_mut()
+                            .filter(|(id, preview)| *id == checkout_id && preview.path == path)
+                            .map(|(_, preview)| preview)
+                        {
+                            preview.text = content;
+                        }
+                        // The file is not what it was: what the Changes view will
+                        // show about it has to be asked again.
+                        app.git_diff.remove(&(checkout_id.clone(), path.clone()));
+                        app.git_diff_request
+                            .remove(&(checkout_id.clone(), path.clone()));
+                        app.request_git_status(&checkout_id, cx);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        document.error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Throw the draft away and put the text the file was read with back.
+    ///
+    /// The editor, not the file: this is what a person means by Cancel, and the
+    /// file has not been written yet, so there is nothing on disk to restore.
+    pub(crate) fn cancel_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_document_draft(cx);
+        let Some(view) = self
+            .document_view
+            .as_ref()
+            .filter(|view| view.dirty && !view.saving)
+        else {
+            return;
+        };
+        let (state, loaded) = (view.state.clone(), view.loaded.clone());
+        let Some(document) = self.document_view.as_mut() else {
+            return;
+        };
+        document.dirty = false;
+        document.error = None;
+        // Putting the text back is an edit the toolkit answers through the
+        // window the editor is drawn in, so that is where it is asked for.
+        cx.spawn_in(window, async move |_, cx| {
+            let _ = state.update_in(cx, |state, window, cx| {
+                state.replace_all(loaded, window, cx);
+                state.focus_handle(cx).focus(window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The two keys a draft answers, and nothing else.
+    ///
+    /// `⌘S` saves it and Escape throws it away, both only while there is a draft:
+    /// a document nobody has edited keeps the Escape that closes the pane and the
+    /// key that nobody asked for.
+    pub(crate) fn document_edit_key(
+        &mut self,
+        key: &gpui_kit::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.document_view.as_ref().is_none_or(|view| view.saving) {
+            return false;
+        }
+        self.refresh_document_draft(cx);
+        if self.document_view.as_ref().is_none_or(|view| !view.dirty) {
+            return false;
+        }
+        let app_modifier = if cfg!(target_os = "macos") {
+            key.modifiers.platform && !key.modifiers.control
+        } else {
+            key.modifiers.control && !key.modifiers.platform
+        };
+        if app_modifier && !key.modifiers.alt && key.key.eq_ignore_ascii_case("s") {
+            self.save_document(cx);
+            return true;
+        }
+        if key.key == "escape" {
+            self.cancel_document(window, cx);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn clear_document(&mut self) {
         // Every gesture that replaces what this window shows comes through here
         // first, so this is where a newer view selection is noted. A decision
@@ -292,6 +493,15 @@ impl TerminalWindow {
         }
         let roles = Roles::of(cx);
         let key = (checkout_id.clone(), path.clone());
+        // What a frame draws is what the editor holds, so the draft is settled
+        // before anything asks about it.
+        self.refresh_document_draft(cx);
+        if let Some(view) = self.document_view.as_mut().filter(|view| view.dirty) {
+            // A draft is edited in its source. The reading is a parse of the text
+            // as it was read, so drawing it now would show a document the editor
+            // no longer holds.
+            view.rendered = false;
+        }
         // Opened where it was clicked: the handler carries this window weakly
         // into the toolkit's text view and dispatches from the click itself.
         let link_handler = link_handler(cx.entity().downgrade());
@@ -333,15 +543,10 @@ impl TerminalWindow {
             // checkout the document itself was read from, so a `../` that would
             // leave it is refused where every other path out of it is refused.
             let media = rendered.as_ref().and_then(|_| {
-                let repo = self
-                    .navigation
-                    .repos
-                    .iter()
-                    .find(|repo| repo.checkouts.iter().any(|one| one.id == checkout_id))?;
-                let checkout = self.navigation.checkout(&checkout_id)?;
+                let (repo, checkout) = self.document_source(&checkout_id)?;
                 Some(media::DocumentMedia::new(
-                    repo.clone(),
-                    checkout.clone(),
+                    repo,
+                    checkout,
                     &path,
                     Arc::downgrade(&self.document_view.as_ref()?.media),
                 ))
@@ -360,12 +565,7 @@ impl TerminalWindow {
             // place a refusal has something to offer instead. What it cannot be
             // is a file outside the checkout — the opener resolves the path
             // through the checkout again, and refuses it there if it is not there.
-            let open_repo = self
-                .navigation
-                .repos
-                .iter()
-                .find(|repo| repo.checkouts.iter().any(|c| c.id == checkout_id))
-                .cloned();
+            let open_repo = self.document_source(&checkout_id).map(|(repo, _)| repo);
             let open_checkout = self.navigation.checkout(&checkout_id).cloned();
             div()
                 .p_3()
@@ -441,6 +641,25 @@ impl TerminalWindow {
             .document_view
             .as_ref()
             .is_some_and(DocumentView::is_rendered);
+        // The changes this file has, in Git's own words: a file with none offers
+        // nothing to see, and one whose change set has not been read is not a file
+        // that can say it has none.
+        let changes = self
+            .git_status
+            .get(&checkout_id)
+            .filter(|status| status.files.iter().any(|file| file.path == path))
+            .map(|status| {
+                let file = status
+                    .files
+                    .iter()
+                    .find(|file| file.path == path)
+                    .expect("asked for");
+                (file.additions, file.deletions)
+            });
+        // A draft is the pane's last row, not a floating box over the text: the
+        // control that writes the file must not move away from where the person
+        // is looking.
+        let draft = self.document_view.as_ref().filter(|view| view.dirty);
         Some(
             div()
                 .id("document-pane")
@@ -506,6 +725,49 @@ impl TerminalWindow {
                                     })),
                             )
                         })
+                        .when_some(changes, |header, (added, removed)| {
+                            header
+                                .child(
+                                    Button::new("document-open-changes")
+                                        .text()
+                                        .small()
+                                        .compact()
+                                        .rounded(px(0.))
+                                        .label("Changes")
+                                        .accessibility_label(format!("Show the changes to {path}"))
+                                        .tooltip("Show this file's changes")
+                                        .on_click(cx.listener(move |app, _, window, cx| {
+                                            app.open_changes(&checkout_id, Some(path.clone()), cx);
+                                            app.focus_terminal(window, cx);
+                                        })),
+                                )
+                                .when(added.unwrap_or(0) + removed.unwrap_or(0) > 0, |row| {
+                                    row.when_some(
+                                        added.filter(|count| *count != 0),
+                                        |row, added| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.))
+                                                    .text_color(roles.status.success)
+                                                    .child(format!("+{added}")),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        removed.filter(|count| *count != 0),
+                                        |row, removed| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.))
+                                                    .text_color(roles.status.danger_text)
+                                                    .child(format!("−{removed}")),
+                                            )
+                                        },
+                                    )
+                                })
+                        })
                         .child(
                             Button::new("close-document")
                                 .custom(crate::app::sidebar_action_style(cx))
@@ -522,6 +784,66 @@ impl TerminalWindow {
                         ),
                 )
                 .child(div().flex_1().min_w_0().min_h_0().child(body))
+                .when_some(
+                    draft.map(|view| (view.saving, view.error.clone())),
+                    |pane, (saving, error)| {
+                        pane.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .border_t_1()
+                                .border_color(roles.border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(roles.status.warning)
+                                        .child(error.unwrap_or_else(|| {
+                                            if saving {
+                                                "Saving…".to_owned()
+                                            } else {
+                                                "Unsaved changes".to_owned()
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("cancel-document")
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .label("Cancel")
+                                        .accessibility_label("Discard the unsaved changes")
+                                        .tooltip("Discard the unsaved changes (Esc)")
+                                        .disabled(saving)
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.cancel_document(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("save-document")
+                                        .small()
+                                        .compact()
+                                        .label("Save")
+                                        .accessibility_label("Save this file")
+                                        .tooltip(if saving {
+                                            "Saving this file".to_owned()
+                                        } else {
+                                            format!("Save this file ({})", save_key())
+                                        })
+                                        .disabled(saving)
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.save_document(cx);
+                                        })),
+                                ),
+                        )
+                    },
+                )
                 .into_any_element(),
         )
     }
@@ -792,7 +1114,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_document_is_readable_whole_and_cannot_be_edited(cx: &mut TestAppContext) {
+    fn a_document_is_readable_whole_and_editable(cx: &mut TestAppContext) {
         let (window, harness) = open(cx);
         let text = "{\n  \"name\": \"muster\",\n  \"empty\": \"\"\n}\n";
         harness.update(cx, |harness, cx| {
@@ -808,16 +1130,17 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(window.find(id).value(), Some(text));
-            // Read-only: the text goes nowhere, and the editor still took it.
+            // The whole file is there to be edited, and the trailing newline is a
+            // line of the file rather than a wrapping detail: typing lands after
+            // it, not inside the last line.
             window.click(id, cx);
             window.input("!", cx);
         })
         .unwrap();
         cx.read(|cx| {
             let state = state.read(cx);
-            // A trailing newline is a line of the file, not a wrapping detail.
-            assert_eq!(state.text().to_string(), text);
-            assert!(state.presentation().is_readonly());
+            assert_eq!(state.text().to_string(), format!("{text}!"));
+            assert!(!state.presentation().is_readonly());
             assert!(state.presentation().is_code_editor());
         });
 
@@ -835,8 +1158,9 @@ mod tests {
                 (selected, copied)
             })
             .unwrap();
-        assert_eq!(selected, text);
-        assert_eq!(copied.as_deref(), Some(text));
+        let edited = format!("{text}!");
+        assert_eq!(selected, edited);
+        assert_eq!(copied.as_deref(), Some(edited.as_str()));
     }
 
     #[gpui_kit::test]

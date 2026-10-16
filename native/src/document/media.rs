@@ -61,6 +61,14 @@ const NAME: &str = "document-media";
 /// from the one this bounds.
 const MAX_IMAGE_EDGE: Pixels = px(720.);
 
+/// The air above and below a picture, a video or a file's name.
+///
+/// The toolkit measures an inline element as a root box, and a root box has no
+/// parent to apply a margin for it, so the space has to be inside the box for
+/// the words around it to stand off from it. A picture that runs straight into
+/// the line above it and the line below it is what this is the answer to.
+const MEDIA_GAP: Pixels = px(8.);
+
 /// How much one document may hold in prepared pictures at once.
 ///
 /// `core::files` bounds a single resource on its way in; this bounds what stays
@@ -393,13 +401,16 @@ impl MarkdownPlugin for DocumentMedia {
     }
 
     /// The picture, or nothing at all — which is the toolkit's own answer for an
-    /// inline object it cannot draw, and is why the line [`parse`] wrote is what
-    /// a reader sees until the picture arrives.
+    /// The picture, or the words that stand in for one.
     ///
-    /// The element itself draws the line too, for the one failure the bytes can
-    /// still fail at: a file whose header says it is a picture and whose rest is
-    /// not one decodes to nothing, and a blank box with the alt text nowhere in
-    /// sight is a worse answer than the words.
+    /// Both answers are one box with the same air around it, so a video and a
+    /// file's name stand where a picture stands and neither crowds the text
+    /// beside it.
+    ///
+    /// The element draws the line too, for the one failure the bytes can
+    /// still fail at: a file whose header says it is a picture and whose rest
+    /// is not one decodes to nothing, and a blank box with the alt text nowhere
+    /// in sight is a worse answer than the words.
     fn render_inline(
         &self,
         node: &MarkdownNode,
@@ -408,7 +419,6 @@ impl MarkdownPlugin for DocumentMedia {
         _cx: &mut App,
     ) -> Option<InlineElement> {
         let picture = node.data::<LocalPicture>()?;
-        let image = picture.store.upgrade()?.image(picture.name.as_deref()?)?;
         // The source offset, because a document may name the same picture twice
         // and two elements with one id are one element as far as a test is
         // concerned.
@@ -423,25 +433,52 @@ impl MarkdownPlugin for DocumentMedia {
             "{NAME}-said-{}",
             node.source_range().map_or(0, |range| range.start)
         );
-        Some(InlineElement::new(
+        // A name that is not a picture has no image to look up and says so by
+        // being absent, rather than by answering nothing at all: the words are
+        // drawn here too, so they stand where a picture stands.
+        let image = picture
+            .store
+            .upgrade()
+            .zip(picture.name.as_deref())
+            .and_then(|(store, name)| store.image(name));
+        let body = match image {
             // The bytes themselves, which the toolkit decodes on its own worker
             // through its asset system. A pathname here would be reopened by the
             // image loader, which is the check/use boundary this exists to
             // remove.
-            img(ImageSource::Image(image))
-                .object_fit(ObjectFit::Contain)
-                .max_w(MAX_IMAGE_EDGE)
-                .max_h(MAX_IMAGE_EDGE)
-                .with_fallback(move || {
-                    div()
-                        .id(said_id.clone())
-                        .test_support()
-                        .child(said.clone())
-                        .into_any_element()
-                })
+            //
+            // This box carries the picture's own id and the words carry the
+            // other one, so the id a document's offset names is there exactly
+            // when the bytes are: a name that was refused, or has not come back
+            // yet, is the words and nothing else.
+            Some(image) => div()
                 .id(id)
-                .test_support(),
-        ))
+                .test_support()
+                .py(MEDIA_GAP)
+                .child(
+                    img(ImageSource::Image(image))
+                        .object_fit(ObjectFit::Contain)
+                        .max_w(MAX_IMAGE_EDGE)
+                        .max_h(MAX_IMAGE_EDGE)
+                        .with_fallback(move || {
+                            div()
+                                .id(said_id.clone())
+                                .test_support()
+                                .child(said.clone())
+                                .into_any_element()
+                        }),
+                )
+                .into_any_element(),
+            // Nothing to draw: the words are the drawing, which is what the
+            // toolkit's own answer for an inline object it cannot draw says.
+            None => div()
+                .id(said_id)
+                .test_support()
+                .py(MEDIA_GAP)
+                .child(said)
+                .into_any_element(),
+        };
+        Some(InlineElement::new(body))
     }
 }
 

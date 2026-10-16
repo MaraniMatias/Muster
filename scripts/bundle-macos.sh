@@ -2,10 +2,10 @@
 # Assemble the macOS application bundle for the native build.
 #
 # On macOS an executable carries no icon of its own. The icon Finder and the Dock
-# show, the name in the menu bar, the version in Get Info and the category the
-# system files the app under are all what `Info.plist` says about the `.app`
-# around it, so a binary run from `target/` has no icon and `muster-native` for a
-# name. This is that `.app`.
+# show, the version in Get Info and the category the system files the app under
+# are all what `Info.plist` says about the `.app` around it, so a binary run
+# from `target/` has no icon. This is that `.app`; its name, its identifier and
+# its copyright are already in both.
 #
 # The identity in it is the one Legacy shipped -- same bundle identifier, same
 # name, same copyright, same artwork -- so the OS files the native build as the
@@ -13,7 +13,7 @@
 # fields that are not copied are explained where they are.
 #
 # Usage: scripts/bundle-macos.sh [binary] [output-dir]
-#   binary      default target/release/muster-native
+#   binary      default target/release/muster
 #   output-dir  default dist/
 set -euo pipefail
 
@@ -23,7 +23,7 @@ set -euo pipefail
 }
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-binary="${1:-$root/target/release/muster-native}"
+binary="${1:-$root/target/release/muster}"
 out="${2:-$root/dist}"
 icon="$root/native/assets/icon.icns"
 app="$out/Muster.app"
@@ -46,9 +46,9 @@ version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/native/Cargo.toml
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-# Named `muster`, not `muster-native`: inside the bundle the executable name is
-# the one the system reports in Activity Monitor and in Get Info, and the one
-# Legacy's bundle answers to.
+# `muster`, the name `CFBundleExecutable` below declares: inside the bundle the
+# executable name is the one the system reports in Activity Monitor and in Get
+# Info, and the one Legacy's bundle answers to.
 install -m 755 "$binary" "$app/Contents/MacOS/muster"
 install -m 644 "$icon" "$app/Contents/Resources/Muster.icns"
 
