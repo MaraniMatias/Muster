@@ -70,11 +70,14 @@ pub(crate) const SIDEBAR_FONT_FAMILY: &str = "Fira Code";
 ///
 /// Called before the first window opens, because a family that is missing when
 /// the first frame is laid out is one GPUI quietly answers with a fallback.
-/// The regular face and the bold face both go in: the rows set a weight.
+/// The regular face and the bold face both go in: the rows set a weight. The
+/// icon face goes in with them, because the terminal draws its private use
+/// glyphs with it from the first frame.
 pub fn load_fonts(cx: &App) {
     if let Err(error) = cx.text_system().add_fonts(vec![
         Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Bold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/NerdSymbols.ttf").as_slice()),
     ]) {
         log::error!("muster: bundled sidebar fonts could not load: {error}");
     }

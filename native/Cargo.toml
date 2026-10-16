@@ -106,4 +106,8 @@ tempfile = "3"
 # Same crate, test-support on: unit tests build the same type universe as the app.
 gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
 tempfile = "3"
+# Already compiled into the test binary through the toolkit, so this costs no
+# build: it reads the bundled icon face's own tables, which is how a test can
+# tell that a private use character has a glyph to be drawn with.
+ttf-parser = "0.25"
 

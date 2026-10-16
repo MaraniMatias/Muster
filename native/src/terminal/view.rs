@@ -135,9 +135,47 @@ fn load_bundled_fonts(window: &mut Window) -> Result<bool, String> {
             std::borrow::Cow::Borrowed(
                 include_bytes!("../../assets/fonts/FiraCode-Bold.ttf").as_slice(),
             ),
+            std::borrow::Cow::Borrowed(
+                include_bytes!("../../assets/fonts/NerdSymbols.ttf").as_slice(),
+            ),
         ])
         .map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+/// The bundled family a private-use glyph draws with, under the name that
+/// family's own `name` table declares.
+///
+/// Fira Code 6.2 carries no Nerd Font glyphs, so a terminal that draws a
+/// prompt's powerline, an agent's icon or a file-type symbol with the text
+/// faces alone answers it with a tofu box. This face is cut from the patched
+/// font those two came from, so its glyphs keep this grid's advances — 1200 of
+/// 1950 units, one cell — and land in the cell the parser gave them.
+const ICON_FONT_FAMILY: &str = "FiraCode Nerd Font Mono";
+
+/// The family a character draws with when it is not the text face's.
+///
+/// The private use ranges are the Nerd Font glyphs' own, and nothing else in
+/// the app asks for them: the ten symbols those patched fonts also moved are
+/// ordinary Unicode that a system face already answers, and Legacy's stack
+/// drew them from the text face for the same reason.
+fn icon_family_for(ch: char) -> Option<&'static str> {
+    matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD).then_some(ICON_FONT_FAMILY)
+}
+
+/// The style one cell draws with: the terminal's, unless the cell holds a
+/// private use character, which only the icon face answers.
+///
+/// A cell is at most one character wide unless it is a wide one, so the first
+/// character is the one that decides: an emoji's variation selector and a
+/// combining mark ride along with the base character they belong to, and the
+/// base character is what has to come out of the right face.
+fn cell_style(base: &TextStyle, text: &str) -> TextStyle {
+    let mut style = base.clone();
+    if let Some(family) = text.chars().next().and_then(icon_family_for) {
+        style.font_family = family.into();
+    }
+    style
 }
 
 /// The thickness of bar and underline cursors, as a fraction of the cell extent.
@@ -693,6 +731,22 @@ impl TerminalView {
         };
         if family != "Fira Code" {
             log::error!("muster: bundled Fira Code did not resolve; using {family}");
+        }
+        // The icon face fails the other way round: a family the loader drops
+        // answers with a fallback rather than with an error, so a private use
+        // glyph would go back to being a tofu box with nothing said about it.
+        let icons = window
+            .text_system()
+            .resolve_font(&gpui_kit::font(ICON_FONT_FAMILY));
+        if window
+            .text_system()
+            .get_font_for_id(icons)
+            .is_none_or(|font| font.family != ICON_FONT_FAMILY)
+        {
+            log::error!(
+                "muster: bundled {ICON_FONT_FAMILY} did not resolve; \
+                 private use glyphs are drawn by another face"
+            );
         }
         self.style.font_family = SharedString::from(family);
         self.style.font_weight = FontWeight::NORMAL;
@@ -1402,7 +1456,11 @@ impl Frame {
                 Default::default(),
             ));
         }
-        let mut style = self.style.clone();
+        // The cell's own face: an icon and the text beside it are two runs,
+        // because a font is chosen per run and the icon face answers nothing
+        // else. The cell is still the cell — the glyph is painted inside the
+        // bounds the parser measured it into either way.
+        let mut style = cell_style(&self.style, text);
         style.color = cursor_colors.foreground;
         style.font_weight = if cell.bold && self.bold_font_loaded {
             FontWeight::BOLD
@@ -2017,6 +2075,76 @@ mod tests {
                 .flex_col()
                 .child(gpui_kit::div().h(self.header).child("title bar"))
                 .child(self.view.clone())
+        }
+    }
+
+    /// What the icon face has to answer, and what it has to be called.
+    ///
+    /// A file that parses is a table of contents: the terminal asks the text
+    /// system for a *family* by name, and the glyph it wants by codepoint, and
+    /// the face is only the icon face if it declares the one name and maps the
+    /// others. That is also what makes the grafted `m` worth its oddity: it is
+    /// the glyph Core Text's loader asks every family for before keeping it, so
+    /// a face without one is dropped, and a dropped face answers the request
+    /// with somebody else's.
+    #[test]
+    fn the_bundled_icon_face_is_the_family_the_terminal_asks_for() {
+        let face = ttf_parser::Face::parse(
+            include_bytes!("../../assets/fonts/NerdSymbols.ttf").as_slice(),
+            0,
+        )
+        .expect("the bundled icon face parses: Core Graphics cannot read WOFF2");
+        // The name table holds a record per platform, and only the Unicode
+        // ones decode; the first record is not necessarily one of them.
+        let declared = |id: u16| {
+            face.names()
+                .into_iter()
+                .filter(|name| name.name_id == id)
+                .find_map(|name| name.to_string())
+        };
+        assert_eq!(
+            declared(ttf_parser::name_id::FAMILY).as_deref(),
+            Some(ICON_FONT_FAMILY),
+            "the terminal asks for a family the face does not declare"
+        );
+        // A typographic family is the one a text stack asks for when it is
+        // there, so a second name is a second answer to this question.
+        assert_eq!(
+            declared(ttf_parser::name_id::TYPOGRAPHIC_FAMILY),
+            None,
+            "a typographic family would answer for the one above"
+        );
+        for icon in ['\u{e0b0}', '\u{ea60}', '\u{f15b}', '\u{f0001}'] {
+            assert!(
+                face.glyph_index(icon).is_some(),
+                "the icon face has no glyph for {icon:?}, which the terminal routes to it"
+            );
+        }
+        assert!(
+            face.glyph_index('m').is_some(),
+            "the glyph Core Text's loader asks a family for before keeping it"
+        );
+    }
+
+    /// Which face a character is drawn with, before anything is drawn.
+    ///
+    /// The routing is the whole of the fix, so it is stated as what it is: a
+    /// private use character goes to the icon face and everything else stays on
+    /// the text face, including the ten symbols the patched fonts also moved,
+    /// which a system face already answers.
+    #[test]
+    fn a_private_use_character_is_the_only_one_that_changes_face() {
+        for icon in ['\u{e0b0}', '\u{f15b}', '\u{f0001}', '\u{ffffd}'] {
+            assert_eq!(icon_family_for(icon), Some(ICON_FONT_FAMILY), "{icon:?}");
+        }
+        for text in ['a', 'Z', '0', '\u{26a1}', '\u{2764}', '\u{4e2d}', ' '] {
+            assert_eq!(icon_family_for(text), None, "{text:?}");
+        }
+        // Either side of each range stays ordinary text: a boundary that
+        // answered the icon face would take a character nobody asked about,
+        // and the face has no glyph for it besides.
+        for text in ['\u{d7ff}', '\u{f900}', '\u{effff}', '\u{10fffd}'] {
+            assert_eq!(icon_family_for(text), None, "{text:?}");
         }
     }
 

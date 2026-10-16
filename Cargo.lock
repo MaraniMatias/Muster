@@ -4255,6 +4255,7 @@ dependencies = [
  "tree-sitter-cmake",
  "tree-sitter-swift",
  "tree-sitter-vue-updated",
+ "ttf-parser",
 ]
 
 [[package]]

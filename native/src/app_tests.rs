@@ -754,3 +754,92 @@ fn a_diff_notice_reads_at_the_size_of_the_code(cx: &mut TestAppContext) {
     .unwrap();
     close(&fixture, cx);
 }
+
+/// The panels are the window's, at every size the window is.
+///
+/// A panel that draws itself at the width a drag last ended on leaves the rest
+/// of its slot bare when the window is resized under it: the group rescales its
+/// slots, the remembered width does not move, and what is left is a band of
+/// background with a panel that stopped short of the edge. The same window is
+/// measured at four sizes here, and the panels have to reach both edges at
+/// every one of them.
+#[gpui_kit::test]
+fn the_workspace_panels_reach_both_edges_of_every_window_size(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+
+    let fixture = open_git(cx);
+    for wanted in [
+        size(px(1280.), px(800.)),
+        size(px(1600.), px(1000.)),
+        size(px(1000.), px(700.)),
+        size(px(1400.), px(900.)),
+    ] {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.resize(wanted);
+            window.bounds_changed(cx);
+        })
+        .expect("the window takes its new size");
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let sidebar = window.find("navigation-panel").bounds();
+            let inspector = window.find("inspector-panel").bounds();
+            assert_eq!(
+                sidebar.origin.x,
+                px(0.),
+                "at {wanted:?} the sidebar starts at {:?}",
+                sidebar.origin.x
+            );
+            assert_eq!(
+                inspector.right(),
+                viewport.width,
+                "at {wanted:?} the inspector ends at {:?} of a {viewport:?} window",
+                inspector.right()
+            );
+        })
+        .expect("the window lays out");
+    }
+    close(&fixture, cx);
+}
+
+/// The grid is the middle panel, so it is what the middle panel is given.
+///
+/// A window that only grows is not a window the parser was told about: the PTY
+/// keeps the columns and rows it was last asked for, and the grid is drawn at
+/// that size into a body of another one.
+#[gpui_kit::test]
+fn resizing_the_window_resizes_the_terminal_grid(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "cat");
+    let (handle, window) = open(cx, size(px(1200.), px(800.)), &backend, &session);
+    settle(cx, handle);
+    let before = window.read_with(cx, |app, cx| {
+        app.terminal()
+            .expect("a spawned shell has a grid")
+            .read(cx)
+            .applied_size()
+    });
+
+    cx.update_window(handle, |_, window, cx| {
+        window.resize(size(px(1600.), px(1000.)));
+        window.bounds_changed(cx);
+    })
+    .expect("the window takes its new size");
+    settle(cx, handle);
+    let after = window.read_with(cx, |app, cx| {
+        app.terminal()
+            .expect("a spawned shell has a grid")
+            .read(cx)
+            .applied_size()
+    });
+
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "a window that grew from {before:?} to 1600x1000 left the grid at {after:?}"
+    );
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .expect("the window closes");
+    cx.run_until_parked();
+    let _ = session.close().wait();
+}

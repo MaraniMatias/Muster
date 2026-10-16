@@ -1348,6 +1348,7 @@ impl TerminalWindow {
             });
         div()
             .id("navigation-panel")
+            .test_support()
             .relative()
             .h_full()
             .w_full()

@@ -1325,9 +1325,14 @@ impl TerminalWindow {
             return div().into_any_element();
         }
         let checkout_id = id.to_owned();
+        // The panel's width is its slot's, not the width a drag last ended on:
+        // the group rescales its slots when the window resizes, and a panel that
+        // kept the remembered width would leave the rest of the slot unpainted.
         let mut panel = div()
-            .w(px(self.inspector_width))
-            .flex_none()
+            .id("inspector-panel")
+            .test_support()
+            .w_full()
+            .min_w_0()
             .h_full()
             .min_h_0()
             .flex()
