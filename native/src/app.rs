@@ -76,7 +76,7 @@ pub fn load_fonts(cx: &App) {
         Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Bold.ttf").as_slice()),
     ]) {
-        log::error!("muster-native: bundled sidebar fonts could not load: {error}");
+        log::error!("muster: bundled sidebar fonts could not load: {error}");
     }
 }
 
@@ -1125,7 +1125,7 @@ impl TerminalWindow {
                     self.diff_totals.insert(id, total);
                 }
                 Err(error) => {
-                    log::debug!("muster-native: {path}: {error}");
+                    log::debug!("muster: {path}: {error}");
                     self.diff_totals.remove(&id);
                 }
             }

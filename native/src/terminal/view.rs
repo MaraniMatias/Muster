@@ -525,7 +525,7 @@ impl TerminalView {
     /// person dismissed, and the banner is what they can act on now.
     fn refuse(&mut self, what: &str, error: &super::SessionError, cx: &mut Context<Self>) {
         let message = format!("{what}: {error}");
-        log::warn!("muster-native: {message}");
+        log::warn!("muster: {message}");
         self.report(message, cx);
         cx.notify();
     }
@@ -549,7 +549,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let message = format!("{what}: {error}");
-        log::warn!("muster-native: {message}");
+        log::warn!("muster: {message}");
         self.report(message, cx);
     }
 }
@@ -667,7 +667,7 @@ impl TerminalView {
         self.bold_font_loaded = match load_bundled_fonts(window) {
             Ok(loaded) => loaded,
             Err(error) => {
-                log::error!("muster-native: bundled terminal fonts could not load: {error}");
+                log::error!("muster: bundled terminal fonts could not load: {error}");
                 false
             }
         };
@@ -692,7 +692,7 @@ impl TerminalView {
                 .unwrap_or("monospace")
         };
         if family != "Fira Code" {
-            log::error!("muster-native: bundled Fira Code did not resolve; using {family}");
+            log::error!("muster: bundled Fira Code did not resolve; using {family}");
         }
         self.style.font_family = SharedString::from(family);
         self.style.font_weight = FontWeight::NORMAL;
@@ -711,7 +711,7 @@ impl TerminalView {
                 self.cell = Some(cell);
             }
             None => log::warn!(
-                "muster-native: the terminal font produced no metrics for {family}; \
+                "muster: the terminal font produced no metrics for {family}; \
                  the grid is not drawn until it does"
             ),
         }
@@ -916,7 +916,7 @@ impl TerminalView {
             alt: modifiers.alt,
             ctrl: modifiers.control,
         }) {
-            log::warn!("muster-native: mouse input was refused: {error}");
+            log::warn!("muster: mouse input was refused: {error}");
         }
     }
 
@@ -1446,7 +1446,7 @@ impl Frame {
             window,
             cx,
         ) {
-            log::warn!("muster-native: a text run was not painted: {error}");
+            log::warn!("muster: a text run was not painted: {error}");
         }
     }
 }
@@ -1673,7 +1673,7 @@ impl Render for TerminalView {
         let focus_state = (snapshot.modes.focus_reporting, focus.accepts_input());
         if self.reported_focus != Some(focus_state) {
             if let Err(error) = self.session.send_focus(focus_state.1) {
-                log::warn!("muster-native: focus report was refused: {error}");
+                log::warn!("muster: focus report was refused: {error}");
             }
             self.reported_focus = Some(focus_state);
         }
@@ -1781,7 +1781,7 @@ impl Render for TerminalView {
                             if size.0 > 0 && size.1 > 0 && applied.get() != size {
                                 applied.set(size);
                                 if let Err(error) = view.resize(size.0, size.1) {
-                                    log::warn!("muster-native: the grid was not resized: {error}");
+                                    log::warn!("muster: the grid was not resized: {error}");
                                 }
                             }
                             Some((cell, size))
@@ -2365,7 +2365,7 @@ mod tests {
     fn script_session(script: &str) -> TerminalSession {
         let backend = Arc::new(crate::pty::TerminalBackend::default());
         let mut config = crate::terminal::TerminalSessionConfig::new(
-            format!("muster-native-view-{}", std::process::id()),
+            format!("muster-view-{}", std::process::id()),
             std::env::temp_dir(),
             80,
             24,
@@ -2481,10 +2481,7 @@ mod tests {
             // A session id of its own per test: ids are how the session store
             // tells two terminals apart, and three tests sharing one would be
             // three tests writing over each other's shell.
-            format!(
-                "muster-native-prompt-{}",
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ),
+            format!("muster-prompt-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
             std::env::temp_dir(),
             80,
             24,

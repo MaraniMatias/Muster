@@ -235,9 +235,9 @@ test("loadLockedPackages audits both manifests and deduplicates shared packages"
     [
       AUDITED_MANIFESTS[1],
       JSON.stringify({
-        workspace_members: ["path+file:///native#muster-native@0.0.0"],
+        workspace_members: ["path+file:///native#muster@0.0.0"],
         packages: [
-          { id: "path+file:///native#muster-native@0.0.0", name: "muster-native", version: "0.0.0", source: null },
+          { id: "path+file:///native#muster@0.0.0", name: "muster", version: "0.0.0", source: null },
           shared,
           {
             id: `path+file://${alacrittyManifest}#alacritty_terminal@0.26.0`,

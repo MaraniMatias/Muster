@@ -24,10 +24,7 @@ const POLL: Duration = Duration::from_millis(10);
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
 fn next_id() -> String {
-    format!(
-        "muster-native-test-{}",
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    )
+    format!("muster-test-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 /// A session running `script` under `/bin/sh`.
@@ -354,7 +351,7 @@ fn the_host_answers_from_the_measured_cell_and_the_views_palette() {
 fn the_working_directory_is_the_first_argument_that_is_one() {
     let dir = std::env::temp_dir();
     let args = vec![
-        OsString::from("muster-native"),
+        OsString::from("Muster"),
         OsString::from("not-a-directory"),
         dir.clone().into_os_string(),
         std::env::temp_dir().join("also-not-here").into_os_string(),
@@ -365,7 +362,7 @@ fn the_working_directory_is_the_first_argument_that_is_one() {
 #[test]
 fn no_argument_at_all_leaves_the_directory_undecided() {
     assert_eq!(
-        directory_from([OsString::from("muster-native")]),
+        directory_from([OsString::from("Muster")]),
         None,
         "the program's own name is not a working directory"
     );

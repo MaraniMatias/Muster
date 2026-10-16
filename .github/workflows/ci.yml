@@ -34,7 +34,7 @@ jobs:
       - run: node --test scripts/audit-rust.test.mjs
       - run: node scripts/audit-rust.mjs
 
-      - run: cargo build --locked --release -p muster-native
+      - run: cargo build --locked --release -p muster
       # The macOS bundle is what carries the app's icon, name and version, so a
       # release build that cannot be bundled is a release build that would ship
       # without an identity.
@@ -57,5 +57,5 @@ jobs:
           workspaces: . -> target
       # The Vulkan, X11 and Wayland development packages GPUI links against.
       - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev
-      - run: cargo build --locked -p muster-native
+      - run: cargo build --locked -p muster
       - run: cargo test --locked -p muster-core

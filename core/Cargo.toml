@@ -2,7 +2,7 @@
 name = "muster-core"
 version = "0.0.0"
 # 2021, matching the sources this crate took over from `src-tauri`. Those files
-# are edition 2021 and `muster-native` -- the only consumer -- does not have to
+# are edition 2021 and `muster` -- the only consumer -- does not have to
 # cross editions to depend on them.
 edition = "2021"
 publish = false

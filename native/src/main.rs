@@ -19,7 +19,7 @@ fn main() {
     let _instance = match muster_core::navigation::NativeInstanceLock::acquire() {
         Ok(instance) => instance,
         Err(error) => {
-            eprintln!("muster-native: {error}");
+            eprintln!("muster: {error}");
             std::process::exit(1);
         }
     };
@@ -46,6 +46,6 @@ fn main() {
                     cx.new(|cx| TerminalWindow::new(window, cx))
                 },
             )
-            .expect("muster-native: failed to open window");
+            .expect("muster: failed to open window");
         });
 }

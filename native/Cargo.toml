@@ -1,5 +1,5 @@
 [package]
-name = "muster-native"
+name = "muster"
 version = "0.0.0"
 # 2021, matching `src-tauri`. The reused `src-tauri` sources are edition 2021 and
 # an in-crate dependency cannot cross editions; GPUI Kit being edition 2024 does
@@ -17,12 +17,15 @@ name = "muster_native"
 path = "src/lib.rs"
 
 [[bin]]
-# `muster`, not `muster-native`, and the package keeps the other name so
-# `cargo run -p muster-native` still names this crate: an unbundled macOS
-# executable is filed under its own filename, so the binary run from `target/`
-# and the bundle `scripts/bundle-macos.sh` wraps around it are one application
-# under one name.
-name = "muster"
+# `Muster`, capitalised, while the package keeps `muster` so `cargo run -p
+# muster` still names this crate. The capitalisation is the point: macOS files
+# an executable that is not inside a bundle under its own filename, and that
+# filename is the name the Dock and the application menu show, so the binary run
+# from `target/` would otherwise answer to "muster" while the bundle answers to
+# "Muster". `CFBundleName` and `CFBundleExecutable` in
+# `scripts/bundle-macos.sh` are this same word, so whichever of the two was
+# launched the system files one application under one name.
+name = "Muster"
 path = "src/main.rs"
 
 [dependencies]
@@ -34,43 +37,43 @@ path = "src/main.rs"
 # Enable the grammars selected by `document::syntax_language`, plus JSDoc for
 # JavaScript injections. Unsupported formats still open as plain text.
 gpui-kit = { version = "0.7.3", features = [
-    "component",
-    "tree-sitter",
-    "tree-sitter-bash",
-    "tree-sitter-c",
-    "tree-sitter-cmake",
-    "tree-sitter-cpp",
-    "tree-sitter-csharp",
-    "tree-sitter-css",
-    "tree-sitter-diff",
-    "tree-sitter-ejs",
-    "tree-sitter-elixir",
-    "tree-sitter-erb",
-    "tree-sitter-go",
-    "tree-sitter-graphql",
-    "tree-sitter-html",
-    "tree-sitter-java",
-    "tree-sitter-javascript",
-    "tree-sitter-jsdoc",
-    "tree-sitter-kotlin",
-    "tree-sitter-lua",
-    "tree-sitter-make",
-    "tree-sitter-markdown",
-    "tree-sitter-markdown-inline",
-    "tree-sitter-php",
-    "tree-sitter-proto",
-    "tree-sitter-python",
-    "tree-sitter-ruby",
-    "tree-sitter-rust",
-    "tree-sitter-scala",
-    "tree-sitter-sql",
-    "tree-sitter-svelte",
-    "tree-sitter-swift",
-    "tree-sitter-toml",
-    "tree-sitter-tsx",
-    "tree-sitter-typescript",
-    "tree-sitter-yaml",
-    "tree-sitter-zig",
+  "component",
+  "tree-sitter",
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cmake",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-ejs",
+  "tree-sitter-elixir",
+  "tree-sitter-erb",
+  "tree-sitter-go",
+  "tree-sitter-graphql",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-jsdoc",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-make",
+  "tree-sitter-markdown",
+  "tree-sitter-markdown-inline",
+  "tree-sitter-php",
+  "tree-sitter-proto",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-scala",
+  "tree-sitter-sql",
+  "tree-sitter-svelte",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
 ] }
 # Already selected by the toolkit features above; expose their upstream
 # queries because GPUI Kit registers these grammars with empty queries.
@@ -103,3 +106,4 @@ tempfile = "3"
 # Same crate, test-support on: unit tests build the same type universe as the app.
 gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
 tempfile = "3"
+

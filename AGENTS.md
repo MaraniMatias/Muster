@@ -8,7 +8,7 @@ workspace of two crates; the Tauri + Vue app it replaces is parked in `legacy/`.
 ```text
 Cargo.toml        workspace: core + native, and the [patch.crates-io] table
 core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
-native/           muster-native the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
+native/           muster            the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
 legacy/           the Tauri 2 + Vue 3 app, frozen at v0.21.1. Not built here.
 scripts/          the RustSec audit, the macOS bundle and the vendored-crate hash pins
 docs/             the migration plan, and what the port has to satisfy

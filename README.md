@@ -9,7 +9,7 @@ under [`legacy/`](legacy), and the root is the new native app.**
 | Path | What it is |
 | --- | --- |
 | [`core/`](core) | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI. |
-| [`native/`](native) | `muster-native`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. |
+| [`native/`](native) | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. |
 | [`legacy/`](legacy) | The Tauri 2 + Vue 3 app, frozen at `v0.21.1`. Not built, not tested, not released from here. |
 | [`docs/native-rust-migration/`](docs/native-rust-migration) | Why the port, and what the terminal milestone has to satisfy. |
 
@@ -23,9 +23,9 @@ Requires the Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) and,
 for the security audit only, Node 22.
 
 ```sh
-rustup run 1.97.1 cargo run --locked -p muster-native
-rustup run 1.97.1 cargo run --locked -p muster-native -- /some/dir
-rustup run 1.97.1 cargo build --locked --release -p muster-native
+rustup run 1.97.1 cargo run --locked -p muster
+rustup run 1.97.1 cargo run --locked -p muster -- /some/dir
+rustup run 1.97.1 cargo build --locked --release -p muster
 
 rustup run 1.97.1 cargo test --locked --workspace
 rustup run 1.97.1 cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -35,7 +35,7 @@ node scripts/audit-rust.mjs                # RustSec over the locked graph
 scripts/perf-native.sh                      # the terminal hot-path cost table
 ```
 
-`MUSTER_LOG=debug cargo run -p muster-native` prints what the terminal refuses
+`MUSTER_LOG=debug cargo run -p muster` prints what the terminal refuses
 and what it could not do. Without a sink installed every one of those records
 would be discarded, so the app installs one before anything that can log.
 

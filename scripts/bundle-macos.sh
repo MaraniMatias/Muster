@@ -13,7 +13,7 @@
 # fields that are not copied are explained where they are.
 #
 # Usage: scripts/bundle-macos.sh [binary] [output-dir]
-#   binary      default target/release/muster
+#   binary      default target/release/Muster
 #   output-dir  default dist/
 set -euo pipefail
 
@@ -23,7 +23,7 @@ set -euo pipefail
 }
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-binary="${1:-$root/target/release/muster}"
+binary="${1:-$root/target/release/Muster}"
 out="${2:-$root/dist}"
 icon="$root/native/assets/icon.icns"
 app="$out/Muster.app"
@@ -46,10 +46,12 @@ version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/native/Cargo.toml
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-# `muster`, the name `CFBundleExecutable` below declares: inside the bundle the
-# executable name is the one the system reports in Activity Monitor and in Get
-# Info, and the one Legacy's bundle answers to.
-install -m 755 "$binary" "$app/Contents/MacOS/muster"
+# `Muster`, the name `CFBundleExecutable` below declares and the name the binary
+# carries in `native/Cargo.toml`: inside the bundle the executable name is the
+# one the system reports in Activity Monitor and in Get Info, and it is the same
+# word `CFBundleName` gives the app, so the bundle and the bare executable in
+# `target/` are one application under one name.
+install -m 755 "$binary" "$app/Contents/MacOS/Muster"
 install -m 644 "$icon" "$app/Contents/Resources/Muster.icns"
 
 cat >"$app/Contents/Info.plist" <<PLIST
@@ -62,7 +64,7 @@ cat >"$app/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>
   <string>Muster</string>
   <key>CFBundleExecutable</key>
-  <string>muster</string>
+  <string>Muster</string>
   <key>CFBundleIconFile</key>
   <string>Muster.icns</string>
   <key>CFBundleIdentifier</key>

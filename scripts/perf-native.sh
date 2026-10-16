@@ -33,10 +33,10 @@ fi
 
 profile_args=()
 if [[ "$PROFILE" == "release" ]]; then profile_args+=(--release); fi
-rustup run "$TOOLCHAIN" cargo test --locked -p muster-native perf:: \
+rustup run "$TOOLCHAIN" cargo test --locked -p muster perf:: \
   "${profile_args[@]}" -- --ignored --nocapture --test-threads=1 "$@"
 
 # Hidden output must coalesce and dropping the view must release workers.
-rustup run "$TOOLCHAIN" cargo test --locked -p muster-native \
+rustup run "$TOOLCHAIN" cargo test --locked -p muster \
   an_unmounted_view_coalesces_output_and_does_not_retain_its_session \
   "${profile_args[@]}" -- --test-threads=1
