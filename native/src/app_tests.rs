@@ -53,6 +53,7 @@ fn open(
     session: &TerminalSession,
 ) -> (AnyWindowHandle, Entity<TerminalWindow>) {
     cx.update(gpui_kit::init);
+    cx.update(crate::terminal::install_keys);
     cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
@@ -897,4 +898,51 @@ fn resizing_the_window_resizes_the_terminal_grid(cx: &mut TestAppContext) {
         .expect("the window closes");
     cx.run_until_parked();
     let _ = session.close().wait();
+}
+
+/// The last line the shell writes is a line somebody can see.
+///
+/// The grid is one row per whole cell of the box it is given, and the child is
+/// told about exactly those rows. A grid that reaches past the bottom of the
+/// window does not have its last row clipped on screen -- the window cuts it
+/// off, and the line the shell just wrote is a line nobody can read and no
+/// scroll brings back. The title bar is what makes the difference: it is the
+/// one part of this window the grid does not start at the top of.
+#[gpui_kit::test]
+fn the_grid_ends_inside_the_window(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{dispose, open};
+
+    let fixture = open(cx);
+    // A window with room for the panels' own height, and one with less than
+    // they ask for: the second is where a grid that measures what it was
+    // given ends up with a row the window cannot show.
+    for wanted in [size(px(1280.), px(800.)), size(px(1280.), px(190.))] {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.resize(wanted);
+            window.bounds_changed(cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .expect("the window takes its new size");
+        cx.run_until_parked();
+
+        let bottom = fixture.view.read_with(cx, |app, cx| {
+            app.terminal()
+                .expect("the fixture opens a shell")
+                .read(cx)
+                .drawn_bottom()
+                .expect("the grid measured a cell")
+        });
+        let viewport = cx
+            .update_window(fixture.handle, |_, window, _| window.viewport_size())
+            .expect("the window has a viewport");
+        assert!(
+            bottom <= viewport.height,
+            "at {wanted:?} the grid's last row ends at {bottom:?}, below a window that ends at \
+             {:?}: the shell writes a line this window cannot show",
+            viewport.height
+        );
+    }
+
+    dispose(&fixture, cx);
 }

@@ -35,7 +35,7 @@ use gpui_kit::{
 use super::input::{self, FocusState};
 use super::{
     CellMetrics, CellSnapshot, ColorSnapshot, CursorShapeSnapshot, GridRange, TerminalSession,
-    TerminalSnapshot,
+    TerminalShiftTab, TerminalSnapshot, TerminalTab,
 };
 
 /// The terminal's font size and line spacing, matching the legacy terminal defaults.
@@ -369,6 +369,23 @@ impl CellSize {
     }
 }
 
+/// The height of `bounds` this window can still show.
+///
+/// The canvas is laid out inside the window's own column, so a window that
+/// gives it more height than it has room for -- the title bar above it, a bar
+/// that appears later -- would otherwise have the grid measure rows that are
+/// painted below the bottom edge. The window cuts those off, and the child was
+/// already told about them: the line it writes last is a line nobody can read
+/// and no scroll brings back.
+///
+/// Clamped rather than refused, because a window too small for a row is a
+/// window that is small, not one that is broken, and a grid of no rows is what
+/// a window with no room for one already draws.
+fn shown_height(bounds: Bounds<Pixels>, window: &Window) -> Pixels {
+    let below = window.viewport_size().height - bounds.origin.y;
+    bounds.size.height.min(below).max(px(0.0))
+}
+
 /// A measured cell in the whole pixels a child's size query is answered in.
 ///
 /// Rounded rather than truncated: a child measuring its text area in pixels
@@ -682,6 +699,19 @@ impl TerminalView {
         self.applied.get()
     }
 
+    /// Where the bottom of the last row this view draws falls in the window.
+    ///
+    /// `None` until a frame has measured a cell. This is the number that says
+    /// whether the grid is one the window can show: the rows are one per whole
+    /// cell of the box the view was given, so a grid that reaches past the
+    /// bottom edge is a shell writing a line nobody can read.
+    #[cfg(test)]
+    pub(crate) fn drawn_bottom(&self) -> Option<Pixels> {
+        let cell = self.cell?;
+        let (_, rows) = self.applied.get();
+        Some(self.canvas_origin.get().y + cell.height * f32::from(rows))
+    }
+
     /// Begin the close sequence, without waiting for it.
     ///
     /// A no-op the second time: the session refuses new work once a close has
@@ -852,7 +882,10 @@ impl TerminalView {
             return;
         }
         if key == "tab" {
-            // Capture phase prevents GPUI's focus traversal binding from taking it.
+            // The toolkit's own root binds Tab to focus traversal and answers
+            // it before this handler runs, so this is the path Tab takes when
+            // no other control answered first; [`Self::on_action_tab`] is the
+            // one that normally does.
             cx.stop_propagation();
         }
         if !modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.platform {
@@ -863,6 +896,44 @@ impl TerminalView {
         }
         cx.stop_propagation();
         if let Err(error) = self.session.send_key(&press) {
+            self.refuse("A keystroke was not sent", &error, cx);
+        }
+    }
+
+    /// Tab, answered before the window root answers it for itself.
+    ///
+    /// The same press `on_key_down` would have encoded, reached through a
+    /// binding rather than a key event, because the root's focus traversal
+    /// takes Tab first. Plain Tab completes; the shifted one asks the shell
+    /// for the history instead, which is the other of the two Tab presses a
+    /// shell reads differently.
+    fn on_action_tab(&mut self, _: &TerminalTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_tab(false, window, cx);
+    }
+
+    fn on_action_shift_tab(
+        &mut self,
+        _: &TerminalShiftTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_tab(true, window, cx);
+    }
+
+    fn send_tab(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_state(window).accepts_input() {
+            return;
+        }
+        self.reset_blink();
+        cx.notify();
+        if let Err(error) = self.session.send_key(&super::KeyPress {
+            key: super::Key::Tab,
+            shift,
+            ctrl: false,
+            alt: false,
+            meta: false,
+            text: None,
+        }) {
             self.refuse("A keystroke was not sent", &error, cx);
         }
     }
@@ -1784,7 +1855,10 @@ impl Render for TerminalView {
         div()
             .id("muster-terminal")
             .size_full()
+            .key_context(super::TAB_CONTEXT)
             .track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_action_tab))
+            .on_action(cx.listener(Self::on_action_shift_tab))
             .on_action(cx.listener(Self::on_action_copy))
             .on_action(cx.listener(Self::on_action_paste))
             // A click anywhere in the grid is a click on the terminal. There is
@@ -1825,12 +1899,12 @@ impl Render for TerminalView {
                     {
                         let applied = Rc::clone(&applied);
                         let view = Arc::clone(&self.session);
-                        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                        move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
                             canvas_origin.set(bounds.origin);
                             let cell = cell?;
                             let size = (
                                 cell.columns_in(bounds.size.width),
-                                cell.rows_in(bounds.size.height),
+                                cell.rows_in(shown_height(bounds, window)),
                             );
                             // A window measuring nothing is invisible or minimised.
                             // `resize` refuses zero already; asking only when the
@@ -2148,6 +2222,125 @@ mod tests {
         }
     }
 
+    /// Tab reaches the child even though the window root wants it.
+    ///
+    /// The toolkit answers a key binding *before* the key reaches any
+    /// element, and the window root binds `tab` to focus traversal and stops
+    /// it there. `open_window` puts every window's app view under that root,
+    /// so a terminal that waits for its own key handler is a shell with no
+    /// completion at all. The two bindings here are the real ones: the root's
+    /// on the outside, the terminal's on the grid, and the deeper context is
+    /// the one that is answered first.
+    #[gpui_kit::test]
+    fn tab_reaches_the_child_even_though_the_window_root_binds_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(crate::terminal::install_keys);
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "tab",
+                RootFocusNext,
+                Some("Root"),
+            )])
+        });
+        // `cat` writes back what it is sent, so what lands in the grid is the
+        // child's answer rather than a copy of what the test wrote. Raw mode
+        // because `cat -v` is what turns the escape a shifted Tab sends into
+        // something the grid can be asked about.
+        let session = script_session("stty raw -echo; printf READY; cat -v");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |v, _| Arc::clone(v.session()));
+        let (root, cx) = cx.add_window_view(|_, _| WindowRoot { view });
+        let view = root.read_with(cx, |root, _| root.view.clone());
+        focus_grid(cx, &view);
+        assert!(
+            wait_for_char(&session, 'R'),
+            "the child never drew its marker"
+        );
+
+        press_key(cx, "tab", Default::default());
+        assert!(
+            wait_for_char(&session, '\t'),
+            "Tab never reached the child: the window root answered it instead"
+        );
+        // The other Tab a shell reads: the history instead of the completion.
+        press_key(
+            cx,
+            "tab",
+            gpui_kit::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            wait_for_char(&session, '^'),
+            "Shift+Tab never reached the child: {}",
+            grid_text(&session)
+        );
+        let _ = session.close().wait();
+    }
+
+    /// Every character the grid holds, one line per row.
+    fn grid_text(session: &TerminalSession) -> String {
+        session
+            .snapshot()
+            .rows
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.c).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One key press, the way the platform delivers one.
+    fn press_key(cx: &mut gpui_kit::VisualTestContext, key: &str, modifiers: gpui_kit::Modifiers) {
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                    keystroke: gpui_kit::Keystroke {
+                        key: key.to_owned(),
+                        key_char: None,
+                        modifiers,
+                    },
+                    is_held: false,
+                    // What macOS delivers: the toolkit answers its bindings
+                    // first, which is the whole reason this test exists.
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        });
+    }
+
+    gpui_kit::actions!(root_context, [RootFocusNext]);
+
+    /// What every window this app opens is drawn under: the toolkit's own
+    /// root, whose `tab` moves focus and keeps the key.
+    struct WindowRoot {
+        view: gpui_kit::Entity<TerminalView>,
+    }
+
+    impl Render for WindowRoot {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            gpui_kit::div()
+                .key_context("Root")
+                .on_action(cx.listener(
+                    |_, _: &RootFocusNext, window: &mut Window, cx: &mut Context<Self>| {
+                        window.focus_next(cx);
+                    },
+                ))
+                .child(self.view.clone())
+        }
+    }
+
     #[gpui_kit::test]
     fn selection_works_under_window_chrome(cx: &mut gpui_kit::TestAppContext) {
         // The app draws a title bar above the grid, so the canvas does not start
@@ -2159,13 +2352,21 @@ mod tests {
             width: 8,
             height: 16,
         }));
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(session, metrics, cx));
-        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
-        let (terminal, cx) = cx.add_window_view(|_, _| Chrome {
-            view,
-            header: px(HEADER),
+        // One window, with the chrome around the grid: a grid measures the box
+        // it is drawn in, so two windows drawing one view would be two answers
+        // to the same question and the grid would answer with whichever of them
+        // painted last.
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = gpui_kit::AppContext::new(cx, |cx| {
+                TerminalView::new(session, Arc::clone(&metrics), cx)
+            });
+            Chrome {
+                view,
+                header: px(HEADER),
+            }
         });
         let view = terminal.read_with(cx, |chrome, _| chrome.view.clone());
+        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
         cx.update(|window, _| window.activate_window());
         for _ in 0..3 {
             cx.update(|window, cx| window.render_frame(cx));
@@ -2174,7 +2375,6 @@ mod tests {
             wait_for_char(&session, 's'),
             "the child never drew its text"
         );
-
         let (origin, cell) = view.read_with(cx, |view, _| {
             (
                 view.canvas_origin.get(),

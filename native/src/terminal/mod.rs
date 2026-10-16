@@ -45,3 +45,29 @@ pub use self::session::{
 pub(crate) use self::view::FONT_SIZE;
 pub use self::view::{xterm_256, CellSize, InputRefused, Palette, Placement, TerminalView};
 pub use self::write_queue::{EnqueueError, WriteQueue, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS};
+
+/// The key context the grid answers keys in, and the two Tab bindings that
+/// belong to it.
+///
+/// A toolkit dispatches a key binding *before* it hands the key to any
+/// element, and the window root's own `tab` binding -- focus traversal --
+/// stops the key there. A terminal that waits for `on_key_down` therefore
+/// never sees a Tab, and a shell is left with no completion at all. This is
+/// the same shape the toolkit's own text field uses: a key context on the
+/// element, and bindings registered for that context, which sort deeper than
+/// the root's and so are answered first.
+pub const TAB_CONTEXT: &str = "MusterTerminal";
+
+gpui_kit::actions!(muster_terminal, [TerminalTab, TerminalShiftTab]);
+
+/// Answer Tab for the terminal, before the window root answers it for itself.
+///
+/// Called once, with the rest of the toolkit's wiring, before any window
+/// exists: a binding registered after a window's first frame would be one
+/// keystroke too late.
+pub fn install_keys(cx: &mut gpui_kit::App) {
+    cx.bind_keys([
+        gpui_kit::KeyBinding::new("tab", TerminalTab, Some(TAB_CONTEXT)),
+        gpui_kit::KeyBinding::new("shift-tab", TerminalShiftTab, Some(TAB_CONTEXT)),
+    ]);
+}

@@ -27,6 +27,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            muster_native::terminal::install_keys(cx);
             muster_native::theme::install(cx);
             // macOS only, and before any window exists: the menu bar is set once
             // for the application, and the About item it carries is answered by
