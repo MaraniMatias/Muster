@@ -2813,6 +2813,63 @@ async fn a_document_offers_the_changes_of_a_file_that_has_them(cx: &mut TestAppC
     close(&fixture, cx);
 }
 
+/// A file's changes offer the source the other way round, unless Git removed it.
+///
+/// The same gesture read from the other pane: the changes of one file are the
+/// document of that file, and the button is what says so. What decides it is
+/// whether the file is still on disk, and that is Git's letter rather than the
+/// window's guess — a change that removed the file has nothing behind the path
+/// to open, so the pane says nothing rather than a read that can only fail.
+#[gpui_kit::test]
+async fn a_files_changes_offer_the_source_of_a_file_that_is_on_disk(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("notes.md"), "# Notes\n").unwrap();
+    std::fs::write(fixture.root.join("gone.md"), "gone\n").unwrap();
+    commit_all(&fixture.root, "first");
+    std::fs::write(fixture.root.join("notes.md"), "# Notes\nedited\n").unwrap();
+    std::fs::remove_file(fixture.root.join("gone.md")).unwrap();
+
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("notes.md".into()), cx)
+    });
+    assert!(
+        draw_until(&fixture, cx, "diff-open-source-notes.md"),
+        "a file that is on disk offers no way to read it"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("diff-open-source-notes.md", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "notes.md")
+    })
+    .await;
+    assert!(
+        fixture.view.read_with(cx, |app, _| app.open_diff.is_none()),
+        "the document and its changes are one panel, and it shows the document"
+    );
+
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("gone.md".into()), cx)
+    });
+    assert!(
+        !draw_until(&fixture, cx, "diff-open-source-gone.md"),
+        "a removed file offers a source it does not have"
+    );
+    close(&fixture, cx);
+}
 /// Open one document of the fixture's checkout and wait for the file to be read.
 async fn open(cx: &mut TestAppContext, fixture: &GitFixture, path: &str) {
     cx.update_window(fixture.handle, |_, window, cx| {

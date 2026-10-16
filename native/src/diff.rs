@@ -57,6 +57,18 @@ fn binary_notice(image: Option<muster_core::navigation::ImageFormat>, status: &s
     }
 }
 
+/// Whether a changed file is still on disk to be read.
+///
+/// Git's own letter is the answer, and it is the letter already drawn on the row:
+/// a change that removed the file puts `D` in one of its columns, and there is
+/// nothing behind the path to open. Every other letter — added, modified,
+/// renamed, untracked, conflicted — has bytes there. A path Git has said nothing
+/// about is not known to be gone either, so it is offered and the read is what
+/// says otherwise.
+fn on_disk(status: &str) -> bool {
+    !status.contains('D')
+}
+
 /// What the window knows about a checkout's change set, as far as a row's click
 /// is concerned.
 ///
@@ -336,6 +348,15 @@ impl TerminalWindow {
             return None;
         }
         let roles = Roles::of(cx);
+        // The source of the file whose change is on screen, when there is one to
+        // read. A whole change set names no file, so it names no source either.
+        let source = selected.as_deref().and_then(|path| {
+            if !on_disk(&self.git_status_status(checkout, path)) {
+                return None;
+            }
+            let (repo, checkout) = self.document_source(checkout)?;
+            Some((repo, checkout, path.to_owned()))
+        });
         let paths = if let Some(path) = selected {
             vec![path.clone()]
         } else if let Some(status) = self.git_status.get(checkout) {
@@ -707,6 +728,29 @@ impl TerminalWindow {
                                 .text_color(roles.text_muted)
                                 .child(selected.clone().unwrap_or_else(|| "All changes".into())),
                         )
+                        .when_some(source, |header, (repo, source_checkout, path)| {
+                            let weak = weak.clone();
+                            header.child(
+                                Button::new(format!("diff-open-source-{path}"))
+                                    .text()
+                                    .small()
+                                    .compact()
+                                    .rounded(px(0.))
+                                    .label("Source")
+                                    .accessibility_label(format!("Show the source of {path}"))
+                                    .tooltip("Show this file's source")
+                                    // The same one transition the other way round
+                                    // is: this pane is a document's changes, and the
+                                    // source is a document of its own.
+                                    .on_click(move |_, window, cx| {
+                                        let (repo, checkout, path) =
+                                            (repo.clone(), source_checkout.clone(), path.clone());
+                                        let _ = weak.update(cx, |app, cx| {
+                                            app.request_document(repo, checkout, path, window, cx)
+                                        });
+                                    }),
+                            )
+                        })
                         .child(
                             Button::new("close-diff")
                                 .custom(crate::app::sidebar_action_style(cx))
@@ -735,8 +779,22 @@ impl TerminalWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::binary_notice;
+    use super::{binary_notice, on_disk};
     use muster_core::navigation::ImageFormat;
+
+    /// A change that removed the file is the one change with nothing behind its
+    /// path, and the letter saying so is the letter the row already wears.
+    #[test]
+    fn a_removed_file_has_no_source_to_offer() {
+        for status in ["D", " D", "MD", "AD", "DD"] {
+            assert!(!on_disk(status), "{status}");
+        }
+        for status in [
+            "", "M", " M", "A", "AM", "??", "R", "R ", "C", "T", "MM", "UU",
+        ] {
+            assert!(on_disk(status), "{status}");
+        }
+    }
 
     /// A change with no text names the change, and the letter Git already put on
     /// the row is what says which change it is.

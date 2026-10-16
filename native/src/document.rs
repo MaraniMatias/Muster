@@ -290,7 +290,7 @@ impl TerminalWindow {
     /// place: a document and its pictures have to reach the same checkout, and a
     /// document that could be read through one checkout and written through another
     /// would be a file nobody can reason about.
-    fn document_source(&self, checkout: &str) -> Option<(Repo, Checkout)> {
+    pub(crate) fn document_source(&self, checkout: &str) -> Option<(Repo, Checkout)> {
         let repo = self
             .navigation
             .repos
@@ -1356,5 +1356,54 @@ mod tests {
             "same path with refreshed content is not stale"
         );
         updated.read_with(cx, |state, _| assert_eq!(state.text().to_string(), "{}\n"));
+    }
+
+    /// Template text is prose, and Legacy painted it as prose.
+    ///
+    /// The Vue grammar's own query opens by capturing `(template_element)`, which
+    /// is the whole `<template>` element, as `@tag`. A span that wide reaches
+    /// every byte the rest of the query does not name — the whitespace, the
+    /// indentation, and the text between the tags — so a label's own text came
+    /// out the colour of a tag. `(text) @none` wears no colour, so nothing
+    /// painted over it. One capture says a container wears nothing, and the text
+    /// inside it falls to the editor's ink.
+    #[gpui_kit::test]
+    fn vue_template_text_is_not_painted_as_a_string(cx: &mut TestAppContext) {
+        let (window, harness) = open(cx);
+        let source =
+            "<template>\n  <x-label for=\"previewType\">Preview Type</x-label>\n</template>\n";
+        harness.update(cx, |h, cx| {
+            h.document = Some(("component.vue".into(), source.into()));
+            cx.notify();
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        let state = editor(cx, &harness);
+        cx.update(|cx| {
+            let mut highlighter = gpui_kit::component::highlighter::SyntaxHighlighter::new("vue");
+            let text = state.read(cx).text().clone();
+            assert!(highlighter.update(None, &text, None), "vue");
+            let theme = gpui_kit::component::Theme::global(cx);
+            let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+            let paint = |needle: &str| {
+                let at = source.find(needle).expect("the label has the needle");
+                styles
+                    .iter()
+                    .filter(|(range, _)| range.start < at + needle.len() && range.end > at)
+                    .filter_map(|(_, style)| style.color)
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                paint("Preview Type").is_empty(),
+                "the text between the tags wears {:?}",
+                paint("Preview Type")
+            );
+            // And the tag around it still wears one, so this is not a file that
+            // failed to parse or a highlighter that found nothing in it.
+            assert!(
+                !paint("x-label").is_empty(),
+                "the tag around the text is not coloured"
+            );
+        });
     }
 }

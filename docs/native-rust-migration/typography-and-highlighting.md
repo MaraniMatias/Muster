@@ -379,3 +379,58 @@ each of the three blocks' styles separately, because a component whose `<style>`
 still passes a check that only asks whether the file is coloured *somewhere*.
 `additional_grammars_produce_legacy_token_colors` stops failing on
 `component.vue`, and its two leftover `eprintln!` probes are gone.
+
+---
+
+# The template's own text wore the colour of a tag
+
+The same file again, one report narrower: the `<template>` was coloured, the tags
+in it were coloured, and the **text between the tags was coloured too** — in the
+tag's own gold, so a label read `Preview Type` in exactly the colour of
+`x-label`.
+
+## The capture was wider than a token
+
+`tree_sitter_vue_updated`'s `highlights.scm` opens with
+
+```scm
+[
+  (template_element)
+  (tag_name)
+  (start_tag)
+  ...
+] @tag
+```
+
+`(template_element)` is not a tag name: it is **the whole `<template>` element**,
+from the opening `<template>` to the closing one. `(element)` is the same idea
+for one tag's body. A span that wide reaches every byte inside that the rest of
+the query does not name, and what the rest does not name is the whitespace, the
+indentation, and the prose between the tags.
+
+The query does name the prose — `(text) @none` — but `@none` wears no colour, so
+the container's gold underneath it is what the editor paints. Legacy's Shiki
+grammar had no such span: template text there was `text`, which its tables leave
+as plain foreground.
+
+## One query says so
+
+`VUE_HIGHLIGHTS` prepends `(template_element) @none` and `(element) @none` to the
+grammar's own query, beside the `(attribute_name) @function` that is already
+there. It is the same trick and the same reason: the highlighter takes the first
+pattern that matches a node, and all three of the grammar's are further down its
+file. A container then wears nothing, the tags inside it are still named by
+`tag_name`, `start_tag`, `end_tag` and the four delimiter literals, and the text
+between them falls to the editor's ink.
+
+### How it is verified
+
+`cargo test --locked --workspace`, `cargo clippy --locked --workspace
+--all-targets -- -D warnings` and `cargo fmt --all --check`.
+
+One new test, `document::tests::vue_template_text_is_not_painted_as_a_string`:
+it opens an SFC, asks for the styles of the whole file, and reads the colours
+that land on `Preview Type` and on `x-label` separately. The second half matters
+as much as the first — a file that failed to parse, or a highlighter that found
+nothing in it, wears no colour anywhere and would pass a check that only asked
+about the text.

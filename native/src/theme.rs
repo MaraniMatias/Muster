@@ -191,8 +191,8 @@ const VUE_INJECTIONS: &str = r#"
 )
 "#;
 
-/// The one place this grammar reads a Vue file differently from the one
-/// Legacy read it with, and it is a single attribute.
+/// The two places this grammar reads a Vue file differently from the one
+/// Legacy read it with.
 ///
 /// Legacy rendered a `.vue` with Shiki's TextMate grammar, where an attribute is
 /// an `entity.other.attribute-name` and a directive is a `meta.attribute.directive`:
@@ -202,11 +202,23 @@ const VUE_INJECTIONS: &str = r#"
 /// and only an attribute with a `:` or an `@` in it read as something else.
 /// One capture says it the way Legacy painted it.
 ///
-/// It comes before the grammar's own query on purpose: the highlighter takes the
-/// first pattern that matches a node, and the grammar's `(attribute_name)` is
-/// further down its file.
+/// The grammar also captures a whole container as `@tag` — `(template_element)`
+/// is the entire `<template>` block, `(element)` a whole tag's body. A span that
+/// wide is wider than any token Legacy had: it reaches every byte inside that
+/// the rest of the query does not name, which is the whitespace, the
+/// indentation, and the prose between the tags. `(text) @none` wears no colour,
+/// so the container's gold showed through and the text in a template came out
+/// the colour of a tag. Legacy left template text as plain text, so a container
+/// wears nothing and what is inside it falls to the editor's ink.
+///
+/// All three come before the grammar's own query on purpose: the highlighter
+/// takes the first pattern that matches a node, and the grammar's
+/// `(attribute_name)`, `(template_element)` and `(element)` are all further down
+/// its file.
 const VUE_HIGHLIGHTS: &str = r#"
 (attribute_name) @function
+(template_element) @none
+(element) @none
 "#;
 
 /// Install Legacy dark for both toolkit widgets and application-owned drawing.
