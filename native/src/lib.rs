@@ -44,6 +44,9 @@ pub mod session_owner;
 /// The serial, bounded writer behind `core::navigation`'s state file.
 pub mod state_writer;
 
+/// Short-lived, dismissible messages raised by the workspace window.
+mod toast;
+
 /// The application's semantic colour roles, read from the toolkit theme.
 pub mod theme;
 

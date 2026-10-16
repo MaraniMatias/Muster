@@ -238,18 +238,17 @@ fn an_uncounted_checkout_draws_nothing_rather_than_zero() {
         Some((3, 1)),
     );
 }
-/// A refusal reaches the banner the window already draws.
+/// A refusal reaches the window's toast stack.
 ///
 /// Through the real window, because that is the whole claim: the terminal view
-/// notices, the window hears, and the message lands in the one place this
-/// window says something went wrong. A test that called the view alone would
-/// pass with the sink never wired at all.
+/// notices, the window hears, and the message lands in the stack the window
+/// draws. A test that called the view alone would pass with the sink never wired.
 ///
 /// The refusal is raised rather than provoked. That the view raises one for a
 /// keystroke and for a paste, and never quotes what it refused, is proven in
 /// the view's own tests; what only a window can prove is the last hop.
 #[gpui_kit::test]
-fn a_refused_input_reaches_the_window_banner(cx: &mut TestAppContext) {
+fn a_refused_input_reaches_the_window_toast(cx: &mut TestAppContext) {
     let backend = Arc::new(TerminalBackend::default());
     let session = session(&backend, "cat");
     let (handle, view) = open(cx, size(px(800.), px(600.)), &backend, &session);
@@ -270,14 +269,22 @@ fn a_refused_input_reaches_the_window_banner(cx: &mut TestAppContext) {
     })
     .unwrap();
 
-    let message = view.read_with(cx, |app, _| app.failure.clone());
+    let message = view.read_with(cx, |app, _| app.toasts.latest_error().map(str::to_owned));
+    assert!(
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("toast-stack").is_some()
+        })
+        .expect("the test window remains open"),
+        "the refusal was not drawn as a toast"
+    );
     let _ = session.close().wait();
     cx.update_window(handle, |_, window, _| window.remove_window())
         .unwrap();
-    let message = message.expect("a refused input said nothing in the banner");
+    let message = message.expect("a refused input said nothing in a toast");
     assert!(
         message.contains("keystroke") && message.contains("closing"),
-        "the banner does not say what was refused and why: {message:?}"
+        "the toast does not say what was refused and why: {message:?}"
     );
 }
 

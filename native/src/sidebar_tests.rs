@@ -1415,7 +1415,7 @@ async fn a_failed_change_read_is_said_rather_than_called_clean(cx: &mut TestAppC
     })
     .unwrap();
     cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture.view.read(cx).failure.is_some()
+        fixture.view.read(cx).toasts.latest_error().is_some()
     })
     .await;
     fixture.view.read_with(cx, |app, _| {
@@ -1433,7 +1433,7 @@ async fn a_failed_change_read_is_said_rather_than_called_clean(cx: &mut TestAppC
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.find("dismiss-message").visible(),
+            window.find("toast-stack").visible(),
             "the failure is in the state and not on screen"
         );
     })
@@ -1502,7 +1502,7 @@ async fn a_clean_list_cached_before_a_failed_read_is_not_a_clean_checkout(cx: &m
     })
     .unwrap();
     cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture.view.read(cx).failure.is_some()
+        fixture.view.read(cx).toasts.latest_error().is_some()
     })
     .await;
     fixture.view.read_with(cx, |app, _| {
@@ -1513,7 +1513,7 @@ async fn a_clean_list_cached_before_a_failed_read_is_not_a_clean_checkout(cx: &m
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.find("dismiss-message").visible(),
+            window.find("toast-stack").visible(),
             "the failure is in the state and not on screen"
         );
     })
@@ -1562,7 +1562,7 @@ async fn a_cached_change_list_is_not_opened_after_the_read_behind_it_failed(
     })
     .unwrap();
     cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture.view.read(cx).failure.is_some()
+        fixture.view.read(cx).toasts.latest_error().is_some()
     })
     .await;
     fixture.view.read_with(cx, |app, _| {
@@ -1951,7 +1951,7 @@ fn moving_a_row_preserves_pty_and_view_identity(cx: &mut TestAppContext) {
         assert_eq!(app.terminals[&id].view.entity_id(), entity);
         assert_eq!(app.navigation.session(&id).unwrap().checkout_id, target);
         assert_eq!(app.navigation.active_session.as_deref(), Some(id.as_str()));
-        assert!(app.notice.as_ref().unwrap().contains("no cd was sent"));
+        assert!(app.toasts.latest_info().unwrap().contains("no cd was sent"));
     });
     assert!(fixture.backend.status(&id).is_ok());
     dispose(&fixture, cx);
@@ -3117,7 +3117,11 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
     cx.run_until_parked();
     fixture.view.update(cx, |app, _| {
         assert!(!app.navigation.archived.contains(&missing_id));
-        assert!(app.failure.as_ref().unwrap().contains("terminal sessions"));
+        assert!(app
+            .toasts
+            .latest_error()
+            .unwrap()
+            .contains("terminal sessions"));
         app.navigation.pending.clear();
     });
 
@@ -3520,7 +3524,7 @@ async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut 
         assert!(app.navigation.active_session.is_none());
         // The rest of the panel is untouched, and nothing complained.
         assert_eq!(app.navigation.repos.len(), 1);
-        assert!(app.failure.is_none());
+        assert!(app.toasts.latest_error().is_none());
     });
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);

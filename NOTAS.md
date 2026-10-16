@@ -70,12 +70,16 @@
 
 ## B · Mensajes → toast
 
-Toca: `native/src/toast.rs` (nuevo). No toca nada más, así que va solo.
-
-- [ ] menssaje, aletars -> deberian ser toast
-      `native/` no tiene toast todavía. Legacy tiene `src/presentation/toasts.ts` y
-      `ToastStack.vue` como referencia: niveles `error`/`info`, 3 s y 6 s, y la pila
-      es click-through para que un toast no se coma un click.
+- [x] mensajes y alertas globales como toast
+      Nuevo `native/src/toast.rs`, conectado al root y a todos los lugares que antes
+      escribían `failure`/`notice`. Sigue Legacy: niveles `error`/`info`, seis y tres
+      segundos, máximo tres; un mensaje idéntico al más nuevo reinicia su reloj. Cada
+      toast tiene su botón de cerrar, y la capa de ancho completo no registra eventos
+      de puntero: el espacio entre y alrededor de las tarjetas sigue siendo click-through.
+      Los errores que pertenecen a un diálogo o a una fila siguen ahí; solo los mensajes
+      globales de la ventana pasan a la pila.
+      Tests: `toast::tests::*`, `a_refused_input_reaches_the_window_toast` y
+      `a_refused_link_is_said_in_the_window_and_dismissed`.
 
 ## C · Color por estado del proceso
 

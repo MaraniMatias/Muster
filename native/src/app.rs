@@ -12,12 +12,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    button::{Button, ButtonCustomVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, ResizableState},
-    window_border, Disableable, Sizable, TitleBar,
+    window_border, Disableable, TitleBar,
 };
 use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
@@ -438,7 +439,7 @@ pub struct TerminalWindow {
     /// logged because the alternative is a gesture that appears to have done
     /// nothing, and drawn under the tree because that is where the row that
     /// asked is. A link is not filed here: it is read in the document pane, so
-    /// its refusal belongs in the window's own failure banner.
+    /// its refusal belongs in the window's own toast stack.
     pub(crate) external_notices: HashMap<(String, String), String>,
     /// How wide a name is at a size, remembered: the tree is measured every
     /// frame it draws and a name is asked once.
@@ -474,8 +475,7 @@ pub struct TerminalWindow {
     pub(crate) worktree: Option<WorktreeDraft>,
     pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
     pub(crate) owner: Arc<SessionOwner>,
-    pub(crate) failure: Option<String>,
-    pub(crate) notice: Option<String>,
+    pub(crate) toasts: crate::toast::ToastStack,
     pub(crate) opening: bool,
     pub(crate) open_repo_menu: Option<String>,
     /// Which crumb's menu is open, so opening one crumb closes the others.
@@ -560,8 +560,7 @@ impl TerminalWindow {
             worktree: None,
             worktree_removal: None,
             owner: SessionOwner::new(backend, owns_backend),
-            failure: None,
-            notice: None,
+            toasts: crate::toast::ToastStack::default(),
             opening: false,
             open_repo_menu: None,
             open_crumb: None,
@@ -624,12 +623,14 @@ impl TerminalWindow {
             let loaded = worker.await;
             let _ = view.update_in(cx, |app, window, cx| {
                 app.opening = false;
-                app.failure = loaded.errors.first().cloned();
+                if let Some(error) = loaded.errors.first().cloned() {
+                    app.push_error(error, cx);
+                }
                 app.navigation = loaded.navigation;
                 app.refresh_diff_totals(cx);
                 match loaded.state_path.map(StateWriter::new).transpose() {
                     Ok(writer) => app.owner.install_writer(writer),
-                    Err(error) => app.failure = Some(error),
+                    Err(error) => app.push_error(error, cx),
                 }
                 app.persist();
                 if let Some(id) = app.navigation.active_checkout.clone() {
@@ -686,13 +687,13 @@ impl TerminalWindow {
             .map(|terminal| &terminal.view)
     }
 
-    /// Route one terminal view's refusals into the banner this window draws.
+    /// Route one terminal view's refusals into this window's toast stack.
     ///
     /// GPUI subscriptions hold a weak window reference; neither entity is kept
     /// alive by the event path. Messages never include the refused payload.
     fn attach_refusals(&mut self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
         cx.subscribe(view, |app, _, event: &crate::terminal::InputRefused, cx| {
-            app.failure = Some(event.0.clone());
+            app.push_error(event.0.clone(), cx);
             cx.notify();
         })
         .detach();
@@ -712,8 +713,10 @@ impl TerminalWindow {
             return;
         }
         if self.removing_checkouts.contains(checkout_id) {
-            self.failure =
-                Some("This worktree is being removed. Wait before opening a terminal.".into());
+            self.push_error(
+                "This worktree is being removed. Wait before opening a terminal.",
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -721,7 +724,7 @@ impl TerminalWindow {
             return;
         };
         if checkout.is_missing || self.navigation.archived.contains(checkout_id) {
-            self.failure = Some("This directory is unavailable.".into());
+            self.push_error("This directory is unavailable.", cx);
             cx.notify();
             return;
         }
@@ -807,7 +810,7 @@ impl TerminalWindow {
                                 .detach();
                         }
                     }
-                    Err(error) => app.failure = Some(error),
+                    Err(error) => app.push_error(error, cx),
                 }
                 cx.notify();
             });
@@ -854,7 +857,10 @@ impl TerminalWindow {
                     match result {
                         Ok(Some(opened)) => {
                             if app.navigation.archived.contains(&opened.checkout_id) {
-                                app.failure = Some("This worktree is archived. Restore it from its repository menu first.".into());
+                                app.push_error(
+                                    "This worktree is archived. Restore it from its repository menu first.",
+                                    cx,
+                                );
                             } else {
                                 let select = app.navigation.revision == revision;
                                 app.navigation.merge(opened, select);
@@ -865,7 +871,7 @@ impl TerminalWindow {
                             }
                         }
                         Ok(None) => (),
-                        Err(error) => app.failure = Some(error),
+                        Err(error) => app.push_error(error, cx),
                     }
                 }
                 cx.notify();
@@ -890,7 +896,7 @@ impl TerminalWindow {
                 ticks += 1;
                 let Ok((epoch, roots, closing)) = view.update(cx, |app, cx| {
                     if let Some(error) = app.owner.writer_failure() {
-                        app.failure = Some(error);
+                        app.push_error(error, cx);
                         cx.notify();
                     }
                     let cadence = cadence(app.visible);
@@ -995,7 +1001,7 @@ impl TerminalWindow {
                                                 !Path::new(&checkout.path).is_dir();
                                         }
                                     }
-                                    app.failure = Some(error);
+                                    app.push_error(error, cx);
                                 }
                             }
                         }
@@ -1229,7 +1235,7 @@ impl TerminalWindow {
                         app.persist();
                         app.focus_terminal(window, cx);
                     }
-                    Err(error) => app.failure = Some(error),
+                    Err(error) => app.push_error(error, cx),
                 }
                 cx.notify();
             });
@@ -1315,7 +1321,7 @@ impl TerminalWindow {
         let name = edit.input.read(cx).value();
         if !name.trim().is_empty() {
             if let Err(error) = self.navigation.rename(&edit.id, &name) {
-                self.failure = Some(error);
+                self.push_error(error, cx);
             }
         }
         self.focus_terminal(window, cx);
@@ -1352,7 +1358,7 @@ impl TerminalWindow {
                 .iter()
                 .any(|item| item.is_primary && !item.is_missing)
         {
-            self.failure = Some("Worktrees need an available primary Git checkout.".into());
+            self.push_error("Worktrees need an available primary Git checkout.", cx);
             cx.notify();
             return;
         }
@@ -1510,19 +1516,22 @@ impl TerminalWindow {
             return;
         };
         if repo.kind != RepoKind::Git {
-            self.failure = Some("Only a Git worktree can be archived or deleted here.".into());
+            self.push_error("Only a Git worktree can be archived or deleted here.", cx);
             cx.notify();
             return;
         }
         if checkout.is_primary || self.navigation.home.as_deref() == Some(checkout_id) {
-            self.failure =
-                Some("The primary checkout and Home cannot be archived or deleted.".into());
+            self.push_error(
+                "The primary checkout and Home cannot be archived or deleted.",
+                cx,
+            );
             cx.notify();
             return;
         }
         if checkout.is_missing {
-            self.failure = Some(
-                "This worktree is missing. Hide it to remove it from the panel; its Git metadata and branch are retained.".into(),
+            self.push_error(
+                "This worktree is missing. Hide it to remove it from the panel; its Git metadata and branch are retained.",
+                cx,
             );
             cx.notify();
             return;
@@ -1949,20 +1958,25 @@ impl TerminalWindow {
                 .as_deref()
                 .is_some_and(|source| self.removing_checkouts.contains(source))
         {
-            self.failure =
-                Some("A worktree being deleted cannot receive or move terminal sessions.".into());
+            self.push_error(
+                "A worktree being deleted cannot receive or move terminal sessions.",
+                cx,
+            );
             cx.notify();
             return;
         }
         let cross_checkout = source.as_deref().is_some_and(|source| source != target);
         if let Err(error) = self.navigation.move_session(id, target, index) {
-            self.failure = Some(error);
+            self.push_error(error, cx);
         } else {
             if let Some(terminal) = self.terminals.get_mut(id) {
                 terminal.checkout_id = target.into();
             }
             if cross_checkout {
-                self.notice = Some("Terminal moved. Its process and working directory were preserved; no cd was sent.".into());
+                self.push_info(
+                    "Terminal moved. Its process and working directory were preserved; no cd was sent.",
+                    cx,
+                );
                 self.focus_terminal(window, cx);
             }
             self.persist();
@@ -2011,7 +2025,10 @@ impl TerminalWindow {
             return;
         }
         if self.checkout_has_terminal_activity(checkout_id) {
-            self.failure = Some("Close this worktree's terminal sessions before hiding it.".into());
+            self.push_error(
+                "Close this worktree's terminal sessions before hiding it.",
+                cx,
+            );
         } else {
             match self.navigation.dismiss_missing_checkout(checkout_id) {
                 Ok(()) => {
@@ -2019,12 +2036,12 @@ impl TerminalWindow {
                     self.membership_revision += 1;
                     self.persist();
                     self.refresh_diff_totals(cx);
-                    self.notice = Some(
-                        "Missing checkout hidden. No files were deleted; Git metadata and branch were retained."
-                            .into(),
+                    self.push_info(
+                        "Missing checkout hidden. No files were deleted; Git metadata and branch were retained.",
+                        cx,
                     );
                 }
-                Err(error) => self.failure = Some(error),
+                Err(error) => self.push_error(error, cx),
             }
         }
         cx.notify();
@@ -2224,7 +2241,7 @@ impl TerminalWindow {
                             app.refresh_diff_totals(cx);
                             app.focus_terminal(window, cx);
                             if let Some(warning) = removed.warning {
-                                app.notice = Some(warning);
+                                app.push_info(warning, cx);
                             }
                         }
                         Err(error) => app.worktree_removal_error(
@@ -2310,7 +2327,10 @@ impl TerminalWindow {
                 .values()
                 .any(|pending| pending == &checkout.id)
         }) {
-            self.failure = Some("A worktree is still being created here. Wait for Git to finish before removing the directory.".into());
+            self.push_error(
+                "A worktree is still being created here. Wait for Git to finish before removing the directory.",
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -2347,7 +2367,10 @@ impl TerminalWindow {
                             return;
                         };
                         if app.navigation.pending.values().any(|pending| repo.checkouts.iter().any(|checkout| checkout.id == *pending)) {
-                            app.failure = Some("A worktree is still being created here. Wait for Git to finish before removing the directory.".into());
+                            app.push_error(
+                                "A worktree is still being created here. Wait for Git to finish before removing the directory.",
+                                cx,
+                            );
                             return;
                         }
                         (
@@ -2379,8 +2402,10 @@ impl TerminalWindow {
         let dialog_open = self.worktree.is_some() || self.worktree_removal.is_some();
         if event.keystroke.key == "escape" && (self.editing.is_some() || dialog_open) {
             if self.worktree.as_ref().is_some_and(|draft| draft.busy) {
-                self.failure =
-                    Some("This worktree is still being created. Wait for it to finish.".into());
+                self.push_error(
+                    "This worktree is still being created. Wait for it to finish.",
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -2618,25 +2643,13 @@ impl Render for TerminalWindow {
                     .as_ref()
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
             });
-        // A failure and a notice are the same bar in the same place, and they
-        // are not the same thing: one says something went wrong, the other says
-        // something happened. Two inks, so they can be told apart without
-        // reading them.
-        let banner = self
-            .failure
-            .as_ref()
-            .map(|message| (message.clone(), roles.status.warning))
-            .or_else(|| {
-                self.notice
-                    .as_ref()
-                    .map(|message| (message.clone(), roles.status.info))
-            });
         // On a target whose window has no frame of its own, the frame is this
         // one: it insets the content out of the shadow, draws the border and
         // owns the resize band. It is a pass-through everywhere else.
         window_border().child(
             div()
                 .id("workspace-root")
+                .relative()
                 .size_full()
                 .flex()
                 .flex_col()
@@ -2644,32 +2657,8 @@ impl Render for TerminalWindow {
                 .text_color(text)
                 .capture_key_down(cx.listener(Self::on_key))
                 .child(self.titlebar(window, cx))
-                // The one place this window says something went wrong.
-                .when_some(banner, |root, (message, ink)| {
-                    root.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .px_2()
-                            .text_size(px(12.))
-                            .text_color(ink)
-                            .child(div().flex_1().child(message))
-                            .child(
-                                Button::new("dismiss-message")
-                                    .custom(sidebar_action_style(cx))
-                                    .small()
-                                    .compact()
-                                    .icon(IconName::X)
-                                    .accessibility_label("Dismiss message")
-                                    .on_click(cx.listener(|app, _, _, cx| {
-                                        app.failure = None;
-                                        app.notice = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                })
                 .child(content)
+                .when_some(self.toast_element(cx), |root, toasts| root.child(toasts))
                 .when_some(dialog, |root, dialog| root.child(dialog)),
         )
     }

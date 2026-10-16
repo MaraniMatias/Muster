@@ -1178,7 +1178,7 @@ impl TerminalWindow {
     /// opener as one argument, refused there if it is not a web address, and its
     /// exit read either way.
     ///
-    /// A refusal is stated in the window's own failure banner rather than under
+    /// A refusal is stated in the window's own toast rather than under
     /// the file tree: a link is read in the document pane and not in the
     /// inspector, and the pane can be read with Files not even selected. The
     /// opener still runs on the background executor, and only the statement of
@@ -1196,7 +1196,7 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update_in(cx, |app, _, cx| {
                 if let Err(error) = result {
-                    app.failure = Some(error);
+                    app.push_error(error, cx);
                 }
                 cx.notify();
             });

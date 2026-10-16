@@ -3465,13 +3465,13 @@ async fn until_the_failure_is_stated(
     view: &Entity<TerminalWindow>,
 ) -> bool {
     for _ in 0..200 {
-        if view.read_with(cx, |app, _| app.failure.is_some()) {
+        if view.read_with(cx, |app, _| app.toasts.latest_error().is_some()) {
             return true;
         }
         cx.background_executor.timer(Duration::from_millis(5)).await;
         cx.run_until_parked();
     }
-    view.read_with(cx, |app, _| app.failure.is_some())
+    view.read_with(cx, |app, _| app.toasts.latest_error().is_some())
 }
 
 /// A rendered link the opener refuses is said in the window, and dismissed.
@@ -3479,8 +3479,8 @@ async fn until_the_failure_is_stated(
 /// The notice used to be filed under the file tree's opener key, and the only
 /// renderer of that key drew file rows and skipped links, so a link that would
 /// not open said nothing at all: a click that looked like it had opened a page.
-/// It is the window's failure banner now, which is drawn whatever the inspector
-/// is showing, and this reads it off the screen.
+/// It is the window's toast now, which is drawn whatever the inspector is
+/// showing, and this reads it off the screen.
 #[gpui_kit::test]
 async fn a_refused_link_is_said_in_the_window_and_dismissed(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -3518,16 +3518,16 @@ async fn a_refused_link_is_said_in_the_window_and_dismissed(cx: &mut TestAppCont
         "the click opened the link without anything else having to draw"
     );
 
-    // The error is on screen, in this window's own banner.
+    // The error is on screen, in this window's own toast stack.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.try_find("dismiss-message").is_some(),
-            "what the opener refused is said where this window already says things"
+            window.try_find("toast-stack").is_some(),
+            "what the opener refused is said in the window's toast stack"
         );
         fixture.view.read_with(cx, |app, _| {
             assert_eq!(
-                app.failure.as_deref(),
+                app.toasts.latest_error(),
                 Some("only an http or https link can be opened in the browser"),
                 "the refusal is the opener's own words"
             );
@@ -3550,18 +3550,22 @@ async fn a_refused_link_is_said_in_the_window_and_dismissed(cx: &mut TestAppCont
         );
     });
 
-    // And it goes away with the one control every other message uses.
+    // And it goes away with its own dismiss button.
+    let toast_id = fixture
+        .view
+        .read_with(cx, |app, _| app.toasts.newest_id())
+        .expect("the toast has an id");
     cx.update_window(fixture.handle, |_, window, cx| {
-        window.click("dismiss-message", cx);
+        window.click(format!("dismiss-toast-{toast_id}"), cx);
         window.render_frame(cx);
         assert!(
-            window.try_find("dismiss-message").is_none(),
+            window.try_find("toast-stack").is_none(),
             "dismissing takes the message away"
         );
     })
     .unwrap();
     fixture.view.read_with(cx, |app, _| {
-        assert!(app.failure.is_none());
+        assert!(app.toasts.latest_error().is_none());
         assert!(
             app.open_document.is_some(),
             "and the document is still open"
@@ -3615,13 +3619,17 @@ async fn a_refused_link_is_said_whatever_the_inspector_is_showing(cx: &mut TestA
         cx.update_window(fixture.handle, |_, window, cx| {
             window.render_frame(cx);
             assert!(
-                window.try_find("dismiss-message").is_some(),
-                "the banner is the window's, not the inspector's"
+                window.try_find("toast-stack").is_some(),
+                "the toast is the window's, not the inspector's"
             );
         })
         .unwrap();
+        let toast_id = fixture
+            .view
+            .read_with(cx, |app, _| app.toasts.newest_id())
+            .expect("the toast has an id");
         cx.update_window(fixture.handle, |_, window, cx| {
-            window.click("dismiss-message", cx);
+            window.click(format!("dismiss-toast-{toast_id}"), cx);
             window.render_frame(cx);
         })
         .unwrap();

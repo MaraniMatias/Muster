@@ -217,9 +217,10 @@ impl TerminalWindow {
                     .get(&choice.checkout)
                     .cloned()
                     .unwrap_or_default();
-                self.failure = Some(format!(
-                    "Could not read the changes of this worktree: {error}"
-                ));
+                self.push_error(
+                    format!("Could not read the changes of this worktree: {error}"),
+                    cx,
+                );
             }
             // Another checkout's read answered, or this one is still on its way.
             ChangePresence::Unknown => {}
