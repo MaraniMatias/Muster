@@ -524,6 +524,12 @@ impl TerminalWindow {
                 cx,
             );
             if new_view {
+                // The header asks whether this file has changes, and the answer is
+                // Git's rather than the maintenance tick's: the file this pane is
+                // drawing is the one that has to be asked about, and a status read
+                // from before it was edited says nothing about it. The tick stays
+                // what it is — the one that refreshes.
+                self.request_git_status(&checkout_id, cx);
                 // Only the reading that is on screen takes the keyboard: a
                 // Markdown document opens as its reading, so the editor behind
                 // it stays unfocused until the header asks for the source.
@@ -676,7 +682,7 @@ impl TerminalWindow {
                         .items_center()
                         .gap_3()
                         .px_3()
-                        .py_1()
+                        .h(px(40.))
                         .border_b_1()
                         .border_color(roles.border)
                         .child(

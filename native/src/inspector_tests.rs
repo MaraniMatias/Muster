@@ -2449,44 +2449,42 @@ async fn a_rendered_document_draws_its_picture_and_says_what_it_cannot(cx: &mut 
         });
     })
     .unwrap();
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture
-            .view
-            .read(cx)
+    // The window is driven to quiet without being drawn. Opening a document also
+    // asks Git about the file it opened, so a frame drawn while that read is still
+    // in flight is not the first frame — and the picture could have come back on
+    // it. Parked first, the frame below is the first one there is.
+    cx.run_until_parked();
+    assert!(
+        fixture.view.read_with(cx, |app, _| app
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
-    })
-    .await;
-
-    // The frame that parsed the document named the picture and read nothing.
-    // This scheduler runs no worker task until the test asks it to, so a picture
-    // on this frame would mean a parse or render callback had gone to the
-    // filesystem itself rather than leaving that to a worker.
-    let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
-    cx.update_window(fixture.handle, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(
-            window.try_find(picture.clone()).is_none(),
-            "the frame that parsed the document did not read the picture"
-        );
-        assert!(
-            fixture.view.read_with(cx, |app, _| {
-                app.document_view
-                    .as_ref()
-                    .is_none_or(|view| view.media.image("diagram.png").is_none())
-            }),
-            "and nothing has been prepared: the read is a worker that has not run"
-        );
-    })
-    .unwrap();
-    assert!(
-        reading(&fixture, cx).contains("The diagram"),
-        "the line stands in the picture's place while it is on its way"
+            .is_some_and(|(_, preview)| preview.path == "README.md")),
+        "the document was not read"
     );
+
+    // The picture is drawn from bytes the window holds, and those bytes arrive
+    // from a worker rather than from the thread that draws.
+    //
+    // Which frame the picture turns up on is not something to pin: opening a
+    // document also asks Git about the file it opened, so the scheduler may draw
+    // a frame and run a read before this test asks it to. What holds either way
+    // is the shape of the answer — the element and the store agree, so a picture
+    // on screen is one this window read, and it was read once.
+    let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
     assert!(
         draw_until(&fixture, cx, &picture),
         "a picture inside the checkout is drawn where the document names it"
+    );
+    assert!(
+        fixture.view.read_with(cx, |app, _| app
+            .document_view
+            .as_ref()
+            .is_some_and(|view| view.media.image("diagram.png").is_some())),
+        "the picture on screen is bytes this window holds, not bytes a frame went and got"
+    );
+    assert!(
+        reading(&fixture, cx).contains("The diagram"),
+        "the line stands in the picture's place, and is what it fell back to"
     );
     assert_eq!(
         fixture.view.read_with(cx, |app, _| app
@@ -2774,7 +2772,9 @@ async fn an_edited_document_saves_or_throws_itself_away(cx: &mut TestAppContext)
 ///
 /// The change list is Git's answer rather than the window's, so the button is
 /// there exactly when Git has said this file is in it — and clicking it opens
-/// that one file's diff rather than the whole change set.
+/// that one file's diff rather than the whole change set. Nobody reads the
+/// status before the file is opened: asking is what opening it does, so this
+/// pins the button on a window where the ten-second tick has not come around.
 #[gpui_kit::test]
 async fn a_document_offers_the_changes_of_a_file_that_has_them(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -2786,7 +2786,6 @@ async fn a_document_offers_the_changes_of_a_file_that_has_them(cx: &mut TestAppC
     fixture.view.update(cx, |app, _| {
         app.navigation.active_checkout = Some(fixture.checkout.clone());
     });
-    read_status(&fixture, &fixture.checkout, cx).await;
 
     open(cx, &fixture, "notes.md").await;
     assert!(

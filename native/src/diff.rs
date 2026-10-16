@@ -715,7 +715,7 @@ impl TerminalWindow {
                         .items_center()
                         .gap_3()
                         .px_3()
-                        .py(px(6.))
+                        .h(px(40.))
                         .flex_none()
                         .border_b_1()
                         .border_color(roles.border)

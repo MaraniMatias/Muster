@@ -6,21 +6,25 @@
       Ya andaban; faltaba comprobarlo. PNG, SVG (rasterizado, se decide por el
       nombre porque no tiene header) y el resto de formatos se dibujan.
       Tests: `a_rendered_document_draws_an_svg_beside_every_other_picture`.
-- [ ] archivos con changes, tab/btn para ver los cambios directamtne
+- [x] archivos con changes, tab/btn para ver los cambios directamtne
       El botón está dibujado (`native/src/document.rs:728-770`, con `+n/-n` y
-      `open_changes(checkout, Some(path))`), pero en la app no sale casi nunca, y el
-      test que lo cubre pasa porque se lee el status a mano antes de abrir el archivo.
-      La razón: el botón se dibuja solo si `git_status` ya tiene el archivo, y **nadie
-      pide ese status al abrir un documento**. `request_git_status` se llama desde el
-      tick de mantenimiento de 2 s (`app.rs:906-914`), y solo para el checkout activo,
-      solo cada 5 ticks (10 s), y solo si `panels_visible || open_diff.is_some()`.
-      Con la barra lateral cerrada no aparece nunca; con ella abierta, recién a los 10 s.
-      - Arreglo: pedir el status del checkout del documento al abrirlo, como ya se hace
-        después de un save (`document.rs:385`). El tick se queda como está: es el que
-        refresca, este es el que responde la pregunta del header.
-      - Test: el mismo `a_document_offers_the_changes_of_a_file_that_has_them`, sin el
-        `read_status` previo. Hoy pasa por el atajo; la pregunta es si el botón
-        aparece sin que nadie haya leído el status antes.
+      `open_changes(checkout, Some(path))`), pero en la app no salía casi nunca:
+      se dibujaba solo si `git_status` ya tenía el archivo, y nadie pedía ese
+      status al abrir un documento. El tick de mantenimiento de 2 s lo pedía cada
+      10 s y solo para el checkout activo — con la barra lateral cerrada, nunca.
+      - Arreglo: el frame que instala la vista del documento pide el status de su
+        checkout (`document.rs:530`, dentro del `new_view`). Sin guarda a propósito:
+        `git_status` cacheado significa "ya tenemos respuesta", no "la respuesta es
+        de este archivo" — con la guarda, un archivo editado después del último
+        status se quedaba sin botón hasta el tick.
+      - Test: `a_document_offers_the_changes_of_a_file_that_has_them`, sin el
+        `read_status` previo. Falla sin el arreglo y pasa con él.
+      - Efecto colateral que sí cambió: abrir un documento ahora agenda una lectura
+        de Git, así que el test de imágenes del documento ya no puede medir "el
+        primer frame no dibujó la foto" — el scheduler puede dibujar y correr una
+        lectura antes de que el test lo pida. Ese test ahora afirma lo que sigue
+        valiendo en cualquier orden: el elemento y el store coinciden, y la foto se
+        leyó una vez.
 - [x] editoar simple funcionar, con save/cancel, foramte como en legacy
       Barra al pie con Cancel/Save (Esc y ⌘S). El save compara contra el texto leído
       y se niega a pisar lo que otro escribió (`core::files::write_preview`).
@@ -77,10 +81,12 @@ Toca: `native/src/toast.rs` (nuevo). No toca nada más, así que va solo.
 
 Toca: `native/src/sidebar.rs` (y `theme.rs` solo si falta un rol).
 
-- [ ] colores segun se ejecuta un proceso o fallo
-      `sidebar.rs:920-930` ya calcula `busy` y `failed`, pero hoy solo los usa para
-      el texto de accesibilidad: nunca se pintan. Es usar `roles.status.*`.
-      El más barato de la lista.
+- [x] colores segun se ejecuta un proceso o fallo
+      Ya estaba: `sidebar.rs:995-1004` pinta el icono de la sesión con
+      `roles.status.warning` / `danger_text` / `success` / `text_muted`. La nota decía
+      que `busy` y `failed` solo alimentaban el texto de accesibilidad — eso ya no es
+      cierto. Lo que no se pinta es el nombre de la fila, que es lo que hacía Legacy y
+      no es un bug.
 
 ## D · Chrome de la app
 
