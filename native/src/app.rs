@@ -933,6 +933,12 @@ impl TerminalWindow {
                 }) else {
                     return;
                 };
+                // The window's own read of its terminals, asked beside the pass
+                // above rather than inside it: that one is Git, this one is the
+                // shells. A window that has not drawn yet has no window to ask
+                // in, and the next tick asks again.
+                let _ =
+                    view.update_in(cx, |app, window, cx| app.close_exited_terminals(window, cx));
                 if closing {
                     return;
                 }
@@ -1165,6 +1171,40 @@ impl TerminalWindow {
             .detach();
         } else {
             self.close_terminal(id, window, cx);
+        }
+    }
+
+    /// Close every session whose shell is gone, the way a terminal closes when
+    /// the shell in it exits.
+    ///
+    /// `exit` and `:q` are how a shell is ended on purpose, so the session goes
+    /// with it. A session left behind shows a frozen frame that looks like a
+    /// hung app, and the only way out would be the close button on a row
+    /// somebody has to go looking for. The close asks about the session once
+    /// more before acting and finds the process already gone, so the question
+    /// that belongs to stopping a live process stays on the close the person
+    /// asked for.
+    ///
+    /// Asked from the window's tick, so a shell that exited while the window was
+    /// behind something else is noticed without anybody looking for it.
+    fn close_exited_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let exited: Vec<String> = self
+            .terminals
+            .iter()
+            .filter(|(id, terminal)| {
+                !self.closing_sessions.contains(*id)
+                    && matches!(
+                        terminal.shell.session.status().shell,
+                        ShellState::Exited { .. }
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in exited {
+            self.request_close_terminal(&id, window, cx);
         }
     }
 

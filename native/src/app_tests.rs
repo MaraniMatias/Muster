@@ -280,6 +280,61 @@ fn a_refused_input_reaches_the_window_banner(cx: &mut TestAppContext) {
     );
 }
 
+/// A shell that exits takes its session with it, the way a terminal closes.
+///
+/// `exit` is how a shell is ended on purpose, and the session that outlives it
+/// shows a frozen frame that looks like a hung app — the only way out would be
+/// the close button on a row somebody has to go looking for. Legacy closed the
+/// session on the same status this window reads, and it did so through the
+/// close the person would have pressed: the process is already gone, so the
+/// question about stopping a live process never comes up.
+///
+/// Through the window rather than the session, because that is the whole claim:
+/// the session noticing its own exit is already pinned in the session's tests.
+#[gpui_kit::test]
+fn a_session_whose_shell_exited_is_closed(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "exit 0");
+    let (handle, view) = open(cx, size(px(800.), px(600.)), &backend, &session);
+    settle(cx, handle);
+
+    let deadline = Instant::now() + PATIENCE;
+    while !matches!(session.status().shell, ShellState::Exited { .. }) {
+        assert!(Instant::now() < deadline, "the shell never exited");
+        std::thread::sleep(POLL);
+    }
+
+    // The one call the window's tick makes on every pass.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |app, cx| app.close_exited_terminals(window, cx));
+    })
+    .expect("the window takes its tick");
+    cx.run_until_parked();
+
+    let left = view.read_with(cx, |app, _| {
+        (
+            app.terminals.len(),
+            app.navigation.active_session.is_none(),
+            app.closing_sessions.len(),
+        )
+    });
+    let _ = session.close().wait();
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .expect("the window closes");
+    cx.run_until_parked();
+
+    assert_eq!(
+        left,
+        (0, true, 0),
+        "a session whose shell exited is still in the window: {} terminals, \
+         an active session: {}, {} still closing",
+        left.0,
+        !left.1,
+        left.2
+    );
+}
+
 #[test]
 fn an_app_quit_ends_the_shell_and_leaves_nothing_to_end_twice() {
     let backend = Arc::new(TerminalBackend::default());
