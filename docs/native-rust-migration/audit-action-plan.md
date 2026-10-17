@@ -1563,7 +1563,7 @@ verification. Cargo reported the existing future-incompatibility warning for
 ### Latest NOTAS integration verification (native v0.1.0)
 
 This supersedes earlier suite counts, not historical results below. With Rust and
-Cargo 1.97.1, `cargo test --locked --workspace` passed **362 native, 159 core and
+Cargo 1.97.1, `cargo test --locked --workspace` passed **364 native, 159 core and
 4 instance-lock tests**; 3 native performance measurements remain ignored.
 `cargo clippy --locked --workspace --all-targets -- -D warnings`,
 `cargo fmt --all --check` and `git diff --check` passed. The release/audit script

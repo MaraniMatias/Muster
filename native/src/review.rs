@@ -10,9 +10,11 @@ use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::dialog::{Dialog, DialogContent, DialogFooter};
 use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 use gpui_kit::component::input::TextareaState;
+use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::component::IndexPath;
 use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, IntoElement, ParentElement,
-    Styled, Window,
+    SharedString, Styled, Window,
 };
 use muster_core::review::{
     self, review_anchor_hash, ReviewContext, ReviewNote, ReviewSide, ReviewStorage,
@@ -144,7 +146,111 @@ pub(crate) struct ReviewComposer {
     pub(crate) code: String,
     pub(crate) editing_id: Option<String>,
     pub(crate) input: Entity<TextareaState>,
+    /// The toolkit select that moves where this note's range starts.
+    pub(crate) start_picker: Entity<SelectState<Vec<SharedString>>>,
+    _save_keys: gpui_kit::Subscription,
+    _picker_events: gpui_kit::Subscription,
     _subscription: gpui_kit::Subscription,
+}
+
+/// A line as this app spells it: a removed line is a negative number.
+///
+/// The export says a note about a removed line with the same minus, so `{-3}`
+/// means old line 3 and `{10}` means new line 10. One convention in the picker
+/// and in the Markdown is what lets a reader of the export tell the two apart.
+pub(crate) fn review_line_label(line: usize, side: ReviewSide) -> SharedString {
+    SharedString::from(match side {
+        ReviewSide::Old => format!("-{line}"),
+        ReviewSide::New => line.to_string(),
+    })
+}
+
+/// The line a picker item stands for, with the minus a removed line carries.
+fn review_line_number(label: &str) -> Option<usize> {
+    label.trim_start_matches('-').parse().ok()
+}
+
+/// The line numbers a note range could start on, and the one this note starts at.
+///
+/// The delegate is the toolkit's own `Vec<SharedString>`, so a candidate is a
+/// line number and nothing else: the mark and a code preview would put a word
+/// beside an address, and the header row already says which lines the range
+/// covers.
+fn review_start_choices(
+    lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
+    side: ReviewSide,
+    start: usize,
+    end: usize,
+) -> (Vec<SharedString>, Option<IndexPath>) {
+    let numbers = review_start_lines(lines, side, end);
+    (
+        numbers
+            .iter()
+            .map(|line| review_line_label(*line, side))
+            .collect(),
+        numbers
+            .iter()
+            .position(|line| *line == start)
+            .map(|row| IndexPath::default().row(row)),
+    )
+}
+
+/// A draft's range picker, and the route from what it confirms back to the draft.
+///
+/// The confirm carries a line number, so what choosing one means belongs to
+/// [`TerminalWindow::set_review_note_start`]: the picker reports what was picked
+/// and nothing else, which is what keeps the two one state rather than two.
+fn review_start_picker(
+    lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
+    side: ReviewSide,
+    start: usize,
+    end: usize,
+    window: &mut Window,
+    cx: &mut Context<TerminalWindow>,
+) -> (
+    Entity<SelectState<Vec<SharedString>>>,
+    gpui_kit::Subscription,
+) {
+    let (items, selected) = review_start_choices(lines, side, start, end);
+    let picker = cx.new(|cx| SelectState::new(items, selected, window, cx));
+    let events = cx.subscribe_in(&picker, window, |app, _, event, window, cx| {
+        let SelectEvent::Confirm(Some(line)) = event else {
+            return;
+        };
+        if let Some(line) = review_line_number(line) {
+            app.set_review_note_start(line, window, cx);
+        }
+    });
+    (picker, events)
+}
+
+/// The keystroke that finishes a note, registered for as long as the composer is open.
+///
+/// An interceptor rather than a key handler on the card because it runs before the
+/// input's own Return: stopping it here is what keeps ⌘↵ from also inserting the
+/// newline a plain Return would, and so keeps a trailing blank line out of the
+/// saved note. Enter on its own still writes the newline Legacy's textarea did.
+fn review_save_keys(
+    input: &Entity<TextareaState>,
+    cx: &mut Context<TerminalWindow>,
+) -> gpui_kit::Subscription {
+    let focus = input.read(cx).focus_handle(cx);
+    let weak = cx.weak_entity();
+    cx.intercept_keystrokes(move |event, window, cx| {
+        if !focus.is_focused(window) || event.keystroke.key != "enter" {
+            return;
+        }
+        let app_modifier = if cfg!(target_os = "macos") {
+            event.keystroke.modifiers.platform
+        } else {
+            event.keystroke.modifiers.control
+        };
+        if !app_modifier || event.keystroke.modifiers.shift {
+            return;
+        }
+        let _ = weak.update(cx, |app, cx| app.save_review_note(cx));
+        cx.stop_propagation();
+    })
 }
 
 impl TerminalWindow {
@@ -172,6 +278,23 @@ impl TerminalWindow {
             DiffSide::Original => ReviewSide::Old,
             DiffSide::Modified => ReviewSide::New,
         };
+        // A range is written the way GitLab writes one: the `+` fixes where the
+        // note ends, and a `+` clicked on a line above an open one says where it
+        // starts. So the click above widens the note already being written and
+        // keeps its text — it is the same comment about more of the same change —
+        // while a click at or below it is a different line and opens a new note.
+        // A note being edited is not a draft to widen: its range is what it was
+        // saved against, so any `+` opens a new one instead.
+        if self.review.composer.as_ref().is_some_and(|composer| {
+            composer.editing_id.is_none()
+                && composer.checkout_id == *checkout_id
+                && composer.path == path
+                && composer.side == side
+                && start < composer.line_end
+        }) {
+            self.set_review_note_start(start, window, cx);
+            return;
+        }
         let lines = review::read_diff_lines(&diff.patch);
         let Some(code) = review::review_range_code(&lines, side, start, end) else {
             self.push_error("The selected diff lines are not loaded.", cx);
@@ -182,11 +305,14 @@ impl TerminalWindow {
             return;
         }
         let input = cx.new(|cx| {
-            let mut input = TextareaState::new(window, cx).auto_grow(2, 6);
+            let mut input = TextareaState::new(window, cx).auto_grow(1, 6);
             input.set_placeholder("What should change here?", window, cx);
             input
         });
         input.read(cx).focus_handle(cx).focus(window, cx);
+        let (start_picker, picker_events) =
+            review_start_picker(&lines, side, start, end, window, cx);
+        let save_keys = review_save_keys(&input, cx);
         let subscription = cx.observe(&input, |_, _, cx| cx.notify());
         self.review.composer = Some(ReviewComposer {
             checkout_id: checkout_id.clone(),
@@ -197,8 +323,12 @@ impl TerminalWindow {
             code,
             editing_id: None,
             input,
+            start_picker,
+            _save_keys: save_keys,
+            _picker_events: picker_events,
             _subscription: subscription,
         });
+        self.sync_review_note_selection(cx);
         cx.notify();
     }
 
@@ -219,28 +349,73 @@ impl TerminalWindow {
             return;
         };
         let input = cx.new(|cx| {
-            let mut input = TextareaState::new(window, cx).auto_grow(2, 6);
+            let mut input = TextareaState::new(window, cx).auto_grow(1, 6);
             input.set_placeholder("What should change here?", window, cx);
             input.set_value(note.content.clone(), window, cx);
             input
         });
         input.read(cx).focus_handle(cx).focus(window, cx);
+        let lines = self
+            .git_diff
+            .get(&(note.checkout_id.clone(), note.path.clone()))
+            .map(|diff| review::read_diff_lines(&diff.patch))
+            .unwrap_or_default();
+        let line_end = note.line_end.unwrap_or(note.line_start);
+        let (start_picker, picker_events) =
+            review_start_picker(&lines, note.side, note.line_start, line_end, window, cx);
+        let save_keys = review_save_keys(&input, cx);
         let subscription = cx.observe(&input, |_, _, cx| cx.notify());
         self.review.composer = Some(ReviewComposer {
             checkout_id: note.checkout_id,
             path: note.path,
             side: note.side,
             line_start: note.line_start,
-            line_end: note.line_end.unwrap_or(note.line_start),
+            line_end,
             code: note.code,
             editing_id: Some(note.id),
             input,
+            start_picker,
+            _save_keys: save_keys,
+            _picker_events: picker_events,
             _subscription: subscription,
         });
+        self.sync_review_note_selection(cx);
         cx.notify();
     }
 
-    pub(crate) fn set_review_note_start(&mut self, line_start: usize, cx: &mut Context<Self>) {
+    /// The lines a draft covers, washed in the diff's own selection.
+    ///
+    /// A note is about a range, and a range is invisible while the box that writes
+    /// it floats over the diff: the start moves, the end does not, and nothing on
+    /// screen says which lines the comment now covers. The toolkit's selection
+    /// already paints that state, so the composer drives it rather than washing
+    /// the lines a second time in a colour of its own. Called from where a draft
+    /// is opened, moved or dropped, and from a diff that was rebuilt underneath
+    /// one: a fresh state starts with nothing selected.
+    pub(crate) fn sync_review_note_selection(&mut self, cx: &mut Context<Self>) {
+        let range = self.review.composer.as_ref().map(|composer| {
+            DiffLineRange::new(
+                composer.path.clone(),
+                match composer.side {
+                    ReviewSide::Old => DiffSide::Original,
+                    ReviewSide::New => DiffSide::Modified,
+                },
+                composer.line_start,
+                composer.line_end,
+            )
+        });
+        if let Some(view) = self.diff_view.as_ref() {
+            view.state
+                .update(cx, |state, cx| state.set_selected_lines(range, cx));
+        }
+    }
+
+    pub(crate) fn set_review_note_start(
+        &mut self,
+        line_start: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(composer) = self.review.composer.as_mut() else {
             return;
         };
@@ -264,9 +439,16 @@ impl TerminalWindow {
         }
         composer.line_start = line_start;
         composer.code = code;
+        // The picker is how this line is chosen, so it is told what the draft now
+        // says rather than left to agree with it by itself.
+        let chosen = review_line_label(line_start, composer.side);
+        composer.start_picker.update(cx, |picker, cx| {
+            picker.set_selected_value(&chosen, window, cx)
+        });
         self.review
             .anchor_hashes
             .remove(&(composer.checkout_id.clone(), composer.path.clone()));
+        self.sync_review_note_selection(cx);
         cx.notify();
     }
 
@@ -338,11 +520,13 @@ impl TerminalWindow {
                 outdated: false,
             });
         }
+        self.sync_review_note_selection(cx);
         cx.notify();
     }
 
     pub(crate) fn cancel_review_note(&mut self, cx: &mut Context<Self>) {
         self.review.composer = None;
+        self.sync_review_note_selection(cx);
         cx.notify();
     }
 
@@ -373,6 +557,7 @@ impl TerminalWindow {
             .is_some_and(|draft| draft.editing_id.as_deref() == Some(id))
         {
             self.review.composer = None;
+            self.sync_review_note_selection(cx);
         }
         cx.notify();
     }

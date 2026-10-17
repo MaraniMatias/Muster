@@ -4221,6 +4221,9 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
+        // The `+` is a control on a drawn diff, so the diff is on screen before a
+        // note opens: the lines the note covers are washed in that view.
+        window.render_frame(cx);
         fixture.view.update(cx, |app, cx| {
             app.begin_review_note(
                 &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
@@ -4234,8 +4237,30 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
     assert!(draw_until(&fixture, cx, "save-review-note"));
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("review-composer-card").bounds().size.height <= px(110.));
+        // The composer is one row of the diff: the field, the range row and
+        // the footer, with Legacy's padding inside the box and none of it
+        // around it. A card that grows past this has picked up margin again.
+        let card = window.find("review-composer-card").bounds();
+        assert!(card.size.height <= px(124.), "{card:?}");
         assert!(window.find("save-review-note").bounds().size.height <= px(24.));
+        // Legacy's order: the range label, then the picker after it, and the
+        // picker is the size of a line number rather than of a field.
+        let picker = window.find("review-range-start").bounds();
+        assert!(
+            picker.size.height <= px(24.) && picker.size.width <= px(60.),
+            "the picker is compact: {picker:?}"
+        );
+        // A range nobody can see is a range about the wrong lines, so the draft
+        // marks the lines it covers with the diff's own selection.
+        fixture.view.read_with(cx, |app, cx| {
+            let state = &app.diff_view.as_ref().unwrap().state;
+            assert_eq!(
+                state.read(cx).selected_lines(),
+                Some(DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3))
+            );
+        });
+        // An empty note is not a note: saving it is refused, and refusing it
+        // leaves the draft and the lines it covers alone.
         window.click("save-review-note", cx);
     })
     .unwrap();
@@ -4260,9 +4285,18 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
         input.update(cx, |input, cx| {
             input.set_value("Keep this comment", window, cx)
         });
-        fixture
-            .view
-            .update(cx, |app, cx| app.set_review_note_start(1, cx));
+        window.render_frame(cx);
+        let card = window.find("review-composer-card").bounds();
+        // A `+` clicked above the note being written says where its range starts
+        // rather than opening another one: the draft is about the same change,
+        // so what has been written stays written.
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 1, 1),
+                window,
+                cx,
+            )
+        });
         fixture.view.read_with(cx, |app, cx| {
             let composer = app.review.composer.as_ref().unwrap();
             assert_eq!(
@@ -4273,7 +4307,36 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
             assert_eq!((composer.line_start, composer.line_end), (1, 3));
         });
         window.render_frame(cx);
+        // The box hangs on the line the `+` was clicked on, so choosing another
+        // start moves the wash over the lines instead of dragging the box up the
+        // diff and away from the caret. A range says one sentence more about
+        // itself, so the card may grow downward; where it *is* cannot change.
+        let widened = window.find("review-composer-card").bounds();
+        assert_eq!(widened.origin, card.origin);
+        assert!(
+            widened.size.height >= card.size.height,
+            "{widened:?} vs {card:?}"
+        );
+        fixture.view.read_with(cx, |app, cx| {
+            let state = &app.diff_view.as_ref().unwrap().state;
+            assert_eq!(
+                state.read(cx).selected_lines(),
+                Some(DiffLineRange::new("change.txt", DiffSide::Modified, 1, 3))
+            );
+        });
         window.click("save-review-note", cx);
+        // A saved note is an annotation of its own now, so the lines it covered
+        // are no longer the diff's selection.
+        fixture.view.read_with(cx, |app, cx| {
+            assert!(app
+                .diff_view
+                .as_ref()
+                .unwrap()
+                .state
+                .read(cx)
+                .selected_lines()
+                .is_none());
+        });
         let note_id = fixture.view.update(cx, |app, cx| {
             let note = &mut app.review.notes.get_mut(&fixture.checkout).unwrap()[0];
             assert_eq!(note.code, "one\ntwo\nthree");
@@ -4296,8 +4359,10 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
         input.update(cx, |input, cx| {
             input.set_value("Edited comment", window, cx)
         });
+        // ⌘↵ finishes the note being edited, and is stopped before the input's own
+        // Return, so the saved text carries no newline of its own.
+        window.dispatch_keystroke(gpui_kit::Keystroke::parse("secondary-enter").unwrap(), cx);
         fixture.view.update(cx, |app, cx| {
-            app.save_review_note(cx);
             let note = &app.review.notes[&fixture.checkout][0];
             assert!(
                 note.outdated,
@@ -4307,13 +4372,208 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
             assert_eq!(note.content, "Edited comment");
             app.edit_review_note(&note_id, window, cx);
         });
+        // A note being edited marks the lines it was saved against.
+        fixture.view.read_with(cx, |app, cx| {
+            let state = &app.diff_view.as_ref().unwrap().state;
+            assert_eq!(
+                state.read(cx).selected_lines(),
+                Some(DiffLineRange::new("change.txt", DiffSide::Modified, 1, 3))
+            );
+        });
         window.render_frame(cx);
         window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
     })
     .unwrap();
-    fixture
-        .view
-        .read_with(cx, |app, _| assert!(app.review.composer.is_none()));
+    fixture.view.read_with(cx, |app, cx| {
+        assert!(app.review.composer.is_none());
+        assert!(
+            app.diff_view
+                .as_ref()
+                .unwrap()
+                .state
+                .read(cx)
+                .selected_lines()
+                .is_none(),
+            "a cancelled note leaves no selection behind it"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// The picker is the draft's own control for where its range starts.
+///
+/// It is the toolkit's select over the line numbers the range could start on, so
+/// what it confirms is a line number and the window routes that straight back
+/// into the draft: one state, rather than a control and a range that can
+/// disagree. The confirmation is emitted rather than clicked, because a dropdown
+/// has no row to hit in a headless window.
+#[gpui_kit::test]
+async fn review_range_picker_moves_the_start_line(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::component::select::SelectEvent;
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The `+` is a control on a drawn diff, so the diff is on screen before
+        // the note opens: the lines it covers are washed in that view.
+        window.render_frame(cx);
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "review-range-start"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // The picker names itself rather than being read as its current value,
+        // and it follows the range label, which is the order Legacy draws them
+        // in: what the range is, then the one thing about it that is a choice.
+        let picker = window.find("review-range-start").bounds();
+        let range = window.find("review-composer-range").bounds();
+        assert_eq!(
+            window.find("review-range-start").label(),
+            Some("First line of the range")
+        );
+        assert!(
+            range.right() <= picker.left(),
+            "the range label comes before the picker: {range:?} then {picker:?}"
+        );
+        let select = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .start_picker
+            .clone();
+        select.update(cx, |_, cx| {
+            cx.emit(SelectEvent::Confirm(Some(gpui_kit::SharedString::from(
+                "2",
+            ))))
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        let composer = app.review.composer.as_ref().unwrap();
+        assert_eq!((composer.line_start, composer.line_end), (2, 3));
+        assert_eq!(composer.code, "two\nthree");
+        // The picker is the draft's control for this line, so it is told what the
+        // draft now says rather than left to agree with it by itself.
+        assert_eq!(
+            composer.start_picker.read(cx).selected_value().cloned(),
+            Some(gpui_kit::SharedString::from("2"))
+        );
+        // The lines the note now covers are the ones it will be saved against.
+        let state = &app.diff_view.as_ref().unwrap().state;
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Modified, 2, 3))
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A note can be written about a line the change removed, not only about one it
+/// added: the `−` side is a side, and the range moves there the same way.
+#[gpui_kit::test]
+async fn a_note_can_cover_lines_the_change_removed(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    commit_all(&fixture.root, "base");
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nTHREE\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The `+` is a control on a drawn diff, so the diff is on screen before
+        // the note opens: the lines it covers are washed in that view.
+        window.render_frame(cx);
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Original, 3, 3),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "review-range-start"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_value("this line goes away", window, cx)
+        });
+        // The removed line above it is a start this note may be widened to, and
+        // widening says the removed side rather than the added one.
+        fixture
+            .view
+            .update(cx, |app, cx| app.set_review_note_start(2, window, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        let composer = app.review.composer.as_ref().unwrap();
+        assert_eq!(composer.side, muster_core::review::ReviewSide::Old);
+        assert_eq!((composer.line_start, composer.line_end), (2, 3));
+        assert_eq!(composer.code, "two\nthree");
+        // The picker speaks the export's language: a removed line is a negative
+        // number, which is what says the note is about the old side.
+        assert_eq!(
+            composer.start_picker.read(cx).selected_value().cloned(),
+            Some(gpui_kit::SharedString::from("-2"))
+        );
+        let state = &app.diff_view.as_ref().unwrap().state;
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Original, 2, 3))
+        );
+        // And the note is saved against the removed side, which is what the
+        // export writes for it.
+    });
+    fixture.view.update(cx, |app, cx| app.save_review_note(cx));
+    fixture.view.read_with(cx, |app, _| {
+        let note = &app.review.notes[&fixture.checkout][0];
+        assert_eq!(note.side, muster_core::review::ReviewSide::Old);
+        assert_eq!((note.line_start, note.line_end), (2, Some(3)));
+        assert_eq!(note.code, "two\nthree");
+        assert_eq!(note.content, "this line goes away");
+    });
     close(&fixture, cx);
 }
 

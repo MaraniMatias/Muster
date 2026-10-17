@@ -376,15 +376,24 @@ pub fn build_review_markdown(notes: &[ReviewNote], context: &ReviewContext<'_>) 
         let blocks = at_path
             .into_iter()
             .map(|note| {
-                let label = match note.line_end.filter(|end| *end != note.line_start) {
-                    Some(end) => format!("{}-{}", note.line_start, end),
-                    None => note.line_start.to_string(),
+                // The lines the note covers, in the fence's own words: one
+                // number for a line, the two ends for a range, and a minus on
+                // every one of them when the change removed those lines. The
+                // sign is the only thing in the document that says which side
+                // of the change the comment is about.
+                let sign = match note.side {
+                    ReviewSide::Old => "-",
+                    ReviewSide::New => "",
+                };
+                let lines = match note.line_end.filter(|end| *end != note.line_start) {
+                    Some(end) => format!("{sign}{},{sign}{end}", note.line_start),
+                    None => format!("{sign}{}", note.line_start),
                 };
                 let language = (context.language)(path);
                 let code = if note.code.is_empty() {
                     String::new()
                 } else {
-                    format!("```{language}{{L{label}}}\n{}\n```\n", note.code)
+                    format!("```{language}{{{lines}}}\n{}\n```\n", note.code)
                 };
                 let quote = note
                     .content
@@ -557,23 +566,101 @@ mod tests {
     }
 
     #[test]
-    fn markdown_uses_captured_code_and_the_legacy_format() {
-        let note = ReviewNote {
-            id: "n1".into(),
+    fn markdown_carries_the_range_in_the_fence_the_way_a_reader_sees_it() {
+        let note = |id: &str,
+                    side: ReviewSide,
+                    line_start: usize,
+                    line_end: Option<usize>,
+                    code: &str,
+                    content: &str| ReviewNote {
+            id: id.into(),
             checkout_id: "checkout:/work".into(),
-            path: "src/main.rs".into(),
-            side: ReviewSide::New,
-            line_start: 10,
-            line_end: Some(11),
-            content: "check this\nplease".into(),
-            code: "let x = 1;\nlet y = 2;".into(),
-            code_hash: review_anchor_hash("let x = 1;"),
+            path: "src/foo.js".into(),
+            side,
+            line_start,
+            line_end,
+            content: content.into(),
+            code: code.into(),
+            code_hash: review_anchor_hash(code),
             outdated: false,
         };
-        assert_eq!(build_review_markdown(&[note], &ReviewContext {
-            branch: Some("feature"), default_branch: Some("main"), date: "2026-06-02",
-            language: |_| "rust",
-        }), "<!-- muster-review-export -->\n# Code Review 2026-06-02\n\n> `main..feature` — 1 file, 1 note\n\n## src/main.rs\n\n```rust{L10-11}\nlet x = 1;\nlet y = 2;\n```\n\n> check this\n> please\n");
+        let notes = [
+            note(
+                "n1",
+                ReviewSide::New,
+                10,
+                None,
+                "const result = a + b;",
+                "revisit this calculation",
+            ),
+            note(
+                "n2",
+                ReviewSide::New,
+                67,
+                Some(72),
+                "function handleUser(user) {\n  if (user.name) {\n    return user.name;\n  }\n}",
+                "null check `user` before `.name`",
+            ),
+            // A note about a line the change removed is written with the minus
+            // the picker showed, which is the only thing in the document that
+            // says the comment is about the old side rather than the new one.
+            note(
+                "n3",
+                ReviewSide::Old,
+                3,
+                Some(3),
+                "const gone = true;",
+                "this whole branch goes",
+            ),
+        ];
+        // The fence carries the lines the note covers as two numbers, one for a
+        // line and the two ends for a range, and the note itself is the quote
+        // under it. The marker on the first line is invisible in a reader and
+        // is what makes an export this app's own to delete later.
+        assert_eq!(
+            build_review_markdown(
+                &notes,
+                &ReviewContext {
+                    branch: Some("feature"),
+                    default_branch: Some("main"),
+                    date: "2026-03-14",
+                    language: |_| "js",
+                }
+            ),
+            r#"<!-- muster-review-export -->
+# Code Review 2026-03-14
+
+> `main..feature` — 1 file, 3 notes
+
+## src/foo.js
+
+```js{-3}
+const gone = true;
+```
+
+> this whole branch goes
+
+---
+
+```js{10}
+const result = a + b;
+```
+
+> revisit this calculation
+
+---
+
+```js{67,72}
+function handleUser(user) {
+  if (user.name) {
+    return user.name;
+  }
+}
+```
+
+> null check `user` before `.name`
+"#
+        );
         assert_eq!(build_review_markdown(&[], &ReviewContext::default()), "");
     }
 }

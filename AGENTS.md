@@ -224,6 +224,62 @@ Three rules it depends on, each pinned by a test:
   editor's rope against the loaded text, so an undo back to what the file holds
   ends the draft instead of leaving a state a draft can be stuck in.
 
+## The review composer
+
+`native/src/diff.rs` draws the note being written as a row of the diff and
+`native/src/review.rs` owns the draft. It is Legacy's composer: the range label
+and then the picker, the field that turns the accent blue while it has focus (what
+`.review-note-input:focus` did there), Legacy's sentence about what a range covers
+and its two buttons with room around them. What is *not* Legacy's is the margin
+around it — the toolkit draws every annotation inside a `px_3 py_3` box, and the
+composer takes that padding back with `m_neg_3` so the card sits flush between the
+lines above and below it.
+
+What it wears is the toolkit's own widgets rather than a hand-rolled imitation of
+them: the range picker is a `Select` over the line numbers a range could start on
+(the delegate is the toolkit's `Vec<SharedString>`, so a candidate is a line
+number and nothing else), and the two keys the card answers are drawn with `Kbd`,
+which is what keeps the hint correct off macOS without the card spelling out a
+platform pair.
+
+Both sides of a change are sides: a note opens on a line the diff **removed** as
+readily as on one it added, widens over removed lines, is washed over them, and is
+saved and exported against `ReviewSide::Old`. Nothing about the composer treats
+the added side as the real one.
+
+**A removed line is a negative number**, and the picker and the export say the
+same thing: `review_line_label` writes `-3` for old line 3 and `3` for new line 3,
+and the Markdown fence carries the same sign (```` ```js{-3,-72} ````). The sign is
+the only thing in an exported document that says which side of the change a comment
+is about, and the offer and the record cannot disagree because they are one
+function's word.
+
+Five rules it depends on, each pinned by a test:
+
+- **A range is written the way GitLab writes one.** The `+` fixes where the note
+  ends, and a `+` clicked on a line above an open draft says where it starts: that
+  click widens the draft and keeps its text, because it is the same comment about
+  more of the same change. A click at or below it is a different line and opens a
+  new note. A note being edited is never widened this way — its range is what it
+  was saved against.
+- **Where the range ends was decided by the `+`.** Only the picker moves it, and
+  it is offered from the moment the note opens rather than after a range exists.
+  Its confirm is routed back through `set_review_note_start`, so the picker and
+  the draft are one state rather than two.
+- **The box does not move, and the lines do.** The card is attached to the
+  composer's **end** line, so choosing another start leaves the box where the
+  person is typing; and the range is driven onto `DiffState::set_selected_lines`
+  by one helper, so the lines the note covers are washed in the diff's own
+  selection — visible while the note is open, re-marked when the diff is rebuilt
+  underneath it, and cleared when it is saved, cancelled or deleted.
+- **Both sides are sides.** `begin_review_note` opens a draft on a `−` line as
+  readily as on a `+` one, the picker offers the removed lines above it, the wash
+  is drawn over them, and the saved note and its export say `old`.
+- **⌘↵ saves, and it is an interceptor rather than a key handler.** Interceptors
+  run before the input's own Return, so stopping it there is what keeps the
+  keystroke from also inserting the newline a plain Return writes. Enter on its own
+  still writes one, as Legacy's textarea did, and `esc` still cancels.
+
 ## The vendored parser
 
 `native/vendor/alacritty_terminal-0.26.0` is a security backport, not vendored

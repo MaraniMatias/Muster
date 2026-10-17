@@ -8,6 +8,8 @@ use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
 };
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::select::Select;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::{
@@ -17,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
+    Keystroke, ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
 use muster_core::review::{self, AnchorOutcome, ReviewSide};
 use muster_core::workspace::RepoKind;
@@ -508,6 +510,9 @@ impl TerminalWindow {
                     ready,
                     _events: events,
                 });
+                // A fresh diff state has nothing selected in it, so a note that
+                // is still being written says which lines it covers again.
+                self.sync_review_note_selection(cx);
             }
         }
         let view = self.diff_view.as_ref()?;
@@ -650,15 +655,7 @@ impl TerminalWindow {
                 composer.checkout_id == *checkout && paths.contains(&composer.path)
             });
         let composer_input = composer.map(|composer| composer.input.clone());
-        let composer_starts = composer.map(|composer| {
-            self.git_diff
-                .get(&(composer.checkout_id.clone(), composer.path.clone()))
-                .map(|diff| review::read_diff_lines(&diff.patch))
-                .map(|lines| {
-                    crate::review::review_start_lines(&lines, composer.side, composer.line_end)
-                })
-                .unwrap_or_default()
-        });
+        let composer_picker = composer.map(|composer| composer.start_picker.clone());
         let composer_can_save =
             composer.is_some_and(|composer| !composer.input.read(cx).value().trim().is_empty());
         let composer_start = composer.map(|composer| composer.line_start).unwrap_or(1);
@@ -669,6 +666,9 @@ impl TerminalWindow {
             .map(|composer| composer.side.as_str())
             .unwrap_or("new");
         if let Some(composer) = composer {
+            // The card hangs on the line the `+` was clicked on rather than the one
+            // the range starts on, so choosing another start moves the wash over
+            // the lines instead of dragging the box up the diff with it.
             annotations.push(DiffAnnotation::line(
                 "review-composer",
                 DiffLinePosition::new(
@@ -677,7 +677,7 @@ impl TerminalWindow {
                         ReviewSide::Old => DiffSide::Original,
                         ReviewSide::New => DiffSide::Modified,
                     },
-                    composer.line_start,
+                    composer.line_end,
                 ),
             ));
         }
@@ -834,7 +834,9 @@ impl TerminalWindow {
             .render_annotation(move |annotation, _window, _cx| {
                 let annotation_id = annotation.id().to_string();
                 if annotation_id == "review-composer" {
-                    let Some(input) = composer_input.as_ref() else {
+                    let (Some(input), Some(picker)) =
+                        (composer_input.as_ref(), composer_picker.as_ref())
+                    else {
                         return div().into_any_element();
                     };
                     let save = annotation_weak.clone();
@@ -842,20 +844,25 @@ impl TerminalWindow {
                     let start = composer_start;
                     let end = composer_end;
                     let side = composer_side;
-                    let starts = composer_starts.clone().unwrap_or_default();
-                    let select = annotation_weak.clone();
                     let cancel_escape = annotation_weak.clone();
-                    let focused = input.read(_cx).focus_handle(_cx).is_focused(_window);
                     return div()
                         .id("review-composer-card")
                         .test_support()
                         .font_family(SIDEBAR_FONT_FAMILY)
                         .text_size(px(12.))
-                        .m_1()
-                        .p_1()
+                        // The toolkit draws every annotation inside a padded box.
+                        // The composer is the one annotation that is a row of the
+                        // diff rather than a card laid over it, so it takes that
+                        // padding back — twelve pixels is the wrapper's own
+                        // `px_3 py_3` — and sits flush between the lines above and
+                        // below it.
+                        .m_neg_3()
                         .border_1()
                         .border_color(roles.border)
                         .bg(roles.surface)
+                        // What is inside the box is Legacy's: the field has room
+                        // to write in and the buttons are not glued to it.
+                        .p_2()
                         .on_key_down(move |event, _, cx| {
                             if event.keystroke.key.eq_ignore_ascii_case("escape") {
                                 let _ =
@@ -864,65 +871,83 @@ impl TerminalWindow {
                             }
                         })
                         .child(
+                            // Legacy's row, read left to right: what the range
+                            // is, then the one thing about it that is still a
+                            // choice. The `+` fixed where it ends, so the picker
+                            // moves where it starts and says nothing but a line
+                            // number — a removed one carries the minus the export
+                            // writes, so the picker offers the word the export
+                            // uses.
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(10.))
+                                .text_color(roles.text_muted)
+                                .child(
+                                    div()
+                                        .id("review-composer-range")
+                                        .test_support()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(if start == end {
+                                            format!("{side} line {end}")
+                                        } else {
+                                            format!("{side} lines {start}-{end}")
+                                        }),
+                                )
+                                .child(
+                                    // The select fills whatever the wrapper is,
+                                    // so the row's own width is what makes it
+                                    // compact rather than a whole-field control.
+                                    div().w(px(56.)).flex_shrink_0().child(
+                                        Select::new(picker)
+                                            .id("review-range-start")
+                                            .xsmall()
+                                            .menu_width(px(96.))
+                                            .accessibility_label("First line of the range"),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            // Legacy's field: a field of its own that turns the
+                            // accent blue while it has focus, which is what
+                            // `.review-note-input:focus` did there. The state
+                            // grows it from one row to six as the note is written.
+                            Textarea::new(input)
+                                .w_full()
+                                .mt_2()
+                                .bg(roles.surface_base)
+                                .rounded(px(4.))
+                                .px_2()
+                                .py_1()
+                                .font_family(SIDEBAR_FONT_FAMILY)
+                                .text_size(px(12.))
+                                .aria_label("Review note")
+                                .into_any_element(),
+                        )
+                        // Legacy's sentence, for the notes it is about: it says
+                        // what a range is about to be saved as.
+                        .when(start != end, |card| {
+                            card.child(
+                                div()
+                                    .mt_2()
+                                    .text_size(px(10.))
+                                    .text_color(roles.text_muted)
+                                    .child("This note covers the selected lines. Cancel to start over."),
+                            )
+                        })
+                        // Legacy's footer: the buttons on the left, where the
+                        // hand puts them, and the keys at the far end. The keys
+                        // come from the toolkit, which is what spells the pair
+                        // for the platform instead of the card spelling it out.
+                        .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .font_family(SIDEBAR_FONT_FAMILY)
-                                .text_size(px(10.))
-                                .text_color(roles.text_muted)
-                                .child(if start == end {
-                                    format!("{side} · line {end}")
-                                } else {
-                                    format!("{side} · lines {start}-{end}")
-                                })
-                                .child(
-                                    zed_button("review-range-start")
-                                        .text()
-                                        .small()
-                                        .compact()
-                                        .h(px(16.))
-                                        .text_size(px(10.))
-                                        .accessibility_label("First line of the range")
-                                        .label(format!("{start} ▾"))
-                                        .ghost()
-                                        .dropdown_menu(move |mut menu, _, _| {
-                                            for &line in &starts {
-                                                let select = select.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(format!("Line {line}"))
-                                                        .on_click(move |_, _, cx| {
-                                                            let _ = select.update(cx, |app, cx| {
-                                                                app.set_review_note_start(line, cx)
-                                                            });
-                                                        }),
-                                                );
-                                            }
-                                            menu
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .border_1()
-                                .border_color(if focused { roles.focus } else { roles.border })
-                                .bg(roles.surface_base)
-                                .child(
-                                    Textarea::new(input)
-                                        .h(px(36.))
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .font_family(SIDEBAR_FONT_FAMILY)
-                                        .text_size(px(12.))
-                                        .aria_label("Review note"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .pt_1()
+                                .mt_2()
                                 .child(
                                     zed_button("save-review-note")
                                         .small()
@@ -948,6 +973,33 @@ impl TerminalWindow {
                                             let _ = cancel
                                                 .update(cx, |app, cx| app.cancel_review_note(cx));
                                         }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .min_w_0()
+                                        .justify_end()
+                                        .text_size(px(10.))
+                                        .text_color(roles.text_muted)
+                                        .child(
+                                            Kbd::new(
+                                                Keystroke::parse("escape")
+                                                    .expect("a literal keystroke"),
+                                            )
+                                            .appearance(false),
+                                        )
+                                        .child("cancels ·")
+                                        .child(
+                                            Kbd::new(
+                                                Keystroke::parse("secondary-enter")
+                                                    .expect("a literal keystroke"),
+                                            )
+                                            .appearance(false),
+                                        )
+                                        .child("saves"),
                                 ),
                         )
                         .into_any_element();
