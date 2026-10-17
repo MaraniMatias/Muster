@@ -1,17 +1,25 @@
 //! Retained, virtualized unified code review surface.
 use crate::{
     app::{InspectorTab, TerminalWindow, SIDEBAR_FONT_FAMILY},
-    theme::Roles,
+    theme::{zed_button, Roles},
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffState};
+use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::diff::{
+    Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
+};
+use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
+use gpui_kit::component::{
+    input::Textarea,
+    menu::{DropdownMenu, PopupMenuItem},
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
+use muster_core::review::{self, AnchorOutcome, ReviewSide};
 use muster_core::workspace::RepoKind;
 
 pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
@@ -282,6 +290,7 @@ impl TerminalWindow {
     ) {
         self.clear_document();
         self.open_diff = Some((checkout.to_owned(), path.clone()));
+        self.restore_opencode_review(checkout, cx);
         self.prune_diff_cache();
         self.focus_pending = false;
         self.open_crumb = None;
@@ -514,12 +523,13 @@ impl TerminalWindow {
                 .map(|(path, error)| (path.clone(), (error.clone(), false))),
         );
         let state = view.state.clone();
+        let ready_paths = view.ready.clone();
         // Sync initial/programmatic expansion without generating user events.
         state.update(cx, |state, cx| {
             for path in &paths {
                 state.set_file_collapsed(
                     path,
-                    !view.ready.contains(path)
+                    !ready_paths.contains(path)
                         || (selected.is_none()
                             && !self
                                 .expanded_diffs
@@ -529,13 +539,192 @@ impl TerminalWindow {
             }
         });
         let weak = cx.weak_entity();
-        // Each header row and each notice row carries its own click target, so
-        // the window is reached through one clone each.
+        // Each rendered row owns the weak handle for the action it offers.
         let header_weak = weak.clone();
-        let annotations = notices
+        let add_note_weak = weak.clone();
+        let annotation_weak = weak.clone();
+        let notes_for_checkout = self
+            .review
+            .notes
+            .get(checkout)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|note| paths.contains(&note.path))
+            .collect::<Vec<_>>();
+        self.review
+            .anchor_hashes
+            .retain(|(cached_checkout, path), _| {
+                cached_checkout == checkout && paths.contains(path)
+            });
+        let mut note_lines = std::collections::HashMap::new();
+        let mut complete_diffs = std::collections::HashMap::new();
+        for note in &notes_for_checkout {
+            if note_lines.contains_key(&note.path) {
+                continue;
+            }
+            let key = (checkout.clone(), note.path.clone());
+            if !ready_paths.contains(&note.path) {
+                self.review.anchor_hashes.remove(&key);
+                complete_diffs.insert(note.path.clone(), false);
+                continue;
+            }
+            let Some(diff) = self.git_diff.get(&key) else {
+                self.review.anchor_hashes.remove(&key);
+                complete_diffs.insert(note.path.clone(), false);
+                continue;
+            };
+            let complete = !diff.too_large && !diff.is_binary && diff.symlink_target.is_none();
+            complete_diffs.insert(note.path.clone(), complete);
+            note_lines.insert(
+                note.path.clone(),
+                crate::review::cached_anchor_hashes(
+                    &mut self.review,
+                    checkout,
+                    &note.path,
+                    &diff.revision,
+                    &diff.patch,
+                    &notes_for_checkout,
+                ),
+            );
+        }
+        if let Some(notes) = self.review.notes.get_mut(checkout) {
+            for note in notes.iter_mut().filter(|note| paths.contains(&note.path)) {
+                if let Some(current_hash) = note_lines
+                    .get(&note.path)
+                    .and_then(|hashes| hashes.get(&(note.side, note.line_start)))
+                    .and_then(Option::as_ref)
+                {
+                    if current_hash != &note.code_hash {
+                        note.outdated = true;
+                    }
+                }
+            }
+        }
+        let notes_for_checkout = self
+            .review
+            .notes
+            .get(checkout)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|note| paths.contains(&note.path))
+            .collect::<Vec<_>>();
+        let mut note_views = std::collections::HashMap::new();
+        let mut annotations = notices
             .keys()
             .map(|path| DiffAnnotation::file(format!("diff-notice-{path}"), path.clone()))
             .collect::<Vec<_>>();
+        for note in notes_for_checkout {
+            let position = DiffLinePosition::new(
+                note.path.clone(),
+                match note.side {
+                    ReviewSide::Old => DiffSide::Original,
+                    ReviewSide::New => DiffSide::Modified,
+                },
+                note.line_start,
+            );
+            let outcome = review::anchor_outcome_hash(
+                &note,
+                note_lines
+                    .get(&note.path)
+                    .and_then(|hashes| hashes.get(&(note.side, note.line_start)))
+                    .and_then(Option::as_deref),
+                complete_diffs.get(&note.path).copied().unwrap_or(false),
+            );
+            let annotation_id = format!("review-note-{}", note.id);
+            if matches!(outcome, AnchorOutcome::Missing | AnchorOutcome::Unknown) {
+                // A line annotation has no row to attach to when an anchor has disappeared.
+                // Keep its controls reachable at file scope instead of silently losing the note.
+                annotations.push(DiffAnnotation::file(
+                    annotation_id.clone(),
+                    note.path.clone(),
+                ));
+            } else {
+                annotations.push(DiffAnnotation::line(annotation_id.clone(), position));
+            }
+            note_views.insert(format!("review-note-{}", note.id), (note, outcome));
+        }
+        let composer =
+            self.review.composer.as_ref().filter(|composer| {
+                composer.checkout_id == *checkout && paths.contains(&composer.path)
+            });
+        let composer_input = composer.map(|composer| composer.input.clone());
+        let composer_starts = composer.map(|composer| {
+            self.git_diff
+                .get(&(composer.checkout_id.clone(), composer.path.clone()))
+                .map(|diff| review::read_diff_lines(&diff.patch))
+                .map(|lines| {
+                    crate::review::review_start_lines(&lines, composer.side, composer.line_end)
+                })
+                .unwrap_or_default()
+        });
+        let composer_can_save =
+            composer.is_some_and(|composer| !composer.input.read(cx).value().trim().is_empty());
+        let composer_start = composer.map(|composer| composer.line_start).unwrap_or(1);
+        let composer_end = composer
+            .map(|composer| composer.line_end)
+            .unwrap_or(composer_start);
+        let composer_side = composer
+            .map(|composer| composer.side.as_str())
+            .unwrap_or("new");
+        if let Some(composer) = composer {
+            annotations.push(DiffAnnotation::line(
+                "review-composer",
+                DiffLinePosition::new(
+                    composer.path.clone(),
+                    match composer.side {
+                        ReviewSide::Old => DiffSide::Original,
+                        ReviewSide::New => DiffSide::Modified,
+                    },
+                    composer.line_start,
+                ),
+            ));
+        }
+        let checkout_id = checkout.clone();
+        let note_count = self.review.notes.get(checkout).map_or(0, |notes| {
+            notes
+                .iter()
+                .filter(|note| self.review.include_outdated || !note.outdated)
+                .count()
+        });
+        let exporting_review = self.review.exporting;
+        let has_pending_opencode =
+            !crate::review::can_start_opencode_round(&self.review.opencode_rounds);
+        let include_outdated = self.review.include_outdated;
+        let opencode_busy = self.review.opencode_busy;
+        let opencode_loading = self.review.opencode_loading;
+        let opencode_selected = matches!(
+            self.review.opencode_destination,
+            Some(
+                muster_core::opencode::Destination::Opencode { .. }
+                    | muster_core::opencode::Destination::OpencodeNew
+            )
+        );
+        let opencode_error = opencode_selected
+            .then(|| self.review.opencode_error.clone())
+            .flatten();
+        let opencode_rounds = self.review.opencode_rounds.clone();
+        let opencode_status = opencode_selected
+            .then(|| opencode_rounds.last())
+            .flatten()
+            .map(|round| {
+                format!(
+                    "Review · {}",
+                    crate::review::opencode_round_state(round.status)
+                )
+            });
+        let opencode_session = match (&self.review.opencode_destination, opencode_selected) {
+            (Some(muster_core::opencode::Destination::Opencode { session_id }), true) => {
+                Some(session_id.clone())
+            }
+            _ => None,
+        };
+        let has_outdated = self
+            .review
+            .notes
+            .get(checkout)
+            .is_some_and(|notes| notes.iter().any(|note| note.outdated));
         let id = checkout.clone();
         // The header row answers for the diff's own chevron, so it needs the
         // checkout the change set belongs to as well as the file.
@@ -637,26 +826,228 @@ impl TerminalWindow {
                     })
             })
             .annotations(annotations)
-            .render_annotation(move |annotation, _, _| {
+            .on_add_annotation(move |range, window, cx| {
+                let _ = add_note_weak.update(cx, |app, cx| {
+                    app.begin_review_note(range, window, cx);
+                });
+            })
+            .render_annotation(move |annotation, _window, _cx| {
+                let annotation_id = annotation.id().to_string();
+                if annotation_id == "review-composer" {
+                    let Some(input) = composer_input.as_ref() else {
+                        return div().into_any_element();
+                    };
+                    let save = annotation_weak.clone();
+                    let cancel = annotation_weak.clone();
+                    let start = composer_start;
+                    let end = composer_end;
+                    let side = composer_side;
+                    let starts = composer_starts.clone().unwrap_or_default();
+                    let select = annotation_weak.clone();
+                    let cancel_escape = annotation_weak.clone();
+                    let focused = input.read(_cx).focus_handle(_cx).is_focused(_window);
+                    return div()
+                        .id("review-composer-card")
+                        .test_support()
+                        .font_family(SIDEBAR_FONT_FAMILY)
+                        .text_size(px(12.))
+                        .m_1()
+                        .p_1()
+                        .border_1()
+                        .border_color(roles.border)
+                        .bg(roles.surface)
+                        .on_key_down(move |event, _, cx| {
+                            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                                let _ =
+                                    cancel_escape.update(cx, |app, cx| app.cancel_review_note(cx));
+                                cx.stop_propagation();
+                            }
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .font_family(SIDEBAR_FONT_FAMILY)
+                                .text_size(px(10.))
+                                .text_color(roles.text_muted)
+                                .child(if start == end {
+                                    format!("{side} · line {end}")
+                                } else {
+                                    format!("{side} · lines {start}-{end}")
+                                })
+                                .child(
+                                    zed_button("review-range-start")
+                                        .text()
+                                        .small()
+                                        .compact()
+                                        .h(px(16.))
+                                        .text_size(px(10.))
+                                        .accessibility_label("First line of the range")
+                                        .label(format!("{start} ▾"))
+                                        .ghost()
+                                        .dropdown_menu(move |mut menu, _, _| {
+                                            for &line in &starts {
+                                                let select = select.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(format!("Line {line}"))
+                                                        .on_click(move |_, _, cx| {
+                                                            let _ = select.update(cx, |app, cx| {
+                                                                app.set_review_note_start(line, cx)
+                                                            });
+                                                        }),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .border_1()
+                                .border_color(if focused { roles.focus } else { roles.border })
+                                .bg(roles.surface_base)
+                                .child(
+                                    Textarea::new(input)
+                                        .h(px(36.))
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .font_family(SIDEBAR_FONT_FAMILY)
+                                        .text_size(px(12.))
+                                        .aria_label("Review note"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .pt_1()
+                                .child(
+                                    zed_button("save-review-note")
+                                        .small()
+                                        .compact()
+                                        .h(px(20.))
+                                        .text_size(px(12.))
+                                        .label("Save note")
+                                        .disabled(!composer_can_save)
+                                        .on_click(move |_, _, cx| {
+                                            let _ =
+                                                save.update(cx, |app, cx| app.save_review_note(cx));
+                                        }),
+                                )
+                                .child(
+                                    zed_button("cancel-review-note")
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .h(px(20.))
+                                        .text_size(px(12.))
+                                        .label("Cancel")
+                                        .on_click(move |_, _, cx| {
+                                            let _ = cancel
+                                                .update(cx, |app, cx| app.cancel_review_note(cx));
+                                        }),
+                                ),
+                        )
+                        .into_any_element();
+                }
+                if let Some((note, outcome)) = note_views.get(&annotation_id) {
+                    let note_id = note.id.clone();
+                    let checkout_id = checkout_id.clone();
+                    let edit = annotation_weak.clone();
+                    let accept = annotation_weak.clone();
+                    let delete = annotation_weak.clone();
+                    let mut card = div()
+                        .id(format!("review-card-{}", note.id))
+                        .test_support()
+                        .px_3()
+                        .py_2()
+                        .bg(roles.surface)
+                        .text_size(px(11.))
+                        .child(div().text_color(roles.text_muted).child(format!(
+                            "{}:{}{}",
+                            note.side.as_str(),
+                            note.line_start,
+                            note.line_end
+                                .filter(|end| *end != note.line_start)
+                                .map(|end| format!("-{end}"))
+                                .unwrap_or_default()
+                        )))
+                        .child(div().py_1().child(note.content.clone()));
+                    if note.outdated {
+                        card = card.child(div().text_color(roles.status.warning).child(
+                            "This anchor changed; it is excluded from export unless included.",
+                        ));
+                    } else if let Some(message) = match outcome {
+                        AnchorOutcome::Changed => Some("This anchor changed."),
+                        AnchorOutcome::Missing => Some("This line is no longer in the diff."),
+                        AnchorOutcome::Unknown => Some("This part of the diff is not loaded."),
+                        AnchorOutcome::Unchanged => None,
+                    } {
+                        card = card.child(div().text_color(roles.text_muted).child(message));
+                    }
+                    let actions = div()
+                        .flex()
+                        .gap_2()
+                        .pt_1()
+                        .when(note.outdated, |actions| {
+                            let id = note_id.clone();
+                            let checkout = checkout_id.clone();
+                            actions.child(
+                                zed_button(format!("accept-review-{}", note.id))
+                                    .ghost()
+                                    .small()
+                                    .label("Accept")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = accept.update(cx, |app, cx| {
+                                            app.accept_outdated_note(&checkout, &id, cx);
+                                        });
+                                    }),
+                            )
+                        })
+                        .child({
+                            let id = note_id.clone();
+                            zed_button(format!("edit-review-{}", note.id))
+                                .ghost()
+                                .small()
+                                .label("Edit")
+                                .on_click(move |_, window, cx| {
+                                    let _ = edit.update(cx, |app, cx| {
+                                        app.edit_review_note(&id, window, cx);
+                                    });
+                                })
+                        })
+                        .child({
+                            let id = note_id;
+                            zed_button(format!("delete-review-{}", note.id))
+                                .ghost()
+                                .small()
+                                .label("Delete")
+                                .on_click(move |_, _, cx| {
+                                    let _ = delete.update(cx, |app, cx| {
+                                        app.delete_review_note(&checkout_id, &id, cx);
+                                    });
+                                })
+                        });
+                    card = card.child(actions);
+                    return card.into_any_element();
+                }
                 let path = annotation.path().to_string();
                 let (message, retry) = notices.get(&path).cloned().unwrap_or_default();
                 let mut row = div().px_3().py_2().child(
                     div()
                         .id(format!("diff-notice-text-{path}"))
                         .test_support()
-                        // The notice is prose, but it is read where the change
-                        // is, and the diff refines its own root down to the
-                        // chrome size: a notice naming no size of its own is the
-                        // smallest letter in the window.
                         .text_size(px(f32::from(crate::terminal::FONT_SIZE)))
                         .text_color(roles.text_muted)
                         .child(message),
                 );
                 if retry {
-                    let weak = weak.clone();
+                    let weak = annotation_weak.clone();
                     let id = id.clone();
                     row = row.child(
-                        Button::new(format!("retry-diff-{path}"))
+                        zed_button(format!("retry-diff-{path}"))
                             .small()
                             .label("Retry")
                             .on_click(move |_, _, cx| {
@@ -665,7 +1056,7 @@ impl TerminalWindow {
                             }),
                     );
                 }
-                row
+                row.into_any_element()
             })
             .size_full()
             .bg(roles.content)
@@ -687,7 +1078,7 @@ impl TerminalWindow {
                 let weak = cx.weak_entity();
                 let checkout = checkout.clone();
                 empty = empty.child(
-                    Button::new("retry-change-set")
+                    zed_button("retry-change-set")
                         .small()
                         .label("Retry")
                         .on_click(move |_, _, cx| {
@@ -701,6 +1092,7 @@ impl TerminalWindow {
             viewer.into_any_element()
         };
         let weak = cx.weak_entity();
+        let close = weak.clone();
         Some(
             div()
                 .size_full()
@@ -712,66 +1104,130 @@ impl TerminalWindow {
                 .text_color(roles.text)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .h(px(40.))
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(roles.border)
+                        .id("review-toolbar")
+                        .test_support()
+                        .flex().flex_col().gap_1().px_3().py_1()
+                        .flex_none().min_w_0()
+                        .text_size(px(12.))
+                        .border_b_1().border_color(roles.border)
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(DIFF_CHROME_PX))
-                                .text_color(roles.text_muted)
-                                .child(selected.clone().unwrap_or_else(|| "All changes".into())),
-                        )
-                        .when_some(source, |header, (repo, source_checkout, path)| {
-                            let weak = weak.clone();
-                            header.child(
-                                Button::new(format!("diff-open-source-{path}"))
-                                    .text()
-                                    .small()
-                                    .compact()
-                                    .rounded(px(0.))
-                                    .label("Source")
-                                    .accessibility_label(format!("Show the source of {path}"))
-                                    .tooltip("Show this file's source")
-                                    // The same one transition the other way round
-                                    // is: this pane is a document's changes, and the
-                                    // source is a document of its own.
+                            div().id("review-title-row").test_support()
+                                .flex().items_center().gap_2().min_w_0()
+                                .child(
+                                    div().flex_1().min_w_0().truncate()
+                                        .text_size(px(DIFF_CHROME_PX))
+                                        .text_color(roles.text_muted)
+                                        .child(selected.clone().unwrap_or_else(|| "All changes".into())),
+                                )
+                                .child({
+                                    let send_action = weak.clone();
+                                    let export_action = weak.clone();
+                                    zed_button("review-primary-action")
+                                        .small().compact().h(px(24.))
+                                        .label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
+                                        .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
+                                        .disabled(note_count == 0 || exporting_review || opencode_busy || opencode_loading || (opencode_selected && has_pending_opencode))
+                                        .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
+                                        .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
+                                })
+                                .child({
+                                    let choose = weak.clone();
+                                    zed_button("review-destination").text().small().compact().h(px(24.))
+                                        .label(if opencode_selected { "OpenCode ▾" } else { "Markdown ▾" })
+                                        .accessibility_label("Review destination")
+                                        .disabled(exporting_review || opencode_busy || opencode_loading)
+                                        .dropdown_menu(move |menu, _, _| {
+                                            let markdown = choose.clone();
+                                            let opencode = choose.clone();
+                                            menu.item(PopupMenuItem::new("Markdown").on_click(move |_, _, cx| {
+                                                let _ = markdown.update(cx, |app, cx| app.set_opencode_destination(muster_core::opencode::Destination::Markdown, cx));
+                                            })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
+                                                let _ = opencode.update(cx, |app, cx| {
+                                                    let destination = match app.review.opencode_destination.clone() {
+                                                        Some(value @ muster_core::opencode::Destination::Opencode { .. }) => value,
+                                                        _ => muster_core::opencode::Destination::OpencodeNew,
+                                                    };
+                                                    app.set_opencode_destination(destination, cx);
+                                                });
+                                            }))
+                                        })
+                                })
+                                .when_some(source, |header, (repo, source_checkout, path)| {
+                                    let weak = weak.clone();
+                                    header.child(zed_button(format!("diff-open-source-{path}"))
+                                        .text().small().compact().h(px(24.)).rounded(px(0.))
+                                        .label("Source").accessibility_label(format!("Show the source of {path}"))
+                                        .tooltip("Show this file's source")
+                                        .on_click(move |_, window, cx| {
+                                            let (repo, checkout, path) = (repo.clone(), source_checkout.clone(), path.clone());
+                                            let _ = weak.update(cx, |app, cx| app.request_document(repo, checkout, path, window, cx));
+                                        }))
+                                })
+                                .child(zed_button("close-diff")
+                                    .custom(crate::app::sidebar_action_style(cx))
+                                    .small().compact().h(px(24.)).rounded(px(0.))
+                                    .icon(IconName::X).accessibility_label("Close preview").tooltip("Close preview")
                                     .on_click(move |_, window, cx| {
-                                        let (repo, checkout, path) =
-                                            (repo.clone(), source_checkout.clone(), path.clone());
-                                        let _ = weak.update(cx, |app, cx| {
-                                            app.request_document(repo, checkout, path, window, cx)
+                                        let _ = close.update(cx, |app, cx| {
+                                            app.open_diff = None;
+                                            app.diff_view = None;
+                                            app.prune_diff_cache();
+                                            app.focus_terminal(window, cx);
+                                            cx.notify();
                                         });
-                                    }),
-                            )
-                        })
-                        .child(
-                            Button::new("close-diff")
-                                .custom(crate::app::sidebar_action_style(cx))
-                                .small()
-                                .compact()
-                                .rounded(px(0.))
-                                .icon(IconName::X)
-                                .accessibility_label("Close preview")
-                                .tooltip("Close preview")
-                                .on_click(move |_, window, cx| {
-                                    let _ = weak.update(cx, |app, cx| {
-                                        app.open_diff = None;
-                                        app.diff_view = None;
-                                        app.prune_diff_cache();
-                                        app.focus_terminal(window, cx);
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                )
+                                    })),
+                        )
+                        .child(div().id("review-secondary-row").test_support()
+                            .flex().items_center().gap_2().min_w_0().text_size(px(9.))
+                            .when(note_count > 0, |row| row.child(div().id("review-note-count").test_support()
+                                .text_color(roles.text_muted).child(format!("{note_count} {}", if note_count == 1 { "note" } else { "notes" }))))
+                            .when(has_outdated, |row| {
+                                let toggle = weak.clone();
+                                row.child(gpui_kit::component::checkbox::Checkbox::new("review-outdated")
+                                    .checked(include_outdated).label("Include outdated notes")
+                                    .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
+                            })
+                            .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
+                                .text().small().compact().h(px(18.)).label("OpenCode session").tooltip(session.clone())
+                                .accessibility_label("Copy the app-created OpenCode session id")
+                                .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(session.clone())))))
+                            .when_some(opencode_status, |row, status| row.child(div().id("opencode-review-status").test_support()
+                                .text_size(px(9.)).text_color(roles.text_muted).child(status)))
+                            .when_some(opencode_error, |row, error| row.child(div().id("opencode-review-error").test_support()
+                                .text_size(px(9.)).text_color(roles.status.danger_text).child(error)))
+                            .when_some(opencode_rounds.iter().find(|round| opencode_selected && (round.status.is_pending()
+                                || round.status == muster_core::opencode::RoundStatus::Unknown))
+                                .map(|round| (round.id.clone(), round.status)), |row, (round_id, status)| {
+                                    let reconcile = weak.clone();
+                                    let reconcile_id = round_id.clone();
+                                    let weak = weak.clone();
+                                    let button = zed_button("resolve-opencode-round").small().compact();
+                                    let button = match status {
+                                        muster_core::opencode::RoundStatus::Queued => button.label("Retry queued review").on_click(move |_, window, cx| {
+                                            let _ = weak.update(cx, |app, cx| app.retry_queued_opencode_rounds(window, cx));
+                                        }),
+                                        muster_core::opencode::RoundStatus::Unknown => button.label("Allow retry (may duplicate)")
+                                            .tooltip("This review may already have been delivered. Sending it again may deliver it twice.")
+                                            .on_click(move |_, window, cx| {
+                                                let round_id = round_id.clone();
+                                                let _ = weak.update(cx, |app, cx| app.resend_unknown_opencode_round(&round_id, window, cx));
+                                            }),
+                                        _ => {
+                                            let round_id = round_id.clone();
+                                            button.label("Reconcile uncertain send").on_click(move |_, window, cx| {
+                                                let _ = weak.update(cx, |app, cx| app.reconcile_opencode_round(&round_id, window, cx));
+                                            })
+                                        }
+                                    };
+                                    row.child(button.disabled(opencode_busy || opencode_loading))
+                                        .when(status == muster_core::opencode::RoundStatus::Unknown, |row| row.child(
+                                            zed_button("recheck-unknown-opencode-round").small().compact().label("Check delivery again")
+                                                .disabled(opencode_busy || opencode_loading)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = reconcile.update(cx, |app, cx| app.reconcile_opencode_round(&reconcile_id, window, cx));
+                                                })))
+                                })),
+                        )
                 .child(div().flex_1().min_h_0().child(body))
                 .into_any_element(),
         )

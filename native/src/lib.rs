@@ -17,6 +17,9 @@ pub mod document;
 /// Central checkout diff previews.
 mod diff;
 
+/// Line-anchored review drafts and Markdown export.
+mod review;
+
 /// Lazy checkout Files inspector.
 pub mod inspector;
 

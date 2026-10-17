@@ -431,6 +431,19 @@ mod tests {
     }
 
     #[test]
+    fn the_production_writer_does_not_overwrite_an_older_workspace_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-workspace.json");
+        let old = br#"{"schemaVersion":1,"roots":["/work/repo"],"archivedCheckoutIds":[],"activeCheckoutId":null,"sidebarWidth":240.0}"#;
+        std::fs::write(&path, old).unwrap();
+        let writer = StateWriter::new(path.clone()).unwrap();
+        writer.send(state(320.));
+        assert!(wait_for_error(&writer).contains("schema 1 is unsupported"));
+        drop(writer);
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    #[test]
     fn the_production_writer_saves_through_the_core_state_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("native-workspace.json");

@@ -67,8 +67,8 @@ foreground-process introspection on both supported platforms.
 | Notes are marked `sent` **before** the agent is called, so a crash can neither fake nor hide delivery                                                                                               | `services/review_round.rs:50-68`                                       |
 | Outdated notes are held back unless explicitly included; busy target offers Send now / Queue / Not now                                                                                              | `FileDiff.vue:230-237, 244-263, 668-671`                               |
 | Export is CodeReview.nvim-compatible with per-extension language fences                                                                                                                             | `src/domain/review.ts:71-172`                                          |
-| Export writes `<timestamp>.md` with `create_new(true)` into the folder `reviews.storage` names: `~/.muster/tmp/reviews`, or `<checkout>/.muster/reviews` in the working directory              | `services/files.rs:75-105, 810-858`                                    |
-| The folder is chosen in Settings, named under the selector with its file count and size, and emptied of its exports from there; `workdir` is refused by the command itself                          | `services/files.rs:164-232`, `SettingsDialog.vue:288-321`              |
+| Export writes `<timestamp>.md` with `create_new(true)` inside `<checkout>/.muster/reviews` by default, or `~/.muster/tmp/reviews` when App cache is selected                      | `core/src/files.rs`, `native/src/titlebar.rs`                          |
+| The folder is chosen in Settings as “This checkout (.muster/reviews)” or “App cache”; checkout exports are never cleared from the app-cache action                              | `native/src/titlebar.rs`, `core/src/files.rs`                          |
 
 ## 4. Agent integration and everything around it
 

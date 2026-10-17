@@ -267,6 +267,10 @@ fn state_roundtrips_without_sessions_and_replaces_atomically() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("profile/native-workspace.json");
     assert_eq!(load(&path).unwrap(), NavigationState::default());
+    assert_eq!(
+        NavigationState::default().review_storage,
+        crate::review::ReviewStorage::Workdir
+    );
     let root = temp
         .path()
         .canonicalize()
@@ -277,6 +281,7 @@ fn state_roundtrips_without_sessions_and_replaces_atomically() {
     let mut state = NavigationState {
         roots: vec![root.clone()],
         active_checkout_id: Some(checkout_id_for_path(&root)),
+        review_storage: crate::review::ReviewStorage::Workdir,
         ..NavigationState::default()
     };
     save(&path, &state).unwrap();

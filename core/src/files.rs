@@ -43,10 +43,14 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
 };
 
+use crate::review::ReviewStorage;
 use crate::workspace::{checkout_id_for_path, repo_id_for_path, Checkout, Repo};
 
 /// The largest file that can be previewed. Anything larger is refused outright.
@@ -61,6 +65,8 @@ pub const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
 pub const MAX_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// The largest directory that can be listed. Anything larger is refused outright.
 pub const MAX_DIRECTORY_ENTRIES: usize = 2000;
+const MAX_REVIEW_EXPORT_BYTES: usize = 512 * 1024;
+const REVIEW_EXPORT_MARKER: &str = "<!-- muster-review-export -->\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -537,6 +543,299 @@ pub fn write_preview(
         return Err(CHANGED_ON_DISK.into());
     }
     replace(&parent, &name, content.as_bytes(), mode)
+}
+
+/// Create a new Markdown review export without following a path outside its owner.
+///
+/// Workdir exports are walked from the registered checkout root with the same
+/// descriptor-based, no-symlink policy as previews. Default exports are walked
+/// from the canonical home directory. Existing names are never overwritten.
+pub fn export_review_markdown(
+    repo: &Repo,
+    checkout: &Checkout,
+    storage: ReviewStorage,
+    timestamp: &str,
+    markdown: &str,
+) -> Result<PathBuf, String> {
+    if !valid_review_timestamp(timestamp) {
+        return Err("review export timestamp is invalid".into());
+    }
+    if markdown.len() > MAX_REVIEW_EXPORT_BYTES || markdown.contains('\0') {
+        return Err("review export is too large or contains binary text".into());
+    }
+    if !markdown.starts_with(REVIEW_EXPORT_MARKER) {
+        return Err("review export is missing its ownership marker".into());
+    }
+    let (base, relative) = review_export_location(repo, checkout, storage)?;
+    let parent = open_root(&base).map_err(|error| error.to_string())?;
+    let directory = create_directories(&parent, &relative)?;
+    let filename = create_review_file(&directory, timestamp, markdown.as_bytes())?;
+    Ok(base.join(relative).join(filename))
+}
+
+/// The same destination shown in Settings and used by the exporter.
+/// Resolving it never creates a directory or an export.
+pub fn review_export_folder(
+    repo: &Repo,
+    checkout: &Checkout,
+    storage: ReviewStorage,
+) -> Result<PathBuf, String> {
+    let (base, relative) = review_export_location(repo, checkout, storage)?;
+    Ok(base.join(relative))
+}
+
+fn review_export_location(
+    repo: &Repo,
+    checkout: &Checkout,
+    storage: ReviewStorage,
+) -> Result<(PathBuf, PathBuf), String> {
+    let checkout_root = root(repo, checkout)?;
+    match storage {
+        ReviewStorage::Workdir => Ok((checkout_root, PathBuf::from(".muster/reviews"))),
+        ReviewStorage::Default => {
+            let home = std::env::var_os("HOME").ok_or("HOME is unavailable")?;
+            let home = PathBuf::from(home);
+            if !home.is_absolute() {
+                return Err("HOME must be an absolute directory".into());
+            }
+            let base = home
+                .canonicalize()
+                .map_err(|error| format!("could not resolve HOME: {error}"))?;
+            Ok((base, PathBuf::from(".muster/tmp/reviews")))
+        }
+    }
+}
+
+/// Remove only this app's marked Markdown exports from its default review cache.
+/// Workdir exports belong to the checkout and are never removed by this action.
+pub fn clear_review_exports(
+    repo: &Repo,
+    checkout: &Checkout,
+    storage: ReviewStorage,
+) -> Result<usize, String> {
+    if storage != ReviewStorage::Default {
+        return Err("review exports inside a checkout are not cleared here".into());
+    }
+    let (base, relative) = review_export_location(repo, checkout, storage)?;
+    let parent = open_root(&base).map_err(|error| error.to_string())?;
+    let directory = match open_directory(&parent, &relative) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("could not open review export folder: {error}")),
+    };
+    clear_marked_review_exports(&directory)
+}
+
+fn clear_marked_review_exports(directory: &OwnedFd) -> Result<usize, String> {
+    let mut stream = DirStream::open(directory)?;
+    let mut names = Vec::new();
+    let mut count = 0;
+    while let Some(entry) = stream.next() {
+        let name = entry?;
+        if name.as_bytes() == b"." || name.as_bytes() == b".." {
+            continue;
+        }
+        count += 1;
+        if count > MAX_DIRECTORY_ENTRIES {
+            return Err(format!(
+                "review export folder has more than {MAX_DIRECTORY_ENTRIES} entries"
+            ));
+        }
+        if !is_review_export_filename(&name) || entry_kind(directory, &name)? != Some(false) {
+            continue;
+        }
+        let Ok(mut file) = open_file(directory, &name) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mut marker = [0; REVIEW_EXPORT_MARKER.len()];
+        if file.read_exact(&mut marker).is_err()
+            || marker.as_slice() != REVIEW_EXPORT_MARKER.as_bytes()
+        {
+            continue;
+        }
+        names.push((name, metadata.dev(), metadata.ino()));
+    }
+    let mut removed = 0;
+    for (name, device, inode) in names {
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut current,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(format!("could not inspect review export: {error}"));
+        }
+        if current.st_mode & libc::S_IFMT != libc::S_IFREG
+            || current.st_dev as u64 != device
+            || current.st_ino as u64 != inode
+        {
+            continue;
+        }
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(format!("could not delete review export: {error}"));
+        }
+        removed += 1;
+    }
+    if removed > 0 && unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "could not sync review export folder: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(removed)
+}
+
+fn is_review_export_filename(name: &CStr) -> bool {
+    let Ok(name) = std::str::from_utf8(name.to_bytes()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let Some(timestamp) = stem.get(..15) else {
+        return false;
+    };
+    if !valid_review_timestamp(timestamp) {
+        return false;
+    }
+    match stem.get(15..) {
+        None | Some("") => true,
+        Some(suffix) => suffix
+            .strip_prefix('-')
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
+
+fn valid_review_timestamp(value: &str) -> bool {
+    value.len() == 15
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value.as_bytes()[10] == b'-'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10) || byte.is_ascii_digit())
+}
+
+fn create_directories(parent: &OwnedFd, relative: &Path) -> Result<OwnedFd, String> {
+    let mut current = parent.try_clone().map_err(|error| error.to_string())?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("review directory must be relative".into());
+        };
+        let name = name_of(name).map_err(|error| error.to_string())?;
+        if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(format!("could not create review export folder: {error}"));
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | WALK_FLAGS,
+            )
+        };
+        current = descriptor(fd)
+            .map_err(|error| format!("could not open review export folder: {error}"))?;
+    }
+    Ok(current)
+}
+
+fn create_review_file(
+    directory: &OwnedFd,
+    timestamp: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let mut temporary_file = None;
+    for _ in 0..32 {
+        let temporary = temporary_name()?;
+        let temporary_c = name_of(OsStr::new(&temporary)).map_err(|error| error.to_string())?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | WALK_FLAGS,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            temporary_file = Some((temporary_c, fd));
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(format!(
+                "could not create review export temporary file: {error}"
+            ));
+        }
+    }
+    let Some((temporary_c, fd)) = temporary_file else {
+        return Err("could not allocate a temporary review export file".into());
+    };
+    let mut file = File::from(
+        descriptor(fd)
+            .map_err(|error| format!("could not create review export temporary file: {error}"))?,
+    );
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
+        return Err(format!("could not write review export: {error}"));
+    }
+    drop(file);
+    for suffix in 1..=MAX_DIRECTORY_ENTRIES {
+        let filename = if suffix == 1 {
+            format!("{timestamp}.md")
+        } else {
+            format!("{timestamp}-{suffix}.md")
+        };
+        let target = name_of(OsStr::new(&filename)).map_err(|error| error.to_string())?;
+        let linked = unsafe {
+            libc::linkat(
+                directory.as_raw_fd(),
+                temporary_c.as_ptr(),
+                directory.as_raw_fd(),
+                target.as_ptr(),
+                0,
+            )
+        };
+        if linked == 0 {
+            unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
+            if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+                return Err(format!(
+                    "could not sync review export folder: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            return Ok(filename);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
+            return Err(format!("could not create review export: {error}"));
+        }
+    }
+    unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_c.as_ptr(), 0) };
+    Err("too many review exports share this timestamp".into())
 }
 
 /// What a replacement leaves behind when it cannot be finished.
@@ -1469,5 +1768,209 @@ mod tests {
             ["script.sh"],
             "a save left something behind: {left:?}"
         );
+    }
+
+    #[test]
+    fn displayed_review_folder_is_the_export_folder_of_the_registered_checkout() {
+        let primary = tempdir().unwrap();
+        let worktree = tempdir().unwrap();
+        let (mut repo, mut checkout) = checkout_of(&primary);
+        checkout.path = worktree
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        checkout.canonical_path = checkout.path.clone();
+        checkout.id = checkout_id_for_path(&checkout.path);
+        checkout.is_primary = false;
+        repo.checkouts.push(checkout.clone());
+        let folder = review_export_folder(&repo, &checkout, ReviewStorage::Workdir).unwrap();
+        assert_eq!(folder, Path::new(&checkout.path).join(".muster/reviews"));
+        assert!(!folder.exists(), "showing the folder must not create it");
+        let exported = export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1234",
+            "<!-- muster-review-export -->\nreview\n",
+        )
+        .unwrap();
+        assert_eq!(exported.parent(), Some(folder.as_path()));
+        assert!(!primary.path().join(".muster/reviews").exists());
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            review_export_folder(&repo, &checkout, ReviewStorage::Default).unwrap(),
+            home.join(".muster/tmp/reviews"),
+        );
+        let mut foreign = checkout.clone();
+        foreign.path = primary.path().to_string_lossy().into_owned();
+        assert!(review_export_folder(&repo, &foreign, ReviewStorage::Workdir).is_err());
+    }
+
+    #[test]
+    fn review_exports_are_exclusive_and_stay_inside_the_checkout() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("2026-06-02-1234.md"),
+            "owned by the project",
+        )
+        .unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let markdown = "<!-- muster-review-export -->\n# Code Review 2026-06-02\n";
+
+        let first = export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1234",
+            markdown,
+        )
+        .unwrap();
+        let second = export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1234",
+            markdown,
+        )
+        .unwrap();
+
+        let checkout_root = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            first,
+            checkout_root.join(".muster/reviews/2026-06-02-1234.md")
+        );
+        assert_eq!(
+            second,
+            checkout_root.join(".muster/reviews/2026-06-02-1234-2.md")
+        );
+        assert_eq!(fs::read_to_string(&first).unwrap(), markdown);
+        assert_eq!(fs::read_to_string(&second).unwrap(), markdown);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("2026-06-02-1234.md")).unwrap(),
+            "owned by the project"
+        );
+        assert!(export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "../escape",
+            markdown,
+        )
+        .is_err());
+        assert!(export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1235",
+            "not marked",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn review_export_does_not_overwrite_an_unmarked_file_with_the_same_timestamp() {
+        let dir = tempdir().unwrap();
+        let review_dir = dir.path().join(".muster/reviews");
+        fs::create_dir_all(&review_dir).unwrap();
+        let existing = review_dir.join("2026-06-02-1234.md");
+        fs::write(&existing, "project-owned content").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let markdown = "<!-- muster-review-export -->\nreview\n";
+
+        let exported = export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1234",
+            markdown,
+        )
+        .unwrap();
+
+        assert!(exported.ends_with("2026-06-02-1234-2.md"));
+        assert_eq!(
+            fs::read_to_string(existing).unwrap(),
+            "project-owned content"
+        );
+        assert_eq!(fs::read_to_string(exported).unwrap(), markdown);
+    }
+
+    #[test]
+    fn clearing_reviews_removes_only_marked_exports_and_refuses_workdir() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_export = outside.path().join("outside.md");
+        fs::write(&outside_export, "<!-- muster-review-export -->\noutside\n").unwrap();
+        let review_dir = dir.path().join(".muster/tmp/reviews");
+        fs::create_dir_all(&review_dir).unwrap();
+        let link = review_dir.join("2026-06-02-1237.md");
+        symlink(&outside_export, &link).unwrap();
+        let marked = review_dir.join("2026-06-02-1234.md");
+        let marked_suffix = review_dir.join("2026-06-02-1234-2.md");
+        let unmarked = review_dir.join("2026-06-02-1235.md");
+        let wrong_name = review_dir.join("notes.md");
+        let wrong_extension = review_dir.join("2026-06-02-1236.txt");
+        fs::write(&marked, "<!-- muster-review-export -->\nreview\n").unwrap();
+        fs::write(&marked_suffix, "<!-- muster-review-export -->\nsecond\n").unwrap();
+        fs::write(&unmarked, "project content\n").unwrap();
+        fs::write(
+            &wrong_name,
+            "<!-- muster-review-export -->\nnot an export\n",
+        )
+        .unwrap();
+        fs::write(
+            &wrong_extension,
+            "<!-- muster-review-export -->\nnot markdown\n",
+        )
+        .unwrap();
+        let directory = open_directory(
+            &open_root(&dir.path().canonicalize().unwrap()).unwrap(),
+            Path::new(".muster/tmp/reviews"),
+        )
+        .unwrap();
+
+        assert_eq!(clear_marked_review_exports(&directory).unwrap(), 2);
+        assert!(!marked.exists());
+        assert!(!marked_suffix.exists());
+        assert_eq!(fs::read_to_string(unmarked).unwrap(), "project content\n");
+        assert!(wrong_name.exists());
+        assert!(wrong_extension.exists());
+        assert!(link.exists());
+        assert_eq!(
+            fs::read_to_string(outside_export).unwrap(),
+            "<!-- muster-review-export -->\noutside\n"
+        );
+
+        let workdir_reviews = dir.path().join(".muster/reviews");
+        fs::create_dir_all(&workdir_reviews).unwrap();
+        let workdir_export = workdir_reviews.join("2026-06-02-1234.md");
+        fs::write(&workdir_export, "<!-- muster-review-export -->\nkeep\n").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        assert_eq!(
+            clear_review_exports(&repo, &checkout, ReviewStorage::Workdir).unwrap_err(),
+            "review exports inside a checkout are not cleared here"
+        );
+        assert!(workdir_export.exists());
+    }
+
+    #[test]
+    fn review_export_refuses_a_symlinked_checkout_folder() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), dir.path().join(".muster")).unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let markdown = "<!-- muster-review-export -->\nreview\n";
+        assert!(export_review_markdown(
+            &repo,
+            &checkout,
+            ReviewStorage::Workdir,
+            "2026-06-02-1234",
+            markdown,
+        )
+        .is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

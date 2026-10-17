@@ -1,7 +1,14 @@
 use super::*;
+use crate::review::ReviewStorage;
 
 /// Only native navigation preferences. All fields are required in the current
 /// schema; incompatible files are refused, not read through compatibility defaults.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaVersionProbe {
+    schema_version: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NavigationState {
@@ -11,6 +18,7 @@ pub struct NavigationState {
     #[serde(deserialize_with = "required_selection")]
     pub active_checkout_id: Option<String>,
     pub sidebar_width: f32,
+    pub review_storage: ReviewStorage,
 }
 
 // An absent field is not the current schema's explicit null selection.
@@ -28,6 +36,7 @@ impl Default for NavigationState {
             archived_checkout_ids: Vec::new(),
             active_checkout_id: None,
             sidebar_width: 240.0,
+            review_storage: ReviewStorage::Workdir,
         }
     }
 }
@@ -157,6 +166,15 @@ pub fn load(path: &Path) -> Result<NavigationState, String> {
         .map_err(|error| format!("could not read native workspace: {error}"))?;
     if bytes.len() as u64 > STATE_CAP {
         return Err("native workspace exceeds the 1 MiB limit".into());
+    }
+    let schema: SchemaVersionProbe = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native workspace {}: {error}", path.display()))?;
+    if let Some(version) = schema.schema_version {
+        if version != SCHEMA_VERSION {
+            return Err(format!(
+                "native workspace schema {version} is unsupported; expected {SCHEMA_VERSION}"
+            ));
+        }
     }
     let state: NavigationState = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native workspace {}: {error}", path.display()))?;

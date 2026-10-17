@@ -18,6 +18,35 @@ totals; Files scrolls horizontally while Changes fits panel-width rows and
 shortens long names. See [current behavior and regression evidence](opening-reading-and-scrolling.md#current-contract-after-ap-01ap-10)
 and [AP-11's current suite record](audit-action-plan.md#ap-11).
 Historical research and pass records below are not current acceptance evidence.
+
+## Native notes pass (v0.1.0)
+
+The Code footer includes explicit formatting with a user-installed `prettier` on
+`PATH` outside the checkout. Formatting uses an isolated temporary input, ignores
+project configuration, and leaves the result as an unsaved draft. Prettier is not
+bundled; the supported parsers match Legacy's formatter, not every editor grammar.
+
+Diff notes can be exported as Markdown or explicitly sent to an app-created session
+of an already-running OpenCode API-major-2 service. Muster reads its local service
+registration; it does not install or start that service or send through a shell.
+Round prompts and note snapshots are persisted before dispatch. An uncertain send
+is reconciled by its marker; absence blocks automatic retry rather than claiming
+exactly-once delivery. Protocol tests use a mock server, not a live provider.
+Unsent note drafts remain window-local. Settings exposes only supported review
+options, not Legacy's unrelated terminal/theme preferences.
+
+Native workspace schema 2 and review-round schema 2 reject incompatible files
+without rewriting them. There is no migration: reset an incompatible state file
+explicitly, retaining a backup if needed. The native crates move to `0.1.0` for this
+stored-contract change; the frozen Legacy application remains `0.21.1`.
+
+## Local build and packaging
+
+`scripts/release.sh check` runs the Rust formatting, clippy and workspace test
+checks plus the RustSec audit. `build` adds the optimized native build; `release`
+packages that build as `dist/Muster.app` on macOS. The entry point requires
+Rust/rustup 1.97.1 and Node.js. It is local-only: it does not create tags, publish,
+sign with a distribution identity or notarize. See `scripts/release.sh --help`.
 AP-12 integration/platform acceptance remains pending; real GPU/IME, image pixels,
 Linux runtime and release measurements are not established by headless tests.
 

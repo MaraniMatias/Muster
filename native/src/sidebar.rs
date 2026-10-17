@@ -14,17 +14,17 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
     input::Input,
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
     Disableable, Icon, Sizable,
 };
 use gpui_kit::{
-    canvas, div, prelude::FluentBuilder, px, AnyElement, App, Bounds, Context, InteractiveElement,
-    IntoElement, Length, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, TestSupportExt,
-    Window,
+    canvas, div, prelude::FluentBuilder, px, AnyElement, App, Bounds, Context, Hsla,
+    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
+    Styled, TestSupportExt, Window,
 };
 use muster_core::workspace::RepoKind;
 
@@ -32,12 +32,37 @@ use crate::app::{
     sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
     sidebar_text_width, toggle, ButtonA11y, TerminalWindow, SIDEBAR_FONT_FAMILY,
 };
-use crate::navigation::{checkout_title, session_title};
+use crate::navigation::{checkout_title, session_title, ForegroundProgram};
 use crate::terminal::ShellState;
-use crate::theme::Roles;
+use crate::theme::{zed_button, Roles};
 
 pub(crate) const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
 pub(crate) const SIDEBAR_SCROLL_EDGE: f32 = 36.0;
+
+pub(crate) fn foreground_program_icon(
+    program: ForegroundProgram,
+    size: Pixels,
+    color: Hsla,
+) -> AnyElement {
+    match program {
+        ForegroundProgram::OpenCode => Icon::new(IconName::Sparkles)
+            .size(size)
+            .text_color(color)
+            .into_any_element(),
+        ForegroundProgram::Pi => div()
+            .flex()
+            .flex_shrink_0()
+            .size(size)
+            .items_center()
+            .justify_center()
+            .font_family(SIDEBAR_FONT_FAMILY)
+            .text_size(size)
+            .line_height(size)
+            .text_color(color)
+            .child("π")
+            .into_any_element(),
+    }
+}
 
 pub(crate) fn sidebar_scroll_step(distance: f32) -> f32 {
     distance.signum() * (distance.abs() / 2.).clamp(2., 14.)
@@ -405,7 +430,7 @@ impl TerminalWindow {
                 .pt(px(8.))
                 .pb(px(4.))
                 .child(
-                    Button::new(SharedString::from(format!("fold-repo-{id}")))
+                    zed_button(SharedString::from(format!("fold-repo-{id}")))
                         .text()
                         .rounded(px(0.))
                         .absolute()
@@ -488,7 +513,7 @@ impl TerminalWindow {
                                 trigger.bg(roles.hover)
                             })
                             .child(
-                                Button::new(SharedString::from(format!("actions-{id}")))
+                                zed_button(SharedString::from(format!("actions-{id}")))
                                     .text()
                                     .text_color(sidebar_faint_ink(cx))
                                     .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
@@ -617,7 +642,7 @@ impl TerminalWindow {
                         move |app, _, window, cx| app.select_checkout_row(&row_select_id, window, cx)
                     }))
                     .child(
-                        Button::new(SharedString::from(format!("fold-checkout-{id}")))
+                        zed_button(SharedString::from(format!("fold-checkout-{id}")))
                             .text()
                             .text_color(sidebar_faint_ink(cx))
                             .small()
@@ -649,7 +674,7 @@ impl TerminalWindow {
                             })),
                     )
                     .child(
-                        Button::new(SharedString::from(format!("select-checkout-{id}")))
+                        zed_button(SharedString::from(format!("select-checkout-{id}")))
                             .text()
                             .rounded(px(0.))
                             .absolute()
@@ -781,7 +806,7 @@ impl TerminalWindow {
                     .when(has_close && checkout.is_missing, |row| {
                         let dismiss_id = id.clone();
                         row.child(
-                            Button::new(SharedString::from(format!("dismiss-missing-{id}")))
+                            zed_button(SharedString::from(format!("dismiss-missing-{id}")))
                                 .custom(sidebar_action_style(cx))
                                 .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
                                 .when(!dragging, |button| button.cursor_pointer())
@@ -816,7 +841,7 @@ impl TerminalWindow {
                             // The contextual lifecycle dialog names both reversible archive
                             // and destructive deletion; no row action deletes immediately.
                             row.child(
-                                Button::new(SharedString::from(format!("worktree-actions-{id}")))
+                                zed_button(SharedString::from(format!("worktree-actions-{id}")))
                                     .custom(sidebar_action_style(cx))
                                     .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
                                     .when(!dragging, |button| button.cursor_pointer())
@@ -920,7 +945,9 @@ impl TerminalWindow {
                     let busy = status.foreground.running;
                     let unknown =
                         status.poll_error.is_some() || status.shell == ShellState::Unknown;
-                    let agent = status.foreground.app.as_deref() == Some("opencode");
+                    let program =
+                        crate::navigation::foreground_program(status.foreground.app.as_deref());
+                    let agent = program == Some(ForegroundProgram::OpenCode);
                     let failed = !agent
                         && matches!(status.shell, ShellState::Running)
                         && terminal
@@ -960,15 +987,17 @@ impl TerminalWindow {
                                 .gap(px(7.))
                                 .h(px(26.))
                                 .w_full()
-                                .child(
-                                    Icon::new(if agent {
-                                        IconName::Sparkles
-                                    } else {
-                                        IconName::SquareTerminal
-                                    })
-                                    .size(px(14.))
-                                    .text_color(roles.text_muted),
-                                )
+                                .child(program.map_or_else(
+                                    || {
+                                        Icon::new(IconName::SquareTerminal)
+                                            .size(px(14.))
+                                            .text_color(roles.text_muted)
+                                            .into_any_element()
+                                    },
+                                    |program| {
+                                        foreground_program_icon(program, px(14.), roles.text_muted)
+                                    },
+                                ))
                                 .child(
                                     Input::new(&editing.input)
                                         .id(SharedString::from(format!("rename-session-{id}")))
@@ -988,14 +1017,8 @@ impl TerminalWindow {
                                 .w_full()
                                 .min_w_0()
                                 .gap(px(7.))
-                                .child(
-                                    Icon::new(if agent {
-                                        IconName::Sparkles
-                                    } else {
-                                        IconName::SquareTerminal
-                                    })
-                                    .size(px(14.))
-                                    .text_color(if unknown {
+                                .child({
+                                    let color = if unknown {
                                         roles.status.warning
                                     } else if failed {
                                         roles.status.danger_text
@@ -1003,8 +1026,17 @@ impl TerminalWindow {
                                         roles.status.success
                                     } else {
                                         roles.text_muted
-                                    }),
-                                )
+                                    };
+                                    program.map_or_else(
+                                        || {
+                                            Icon::new(IconName::SquareTerminal)
+                                                .size(px(14.))
+                                                .text_color(color)
+                                                .into_any_element()
+                                        },
+                                        |program| foreground_program_icon(program, px(14.), color),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .flex_1()
@@ -1076,7 +1108,7 @@ impl TerminalWindow {
                         })
                         .when(!renaming, |row| {
                             row.child(
-                                Button::new(SharedString::from(format!("select-session-{id}")))
+                                zed_button(SharedString::from(format!("select-session-{id}")))
                                     .text()
                                     .rounded(px(0.))
                                     .absolute()
@@ -1121,7 +1153,7 @@ impl TerminalWindow {
                         })
                         .child(div().flex_1().min_w_0().pr(px(20.)).child(content))
                         .child(
-                            Button::new(SharedString::from(format!("close-session-{id}")))
+                            zed_button(SharedString::from(format!("close-session-{id}")))
                                 .custom(sidebar_action_style(cx))
                                 .when(!dragging && !closing, |button| button.cursor_pointer())
                                 .rounded(px(0.))
@@ -1380,7 +1412,7 @@ impl TerminalWindow {
             )
             .child(
                 div().border_t_1().border_color(roles.border).child(
-                    Button::new("open-directory")
+                    zed_button("open-directory")
                         .text()
                         .text_color(sidebar_faint_ink(cx))
                         .small()

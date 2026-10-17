@@ -180,11 +180,12 @@ pixels. That gap is stated rather than closed.
 
 ## Historical security note (not a current vulnerability lookup)
 
-`node scripts/audit-rust.mjs` was run after the lockfile grew and **blocks** on
+`node scripts/audit-rust.mjs` was run after the lockfile grew and **blocked** on
 four advisories against `rustls` 0.23.45 (RUSTSEC-2026-0346/0347/0348/0349).
-That version is pre-existing and untouched by this work; no grammar crate is
-flagged. The gate is therefore red for a reason outside this change, and the
-resolution belongs in its own change rather than here.
+That version was pre-existing and untouched by this work, and no grammar crate
+was flagged, so the resolution belonged in its own change rather than here. It
+was done there: all four are fixed in `rustls` 0.23.46, so `Cargo.lock` carries
+that patch release and the gate is green.
 ---
 
 # One surface, every capture, and the whole header row

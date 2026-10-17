@@ -1453,6 +1453,37 @@ async fn changes_open_in_the_center_and_refresh_without_replacing_the_terminal(
     close(&fixture, cx);
 }
 
+#[gpui_kit::test]
+async fn clearing_review_exports_requires_confirmation(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "review\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.review_storage = muster_core::review::ReviewStorage::Default;
+        app.open_review_clear_confirmation(cx);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("confirm-clear-review-exports").is_some());
+        window.click("cancel-clear-review-exports", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("confirm-clear-review-exports").is_none());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// Retry answers the failure it is showing.
 ///
 /// A directory that could not be listed and a file that could not be read are
@@ -2967,6 +2998,14 @@ async fn an_edited_document_saves_or_throws_itself_away(cx: &mut TestAppContext)
         window.render_frame(cx);
     })
     .unwrap();
+    assert!(
+        draw_until(&fixture, cx, "format-document"),
+        "Code mode does not keep its footer visible"
+    );
+    assert!(
+        !draw_until(&fixture, cx, "save-document"),
+        "a clean document offers to save"
+    );
 
     // Typed text, and the bar that says so.
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2999,6 +3038,10 @@ async fn an_edited_document_saves_or_throws_itself_away(cx: &mut TestAppContext)
         );
     })
     .unwrap();
+    assert!(
+        draw_until(&fixture, cx, "format-document"),
+        "Cancel hid the Code footer"
+    );
     assert!(
         !draw_until(&fixture, cx, "save-document"),
         "a document nobody has edited still offers to be saved"
@@ -3037,6 +3080,10 @@ async fn an_edited_document_saves_or_throws_itself_away(cx: &mut TestAppContext)
         std::fs::read_to_string(&file).unwrap(),
         "# Notes\nedited ",
         "the save did not write what the editor held"
+    );
+    assert!(
+        draw_until(&fixture, cx, "format-document"),
+        "saving hid the Code footer"
     );
     assert!(
         !draw_until(&fixture, cx, "save-document"),
@@ -3984,6 +4031,290 @@ async fn a_link_clicked_after_its_window_is_released_opens_nothing(cx: &mut Test
     cx.update_window(handle, |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+async fn a_review_note_with_a_missing_line_stays_visible_on_its_file(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let path = "orphan.txt";
+    std::fs::write(fixture.root.join(path), "original line\n").unwrap();
+    commit_all(&fixture.root, "add review target");
+    std::fs::remove_file(fixture.root.join(path)).unwrap();
+    let note = muster_core::review::ReviewNote {
+        id: "orphan-note".into(),
+        checkout_id: fixture.checkout.clone(),
+        path: path.into(),
+        side: muster_core::review::ReviewSide::Old,
+        line_start: 99,
+        line_end: None,
+        content: "This line disappeared".into(),
+        code: "original line".into(),
+        code_hash: muster_core::review::review_anchor_hash("original line"),
+        outdated: false,
+    };
+    fixture.view.update(cx, |app, cx| {
+        app.review
+            .notes
+            .insert(fixture.checkout.clone(), vec![note]);
+        app.inspector_tab = InspectorTab::Changes;
+        app.open_changes(&fixture.checkout, Some(path.into()), cx);
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .get(&(fixture.checkout.clone(), path.into()))
+            .is_some_and(|diff| !diff.patch.is_empty())
+    })
+    .await;
+    assert!(draw_until(&fixture, cx, "review-destination"));
+    assert!(draw_until(&fixture, cx, "review-card-orphan-note"));
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn an_unknown_review_can_be_checked_again_without_authorizing_a_duplicate(
+    cx: &mut TestAppContext,
+) {
+    use muster_core::opencode::{ReviewRound, RoundStatus};
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "review\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx);
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        let app = fixture.view.read(cx);
+        !app.review.opencode_loading
+            && app
+                .git_diff
+                .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    fixture.view.update(cx, |app, cx| {
+        app.review.opencode_destination = Some(muster_core::opencode::Destination::Opencode {
+            session_id: "ses_review".into(),
+        });
+        app.review.opencode_rounds = vec![ReviewRound {
+            id: "uncertain-round".into(),
+            checkout_id: fixture.checkout.clone(),
+            session_id: "ses_review".into(),
+            status: RoundStatus::Unknown,
+            marker: "muster-review:uncertain-round".into(),
+            prompt: "review".into(),
+            note_ids: Vec::new(),
+            claim: String::new(),
+            notes: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        cx.notify();
+    });
+    assert!(draw_until(&fixture, cx, "recheck-unknown-opencode-round"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("resolve-opencode-round").label(),
+            Some("Allow retry (may duplicate)")
+        );
+        assert_eq!(
+            window.find("recheck-unknown-opencode-round").label(),
+            Some("Check delivery again")
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        let app = fixture.view.read(cx);
+        !app.review.opencode_loading
+            && app
+                .git_diff
+                .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.panels_visible = false;
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(gpui_kit::size(px(600.), px(800.)));
+        window.bounds_changed(cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "review-primary-action"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-primary-action").label(),
+            Some("Export as Markdown")
+        );
+        for id in [
+            "review-storage",
+            "clear-review-exports",
+            "send-review-opencode",
+            "export-review",
+            "review-outdated",
+        ] {
+            assert!(
+                window.try_find(id).is_none(),
+                "{id} should not crowd the toolbar"
+            );
+        }
+        let toolbar = window.find("review-title-row").bounds();
+        let controls = [
+            window.find("review-primary-action").bounds(),
+            window.find("review-destination").bounds(),
+            window.find("diff-open-source-change.txt").bounds(),
+            window.find("close-diff").bounds(),
+        ];
+        for control in controls {
+            assert!(control.top() >= toolbar.top() && control.bottom() <= toolbar.bottom());
+            assert!(control.left() >= px(0.) && control.right() <= px(600.));
+        }
+        assert!(window.find("review-primary-action").bounds().left() > toolbar.left());
+        window.click("review-primary-action", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.review.exporting && !app.review.opencode_busy);
+        assert!(app.review.opencode_rounds.is_empty());
+    });
+    fixture.view.update(cx, |app, cx| {
+        app.review.opencode_destination = Some(muster_core::opencode::Destination::OpencodeNew);
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("review-primary-action").label(),
+            Some("Send to OpenCode")
+        );
+        assert!(window.try_find("copy-opencode-session-id").is_none());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "save-review-note"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("review-composer-card").bounds().size.height <= px(110.));
+        assert!(window.find("save-review-note").bounds().size.height <= px(24.));
+        window.click("save-review-note", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.review.composer.is_some());
+        assert!(app
+            .review
+            .notes
+            .get(&fixture.checkout)
+            .is_none_or(Vec::is_empty));
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_value("Keep this comment", window, cx)
+        });
+        fixture
+            .view
+            .update(cx, |app, cx| app.set_review_note_start(1, cx));
+        fixture.view.read_with(cx, |app, cx| {
+            let composer = app.review.composer.as_ref().unwrap();
+            assert_eq!(
+                composer.input.read(cx).value().as_str(),
+                "Keep this comment"
+            );
+            assert_eq!(composer.code, "one\ntwo\nthree");
+            assert_eq!((composer.line_start, composer.line_end), (1, 3));
+        });
+        window.render_frame(cx);
+        window.click("save-review-note", cx);
+        let note_id = fixture.view.update(cx, |app, cx| {
+            let note = &mut app.review.notes.get_mut(&fixture.checkout).unwrap()[0];
+            assert_eq!(note.code, "one\ntwo\nthree");
+            assert_eq!((note.line_start, note.line_end), (1, Some(3)));
+            note.outdated = true;
+            note.code_hash = "accepted-anchor".into();
+            let id = note.id.clone();
+            app.edit_review_note(&id, window, cx);
+            id
+        });
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_value("Edited comment", window, cx)
+        });
+        fixture.view.update(cx, |app, cx| {
+            app.save_review_note(cx);
+            let note = &app.review.notes[&fixture.checkout][0];
+            assert!(
+                note.outdated,
+                "editing prose must not accept a drifted anchor"
+            );
+            assert_eq!(note.code_hash, "accepted-anchor");
+            assert_eq!(note.content, "Edited comment");
+            app.edit_review_note(&note_id, window, cx);
+        });
+        window.render_frame(cx);
+        window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+    })
+    .unwrap();
+    fixture
+        .view
+        .read_with(cx, |app, _| assert!(app.review.composer.is_none()));
+    close(&fixture, cx);
 }
 
 /// A window with nothing in it, for a handler that only needs somewhere to be

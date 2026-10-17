@@ -37,3 +37,10 @@ pub mod files;
 
 /// Hands a file or a link to the application this machine has for it.
 pub mod opener;
+
+/// Review notes anchored to source lines in diffs.
+pub mod review;
+
+/// A client for the OpenCode service a person started, and the durable rounds that
+/// make sending a review to it safe to retry.
+pub mod opencode;

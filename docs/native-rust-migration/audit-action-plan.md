@@ -1,6 +1,6 @@
 # Native application audit: implementation action plan
 
-**Status:** AP-01 through AP-11 implemented and verified in the uncommitted patch over `69ae8ba`. AP-12 required automated gates and actual macOS debug-binary bundle smoke passed; release performance is blocked by existing release artifacts, and Linux/manual GUI/platform acceptance remains pending. This is not unconditional release readiness. Historical per-task runs below are not final release acceptance.
+**Status:** AP-01 through AP-11 implemented and verified in the uncommitted patch over `69ae8ba`. AP-12 required automated gates and actual macOS debug-binary bundle smoke passed; the release build blocker is diagnosed and fixed and `scripts/release.sh release` completes, while release performance measurements and Linux/manual GUI/platform acceptance remain pending. This is not unconditional release readiness. Historical per-task runs below are not final release acceptance.
 
 **Source baseline:** `7265e48` (`chore: fixes some issues`).
 
@@ -143,7 +143,7 @@ Priority is implementation order, not a claim of critical severity. The revised 
 | [AP-09](#ap-09) | Remove the obsolete preview truncation field | M2 | Small cleanup | AP-03 and AP-05 | Implemented and verified |
 | [AP-10](#ap-10) | Correct source comments; assess only necessary readability changes | S1, remaining S3; A2/A3 disposition | Small cleanup | AP-01 through AP-09 | Implemented and verified |
 | [AP-11](#ap-11) | Reconcile current documentation and verification claims | S2, packaging caveats | Documentation | AP-01 through AP-10 | Implemented and verified |
-| [AP-12](#ap-12) | Run integration, lifecycle, and platform acceptance | M3 and all acceptance evidence | Final | AP-01 through AP-11 | Automated complete; release blocked; Linux/manual pending |
+| [AP-12](#ap-12) | Run integration, lifecycle, and platform acceptance | M3 and all acceptance evidence | Final | AP-01 through AP-11 | Automated complete; release build fixed; Linux/manual pending |
 
 Recommended serial order: **AP-01 -> AP-02 -> AP-03 -> AP-04 -> AP-05 -> AP-06 -> AP-07 -> AP-08 -> AP-09 -> AP-10 -> AP-11 -> AP-12**.
 
@@ -1116,7 +1116,10 @@ worktree holds a corrupted `libserde_derive` proc-macro dylib ("mis-aligned
 LINKEDIT string pool", dated before this task), so a `--release` build of the
 workspace fails to link for reasons unrelated to this change. Fixing that build
 directory is not this task's work, and a release number would not be comparable
-to the test-profile baseline in §2 anyway. Drag selection on a real window was
+to the test-profile baseline in §2 anyway. (AP-12 later established that the
+dylib was not damaged build-directory output: the cause was the release
+profile's strip step, and it is fixed. No release measurement was taken here
+either way.) Drag selection on a real window was
 not exercised manually; the headless cases above drive the production session and
 the production handlers. The workspace-wide gate (`cargo test --locked
 --workspace`, workspace clippy, audit tests, bundle smoke) stays deferred to
@@ -1557,6 +1560,27 @@ verification. Cargo reported the existing future-incompatibility warning for
 <a id="ap-11"></a>
 ## AP-11: Reconcile current documentation, measurements, and packaging claims
 
+### Latest NOTAS integration verification (native v0.1.0)
+
+This supersedes earlier suite counts, not historical results below. With Rust and
+Cargo 1.97.1, `cargo test --locked --workspace` passed **362 native, 159 core and
+4 instance-lock tests**; 3 native performance measurements remain ignored.
+`cargo clippy --locked --workspace --all-targets -- -D warnings`,
+`cargo fmt --all --check` and `git diff --check` passed. The release/audit script
+suite contains 23 tests; the live dependency audit has no blocking advisories after
+updating `rustls` to 0.23.46. OpenCode protocol tests use a mock local service;
+a real OpenCode session and a real external Prettier installation are not manual
+acceptance evidence. Linux runtime and graphical/platform acceptance remain open.
+`scripts/release.sh release` passed and produced `dist/Muster.app` (0.1.0), including
+local plist and ad-hoc signature verification. A clean optimized build needs
+`strip = "none"`: the pinned compiler's debuginfo-stripping pass otherwise produces
+misaligned Mach-O proc-macro libraries. This is not a cache-corruption workaround.
+The bundle was not launched, distribution-signed or notarized.
+Review parity regressions cover the two-row toolbar at 600 px, destination
+selection without dispatch, range/text preservation, saved code capture, sticky
+drift during prose edits, Escape cancellation, and Settings/export folder agreement
+for a registered worktree. The same release script passed after these fixes.
+
 ### Inspect first
 
 - `docs/native-rust-migration/README.md`, especially the dated current-implementation summary.
@@ -1763,13 +1787,28 @@ Fixture construction separately **73.750 us / 249.833 us** (one per size).
 These are local CPU preparation/snapshot costs, not paint/frame latency,
 release figures, memory bounds, or portable performance thresholds.
 
-**Release blocker:** existing `target/release/deps/libserde_derive-d86fbf3cb6548c8b.dylib`
-failed `dlopen` with `mis-aligned LINKEDIT string pool, fileOffset=0x002CE8E4`.
-Compilation also reported E0463 for `zerofrom_derive` and `zerocopy_derive`.
-This reproduces the previously reported release-artifact problem before app
-compilation; it is not evidence of an AP patch regression. No clean, artifact
-deletion or expensive alternate-target rebuild was attempted. **No release
-measurements or release app build acceptance obtained.**
+**Release blocker — diagnosed and fixed.** The earlier reading of
+`target/release/deps/libserde_derive-d86fbf3cb6548c8b.dylib` failing `dlopen`
+with `mis-aligned LINKEDIT string pool, fileOffset=0x002CE8E4`, and E0463 for
+`zerofrom_derive`/`zerocopy_derive`, as pre-existing damage in the build
+directory, was wrong. `cargo clean --release` reproduces it, and so does
+re-running the exact `serde_derive` rustc command by hand.
+
+The cause is the profile, not the cache: Cargo's default `strip = "debuginfo"`
+for `release` is not a linker flag — rustc rewrites the finished Mach-O itself,
+and on rustc 1.97.1 / aarch64-apple-darwin / macOS 27 that rewrite leaves a
+dylib's `LC_SYMTAB` string pool at an offset that is not a multiple of eight.
+dyld rejects the file, so rustc cannot load any proc macro and reports E0463
+for whichever one it reaches first; deleting one dylib only moves the error to
+the next. Verified from the artifacts: the release dylib has
+`stroff = 0x2ce8e4` (`& 7 == 4`) against the dev dylib's `0x330c98`
+(`& 7 == 0`); the linker command line is byte-identical with and without the
+strip step; and `/usr/bin/strip -S` applied to the same file yields an aligned,
+loadable dylib (`0x2ce8e8`). Release emits no debuginfo to strip, so the root
+`Cargo.toml` sets `[profile.release] strip = "none"`, `scripts/release.test.mjs`
+pins it, and `cargo build --locked --release -p muster` completes. **No release
+performance measurements taken**: the ignored checks in `scripts/perf-native.sh`
+still need a run.
 
 **Not run / remaining acceptance:**
 
@@ -1787,8 +1826,10 @@ measurements or release app build acceptance obtained.**
 - Live vulnerability/network audit: **NOT RUN**, not requested for this pass.
   The 18 auditor unit tests validate auditor behavior and the pinned vendor hash,
   not current vulnerability status; the existing CI dependency-audit gate remains.
-- Release performance: **BLOCKED**, exact exit/error above; rerun after the owner
-  addresses the pre-existing release artifacts.
+- Release performance: **NOT RUN**. The blocker above was the release profile's
+  strip step, not a damaged build directory, and it is fixed, so the ignored
+  checks in `scripts/perf-native.sh` can now run; no release timings have been
+  measured and none are claimed.
 
 No application was launched, no personal workspace state was intentionally read
 or written, and no external opener was invoked by this acceptance pass. The

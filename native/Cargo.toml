@@ -1,6 +1,6 @@
 [package]
 name = "muster"
-version = "0.0.0"
+version = "0.1.0"
 # 2021, matching `src-tauri`. The reused `src-tauri` sources are edition 2021 and
 # an in-crate dependency cannot cross editions; GPUI Kit being edition 2024 does
 # not force this crate to be.

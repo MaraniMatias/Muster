@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
     checkbox::Checkbox,
     dialog::{Dialog, DialogContent, DialogFooter},
     input::{Input, InputState},
@@ -28,7 +28,7 @@ use muster_core::navigation::WorktreeRemovalInfo;
 use muster_core::workspace::RepoKind;
 
 use crate::app::TerminalWindow;
-use crate::theme::Roles;
+use crate::theme::{zed_button, Roles};
 
 /// The one worktree this window is removing, if it is removing one.
 pub(crate) struct WorktreeRemovalDraft {
@@ -175,6 +175,10 @@ impl TerminalWindow {
                     .child(
                         Input::new(&task)
                             .bg(roles.surface_base)
+                            // A field is a control, not an overlay: Zed rounds
+                            // one `rounded_sm`, where the theme's own radius is
+                            // the overlay's 8px.
+                            .rounded(px(4.))
                             .aria_label("Task name")
                             .w_full(),
                     )
@@ -192,6 +196,10 @@ impl TerminalWindow {
                     .child(
                         Input::new(&branch)
                             .bg(roles.surface_base)
+                            // A field is a control, not an overlay: Zed rounds
+                            // one `rounded_sm`, where the theme's own radius is
+                            // the overlay's 8px.
+                            .rounded(px(4.))
                             .aria_label("New branch")
                             .w_full(),
                     )
@@ -204,6 +212,10 @@ impl TerminalWindow {
                     .child(
                         Input::new(&base)
                             .bg(roles.surface_base)
+                            // A field is a control, not an overlay: Zed rounds
+                            // one `rounded_sm`, where the theme's own radius is
+                            // the overlay's 8px.
+                            .rounded(px(4.))
                             .aria_label("Starting from branch")
                             .w_full(),
                     );
@@ -230,7 +242,7 @@ impl TerminalWindow {
             .footer(
                 DialogFooter::new()
                     .child(
-                        Button::new("worktree-cancel")
+                        zed_button("worktree-cancel")
                             .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
                             .label("Cancel")
                             .on_click(move |_, _window, cx| {
@@ -241,7 +253,7 @@ impl TerminalWindow {
                             }),
                     )
                     .child(
-                        Button::new("worktree-create")
+                        zed_button("worktree-create")
                             .primary()
                             .label(if draft.busy {
                                 "Creating…"
@@ -425,7 +437,7 @@ impl TerminalWindow {
                         let shell_checkout_id = shell_checkout_id.clone();
                         content = content
                             .child(preview)
-                            .child(Button::new("worktree-commit-shell")
+                            .child(zed_button("worktree-commit-shell")
                                 .text()
                                 .label("Open a shell to commit or stash first")
                                 .disabled(busy)
@@ -571,7 +583,7 @@ impl TerminalWindow {
             .footer(
                 DialogFooter::new()
                     .child(
-                        Button::new("worktree-removal-cancel")
+                        zed_button("worktree-removal-cancel")
                             .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
                             .label("Cancel")
                             .disabled(busy)
@@ -587,7 +599,7 @@ impl TerminalWindow {
                             }),
                     )
                     .child(
-                        Button::new("worktree-archive")
+                        zed_button("worktree-archive")
                             .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
                             .label(if busy { "Archiving…" } else { "Archive" })
                             .disabled(!can_archive)
@@ -601,7 +613,7 @@ impl TerminalWindow {
                             }),
                     )
                     .child(
-                        Button::new("worktree-delete")
+                        zed_button("worktree-delete")
                             .danger()
                             .border_1()
                             .border_color(roles.status.danger)

@@ -54,7 +54,7 @@ use crate::sidebar::{
 };
 use crate::state_writer::StateWriter;
 use crate::terminal::{ShellState, TerminalSession, TerminalSessionConfig, TerminalView};
-use crate::theme::Roles;
+use crate::theme::{zed_button, Roles};
 use crate::titlebar::Crumb;
 use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
@@ -489,6 +489,7 @@ pub struct TerminalWindow {
     pub(crate) git_diff_errors: HashMap<(String, String), String>,
     pub(crate) git_diff_request: HashMap<(String, String), u64>,
     pub(crate) diff_view: Option<crate::diff::DiffView>,
+    pub(crate) review: crate::review::ReviewState,
     /// The diff reads this window still wants, and how many are running.
     pub(crate) diff_queue: crate::inspector::DiffQueue,
     pub(crate) inspector_width: f32,
@@ -596,6 +597,7 @@ impl TerminalWindow {
             git_diff_errors: HashMap::new(),
             git_diff_request: HashMap::new(),
             diff_view: None,
+            review: crate::review::ReviewState::default(),
             diff_queue: Default::default(),
             inspector_width: 280.,
             next_file_request: 0,
@@ -2610,7 +2612,7 @@ impl Render for TerminalWindow {
                     "Open a directory to get started."
                 })
                 .child(
-                    Button::new("empty-action")
+                    zed_button("empty-action")
                         .label(if available {
                             "New terminal"
                         } else {
@@ -2684,7 +2686,8 @@ impl Render for TerminalWindow {
                 self.worktree_removal
                     .as_ref()
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
-            });
+            })
+            .or_else(|| self.review_clear_dialog(cx));
         // On a target whose window has no frame of its own, the frame is this
         // one: it insets the content out of the shadow, draws the border and
         // owns the resize band. It is a pass-through everywhere else.
@@ -2761,6 +2764,7 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
     let mut nav = Navigation::new();
     let active_checkout_id = state.active_checkout_id.clone();
     nav.sidebar_width = state.sidebar_width;
+    nav.review_storage = state.review_storage;
     nav.archived = state.archived_checkout_ids.into_iter().collect();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         match Repo::plain(&home, "startup") {

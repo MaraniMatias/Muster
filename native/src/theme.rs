@@ -5,6 +5,17 @@
 //! components paint with. A row drawn by hand and a menu drawn by the toolkit
 //! are therefore the same colour rather than two constants that agree today.
 //!
+//! ## Shape: Zed's radii, the toolkit's sizes
+//!
+//! GPUI Kit is not the widget library Zed draws with — Zed's buttons and
+//! overlays live in its own unpublished crate, and the toolkit's widgets are
+//! a different design system on the same `gpui` core. So the shape of a
+//! control is set here too: [`install`] gives the theme Zed's two corner
+//! radii (4px for a control, 8px for an overlay) and [`zed_button`] gives every
+//! button Zed's borderless fill. What the toolkit still decides on its own is
+//! the *size* ladder — 20/24/32px where Zed's is 22/28/32 — because it hardcodes
+//! those in each widget's render and no theme token reaches them.
+//!
 //! ## Dark only
 //!
 //! [`install`] applies the dark tokens from `legacy/src/muster.css` before the
@@ -20,9 +31,10 @@
 
 use std::sync::Arc;
 
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle, LanguageConfig};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{rgb, rgba, App, Hsla};
+use gpui_kit::{px, rgb, rgba, App, ElementId, Hsla};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
@@ -444,8 +456,53 @@ pub fn install(cx: &mut App) {
         // letter, and moving the grid moves all three with it.
         theme.mono_font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
         theme.mono_font_size = crate::terminal::FONT_SIZE;
+        // Zed's two corner radii, in the places the toolkit keeps them. A
+        // control in Zed is rounded 4px (`rounded_sm`) and an overlay — a
+        // dialog, a palette, a dropdown panel — is rounded 8px
+        // (`rounded_lg`).
+        //
+        // The toolkit keeps one `radius` for both roles and a `radius_lg` for
+        // the panels it knows are large, so `radius` is given Zed's *overlay*
+        // number: it is the one its dropdown menus and popovers read, and a
+        // menu that rounds 4px where every Zed menu rounds 8px is the one
+        // shape difference a menu cannot hide. The controls that share that
+        // token — buttons through [`zed_button`], the app's own fields —
+        // name Zed's 4px where they are built, because a control is not an
+        // overlay and a 8px corner on a 24px control is a pill.
+        theme.radius = px(8.);
+        theme.radius_lg = px(8.);
         theme.highlight_theme = Arc::new(content_highlight_theme(theme));
     });
+}
+
+/// A button wearing the shape Zed draws one in, in this app's colours.
+///
+/// Zed fills a control and rounds it 4px, with no outline at all: the only edge
+/// a button has is the contrast between its fill and the surface behind it. The
+/// toolkit's default variant is the opposite — the same fill inside a 1px
+/// hairline box — so a button drawn that way reads as a text field rather than
+/// as something to press, which is the shape a user asked this app to stop
+/// drawing.
+///
+/// `Secondary` is that same default without its border: [`install`] gives
+/// `button`, `button_hover`, `button_active` and their foregrounds to both
+/// variants, so the fill, the pointer ramp and the ink are unchanged and only
+/// the outline goes.
+///
+/// A control that means to be one of Zed's *other* buttons says so after this
+/// — `.ghost()`, `.text()` and `.custom(..)` each replace the variant — so this
+/// is the shape a button wears unless the call site names another.
+///
+/// The 4px corner is named here rather than left to [`Theme::radius`], which
+/// carries the *overlay's* radius: a button is a control, and Zed rounds a
+/// control `rounded_sm`.
+///
+/// One state does move: a disabled control keeps its fill and dims its ink,
+/// where the default variant dimmed the fill as well. That is what every
+/// borderless variant in the toolkit does, and a dimmed label on an unchanged
+/// fill still says "not now" next to a pointer that no longer answers.
+pub fn zed_button(id: impl Into<ElementId>) -> Button {
+    Button::new(id).secondary().rounded(px(4.))
 }
 
 /// Every capture name a grammar this app compiles in can emit, and the Legacy
@@ -1041,6 +1098,38 @@ mod tests {
             // Not changed on purpose: the toolkit derives the window's `rem`
             // from it, so every `text_*` in the app would move with it.
             assert_eq!(theme.font_size, px(16.));
+        });
+    }
+
+    /// Every overlay is rounded the way Zed rounds one.
+    ///
+    /// The toolkit's own default is 6px, which is its design system's radius
+    /// rather than Zed's, and it is what a dropdown panel, a popover and a
+    /// dialog would all inherit. Zed rounds every one of those `rounded_lg`.
+    ///
+    /// A *control* is not on this test: the toolkit keeps one token for both
+    /// roles, so `radius` holds the overlay's 8px and the controls name the
+    /// 4px they wear where they are built — `zed_button` for every button,
+    /// and the field that takes a search query.
+    #[gpui_kit::test]
+    fn overlays_are_rounded_lg(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx);
+        });
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(
+                theme.radius,
+                px(8.),
+                "a dropdown, a popover and a dialog follow Zed's rounded_lg"
+            );
+            assert_eq!(
+                theme.radius_lg,
+                px(8.),
+                "and so does the panel the toolkit knows is large"
+            );
+            assert_eq!(theme.radius_tokens().md, px(8.));
         });
     }
 

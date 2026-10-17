@@ -15,6 +15,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     command::{Command, CommandGroup, CommandItem, CommandState},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     popover::Popover,
     Disableable, Icon, IndexPath, Sizable, TitleBar,
 };
@@ -23,14 +24,16 @@ use gpui_kit::{
     InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled,
     TestSupportExt, Window,
 };
+use muster_core::review::ReviewStorage;
 use muster_core::workspace::{Repo, RepoKind};
 
 use crate::app::{
     fitted_name, sidebar_faint_ink, sidebar_text_width, TerminalWindow, SIDEBAR_FONT_FAMILY,
 };
 use crate::file_icons;
-use crate::navigation::checkout_title;
-use crate::theme::Roles;
+use crate::navigation::{checkout_title, foreground_program, ForegroundProgram};
+use crate::sidebar::foreground_program_icon;
+use crate::theme::{zed_button, Roles};
 fn crumb_separator(cx: &App) -> AnyElement {
     div()
         .font_family(SIDEBAR_FONT_FAMILY)
@@ -54,6 +57,7 @@ fn crumb_separator(cx: &App) -> AnyElement {
 pub(crate) enum CrumbGlyph {
     None,
     Named(IconName),
+    Program(ForegroundProgram),
     File(String),
 }
 
@@ -96,7 +100,7 @@ fn titlebar_crumb(
     // Account for the button's inset and glyph before fitting the text.
     let icon_width = if glyph.present() { 20. } else { 0. };
     let fitted = fitted_name(window, label, (budget - 8. - icon_width).max(0.), 14.);
-    let crumb = Button::new(id)
+    let crumb = zed_button(id)
         .text()
         .small()
         .rounded(px(0.))
@@ -115,6 +119,20 @@ fn titlebar_crumb(
     match glyph {
         CrumbGlyph::None => crumb.label(fitted),
         CrumbGlyph::Named(icon) => crumb.icon(Icon::new(*icon).size(px(12.))).label(fitted),
+        CrumbGlyph::Program(program) => crumb.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(foreground_program_icon(*program, px(12.), color))
+                .child(
+                    div()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(fitted),
+                ),
+        ),
         // A file icon is a stack of layers rather than one glyph, and a button's own icon slot
         // holds exactly one element, so the crumb lays out its content here instead. The gap is
         // the one a Small button puts between its icon and its label, so a crumb wearing a file
@@ -181,10 +199,15 @@ fn titlebar_menu_popover(cx: &App, id: &'static str) -> Popover {
     Popover::new(id)
         .appearance(false)
         .w(px(288.))
+        // Zed's overlay: rounded 8px with a 4px inset, which is what keeps a
+        // row from painting over the corner the panel rounds off. The panel's
+        // own rows are square because the toolkit's Command bleeds them to the
+        // edge; this is the padding that makes a rounded edge possible.
+        .p(px(4.))
         .bg(roles.surface_raised)
         .border_1()
         .border_color(roles.border_strong)
-        .rounded(px(0.))
+        .rounded(px(8.))
         .font_family(SIDEBAR_FONT_FAMILY)
         .text_size(px(13.))
         .line_height(px(18.))
@@ -266,7 +289,7 @@ fn crumb_menu(
                         .my(px(-6.))
                         .px(px(8.))
                         .py(px(5.))
-                        .rounded(px(0.))
+                        .rounded(px(4.))
                         .border_1()
                         .border_color(if selected {
                             roles.accent
@@ -372,7 +395,7 @@ fn crumb_menu(
                         .w_full()
                         .justify_start()
                         .h(px(28.))
-                        .rounded(px(0.))
+                        .rounded(px(4.))
                         .px(px(8.))
                         .font_family(SIDEBAR_FONT_FAMILY)
                         .text_size(px(13.))
@@ -418,6 +441,70 @@ pub(crate) struct CrumbRow {
 }
 
 impl TerminalWindow {
+    fn settings_menu(
+        &self,
+        view: gpui_kit::WeakEntity<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
+        let storage = self.navigation.review_storage;
+        let can_clear = storage == ReviewStorage::Default && self.open_diff.is_some();
+        let checkout_id = self
+            .open_diff
+            .as_ref()
+            .map(|(id, _)| id.as_str())
+            .or(self.navigation.active_checkout.as_deref());
+        let folder = checkout_id
+            .and_then(|id| self.document_source(id))
+            .map(|(repo, checkout)| {
+                muster_core::files::review_export_folder(&repo, &checkout, storage)
+            })
+            .map(|result| match result {
+                Ok(path) => format!("Folder: {}", path.display()),
+                Err(error) => format!("Review folder unavailable: {error}"),
+            })
+            .unwrap_or_else(|| "Open a checkout to view its review folder".into());
+        move |menu, _, _| {
+            let home_view = view.clone();
+            let checkout_view = view.clone();
+            let clear_view = view.clone();
+            menu.min_w(px(224.))
+                .item(PopupMenuItem::new(folder.clone()).disabled(true))
+                .separator()
+                .item(
+                    PopupMenuItem::new(if storage == ReviewStorage::Workdir {
+                        "✓ This checkout (.muster/reviews)"
+                    } else {
+                        "This checkout (.muster/reviews)"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = checkout_view.update(cx, |app, cx| {
+                            app.set_review_storage(ReviewStorage::Workdir, cx)
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(if storage == ReviewStorage::Default {
+                        "✓ App cache"
+                    } else {
+                        "App cache"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = home_view.update(cx, |app, cx| {
+                            app.set_review_storage(ReviewStorage::Default, cx)
+                        });
+                    }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Clear cached review exports…")
+                        .disabled(!can_clear)
+                        .on_click(move |_, _, cx| {
+                            let _ = clear_view
+                                .update(cx, |app, cx| app.open_review_clear_confirmation(cx));
+                        }),
+                )
+        }
+    }
+
     /// Searchable choices of live sessions in the active checkout.
     fn session_rows(&self, checkout_id: &str) -> Rc<Vec<CrumbRow>> {
         Rc::new(
@@ -531,9 +618,25 @@ impl TerminalWindow {
                     .map(|(_, path)| path.as_str())
             })
             .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned());
+        let item_program = if item_file.is_none() && !document_is_active {
+            self.navigation
+                .active_session
+                .as_deref()
+                .and_then(|id| self.terminals.get(id))
+                .and_then(|terminal| {
+                    let status = terminal.shell.session.status();
+                    foreground_program(status.foreground.app.as_deref())
+                })
+        } else {
+            None
+        };
         let workdir_glyph = crumb_glyph(Crumb::Workdir, None);
         let worktree_glyph = crumb_glyph(Crumb::Worktree, None);
-        let item_glyph = crumb_glyph(Crumb::Item, item_file.as_deref());
+        let item_glyph = item_file
+            .as_deref()
+            .map(|file| CrumbGlyph::File(file.to_owned()))
+            .or_else(|| item_program.map(CrumbGlyph::Program))
+            .unwrap_or_else(|| crumb_glyph(Crumb::Item, None));
         let mut repo_budget = repo
             .map(|repo| titlebar_crumb_width(window, &repo.name, &workdir_glyph))
             .unwrap_or(0.);
@@ -641,7 +744,7 @@ impl TerminalWindow {
                                     let chooser = chooser.clone();
                                     move || {
                                         let chooser = chooser.clone();
-                                        Button::new("workdir-open-directory")
+                                        zed_button("workdir-open-directory")
                                             .text()
                                             .small()
                                             .label("Open directory")
@@ -729,7 +832,7 @@ impl TerminalWindow {
                                         move || {
                                             let dialog = dialog.clone();
                                             let repo_id = repo_id.clone();
-                                            Button::new("worktree-new")
+                                            zed_button("worktree-new")
                                                 .text()
                                                 .small()
                                                 .label("New worktree")
@@ -805,7 +908,7 @@ impl TerminalWindow {
                                             move || {
                                                 let add = add.clone();
                                                 let checkout_id = checkout_id.clone();
-                                                Button::new("item-new-terminal")
+                                                zed_button("item-new-terminal")
                                                     .text()
                                                     .small()
                                                     .label("New terminal")
@@ -856,7 +959,22 @@ impl TerminalWindow {
         // The room between the line and the actions is the window's to drag.
         bar.push(div().flex_1().min_w(px(8.)).into_any_element());
         bar.push(
-            Button::new("toggle-panels")
+            zed_button("settings")
+                .custom(crate::app::sidebar_action_style(cx))
+                .small()
+                .compact()
+                .h(px(20.))
+                .mr(px(4.))
+                .cursor_pointer()
+                .icon(IconName::Settings)
+                .accessibility_label("Settings")
+                .tooltip("Settings")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .dropdown_menu(self.settings_menu(view.clone()))
+                .into_any_element(),
+        );
+        bar.push(
+            zed_button("toggle-panels")
                 .custom(crate::app::sidebar_action_style(cx))
                 .small()
                 .compact()

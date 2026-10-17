@@ -1,8 +1,8 @@
 //! The central document: read as a reading, edited as its source.
 use crate::app::TerminalWindow;
-use crate::theme::Roles;
+use crate::theme::{zed_button, Roles};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState};
@@ -14,6 +14,11 @@ use gpui_kit::{
     Styled, TestSupportExt, Window,
 };
 use muster_core::workspace::{Checkout, Repo};
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 mod media;
@@ -47,7 +52,11 @@ pub(crate) struct DocumentView {
     dirty: bool,
     /// A save is on its way, so the controls wait for its answer.
     saving: bool,
-    /// What the last save said, drawn beside the bar that caused it.
+    /// Prettier is working on a captured copy; its answer may only replace that same text.
+    formatting: bool,
+    /// Cancelling or replacing this document invalidates an in-flight formatter result.
+    format_generation: u64,
+    /// What the last save or format said, drawn beside the bar that caused it.
     error: Option<String>,
     /// The pictures this document's reading has named, and the bytes that came
     /// back for them. Owned by the document rather than by the window, so a
@@ -88,6 +97,8 @@ impl DocumentView {
             loaded: text.to_owned(),
             dirty: false,
             saving: false,
+            formatting: false,
+            format_generation: 0,
             error: None,
             media: media::MediaStore::new(),
         }
@@ -230,6 +241,178 @@ pub(crate) fn syntax_language(path: &str) -> &'static str {
         "zig" => "zig",
         _ => "plaintext",
     }
+}
+
+fn prettier_parser(path: &str, language: &str) -> Option<&'static str> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match language {
+        "javascript" => Some("babel"),
+        "typescript" | "tsx" => Some("typescript"),
+        "json" => Some(match extension.as_str() {
+            "jsonc" => "jsonc",
+            "json5" => "json5",
+            _ => "json",
+        }),
+        "css" => Some(match extension.as_str() {
+            "scss" => "scss",
+            "less" => "less",
+            _ => "css",
+        }),
+        "scss" => Some("scss"),
+        "less" => Some("less"),
+        "html" => Some("html"),
+        "vue" => Some("vue"),
+        "markdown" => Some("markdown"),
+        "yaml" => Some("yaml"),
+        "graphql" => Some("graphql"),
+        _ => None,
+    }
+}
+
+fn formatter_result_is_current(
+    current_text: &str,
+    expected_text: &str,
+    current_language: &str,
+    expected_language: &str,
+) -> bool {
+    current_text == expected_text && current_language == expected_language
+}
+
+fn formatter_suffix(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "js" | "jsx" | "mjs" | "cjs" => ".js",
+        "ts" | "mts" | "cts" => ".ts",
+        "tsx" => ".tsx",
+        "json" => ".json",
+        "jsonc" => ".jsonc",
+        "json5" => ".json5",
+        "css" => ".css",
+        "scss" => ".scss",
+        "less" => ".less",
+        "html" | "htm" => ".html",
+        "vue" => ".vue",
+        "md" | "markdown" | "mdown" | "mkd" => ".md",
+        "yaml" | "yml" => ".yaml",
+        "gql" | "graphql" => ".graphql",
+        _ => ".txt",
+    }
+}
+
+/// A user-installed Prettier executable, never a command from the checkout.
+fn prettier_executable(checkout_root: &Path) -> Result<(PathBuf, OsString), String> {
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        "Prettier is unavailable because PATH is not set. Install it outside the checkout."
+            .to_owned()
+    })?;
+    prettier_executable_from_path(checkout_root, &path)
+}
+
+fn prettier_executable_from_path(
+    checkout_root: &Path,
+    path: &OsStr,
+) -> Result<(PathBuf, OsString), String> {
+    let checkout_root = checkout_root
+        .canonicalize()
+        .map_err(|error| format!("could not resolve checkout for formatting: {error}"))?;
+    let mut directories = Vec::new();
+    for directory in std::env::split_paths(path) {
+        let Ok(absolute) = std::path::absolute(&directory) else {
+            continue;
+        };
+        if absolute.starts_with(&checkout_root) {
+            continue;
+        }
+        let Ok(directory) = directory.canonicalize() else {
+            continue;
+        };
+        if !directory.starts_with(&checkout_root) && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    let safe_path = std::env::join_paths(&directories)
+        .map_err(|error| format!("could not prepare formatter PATH: {error}"))?;
+    for directory in directories {
+        let Ok(executable) = directory.join("prettier").canonicalize() else {
+            continue;
+        };
+        if executable.starts_with(&checkout_root) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&executable) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Ok((executable, safe_path));
+        }
+    }
+    Err("Prettier was not found on PATH outside this checkout. Install it as a user-level tool and try again.".into())
+}
+
+/// Run only the user's Prettier binary, with project config, editorconfig, plugins, and checkout-local
+/// PATH entries excluded. Formatting is explicit and its output remains a draft in the editor.
+fn run_prettier(
+    checkout_root: &Path,
+    path: &str,
+    parser: &str,
+    source: &str,
+) -> Result<String, String> {
+    if source.len() > muster_core::files::MAX_PREVIEW_BYTES {
+        return Err(
+            "Prettier cannot format a document larger than the editor's size limit.".into(),
+        );
+    }
+    let (executable, safe_path) = prettier_executable(checkout_root)?;
+    run_prettier_with(&executable, &safe_path, path, parser, source)
+}
+
+fn run_prettier_with(
+    executable: &Path,
+    safe_path: &OsStr,
+    path: &str,
+    parser: &str,
+    source: &str,
+) -> Result<String, String> {
+    let temp_dir = tempfile::tempdir()
+        .map_err(|error| format!("could not prepare formatter input: {error}"))?;
+    let mut input = tempfile::Builder::new()
+        .prefix("muster-format-")
+        .suffix(formatter_suffix(path))
+        .tempfile_in(temp_dir.path())
+        .map_err(|error| format!("could not prepare formatter input: {error}"))?;
+    input
+        .write_all(source.as_bytes())
+        .map_err(|error| format!("could not write formatter input: {error}"))?;
+    let output = Command::new(executable)
+        .current_dir(temp_dir.path())
+        .env("PATH", safe_path)
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .args(["--no-config", "--no-editorconfig", "--parser", parser])
+        .arg(input.path())
+        .output()
+        .map_err(|error| format!("could not start Prettier: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            format!("Prettier exited with {}.", output.status)
+        } else {
+            message
+        });
+    }
+    if output.stdout.len() > muster_core::files::MAX_PREVIEW_BYTES {
+        return Err("Prettier produced output larger than the editor's size limit.".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "Prettier returned non-UTF-8 output.".into())
 }
 
 fn filename_language(name: &str) -> Option<&'static str> {
@@ -433,7 +616,7 @@ fn grammar_menu(
                 .gap_2()
                 .h(px(GRAMMAR_ROW_PX))
                 .px_2()
-                .rounded(px(6.))
+                .rounded(px(4.))
                 .font_family(crate::app::SIDEBAR_FONT_FAMILY)
                 .text_size(px(13.))
                 .line_height(px(18.))
@@ -673,7 +856,7 @@ impl TerminalWindow {
         let (expected, content) = match self
             .document_view
             .as_ref()
-            .filter(|view| view.dirty && !view.saving)
+            .filter(|view| view.dirty && !view.saving && !view.formatting)
         {
             Some(view) => (view.loaded.clone(), view.state.read(cx).text().to_string()),
             None => return,
@@ -736,6 +919,148 @@ impl TerminalWindow {
             });
         })
         .detach();
+    }
+
+    /// Format the editor's captured text off the UI thread, and accept the answer
+    /// only if the same document, language and text are still on screen.
+    pub(crate) fn format_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_document_draft(cx);
+        let Some((checkout_id, path)) = self.document_target.clone() else {
+            return;
+        };
+        let Some((_, checkout)) = self.document_source(&checkout_id) else {
+            return;
+        };
+        let language_key = document_language_key(&checkout_id, &path);
+        let language = self
+            .document_language_overrides
+            .get(&language_key)
+            .map(String::as_str)
+            .unwrap_or_else(|| syntax_language(&path))
+            .to_owned();
+        let Some(parser) = prettier_parser(&path, &language) else {
+            return;
+        };
+        let request = self.document_request;
+        let identity = format!("{checkout_id}\0{path}\0{request}");
+        let Some(document) = self
+            .document_view
+            .as_mut()
+            .filter(|view| view.path == identity)
+        else {
+            return;
+        };
+        if document.saving || document.formatting {
+            return;
+        }
+        let source = document.state.read(cx).text().to_string();
+        document.formatting = true;
+        document.error = None;
+        document.format_generation = document.format_generation.wrapping_add(1);
+        let generation = document.format_generation;
+        let checkout_root = PathBuf::from(checkout.canonical_path);
+        let path_for_format = path.clone();
+        let language_key = language_key.clone();
+        let language_for_check = language.clone();
+        let source_for_format = source.clone();
+        let source_for_check = source.clone();
+        let worker = cx.background_executor().spawn(async move {
+            run_prettier(&checkout_root, &path_for_format, parser, &source_for_format)
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let mut install = None;
+            let _ = view.update_in(cx, |app, _, cx| {
+                if app.document_request != request {
+                    return;
+                }
+                let current_language = app
+                    .document_language_overrides
+                    .get(&language_key)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| syntax_language(&path))
+                    .to_owned();
+                let Some(document) = app
+                    .document_view
+                    .as_mut()
+                    .filter(|document| document.path == identity)
+                else {
+                    return;
+                };
+                if document.format_generation != generation {
+                    return;
+                }
+                let current = document.state.read(cx).text().to_string();
+                if !formatter_result_is_current(
+                    &current,
+                    &source_for_check,
+                    &current_language,
+                    &language_for_check,
+                ) {
+                    document.formatting = false;
+                    document.dirty = current != document.loaded;
+                    document.error = Some(
+                        "The document changed while formatting; the result was discarded.".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(formatted) if formatted == current => {
+                        document.formatting = false;
+                        document.dirty = formatted != document.loaded;
+                        document.error = None;
+                        cx.notify();
+                    }
+                    Ok(formatted) => {
+                        install = Some((document.state.clone(), formatted));
+                    }
+                    Err(error) => {
+                        document.formatting = false;
+                        document.error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+            if let Some((state, formatted)) = install {
+                let expected = source_for_check;
+                let next = formatted.clone();
+                let installed = state
+                    .update_in(cx, move |state, window, cx| {
+                        if *state.text() != expected.as_str() {
+                            return false;
+                        }
+                        state.replace_all(next, window, cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                let _ = view.update(cx, |app, cx| {
+                    if app.document_request != request {
+                        return;
+                    }
+                    let Some(document) = app.document_view.as_mut().filter(|document| {
+                        document.path == identity && document.format_generation == generation
+                    }) else {
+                        return;
+                    };
+                    document.formatting = false;
+                    if installed {
+                        document.dirty = formatted != document.loaded;
+                        document.error = None;
+                    } else {
+                        let current = document.state.read(cx).text().to_string();
+                        document.dirty = current != document.loaded;
+                        document.error = Some(
+                            "The document changed while formatting; the result was discarded."
+                                .into(),
+                        );
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Watch the grammar menu's search field for as long as the menu is open.
@@ -852,6 +1177,8 @@ impl TerminalWindow {
             return;
         };
         document.dirty = false;
+        document.formatting = false;
+        document.format_generation = document.format_generation.wrapping_add(1);
         document.error = None;
         // Putting the text back is an edit the toolkit answers through the
         // window the editor is drawn in, so that is where it is asked for.
@@ -1028,7 +1355,7 @@ impl TerminalWindow {
                 .gap_2()
                 .child(div().text_color(roles.status.warning).child(error.clone()))
                 .child(
-                    Button::new(format!("retry-read-{path}"))
+                    zed_button(format!("retry-read-{path}"))
                         .ghost()
                         .small()
                         .label("Retry")
@@ -1057,7 +1384,7 @@ impl TerminalWindow {
                     let checkout = open_checkout.clone().expect("asked for");
                     let opened = path.clone();
                     pane.child(
-                        Button::new(format!("open-externally-{path}"))
+                        zed_button(format!("open-externally-{path}"))
                             .ghost()
                             .small()
                             .label("Open externally")
@@ -1110,10 +1437,21 @@ impl TerminalWindow {
                     .expect("asked for");
                 (file.additions, file.deletions)
             });
-        // A draft is the pane's last row, not a floating box over the text: the
-        // control that writes the file must not move away from where the person
-        // is looking.
-        let draft = self.document_view.as_ref().filter(|view| view.dirty);
+        // Code always has its footer for Format. Save and Cancel appear only for a
+        // dirty editor, as in Legacy's Code view.
+        let identity = format!("{checkout_id}\0{path}\0{}", self.document_request);
+        let code_footer = self
+            .document_view
+            .as_ref()
+            .filter(|view| view.path == identity && !rendered)
+            .map(|view| (view.dirty, view.saving, view.formatting, view.error.clone()));
+        let format_language = self
+            .document_language_overrides
+            .get(&grammar_key)
+            .map(String::as_str)
+            .unwrap_or_else(|| syntax_language(&path))
+            .to_owned();
+        let format_supported = prettier_parser(&path, &format_language).is_some();
         let grammar_selector = if !rendered && self.document_view.is_some() {
             let override_language = self.document_language_overrides.get(&grammar_key).cloned();
             let trigger_label = document_language_label(&path, override_language.as_deref());
@@ -1154,12 +1492,16 @@ impl TerminalWindow {
                     })
                     .track_focus(&focus)
                     .w(px(232.))
+                    // Zed's overlay: rounded 8px with a 4px inset, which is
+                    // what keeps the last row from painting over the corner
+                    // the panel rounds off.
+                    .p(px(4.))
                     .bg(roles.surface_raised)
                     .border_1()
                     .border_color(roles.border_strong)
-                    .rounded(px(0.))
+                    .rounded(px(8.))
                     .trigger(
-                        Button::new("document-grammar")
+                        zed_button("document-grammar")
                             .text()
                             .small()
                             .compact()
@@ -1230,7 +1572,7 @@ impl TerminalWindow {
                         .when_some(grammar_selector, |header, selector| header.child(selector))
                         .when(markdown, |header| {
                             header.child(
-                                Button::new("document-toggle-reading")
+                                zed_button("document-toggle-reading")
                                     .text()
                                     .small()
                                     .compact()
@@ -1269,7 +1611,7 @@ impl TerminalWindow {
                         .when_some(changes, |header, (added, removed)| {
                             header
                                 .child(
-                                    Button::new("document-open-changes")
+                                    zed_button("document-open-changes")
                                         .text()
                                         .small()
                                         .compact()
@@ -1310,7 +1652,7 @@ impl TerminalWindow {
                                 })
                         })
                         .child(
-                            Button::new("close-document")
+                            zed_button("close-document")
                                 .custom(crate::app::sidebar_action_style(cx))
                                 .small()
                                 .compact()
@@ -1325,66 +1667,103 @@ impl TerminalWindow {
                         ),
                 )
                 .child(div().flex_1().min_w_0().min_h_0().child(body))
-                .when_some(
-                    draft.map(|view| (view.saving, view.error.clone())),
-                    |pane, (saving, error)| {
-                        pane.child(
-                            div()
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .gap_2()
-                                .px_3()
-                                .py_1()
-                                .border_t_1()
-                                .border_color(roles.border)
-                                .child(
+                .when_some(code_footer, |pane, (dirty, saving, formatting, error)| {
+                    let has_error = error.is_some();
+                    pane.child(
+                        div()
+                            .id("document-actions")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(roles.border)
+                            .child(
+                                zed_button("format-document")
+                                    .small()
+                                    .compact()
+                                    .icon(IconName::WandSparkles)
+                                    .accessibility_label("Format with Prettier")
+                                    .tooltip(if !format_supported {
+                                        format!("Prettier does not format {format_language}.")
+                                    } else if formatting {
+                                        "Formatting…".to_owned()
+                                    } else {
+                                        "Format with Prettier; the result stays an unsaved draft."
+                                            .to_owned()
+                                    })
+                                    .disabled(!format_supported || saving || formatting)
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.format_document(window, cx);
+                                    })),
+                            )
+                            .when(dirty || saving || formatting || has_error, |footer| {
+                                footer.child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
                                         .text_xs()
-                                        .text_color(roles.status.warning)
+                                        .text_color(if has_error {
+                                            roles.status.danger_text
+                                        } else {
+                                            roles.status.warning
+                                        })
                                         .child(error.unwrap_or_else(|| {
                                             if saving {
                                                 "Saving…".to_owned()
+                                            } else if formatting {
+                                                "Formatting…".to_owned()
                                             } else {
                                                 "Unsaved changes".to_owned()
                                             }
                                         })),
                                 )
-                                .child(
-                                    Button::new("cancel-document")
-                                        .ghost()
-                                        .small()
-                                        .compact()
-                                        .label("Cancel")
-                                        .accessibility_label("Discard the unsaved changes")
-                                        .tooltip("Discard the unsaved changes (Esc)")
-                                        .disabled(saving)
-                                        .on_click(cx.listener(|app, _, window, cx| {
-                                            app.cancel_document(window, cx);
-                                        })),
+                            })
+                            .when(dirty, |footer| {
+                                footer.child(
+                                    div()
+                                        .id("document-draft-actions")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            zed_button("cancel-document")
+                                                .ghost()
+                                                .small()
+                                                .compact()
+                                                .label("Cancel")
+                                                .accessibility_label("Discard the unsaved changes")
+                                                .tooltip("Discard the unsaved changes (Esc)")
+                                                .disabled(saving)
+                                                .on_click(cx.listener(|app, _, window, cx| {
+                                                    app.cancel_document(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            zed_button("save-document")
+                                                .small()
+                                                .compact()
+                                                .label(if saving { "Saving…" } else { "Save" })
+                                                .accessibility_label("Save this file")
+                                                .tooltip(if saving || formatting {
+                                                    "Save unavailable while an operation is running"
+                                                        .to_owned()
+                                                } else {
+                                                    format!("Save this file ({})", save_key())
+                                                })
+                                                .disabled(saving || formatting)
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    app.save_document(cx);
+                                                })),
+                                        ),
                                 )
-                                .child(
-                                    Button::new("save-document")
-                                        .small()
-                                        .compact()
-                                        .label("Save")
-                                        .accessibility_label("Save this file")
-                                        .tooltip(if saving {
-                                            "Saving this file".to_owned()
-                                        } else {
-                                            format!("Save this file ({})", save_key())
-                                        })
-                                        .disabled(saving)
-                                        .on_click(cx.listener(|app, _, _, cx| {
-                                            app.save_document(cx);
-                                        })),
-                                ),
-                        )
-                    },
-                )
+                            }),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -1970,5 +2349,76 @@ mod tests {
                 "the tag around the text is not coloured"
             );
         });
+    }
+
+    #[test]
+    fn prettier_parser_matches_legacy_supported_languages() {
+        for (path, language, parser) in [
+            ("src/main.ts", "typescript", Some("typescript")),
+            ("src/view.tsx", "tsx", Some("typescript")),
+            ("src/data.jsonc", "json", Some("jsonc")),
+            ("src/theme.scss", "css", Some("scss")),
+            ("src/page.vue", "vue", Some("vue")),
+            ("README.md", "markdown", Some("markdown")),
+            ("src/main.rs", "rust", None),
+        ] {
+            assert_eq!(prettier_parser(path, language), parser, "{path}");
+        }
+    }
+
+    #[test]
+    fn formatter_result_is_discarded_after_text_or_language_changes() {
+        assert!(formatter_result_is_current(
+            "draft", "draft", "json", "json"
+        ));
+        assert!(!formatter_result_is_current(
+            "new draft",
+            "draft",
+            "json",
+            "json"
+        ));
+        assert!(!formatter_result_is_current(
+            "draft",
+            "draft",
+            "json",
+            "typescript"
+        ));
+    }
+
+    #[test]
+    fn formatter_skips_checkout_tools_and_uses_an_isolated_input() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        fn install(path: &Path, script: &str) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let checkout = tempfile::tempdir().unwrap();
+        let local_bin = checkout.path().join(".tools");
+        let local_prettier = local_bin.join("prettier");
+        install(&local_prettier, "#!/bin/sh\nprintf unsafe\n");
+
+        let user_bin = tempfile::tempdir().unwrap();
+        let user_prettier = user_bin.path().join("prettier");
+        install(
+            &user_prettier,
+            "#!/bin/sh\n[ \"$1\" = \"--no-config\" ] || exit 21\n[ \"$2\" = \"--no-editorconfig\" ] || exit 22\n[ \"$3\" = \"--parser\" ] || exit 23\n[ \"$4\" = \"json\" ] || exit 24\nexec /bin/cat \"$5\"\n",
+        );
+        let path =
+            std::env::join_paths([local_bin.as_os_str(), user_bin.path().as_os_str()]).unwrap();
+        let (executable, safe_path) =
+            prettier_executable_from_path(checkout.path(), &path).unwrap();
+        assert_eq!(executable, user_prettier.canonicalize().unwrap());
+        assert!(std::env::split_paths(&safe_path)
+            .all(|directory| !directory.starts_with(checkout.path())));
+
+        let source = "{\"name\":\"muster\"}\n";
+        assert_eq!(
+            run_prettier_with(&executable, &safe_path, "config.json", "json", source).unwrap(),
+            source,
+            "the formatter reads a temp copy and cannot run the checkout's executable"
+        );
     }
 }

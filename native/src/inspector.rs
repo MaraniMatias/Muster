@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
@@ -18,7 +18,7 @@ use muster_core::workspace::{Checkout, Repo, RepoKind};
 use crate::{
     app::{measured_width, ButtonA11y, InspectorTab, TerminalWindow, WidthCache},
     file_icons,
-    theme::Roles,
+    theme::{zed_button, Roles},
 };
 
 /// The size the panel's own rows draw their names at.
@@ -139,7 +139,7 @@ fn note_row(
                     .child(message.to_owned()),
             )
             .child(
-                Button::new(format!("retry-list-{path}"))
+                zed_button(format!("retry-list-{path}"))
                     .ghost()
                     .small()
                     .compact()
@@ -174,7 +174,7 @@ fn row_control(
     expanded: Option<bool>,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
-    Button::new(id)
+    zed_button(id)
         .text()
         .rounded(px(0.))
         .absolute()
@@ -212,7 +212,7 @@ fn fold_control(
     left: gpui_kit::Pixels,
     on_click: impl Fn(&mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
-    Button::new(id)
+    zed_button(id)
         .text()
         .rounded(px(0.))
         .absolute()
@@ -285,7 +285,7 @@ fn inspector_tab(
                 }),
         )
         .child(
-            Button::new(id)
+            zed_button(id)
                 .text()
                 .rounded(px(0.))
                 .absolute()
@@ -749,6 +749,15 @@ pub(crate) struct TreeSource<'a> {
     pub(crate) expanded: &'a HashSet<(String, String)>,
     /// This checkout's changed files by path, or nothing while Git has not answered.
     pub(crate) statuses: Option<&'a StatusIndex>,
+}
+
+/// A folder is empty only after its successful listing arrived; an unread folder
+/// keeps its disclosure control so it can be opened.
+fn listed_directory_is_empty(
+    entries: &HashMap<(String, String), Vec<muster_core::files::FileEntry>>,
+    key: &(String, String),
+) -> bool {
+    entries.get(key).is_some_and(Vec::is_empty)
 }
 
 /// Every visible row of the tree, in the order it is drawn.
@@ -1444,7 +1453,7 @@ impl TerminalWindow {
                             .child(error.clone()),
                     )
                     .child(
-                        Button::new("retry-status")
+                        zed_button("retry-status")
                             .ghost()
                             .small()
                             .label("Retry")
@@ -1705,9 +1714,10 @@ impl TerminalWindow {
                     TreeRow::Entry { entry, depth, .. } => {
                         let path = entry.path.clone();
                         let directory = entry.directory;
-                        let open = self
-                            .expanded_files
-                            .contains(&(checkout_for.id.clone(), path.clone()));
+                        let key = (checkout_for.id.clone(), path.clone());
+                        let open = self.expanded_files.contains(&key);
+                        let empty =
+                            directory && listed_directory_is_empty(&self.file_entries, &key);
                         let FileStatus {
                             marker,
                             additions,
@@ -1744,7 +1754,7 @@ impl TerminalWindow {
                                         .flex_shrink_0()
                                         .w(px(16.))
                                         .h(px(16.))
-                                        .when(directory, |slot| {
+                                        .when(directory && !empty, |slot| {
                                             slot.child(Icon::new(if open {
                                                 IconName::ChevronDown
                                             } else {
@@ -1787,7 +1797,7 @@ impl TerminalWindow {
                                     path.clone(),
                                     Some(path.clone()),
                                     selected,
-                                    directory.then_some(open),
+                                    (directory && !empty).then_some(open),
                                     move |event, window, cx| {
                                         let _ = weak.update(cx, |app, cx| {
                                             // Ctrl on Linux and Windows, cmd on
@@ -1808,6 +1818,9 @@ impl TerminalWindow {
                                                 return;
                                             }
                                             if directory {
+                                                if empty {
+                                                    return;
+                                                }
                                                 let key = (checkout.id.clone(), path.clone());
                                                 if !app.expanded_files.remove(&key) {
                                                     app.expanded_files.insert(key.clone());
@@ -1907,7 +1920,7 @@ impl TerminalWindow {
             let rrepo = repo.clone();
             let rcheckout = checkout.clone();
             body = body.child(
-                Button::new("retry-list-root")
+                zed_button("retry-list-root")
                     .ghost()
                     .small()
                     .label("Retry root/")
@@ -1959,7 +1972,7 @@ impl TerminalWindow {
                     .text_color(roles.status.warning)
                     .child(div().min_w_0().truncate().child(message))
                     .child(
-                        Button::new(format!("dismiss-external-{path}"))
+                        zed_button(format!("dismiss-external-{path}"))
                             .text()
                             .small()
                             .rounded(px(0.))
@@ -1997,6 +2010,29 @@ mod tests {
         assert!(!within("outermost", "outer"));
         assert!(!within("", "outer"));
         assert!(within("outer", ""));
+    }
+
+    #[test]
+    fn a_folder_is_empty_only_after_an_empty_listing_arrives() {
+        let empty = ("checkout".into(), "empty".into());
+        let populated = ("checkout".into(), "populated".into());
+        let entries = HashMap::from([
+            (empty.clone(), Vec::new()),
+            (
+                populated.clone(),
+                vec![muster_core::files::FileEntry {
+                    name: "file".into(),
+                    path: "populated/file".into(),
+                    directory: false,
+                }],
+            ),
+        ]);
+        assert!(listed_directory_is_empty(&entries, &empty));
+        assert!(!listed_directory_is_empty(&entries, &populated));
+        assert!(!listed_directory_is_empty(
+            &entries,
+            &("checkout".into(), "unread".into())
+        ));
     }
 
     #[test]

@@ -38,9 +38,14 @@ docs/             the migration plan, and what the port has to satisfy
   keeps, drops and flushes is decided without one.
 - The native workspace lives in `~/.muster/native-workspace.json`, written by
   `core::navigation`. It is **not** the Legacy SQLite database and nothing reads
-  the old one. It holds roots, archived checkout ids, the active checkout and
-  the sidebar width. Live sessions and terminal layouts are never written, so a
-  restart creates a fresh shell in the selected checkout; it never revives
+  the old one. It holds roots, archived checkout ids, the active checkout, the
+  sidebar width and the review export location. Live sessions and terminal
+  layouts are never written; review notes stay in window memory until exported,
+  except for the notes a review sent, which are captured in
+  `~/.muster/opencode-rounds.json` so a sent review can be shown and settled
+  later. That file is app state like the workspace file, under the same lock and
+  the same bounded, non-symlink read.
+  A restart creates a fresh shell in the selected checkout; it never revives
   processes that are gone.
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
   `linux-build` job in `.github/workflows/ci.yml` for the current list.
@@ -75,6 +80,39 @@ state-to-colour combination is decided, because GPUI refines a hover style
 after the rest style: a drawing that answers both in its own closure will paint
 the open row's hover over its selection for exactly as long as the pointer is
 resting on it.
+
+## Shape: Zed's radii, the toolkit's sizes
+
+GPUI Kit is **not** the widget library Zed draws with. Only the core is: the
+toolkit depends on `gpui-pre`, a snapshot of Zed's `gpui`, so the primitives and
+the focus handling are Zed's. The *widgets* are longbridge's `gpui-component`,
+a shadcn-flavoured design system, where Zed's buttons and overlays live in Zed's
+own unpublished crate. So a control drawn here wears the toolkit's shape unless
+this app says otherwise, and `theme::install` is where it says so:
+
+| what | where | value |
+| --- | --- | --- |
+| an overlay's corner | `theme.radius`, `theme.radius_lg` | `8px`, Zed's `rounded_lg` |
+| a button's corner | `theme::zed_button` | `4px`, Zed's `rounded_sm` |
+| a button's outline | `theme::zed_button` | none; Zed fills a control and gives it no border |
+
+The toolkit keeps **one** radius token for both roles, so `install` gives it the
+overlay's `8px` — its dropdown menus and popovers read that one — and the
+controls name Zed's `4px` where they are built. A control must therefore not be
+left to the token: a button through `theme::zed_button`, and the dialog's own
+fields where they are.
+
+A button is built with `theme::zed_button(id)`, which is the toolkit's
+`Secondary` variant: `install` gives `button`, `button_hover`, `button_active`
+and their foregrounds to both `Default` and `Secondary`, so the fill, the
+pointer ramp and the ink are the ones already installed and only the 1px
+hairline box goes. A control that means to be one of Zed's other buttons says
+so after it — `.ghost()`, `.text()`, `.custom(..)`, `.danger()` — which is why
+those calls still exist at call sites.
+
+What no token reaches is the size ladder: the toolkit hardcodes 20/24/32px
+where Zed's is 22/28/32, so a `.small()` button here is 4px shorter than Zed's
+`Medium`. Correcting that means pinning `.h(..)` per button, which is not done.
 
 ### Not the terminal's palette
 
@@ -215,9 +253,13 @@ that is not a workspace member will fail the audit closed, which is the intent.
   output, so a crate for them would have one caller.
 - Reading a checkout's files and writing one are the **same** boundary, in
   `core::files`, for the reason above: a second path to a file on disk is a second
-  path policy. No write of a checkout's file anywhere in `native` goes around
-  `write_preview` — the workspace state in `~/.muster` is not one of them, and
-  `native/src/state_writer.rs` is its own thing.
+  path policy. Writes of existing checkout files go through `write_preview`.
+  Review Markdown export is the deliberate exception: it creates a new file under
+  `.muster/reviews` through `export_review_markdown`, which validates the registered
+  checkout, rejects symlinks, and creates the export without overwriting. Clearing
+  reviews only removes marked app exports from the default cache and refuses workdir
+  mode. Workspace state in `~/.muster` is separate and
+  `native/src/state_writer.rs` owns it.
 - `legacy/` is reference material. Reading it is expected; editing it is not, and
   nothing verifies it any more.
 

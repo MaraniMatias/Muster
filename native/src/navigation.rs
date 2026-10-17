@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use muster_core::navigation::{NavigationState, OpenedDirectory};
+use muster_core::review::ReviewStorage;
 use muster_core::workspace::{Checkout, Repo, RepoKind, Session};
 
 #[derive(Default)]
@@ -21,6 +22,7 @@ pub(crate) struct Navigation {
     pub pending: HashMap<String, String>,
     pub revision: u64,
     pub sidebar_width: f32,
+    pub review_storage: ReviewStorage,
     pub panels_visible: bool,
 }
 
@@ -345,6 +347,7 @@ impl Navigation {
             archived_checkout_ids,
             active_checkout_id: self.active_checkout.clone(),
             sidebar_width: self.sidebar_width,
+            review_storage: self.review_storage,
             ..NavigationState::default()
         }
     }
@@ -362,8 +365,22 @@ pub(crate) fn checkout_title(repo: &Repo, checkout: &Checkout) -> String {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForegroundProgram {
+    OpenCode,
+    Pi,
+}
+
+pub(crate) fn foreground_program(app: Option<&str>) -> Option<ForegroundProgram> {
+    match app {
+        Some(app) if app.eq_ignore_ascii_case("opencode") => Some(ForegroundProgram::OpenCode),
+        Some(app) if app.eq_ignore_ascii_case("pi") => Some(ForegroundProgram::Pi),
+        _ => None,
+    }
+}
+
 pub(crate) fn session_title(name: &str, app: Option<&str>, title: Option<&str>) -> String {
-    if app == Some("opencode") {
+    if foreground_program(app) == Some(ForegroundProgram::OpenCode) {
         if let Some(title) = title
             .and_then(|title| title.strip_prefix("OC | "))
             .map(str::trim)
@@ -697,9 +714,19 @@ mod tests {
     }
 
     #[test]
-    fn process_identity_gates_agent_title() {
+    fn process_identity_gates_agent_title_and_program_icon() {
         assert_eq!(session_title("renamed", None, Some("OC | old")), "renamed");
         assert_eq!(session_title("sh", Some("nvim"), Some("OC | old")), "nvim");
+        assert_eq!(
+            foreground_program(Some("opencode")),
+            Some(ForegroundProgram::OpenCode)
+        );
+        assert_eq!(
+            foreground_program(Some("OpenCode")),
+            Some(ForegroundProgram::OpenCode)
+        );
+        assert_eq!(foreground_program(Some("pi")), Some(ForegroundProgram::Pi));
+        assert_eq!(foreground_program(Some("bash")), None);
         assert_eq!(
             session_title("sh", Some("opencode"), Some("OC | OC | nested")),
             "OC | nested"

@@ -27,14 +27,16 @@ fn the_bar_draws_the_crumb_line_over_the_actions(cx: &mut TestAppContext) {
             "a plain directory has no worktree level to name"
         );
         let crumb = window.find("repo-crumb").bounds();
+        let settings = window.find("settings").bounds();
         let action = window.find("toggle-panels").bounds();
+        assert!(window.find("settings").visible());
         assert!(
             crumb.bottom() <= px(32.),
             "the crumb line belongs to the 32px bar"
         );
         assert!(
-            crumb.right() < action.left(),
-            "the crumbs never reach the actions at the far end"
+            crumb.right() < settings.left() && settings.right() < action.left(),
+            "the crumbs, Settings and panel action keep separate space: {crumb:?}, {settings:?}, {action:?}"
         );
     })
     .unwrap();
@@ -122,7 +124,9 @@ fn opening_one_crumb_closes_the_previous_one(cx: &mut TestAppContext) {
             "the menu has a search field"
         );
         assert!(
-            window.find("command").bounds().size.width >= px(280.)
+            // The panel is 288px wide and its own border and 4px inset take
+            // 10 of them, which is what Zed's rounded panel costs.
+            window.find("command").bounds().size.width >= px(276.)
                 && window.find("command").bounds().size.width <= px(288.)
         );
         window.click("worktree-crumb", cx);
@@ -192,7 +196,9 @@ fn opening_the_session_menu_closes_the_previous_crumb(cx: &mut TestAppContext) {
         assert!(window.find("item-new-terminal").visible());
         assert!(window.try_find("workdir-open-directory").is_none());
         assert!(
-            window.find("command").bounds().size.width >= px(280.)
+            // The panel is 288px wide and its own border and 4px inset take
+            // 10 of them, which is what Zed's rounded panel costs.
+            window.find("command").bounds().size.width >= px(276.)
                 && window.find("command").bounds().size.width <= px(288.)
         );
     })
@@ -558,9 +564,12 @@ fn a_long_name_gives_up_segments_and_keeps_saying_what_it_names(cx: &mut TestApp
             crumb.bounds().size.width > px(300.),
             "the branch gets the space the short repo crumb leaves unused"
         );
+        let settings = window.find("settings").bounds();
+        let action = window.find("toggle-panels").bounds();
         assert!(
-            crumb.bounds().right() < window.find("toggle-panels").bounds().left(),
-            "the actions at the far end are still their own"
+            crumb.bounds().right() < settings.left() && settings.right() < action.left(),
+            "the crumbs, Settings and panel action keep separate space: {:?}, {settings:?}, {action:?}",
+            crumb.bounds()
         );
     })
     .unwrap();
