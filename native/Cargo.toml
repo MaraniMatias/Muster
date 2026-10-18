@@ -1,0 +1,119 @@
+[package]
+name = "muster"
+version = "0.2.0"
+# 2021, as `muster-core` is. The toolkit this app draws with is edition 2024,
+# and a crate may depend on one of a different edition, so nothing here forces
+# this one to move.
+edition = "2021"
+publish = false
+description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer. The Tauri app under legacy/ is parked and is not built from here."
+# Read by the About panel, the same way Legacy's read it: `env!` is resolved by
+# rustc, so the URL lands in the binary, where a field read off the bundle config
+# at runtime would not.
+homepage = "https://github.com/MaraniMatias/Muster"
+
+[lib]
+name = "muster_native"
+path = "src/lib.rs"
+
+[[bin]]
+# `Muster`, capitalised, while the package keeps `muster` so `cargo run -p
+# muster` still names this crate. The capitalisation is the point: macOS files
+# an executable that is not inside a bundle under its own filename, and that
+# filename is the name the Dock and the application menu show, so the binary run
+# from `target/` would otherwise answer to "muster" while the bundle answers to
+# "Muster". `CFBundleName` and `CFBundleExecutable` in
+# `scripts/bundle-macos.sh` are this same word, so whichever of the two was
+# launched the system files one application under one name.
+name = "Muster"
+path = "src/main.rs"
+
+[dependencies]
+# Pin the component crate paired with this kit, so a lockfile update does not
+# select its older dependency on the incompatible gpui-pre version.
+gpui-component = "=0.7.3"
+# `component` is the widget layer this app draws its chrome with. The
+# `tree-sitter*` features enable the toolkit's grammars selected by
+# `document::syntax_language`, plus JSDoc for JavaScript injections. Gitignore
+# has its own pinned parser; Dotenv reuses the toolkit's Bash grammar. Unsupported
+# formats still open as plain text.
+gpui-kit = { version = "0.7.3", features = [
+  "component",
+  "tree-sitter",
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cmake",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-ejs",
+  "tree-sitter-elixir",
+  "tree-sitter-erb",
+  "tree-sitter-go",
+  "tree-sitter-graphql",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-jsdoc",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-make",
+  "tree-sitter-markdown",
+  "tree-sitter-markdown-inline",
+  "tree-sitter-php",
+  "tree-sitter-proto",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-scala",
+  "tree-sitter-sql",
+  "tree-sitter-svelte",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
+] }
+# Already selected by the toolkit features above; expose their upstream
+# queries because GPUI Kit registers these grammars with empty queries.
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cmake = "0.7.5"
+tree-sitter-swift = "0.7.4"
+# The toolkit has no Vue grammar at all and no feature to turn one on, and
+# Legacy highlighted Vue. `theme::install` registers this one in the toolkit's
+# own registry with the queries it ships, the same mechanism the three above
+# use for an empty query. Nothing else depends on it and it adds no new
+# highlighter.
+tree-sitter-vue-updated = "0.1.0"
+# The toolkit has no Gitignore parser. This pinned upstream grammar is built with
+# the workspace's compatible cc release; its tree hash is checked by the RustSec audit.
+tree-sitter-gitignore = { package = "konomanoasa-tree-sitter-gitignore", path = "vendor/konomanoasa-tree-sitter-gitignore-0.3.1" }
+tree-sitter-ini = "1.4.0"
+# Already in the graph through the toolkit. Needed because a toolkit
+# `ThemeStyle`'s colour field is private, so a highlight theme is installed by
+# deserializing the theme literal rather than by assigning fields.
+serde_json = "1"
+# The PTY layer is not reimplemented here: the same backend the Tauri app used,
+# as a dependency. Process lifetime, bounded writes and group-safe shutdown have
+# exactly one implementation.
+muster-core = { path = "../core" }
+portable-pty = "0.9"
+libc = "0.2"
+log = "0.4"
+alacritty_terminal = "0.26.0"
+unicode-width = "0.2"
+# The shell-integration scripts are written to a private directory that has to
+# outlive the spawn and disappear with the session; nothing else owns that.
+tempfile = "3"
+
+[dev-dependencies]
+# Same crate, test-support on: unit tests build the same type universe as the app.
+gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
+tempfile = "3"
+# Already compiled into the test binary through the toolkit, so this costs no
+# build: it reads the bundled icon face's own tables, which is how a test can
+# tell that a private use character has a glyph to be drawn with.
+ttf-parser = "0.25"
+

@@ -1,77 +1,63 @@
 name: CI
 
 on:
-  workflow_call:
-    inputs:
-      ref:
-        required: true
-        type: string
-  # Branch-scoped so a release tag only runs release.yml, instead of building the same commit here too.
   push:
     branches:
       - main
   pull_request:
 
 jobs:
+  # The workspace is the two crates at the root: `core` and `native`. The Tauri tree under
+  # `legacy/` is parked -- it is not built, not tested and not released from here, so nothing in
+  # this workflow reaches into it.
   checks:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-      # pnpm before node: `cache: pnpm` shells out to pnpm to find the store, so a pnpm that is not
-      # installed yet fails the step instead of skipping the cache.
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: pnpm
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       # The Rust dependencies are the build's cost, and they only change when Cargo.lock does.
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm release:check
-      - run: pnpm fmt:check
-      - run: pnpm lint
-      - run: pnpm lint:rust
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm test:security
-      - run: pnpm test:coverage
-      - run: pnpm build:app
-      # Expected upstream block: glib 0.18.5 (RUSTSEC-2024-0429 / GHSA-WRW7-89JP-8Q8G), pulled by GTK 0.18.
-      # The fixed glib 0.20 line is not currently GTK-compatible; keep this gate fail-closed, with no allowlist.
-      - run: pnpm audit:security
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: frontend-coverage
-          path: coverage/
-          if-no-files-found: warn
+          workspaces: . -> target
 
-  # macOS never compiles the Linux branches of the code or links webkit2gtk, so nothing above would
-  # notice them rotting. This only builds the .deb: proving the app can be packaged for the platform
-  # it ships to is the point, and the tests are platform-independent enough to run once.
-  linux-build:
-    # Pinned, not ubuntu-latest: AppImage bundling wants the pre-t64 package names, and the newer
-    # images are on the t64 ones.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+      # The audit is the one thing here that is not `cargo`: it reads the locked graph, refuses any
+      # path package it cannot hash-pin, and queries OSV. Node is needed for that alone, and for
+      # the release command tests `scripts/release.sh check` runs beside the audit -- same two files,
+      # so a release profile or command that breaks is caught here rather than at packaging.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: pnpm/action-setup@v6
+      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs
+      - run: node scripts/audit-rust.mjs
+
+      - run: cargo build --locked --release -p muster
+      # The macOS bundle is what carries the app's icon, name and version, so a
+      # release build that cannot be bundled is a release build that would ship
+      # without an identity.
+      - run: scripts/bundle-macos.sh
+
+  # macOS never compiles the Linux branches of the code, so nothing above would notice them
+  # rotting. GPUI Kit has real Linux targets; building them is the point of this job. The core
+  # suite runs here too, because half of it is POSIX behaviour the macOS runner cannot exercise:
+  # the instance lock, symlink and O_NOFOLLOW refusals, process groups, signals. git is already on
+  # the runner image and these tests create their own repositories.
+  linux-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
-      - name: Install shared Tauri Linux prerequisites
-        run: bash scripts/install-linux-deps.sh
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test
-      - run: pnpm run build:app -- --bundles deb
-      - run: pnpm audit:rust
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      # The Vulkan, X11 and Wayland development packages GPUI links against.
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev
+      - run: cargo build --locked -p muster
+      - run: cargo test --locked -p muster-core

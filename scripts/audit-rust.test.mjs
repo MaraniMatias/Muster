@@ -1,10 +1,31 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { auditPackages, cargoMetadataArgs, isBlocking, loadLockedPackages, parseCargoMetadata } from "./audit-rust.mjs";
-import { isAuditedPatchedGlib, PATCHED_GLIB_ADVISORY_IDS, PATCHED_GLIB_DIR } from "./patched-glib.mjs";
+import {
+  auditPackages,
+  AUDITED_MANIFESTS,
+  cargoMetadataArgs,
+  isBlocking,
+  loadLockedPackages,
+  parseCargoMetadata,
+} from "./audit-rust.mjs";
+import {
+  auditedPatchedAlacritty,
+  isAuditedAlacritty,
+  PATCHED_ALACRITTY_ARCHIVE_SHA256,
+  PATCHED_ALACRITTY_DIR,
+  PATCHED_ALACRITTY_TREE_SHA256,
+  patchedAlacrittyTreeSha256,
+} from "./patched-alacritty.mjs";
+import {
+  auditedPatchedGitignore,
+  PATCHED_GITIGNORE_ARCHIVE_SHA256,
+  PATCHED_GITIGNORE_DIR,
+  PATCHED_GITIGNORE_TREE_SHA256,
+  patchedGitignoreTreeSha256,
+} from "./patched-gitignore.mjs";
 
 function response(results, ok = true, status = 200) {
   return { ok, status, json: async () => ({ results }) };
@@ -25,15 +46,31 @@ function queryResult(ids) {
 const APP_ID = "path+file:///fixture#app@0.1.0";
 const CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index";
 
-function patchedGlibPackage() {
-  const manifestPath = join(PATCHED_GLIB_DIR, "Cargo.toml");
+function patchedAlacrittyPackage() {
+  const manifestPath = join(PATCHED_ALACRITTY_DIR, "Cargo.toml");
   return parseCargoMetadata({
     workspace_members: [APP_ID],
     packages: [
       {
-        id: `path+file://${manifestPath}#glib@0.18.5`,
-        name: "glib",
-        version: "0.18.5",
+        id: `path+file://${manifestPath}#alacritty_terminal@0.26.0`,
+        name: "alacritty_terminal",
+        version: "0.26.0",
+        source: null,
+        manifest_path: manifestPath,
+      },
+    ],
+  })[0];
+}
+
+function patchedGitignorePackage() {
+  const manifestPath = join(PATCHED_GITIGNORE_DIR, "Cargo.toml");
+  return parseCargoMetadata({
+    workspace_members: [APP_ID],
+    packages: [
+      {
+        id: `path+file://${manifestPath}#konomanoasa-tree-sitter-gitignore@0.3.1`,
+        name: "konomanoasa-tree-sitter-gitignore",
+        version: "0.3.1",
         source: null,
         manifest_path: manifestPath,
       },
@@ -47,7 +84,7 @@ test("malformed Cargo.lock fails before any advisory lookup", (t) => {
   const manifestPath = join(directory, "Cargo.toml");
   writeFileSync(manifestPath, '[package]\nname = "audit-fixture"\nversion = "0.1.0"\nedition = "2021"\n');
   writeFileSync(join(directory, "Cargo.lock"), "this is not valid TOML = [\n");
-  assert.throws(() => loadLockedPackages({ manifestPath }), /could not validate Cargo\.lock/);
+  assert.throws(() => loadLockedPackages({ manifestPaths: [manifestPath] }), /could not validate Cargo\.lock/);
 });
 
 test("metadata selects locked all-feature dependencies without host-platform filtering", () => {
@@ -118,27 +155,159 @@ test("external git and path packages fail closed", () => {
   );
 });
 
-test("only the hash-pinned local glib backport is accepted as an external path package", () => {
-  const glib = patchedGlibPackage();
-  assert.equal(glib.name, "glib");
-  assert.equal(glib.version, "0.18.5");
-  assert.ok(isAuditedPatchedGlib(glib));
+test("the pinned alacritty patch is accepted and its pinned digest describes the vendored tree", () => {
+  assert.equal(patchedAlacrittyTreeSha256(), PATCHED_ALACRITTY_TREE_SHA256);
+  assert.match(PATCHED_ALACRITTY_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
 
+  const alacritty = patchedAlacrittyPackage();
+  assert.equal(alacritty.name, "alacritty_terminal");
+  assert.equal(alacritty.version, "0.26.0");
+  assert.equal(alacritty.source, null);
+  assert.ok(isAuditedAlacritty(alacritty));
+});
+
+test("the Gitignore grammar is accepted only with its pinned source tree", () => {
+  assert.equal(patchedGitignoreTreeSha256(), PATCHED_GITIGNORE_TREE_SHA256);
+  assert.match(PATCHED_GITIGNORE_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
+
+  const grammar = patchedGitignorePackage();
+  assert.equal(grammar.name, "konomanoasa-tree-sitter-gitignore");
+  assert.equal(grammar.version, "0.3.1");
+  assert.equal(grammar.source, null);
+});
+
+test("editing the vendored Gitignore grammar breaks its pinned hash", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "muster-vendored-gitignore-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const copy = join(directory, "gitignore");
+  cpSync(PATCHED_GITIGNORE_DIR, copy, { recursive: true });
+  assert.equal(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
+
+  const patched = join(copy, "src/scanner.c");
+  writeFileSync(patched, `${readFileSync(patched, "utf8")}\n/* quiet edit */\n`);
+  assert.notEqual(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
+});
+
+test("a registry-sourced alacritty_terminal is not the patched package", () => {
+  assert.equal(
+    auditedPatchedAlacritty({
+      name: "alacritty_terminal",
+      version: "0.26.0",
+      source: CRATES_IO_SOURCE,
+      manifest_path: join(PATCHED_ALACRITTY_DIR, "Cargo.toml"),
+    }),
+    null,
+  );
+
+  const [pkg] = parseCargoMetadata({
+    workspace_members: [APP_ID],
+    packages: [
+      {
+        id: "registry+crates.io#alacritty_terminal@0.26.0",
+        name: "alacritty_terminal",
+        version: "0.26.0",
+        source: CRATES_IO_SOURCE,
+      },
+    ],
+  });
+  assert.equal(pkg.source, CRATES_IO_SOURCE);
+  assert.equal(isAuditedAlacritty(pkg), false);
+});
+
+test("an alacritty_terminal outside the pinned identity is refused", () => {
+  const pinnedManifest = join(PATCHED_ALACRITTY_DIR, "Cargo.toml");
+  for (const pkg of [
+    { name: "alacritty_terminal", version: "0.25.0", manifest_path: pinnedManifest },
+    { name: "alacritty-terminal", version: "0.26.0", manifest_path: pinnedManifest },
+    { name: "alacritty_terminal", version: "0.26.0", manifest_path: "/external/alacritty/Cargo.toml" },
+  ]) {
+    assert.equal(auditedPatchedAlacritty({ source: null, ...pkg }), null);
+    assert.throws(
+      () =>
+        parseCargoMetadata({
+          workspace_members: [APP_ID],
+          packages: [{ id: `path+file:///external#${pkg.name}@0.0.0`, source: null, ...pkg }],
+        }),
+      (error) => error.message === `unsupported external path dependency for ${pkg.name}@${pkg.version}`,
+    );
+  }
+});
+
+test("editing the vendored alacritty tree breaks the pinned hash", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "muster-vendored-alacritty-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const copy = join(directory, "alacritty_terminal-0.26.0");
+  cpSync(PATCHED_ALACRITTY_DIR, copy, { recursive: true });
+
+  // The digest covers names and contents, not the directory the tree happens to live in.
+  assert.equal(patchedAlacrittyTreeSha256(copy), PATCHED_ALACRITTY_TREE_SHA256);
+
+  const patched = join(copy, "src/term/mod.rs");
+  writeFileSync(patched, `${readFileSync(patched, "utf8")}\n// quiet edit\n`);
+  assert.notEqual(patchedAlacrittyTreeSha256(copy), PATCHED_ALACRITTY_TREE_SHA256);
+});
+
+test("a path dependency sitting beside the backports is still refused", () => {
   assert.throws(
     () =>
       parseCargoMetadata({
         workspace_members: [APP_ID],
         packages: [
           {
-            id: "path+file:///external/glib#glib@0.18.5",
-            name: "glib",
-            version: "0.18.5",
+            id: "path+file:///vendor/rogue@1.0.0",
+            name: "rogue",
+            version: "1.0.0",
             source: null,
-            manifest_path: "/external/glib/Cargo.toml",
+            manifest_path: join(PATCHED_ALACRITTY_DIR, "../rogue/Cargo.toml"),
           },
         ],
       }),
-    /unsupported external path dependency for glib@0\.18\.5/,
+    /unsupported external path dependency for rogue@1\.0\.0/,
+  );
+});
+
+test("loadLockedPackages audits both manifests and deduplicates shared packages", () => {
+  const alacrittyManifest = join(PATCHED_ALACRITTY_DIR, "Cargo.toml");
+  const shared = { id: "registry+crates.io#shared@1.0.0", name: "shared", version: "1.0.0", source: CRATES_IO_SOURCE };
+  const outputs = new Map([
+    [
+      AUDITED_MANIFESTS[0],
+      JSON.stringify({
+        workspace_members: [APP_ID],
+        packages: [{ id: APP_ID, name: "app", version: "0.1.0", source: null }, shared],
+      }),
+    ],
+    [
+      AUDITED_MANIFESTS[1],
+      JSON.stringify({
+        workspace_members: ["path+file:///native#muster@0.0.0"],
+        packages: [
+          { id: "path+file:///native#muster@0.0.0", name: "muster", version: "0.0.0", source: null },
+          shared,
+          {
+            id: `path+file://${alacrittyManifest}#alacritty_terminal@0.26.0`,
+            name: "alacritty_terminal",
+            version: "0.26.0",
+            source: null,
+            manifest_path: alacrittyManifest,
+          },
+        ],
+      }),
+    ],
+  ]);
+
+  const requested = [];
+  const packages = loadLockedPackages({
+    run: (_command, args) => {
+      requested.push(args.at(-1));
+      return { status: 0, stdout: outputs.get(args.at(-1)) };
+    },
+  });
+
+  assert.deepEqual(requested, [...AUDITED_MANIFESTS]);
+  assert.deepEqual(
+    packages.map(({ name, version }) => `${name}@${version}`),
+    ["alacritty_terminal@0.26.0", "shared@1.0.0"],
   );
 });
 
@@ -185,6 +354,18 @@ test("informational unmaintained advisories warn without becoming a false clean 
   assert.equal(isBlocking(advisories[0]), false);
 });
 
+test("the RustSec 'no longer maintained' phrasing is also informational", async () => {
+  const advisories = await auditPackages([{ name: "fixture", version: "1.0.0" }], {
+    fetchImpl: async (url, { method }) =>
+      method === "POST"
+        ? queryResult(["RUSTSEC-2024-0436"])
+        : jsonResponse({ id: "RUSTSEC-2024-0436", summary: "paste - no longer maintained" }),
+  });
+  assert.equal(advisories.length, 1);
+  assert.equal(advisories[0].severity, "INFO");
+  assert.equal(isBlocking(advisories[0]), false);
+});
+
 test("moderate advisories block the audit", async () => {
   const advisories = await auditPackages([{ name: "glib", version: "0.18.5" }], {
     fetchImpl: async (url, { method }) =>
@@ -193,31 +374,6 @@ test("moderate advisories block the audit", async () => {
         : jsonResponse(vuln("RUSTSEC-2024-0429", ["GHSA-aaaa-bbbb-cccc"])),
   });
   assert.equal(advisories[0].severity, "MODERATE");
-  assert.equal(isBlocking(advisories[0]), true);
-});
-
-test("the exact patched glib advisory is reported fixed only for the pinned backport", async () => {
-  const glib = patchedGlibPackage();
-  const [id, alias] = PATCHED_GLIB_ADVISORY_IDS;
-  const advisories = await auditPackages([glib], {
-    fetchImpl: async (_url, { method }) => (method === "POST" ? queryResult([id]) : jsonResponse(vuln(id, [alias]))),
-  });
-
-  assert.equal(advisories.length, 1);
-  assert.equal(advisories[0].severity, "MODERATE");
-  assert.equal(advisories[0].status, "FIXED");
-  assert.equal(isBlocking(advisories[0]), false);
-});
-
-test("other advisories in the patched glib version remain blocking", async () => {
-  const glib = patchedGlibPackage();
-  const advisories = await auditPackages([glib], {
-    fetchImpl: async (_url, { method }) =>
-      method === "POST" ? queryResult(["RUSTSEC-2025-9999"]) : jsonResponse(vuln("RUSTSEC-2025-9999", [])),
-  });
-
-  assert.equal(advisories.length, 1);
-  assert.equal(advisories[0].status, "ACTIVE");
   assert.equal(isBlocking(advisories[0]), true);
 });
 

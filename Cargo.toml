@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["core", "native"]
+
+# Declared here rather than in `native/Cargo.toml` because only the workspace
+# root's patch table is read. `native/vendor/alacritty_terminal-0.26.0` carries
+# a one-line fix over the published crate: crates.io 0.26.0 is the latest release
+# and panics on a remotely triggerable input. `native/vendor/.../PATCHES.md`
+# records what changed and why, and `scripts/patched-alacritty.mjs` hash-pins the
+# whole tree.
+[patch.crates-io]
+alacritty_terminal = { path = "native/vendor/alacritty_terminal-0.26.0" }
+
+# The VT parser and the GPUI text stack are hot enough that an unoptimized debug
+# build is not worth waiting for, and every third-party crate is worse.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# `strip = "none"`, and Cargo's default `strip = "debuginfo"` is deliberately
+# not used: rustc does that itself, after the link, by rewriting the Mach-O. On
+# this toolchain the rewrite leaves `LC_SYMTAB`'s string pool at an offset that
+# is not a multiple of eight, and dyld refuses the file ("mis-aligned LINKEDIT
+# string pool"), so every proc macro built for `release` fails to load and the
+# build stops with `E0463: can't find crate for <name>_derive`. It is not a
+# stale artifact: a full clean reproduces it, and every proc macro hits it.
+# Release builds no debuginfo anyway (`debug` defaults to false), so the step
+# buys nothing to lose. `scripts/release.test.mjs` pins this.
+[profile.release]
+strip = "none"

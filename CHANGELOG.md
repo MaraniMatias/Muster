@@ -20,6 +20,61 @@ here still gets its generated notes.
   asked to be told about keys at all — no terminal can send a chord no program has agreed to
   distinguish.
 
+- **There is one stored shape, and the file carries no version.** Both state
+  files in `~/.muster` -- the native workspace and the review round store --
+  carry no `schemaVersion` at all: every field is required, no field is unknown,
+  and the shape itself is the whole contract. A shape is changed in place, a file
+  this build cannot read is refused by name and never written over, and nothing
+  left behind reads an older file: the navigation store no longer parses a second
+  time to accept a file that carries no version at all, and a stamped file is
+  refused like any other one this build does not know.
+
+- **A document can be edited, and a save says what it wrote.** The document pane
+  is its editor: type in it, and a bar appears along the bottom with Cancel and
+  Save — `Esc` and `⌘S` are the same two controls. Cancel puts the text the file
+  was read with back; Save writes what the editor holds, through the same walk
+  every read of a checkout is answered by: a path outside the checkout, a link, a
+  file somebody else wrote since it was opened, or a file that is read-only are
+  all refused in as many words rather than overwritten, and what is written is a
+  replacement rather than a rewrite, so a reader sees the old text or the new one.
+  A Markdown document opens as its reading and is edited as its source, because
+  the reading is a parse of the text as it was read.
+
+- **A file with changes offers them from its own document.** When Git has said
+  this file is in the change set, the document's header carries a **Changes**
+  button with the counts beside it, and it opens that one file's diff rather than
+  the whole set. A file Git has not answered about offers nothing, because a
+  button that appears and disappears with a read is worse than one that waits.
+
+- **A picture, a video and a file's name stand apart from the text.** The toolkit
+  measures an inline element as a box of its own, so the air above and below a
+  picture — and around the words that stand in for what cannot be drawn — is
+  inside that box. A document's SVG is drawn like any other picture: it is the
+  one format this window takes by name rather than by its bytes.
+
+- **The app has its icon back on macOS.** An executable carries no icon there: the
+  icon is what the bundle around it says it is. `scripts/bundle-macos.sh` builds
+  `Muster.app` with the same bundle identifier, name, copyright and artwork the
+  Tauri build shipped, so the OS files the native shell as the same application
+  rather than as a second one that happens to look like it. Two fields differ on
+  purpose: the bundle declares macOS 15 as its floor, which is what the toolkit
+  this app is built on needs rather than what the old webview build needed, and
+  the build now enforces that floor instead of only promising it, so an API newer
+  than 15.0 is a build error rather than a crash on someone else's Mac. The
+  version is whatever `native/Cargo.toml` declares.
+
+- **There is a menu bar on macOS.** The app menu carries About, Services, Hide,
+  Hide Others and Quit, and the Edit submenu carries Undo through Select All —
+  the same two submenus the Tauri build had. Edit is not decoration there: those
+  are the key equivalents `⌘C`, `⌘V`, `⌘X`, `⌘A` and `⌘Z` are answered by, and on
+  macOS they are answered before the key reaches the window, so the terminal
+  answers them as the toolkit's copy and paste actions as well as in its own key
+  handling. Either way the grid copies its selection and pastes into the child.
+
+- **About Muster says what it always said.** The icon, the name, the version, the
+  copyright and the repository, in the order macOS shows them, in a panel of its
+  own that closes with `⌘W`.
+
 - **Where an exported review round lands is a preference.** Settings has a "Review notes" section
   with a selector for it: `Default` keeps them in `~/.muster/tmp/reviews`, and `Work directory`
   keeps them in `.muster/reviews` inside the checkout the review was made in — the repository or

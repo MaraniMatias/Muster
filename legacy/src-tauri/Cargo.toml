@@ -1,0 +1,58 @@
+[package]
+name = "muster"
+version = "0.22.0"
+description = "A focused workspace for repositories and checkouts"
+authors = ["Marani Matias Ezequiel"]
+license = "MIT"
+homepage = "https://github.com/MaraniMatias/Muster"
+repository = "https://github.com/MaraniMatias/Muster"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The PTY backend and the workspace shapes, shared with the native host. One
+# implementation of process lifetime, bounded writes and group-safe shutdown.
+muster-core = { path = "../../core" }
+base64 = "0.22"
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `~/.muster/config.yml`, written by the Settings dialog and hand-editable, so it is read as YAML
+# rather than as JSON: a person opening the file should be able to read it.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+# One copy of the app. Registered first, before anything opens the database: opening it clears the
+# stored terminal sessions, so a second copy arriving later would wipe the first copy's.
+tauri-plugin-single-instance = "2"
+# Diagnostics for the parts that fail without saying so: the git watcher, the terminal backend
+# and the per-checkout agent servers. Used from Rust only, so no webview permission is granted.
+tauri-plugin-log = "2"
+log = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+portable-pty = "0.9"
+# Blocking HTTP client for the per-checkout OpenCode server on 127.0.0.1. TLS is
+# deliberately off: the server is a child process we start ourselves on loopback.
+ureq = { version = "3", default-features = false, features = ["json"] }
+notify = "8"
+libc = "0.2"
+# Local MCP automation bridge. Optional and only compiled with the `dev-bridge`
+# feature, so release builds never include it.
+tauri-plugin-mcp-bridge = { version = "0.13", optional = true }
+
+[patch.crates-io]
+# Backport gtk-rs/gtk-rs-core#1343 to the GTK 0.18-compatible glib release.
+glib = { path = "vendor/glib-0.18.5" }
+
+[features]
+default = []
+dev-bridge = ["dep:tauri-plugin-mcp-bridge"]
+
+[dev-dependencies]
+tempfile = "3"
+# The mock runtime, to build a real AppHandle in tests and read the About panel's actual values
+# instead of grepping the source for them. Dev-only, so it is not in a shipped binary.
+tauri = { version = "2", features = ["test"] }
