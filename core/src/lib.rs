@@ -41,6 +41,12 @@ pub mod files;
 /// Hands a file or a link to the application this machine has for it.
 pub mod opener;
 
+/// The preferences a person sets once and forgets they made, in `~/.muster/settings.json`.
+///
+/// Kept out of [`navigation`] on purpose: that is what a workspace is, and this is how things
+/// look. No window is needed to read a preference, so it belongs here rather than in the host.
+pub mod settings;
+
 /// Review notes anchored to source lines in diffs.
 pub mod review;
 

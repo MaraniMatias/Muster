@@ -2443,6 +2443,38 @@ mod tests {
         assert_eq!(copied.as_deref(), Some(edited.as_str()));
     }
 
+    /// Tab is two spaces, and the shifted one takes them back: an editor that
+    /// answers Tab with focus traversal reads as a pane the keyboard skipped.
+    #[gpui_kit::test]
+    fn a_tab_in_the_source_is_two_spaces_and_shift_tab_is_the_other_way(cx: &mut TestAppContext) {
+        let (window, harness) = open(cx);
+        let text = "fn main() {}\n";
+        harness.update(cx, |harness, cx| {
+            harness.document = Some(("src/main.rs".into(), text.into()));
+            cx.notify();
+        });
+        settle(cx, window);
+        let state = editor(cx, &harness);
+        let id = at(&state);
+        cx.update_window(window, |_, window, cx| {
+            window.click(id, cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.read(|cx| {
+            assert_eq!(
+                state.read(cx).text().to_string(),
+                format!("{text}  "),
+                "Tab writes the indent rather than moving the focus"
+            )
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.press("shift-tab", cx);
+        })
+        .unwrap();
+        cx.read(|cx| assert_eq!(state.read(cx).text().to_string(), text));
+    }
+
     #[gpui_kit::test]
     fn an_empty_file_is_an_empty_editor_and_not_a_missing_one(cx: &mut TestAppContext) {
         let (window, harness) = open(cx);

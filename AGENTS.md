@@ -56,6 +56,15 @@ docs/             the migration plan, and what the port has to satisfy
   sent again. Neither action touches queued, dispatching or unknown rounds.
   A restart creates a fresh shell in the selected checkout; it never revives
   processes that are gone.
+- The preferences live in `~/.muster/settings.json`, written by `core::settings`.
+  This is the one store in `~/.muster` with **no schema version**: every field
+  defaults, a key this build does not have is ignored, and a size outside its
+  documented range is clamped rather than refused, because a preference holds no
+  work and the file is deliberately a document a person may open and edit. It
+  carries no colour, no theme and no zoom -- one appearance is dark and
+  `native/src/theme.rs` is its only authority -- and no review storage, which
+  `core::navigation` already persists. A file that does not parse is never
+  written over.
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
   `linux-build` job in `.github/workflows/ci.yml` for the current list.
 
@@ -290,6 +299,36 @@ Five rules it depends on, each pinned by a test:
   run before the input's own Return, so stopping it there is what keeps the
   keystroke from also inserting the newline a plain Return writes. Enter on its own
   still writes one, as Legacy's textarea did, and `esc` still cancels.
+
+## The preferences panel
+
+`native/src/settings.rs` is the panel, and the shape it draws is
+`core::settings::AppSettings` — the same schema Legacy generated its dialog from,
+so a preference added there is a row and a closure rather than a branch in a
+template.
+
+Three things about it are decisions rather than arrangement:
+
+- **It is a draft, and nothing reaches the file until Apply.** That is what makes
+  Cancel possible, and it is why a size somebody is still typing is never a size
+  anything is drawn at. The draft is built whole on every open.
+- **The four sizes live in their fields, not in the model.** A toggle and a select
+  report their change; a number field is a person mid-thought. The range is applied
+  when the draft is written, and the clamped number is written back into the field,
+  so the panel closes on what is on file rather than on what was typed.
+- **A broken file opens the panel rather than stopping it.** Whoever typed it is who
+  can fix it, so the fields show the defaults with the failure beside them — and
+  Apply refuses, because that file is the only copy of somebody's preferences.
+
+**Apply writes the file and the review location, and it does not repaint a live
+terminal.** Nothing in this app can change a running grid's font, cursor or
+scrollback yet. A panel that implied otherwise would be a lie about what a
+preference does, so it says nothing about it instead.
+
+The Settings action in the title bar opens this panel, and the review storage,
+**Clear cached review exports…** and **Forget delivered reviews…** moved into its
+Review notes section: they are one surface now, which is what `AGENTS.md`'s
+**Settings → Forget delivered reviews…** had been claiming.
 
 ## The tooltip
 

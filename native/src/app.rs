@@ -517,6 +517,13 @@ pub struct TerminalWindow {
     pub(crate) next_file_request: u64,
     pub(crate) worktree: Option<WorktreeDraft>,
     pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
+    /// The preferences panel's own draft, while it is open.
+    ///
+    /// A field rather than part of `Navigation`, because a preference is not workspace state
+    /// and the file it is written to is not the one navigation is persisted to.
+    pub(crate) settings: Option<crate::settings::SettingsDraft>,
+    /// Why the panel has nowhere to write, when that is what stopped it opening.
+    pub(crate) settings_error: Option<String>,
     pub(crate) owner: Arc<SessionOwner>,
     pub(crate) toasts: crate::toast::ToastStack,
     pub(crate) opening: bool,
@@ -584,6 +591,8 @@ impl TerminalWindow {
         };
         Self {
             navigation: Navigation::new(),
+            settings: None,
+            settings_error: None,
             terminals: HashMap::new(),
             diff_totals: HashMap::new(),
             diff_refresh_running: false,
@@ -2761,7 +2770,14 @@ impl Render for TerminalWindow {
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
             })
             .or_else(|| self.review_clear_dialog(cx))
-            .or_else(|| self.opencode_forget_dialog(cx));
+            .or_else(|| self.opencode_forget_dialog(cx))
+            // Last, so a confirmation raised from inside the panel is the dialog on screen
+            // rather than the panel behind it.
+            .or_else(|| {
+                self.settings
+                    .as_ref()
+                    .map(|draft| self.settings_dialog(draft, cx))
+            });
         // On a target whose window has no frame of its own, the frame is this
         // one: it insets the content out of the shadow, draws the border and
         // owns the resize band. It is a pass-through everywhere else.
@@ -2975,6 +2991,10 @@ mod tests;
 #[cfg(test)]
 #[path = "sidebar_tests.rs"]
 mod sidebar_tests;
+
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;
 
 #[cfg(test)]
 #[path = "titlebar_tests.rs"]

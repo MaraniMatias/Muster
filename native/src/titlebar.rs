@@ -15,7 +15,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     command::{Command, CommandGroup, CommandItem, CommandState},
-    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     popover::Popover,
     Disableable, Icon, IndexPath, Sizable, TitleBar,
 };
@@ -24,7 +23,6 @@ use gpui_kit::{
     InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled,
     TestSupportExt, Window,
 };
-use muster_core::review::ReviewStorage;
 use muster_core::workspace::{Repo, RepoKind};
 
 use crate::app::{
@@ -442,82 +440,6 @@ pub(crate) struct CrumbRow {
 }
 
 impl TerminalWindow {
-    fn settings_menu(
-        &self,
-        view: gpui_kit::WeakEntity<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
-        let storage = self.navigation.review_storage;
-        let can_clear = storage == ReviewStorage::Default && self.open_diff.is_some();
-        // Every checkout's delivered reviews, from any state: the store is one file, and
-        // the moment it needs room is usually a moment with no diff open.
-        let can_forget = !self.review.forgetting;
-        let checkout_id = self
-            .open_diff
-            .as_ref()
-            .map(|(id, _)| id.as_str())
-            .or(self.navigation.active_checkout.as_deref());
-        let folder = checkout_id
-            .and_then(|id| self.document_source(id))
-            .map(|(repo, checkout)| {
-                muster_core::files::review_export_folder(&repo, &checkout, storage)
-            })
-            .map(|result| match result {
-                Ok(path) => format!("Folder: {}", path.display()),
-                Err(error) => format!("Review folder unavailable: {error}"),
-            })
-            .unwrap_or_else(|| "Open a checkout to view its review folder".into());
-        move |menu, _, _| {
-            let home_view = view.clone();
-            let checkout_view = view.clone();
-            let clear_view = view.clone();
-            let forget_view = view.clone();
-            menu.min_w(px(224.))
-                .item(PopupMenuItem::new(folder.clone()).disabled(true))
-                .separator()
-                .item(
-                    PopupMenuItem::new(if storage == ReviewStorage::Workdir {
-                        "✓ This checkout (.muster/reviews)"
-                    } else {
-                        "This checkout (.muster/reviews)"
-                    })
-                    .on_click(move |_, _, cx| {
-                        let _ = checkout_view.update(cx, |app, cx| {
-                            app.set_review_storage(ReviewStorage::Workdir, cx)
-                        });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new(if storage == ReviewStorage::Default {
-                        "✓ App cache"
-                    } else {
-                        "App cache"
-                    })
-                    .on_click(move |_, _, cx| {
-                        let _ = home_view.update(cx, |app, cx| {
-                            app.set_review_storage(ReviewStorage::Default, cx)
-                        });
-                    }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new("Clear cached review exports…")
-                        .disabled(!can_clear)
-                        .on_click(move |_, _, cx| {
-                            let _ = clear_view
-                                .update(cx, |app, cx| app.open_review_clear_confirmation(cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("Forget delivered reviews…")
-                        .disabled(!can_forget)
-                        .on_click(move |_, _, cx| {
-                            let _ = forget_view
-                                .update(cx, |app, cx| app.open_opencode_forget_confirmation(cx));
-                        }),
-                )
-        }
-    }
-
     /// Searchable choices of live sessions in the active checkout.
     fn session_rows(&self, checkout_id: &str) -> Rc<Vec<CrumbRow>> {
         Rc::new(
@@ -985,6 +907,7 @@ impl TerminalWindow {
         }
         // The room between the line and the actions is the window's to drag.
         bar.push(div().flex_1().min_w(px(8.)).into_any_element());
+        let open_settings = view.clone();
         bar.push(
             zed_button("settings")
                 .custom(crate::app::sidebar_action_style(cx))
@@ -997,7 +920,9 @@ impl TerminalWindow {
                 .accessibility_label("Settings")
                 .resting_tooltip("Settings")
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .dropdown_menu(self.settings_menu(view.clone()))
+                .on_click(move |_, window, cx| {
+                    let _ = open_settings.update(cx, |app, cx| app.open_settings(window, cx));
+                })
                 .into_any_element(),
         );
         bar.push(

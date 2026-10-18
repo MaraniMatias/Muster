@@ -42,6 +42,9 @@ pub mod worktree_dialog;
 /// The crumb line and the searchable menu each crumb opens.
 pub mod titlebar;
 
+/// The preferences panel: the draft it edits and the dialog it draws.
+pub mod settings;
+
 /// Who owns a PTY, and the window's end of it.
 pub mod session_owner;
 
