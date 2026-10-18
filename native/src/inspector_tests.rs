@@ -3504,6 +3504,14 @@ async fn dirty_document_save_conflict_keeps_draft_and_pending_destination(cx: &m
     std::fs::write(fixture.root.join("first.txt"), "external edit").unwrap();
     cx.simulate_prompt_answer("Save");
     cx.run_until_parked();
+    // The refusal is the window's toast rather than a line in the action bar: the bar
+    // is Legacy's, and it says what the draft needs rather than what went wrong.
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.toasts.latest_error().map(str::to_owned)),
+        Some("file changed on disk; reload it before saving".to_owned())
+    );
     fixture.view.read_with(cx, |app, cx| {
         assert_eq!(app.document_target.as_ref().unwrap().1, "first.txt");
         assert!(app.document_view.as_ref().unwrap().is_dirty());

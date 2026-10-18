@@ -62,8 +62,6 @@ pub(crate) struct DocumentView {
     pub(crate) formatting: bool,
     /// Cancelling or replacing this document invalidates an in-flight formatter result.
     format_generation: u64,
-    /// What the last save or format said, drawn beside the bar that caused it.
-    error: Option<String>,
     /// The pictures this document's reading has named, and the bytes that came
     /// back for them. Owned by the document rather than by the window, so a
     /// different document — or closing this one — drops them with the view, and
@@ -106,7 +104,6 @@ impl DocumentView {
             saving: false,
             formatting: false,
             format_generation: 0,
-            error: None,
             media: media::MediaStore::new(),
         }
     }
@@ -323,6 +320,13 @@ fn formatter_suffix(path: &str) -> &'static str {
     }
 }
 
+/// The formatters this app runs, in the order it prefers them.
+///
+/// `prettierd` first because it keeps Prettier loaded between formats, and the
+/// plain `prettier` when the daemon is not installed. Both are asked for by
+/// name on PATH, outside the checkout, in the order they are written here.
+const FORMATTERS: [&str; 2] = ["prettierd", "prettier"];
+
 /// A user-installed Prettier executable, never a command from the checkout.
 fn prettier_executable(checkout_root: &Path) -> Result<(PathBuf, OsString), String> {
     let path = std::env::var_os("PATH").ok_or_else(|| {
@@ -356,24 +360,29 @@ fn prettier_executable_from_path(
     }
     let safe_path = std::env::join_paths(&directories)
         .map_err(|error| format!("could not prepare formatter PATH: {error}"))?;
-    for directory in directories {
-        let Ok(executable) = directory.join("prettier").canonicalize() else {
-            continue;
-        };
-        if executable.starts_with(&checkout_root) {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(&executable) else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Ok((executable, safe_path));
+    // The name is the outer loop, so a daemon installed late on PATH still wins over
+    // a plain `prettier` installed early: that is the preference, not the order the
+    // directories happen to be listed in.
+    for name in FORMATTERS {
+        for directory in &directories {
+            let Ok(executable) = directory.join(name).canonicalize() else {
+                continue;
+            };
+            if executable.starts_with(&checkout_root) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(&executable) else {
+                continue;
+            };
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return Ok((executable, safe_path));
+            }
         }
     }
-    Err("Prettier was not found on PATH outside this checkout. Install it as a user-level tool and try again.".into())
+    Err("Neither prettierd nor prettier is installed as a tool of your own. `npm install -g @fsouza/prettierd` or `npm install -g prettier` puts one on PATH; a copy inside the checkout is deliberately not run.".into())
 }
 
-/// Run only the user's Prettier binary, with project config, editorconfig, plugins, and checkout-local
+/// Run only the user's Prettier, with project config, editorconfig, plugins, and checkout-local
 /// PATH entries excluded. Formatting is explicit and its output remains a draft in the editor.
 fn run_prettier(
     checkout_root: &Path,
@@ -388,6 +397,29 @@ fn run_prettier(
     }
     let (executable, safe_path) = prettier_executable(checkout_root)?;
     run_prettier_with(&executable, &safe_path, path, parser, source)
+}
+
+/// Whether this formatter is the daemon rather than the plain command line.
+///
+/// It is a question about the name because the daemon is chosen by name and the two
+/// differ in one place only: `prettierd` is given the document on stdin and takes its
+/// options as `--option=value`, because a bare word after a flag is a second file path
+/// to it. Everything else — the captured copy, the PATH, the timeout — is one call.
+fn is_daemon_formatter(executable: &Path) -> bool {
+    executable.file_name() == Some(OsStr::new(FORMATTERS[0]))
+}
+
+/// A working directory for the formatter that is neither the checkout nor the copy's
+/// own temporary one.
+///
+/// A daemon keys the process it keeps alive by the directory it was started in, so a
+/// directory that changes with every format would start a daemon per click and leave
+/// each one behind. This one is empty of anything a formatter could read a config from.
+fn formatter_working_dir() -> Result<PathBuf, String> {
+    let directory = std::env::temp_dir().join("muster-formatter");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not prepare the formatter's directory: {error}"))?;
+    Ok(directory)
 }
 
 fn run_prettier_with(
@@ -407,20 +439,29 @@ fn run_prettier_with(
     input
         .write_all(source.as_bytes())
         .map_err(|error| format!("could not write formatter input: {error}"))?;
+    let daemon = is_daemon_formatter(executable);
+    let parser_argument = format!("--parser={parser}");
     let mut command = Command::new(executable);
     command
-        .current_dir(temp_dir.path())
+        .current_dir(formatter_working_dir()?)
         .env("PATH", safe_path)
         .env_remove("NODE_OPTIONS")
-        .env_remove("NODE_PATH")
-        .args(["--no-config", "--no-editorconfig", "--parser", parser])
-        .arg(input.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("NODE_PATH");
+    if daemon {
+        command
+            .args(["--no-config", "--no-editorconfig", &parser_argument])
+            .arg(input.path())
+            .stdin(Stdio::piped());
+    } else {
+        command
+            .args(["--no-config", "--no-editorconfig", "--parser", parser])
+            .arg(input.path())
+            .stdin(Stdio::null());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     use std::os::unix::process::CommandExt;
     command.process_group(0);
-    let output = run_formatter_process(command)?;
+    let output = run_formatter_process(command, daemon.then_some(source))?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if message.is_empty() {
@@ -442,17 +483,34 @@ struct FormatterOutput {
     stderr: Vec<u8>,
 }
 
-fn run_formatter_process(command: Command) -> Result<FormatterOutput, String> {
-    run_formatter_process_with_timeout(command, FORMATTER_TIMEOUT)
+/// Run the formatter, handing it `stdin_source` when it reads the document that way.
+///
+/// The write happens before the streams are read and the daemon reads its input before
+/// it answers, so the two cannot block each other; a formatter that died first takes the
+/// write as its own failure rather than as a document it refused.
+fn run_formatter_process(
+    command: Command,
+    stdin_source: Option<&str>,
+) -> Result<FormatterOutput, String> {
+    run_formatter_process_with_timeout(command, stdin_source, FORMATTER_TIMEOUT)
 }
 
 fn run_formatter_process_with_timeout(
     mut command: Command,
+    stdin_source: Option<&str>,
     timeout: Duration,
 ) -> Result<FormatterOutput, String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Prettier: {error}"))?;
+    if let Some(source) = stdin_source {
+        let mut stdin = child.stdin.take().ok_or("Prettier stdin was not piped.")?;
+        if let Err(error) = stdin.write_all(source.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("could not hand the document to Prettier: {error}"));
+        }
+    }
     let stdout = child
         .stdout
         .take()
@@ -1101,7 +1159,6 @@ impl TerminalWindow {
         };
         if let Some(view) = self.document_view.as_mut() {
             view.saving = true;
-            view.error = None;
         }
         let token = self.document_request;
         let written = (checkout_id.clone(), path.clone(), content.clone());
@@ -1123,6 +1180,7 @@ impl TerminalWindow {
                 let mut transition = None;
                 let mut reconsider_transition = false;
                 let mut refresh_git_status = false;
+                let refusal;
                 match result {
                     Ok(()) => {
                         let current = document.state.read(cx).text().to_string();
@@ -1130,9 +1188,9 @@ impl TerminalWindow {
                         document.durability_uncertain = false;
                         document.dirty = current != content;
                         let saved_cleanly = !document.dirty;
-                        document.error = document.dirty.then(|| {
+                        refusal = document.dirty.then(|| {
                             "The document changed while saving; the newer edits remain unsaved."
-                                .into()
+                                .to_owned()
                         });
                         // The reading is a parse of the text as saved, and the
                         // saved text is the only one it can be right about.
@@ -1186,15 +1244,18 @@ impl TerminalWindow {
                         app.git_diff_request
                             .remove(&(checkout_id.clone(), path.clone()));
                         refresh_git_status = true;
-                        document.error = Some(format!(
+                        refusal = Some(format!(
                             "Save is visible but may not survive a system failure: {error}"
                         ));
                         cx.notify();
                     }
                     Err(muster_core::files::WritePreviewError::BeforePublication(error)) => {
-                        document.error = Some(error);
+                        refusal = Some(error);
                         cx.notify();
                     }
+                }
+                if let Some(message) = refusal {
+                    app.push_error(message, cx);
                 }
                 if refresh_git_status {
                     app.request_git_status(&checkout_id, cx);
@@ -1243,7 +1304,6 @@ impl TerminalWindow {
         }
         let source = document.state.read(cx).text().to_string();
         document.formatting = true;
-        document.error = None;
         document.format_generation = document.format_generation.wrapping_add(1);
         let generation = document.format_generation;
         let checkout_root = PathBuf::from(checkout.canonical_path);
@@ -1258,6 +1318,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let mut install = None;
+            let mut refusal = None;
             let _ = view.update_in(cx, |app, _, cx| {
                 if !formatter_navigation_is_current(app.document_request, request) {
                     return;
@@ -1287,8 +1348,9 @@ impl TerminalWindow {
                 ) {
                     document.formatting = false;
                     document.dirty = current != document.loaded;
-                    document.error = Some(
-                        "The document changed while formatting; the result was discarded.".into(),
+                    refusal = Some(
+                        "The document changed while formatting; the result was discarded."
+                            .to_owned(),
                     );
                     cx.notify();
                     return;
@@ -1297,7 +1359,6 @@ impl TerminalWindow {
                     Ok(formatted) if formatted == current => {
                         document.formatting = false;
                         document.dirty = formatted != document.loaded;
-                        document.error = None;
                         cx.notify();
                     }
                     Ok(formatted) => {
@@ -1305,11 +1366,14 @@ impl TerminalWindow {
                     }
                     Err(error) => {
                         document.formatting = false;
-                        document.error = Some(error);
+                        refusal = Some(error);
                         cx.notify();
                     }
                 }
             });
+            if let Some(message) = refusal {
+                let _ = view.update(cx, |app, cx| app.push_error(message, cx));
+            }
             if let Some((state, formatted)) = install {
                 let expected = source_for_check;
                 let next = formatted.clone();
@@ -1332,18 +1396,21 @@ impl TerminalWindow {
                         return;
                     };
                     document.formatting = false;
+                    let mut discarded = None;
                     if installed {
                         document.dirty = formatted != document.loaded;
-                        document.error = None;
                     } else {
                         let current = document.state.read(cx).text().to_string();
                         document.dirty = current != document.loaded;
-                        document.error = Some(
+                        discarded = Some(
                             "The document changed while formatting; the result was discarded."
-                                .into(),
+                                .to_owned(),
                         );
                     }
                     cx.notify();
+                    if let Some(message) = discarded {
+                        app.push_error(message, cx);
+                    }
                 });
             }
             let _ = view.update_in(cx, |app, window, cx| {
@@ -1472,7 +1539,6 @@ impl TerminalWindow {
         document.dirty = false;
         document.formatting = false;
         document.format_generation = document.format_generation.wrapping_add(1);
-        document.error = None;
         // Putting the text back is an edit the toolkit answers through the
         // window the editor is drawn in, so that is where it is asked for.
         cx.spawn_in(window, async move |_, cx| {
@@ -1749,7 +1815,6 @@ impl TerminalWindow {
                     view.dirty || view.durability_uncertain,
                     view.saving,
                     view.formatting,
-                    view.error.clone(),
                     self.pending_document_transition.is_some(),
                 )
             });
@@ -1986,8 +2051,7 @@ impl TerminalWindow {
                         ),
                 )
                 .child(div().flex_1().min_w_0().min_h_0().child(body))
-                .when_some(code_footer, |pane, (dirty, save_needed, saving, formatting, error, transition_pending)| {
-                    let has_error = error.is_some();
+                .when_some(code_footer, |pane, (dirty, save_needed, saving, formatting, transition_pending)| {
                     pane.child(
                         div()
                             .id("document-actions")
@@ -2000,11 +2064,14 @@ impl TerminalWindow {
                             .py_1()
                             .border_t_1()
                             .border_color(roles.border)
+                            // Legacy's format control: the braces it draws, on the flat
+                            // hover wash its `document-action` wears rather than a button box.
                             .child(
                                 zed_button("format-document")
+                                    .custom(crate::app::sidebar_action_style(cx))
                                     .small()
                                     .compact()
-                                    .icon(IconName::WandSparkles)
+                                    .icon(IconName::Braces)
                                     .accessibility_label("Format with Prettier")
                                     .resting_tooltip(if !format_supported {
                                         format!("Prettier does not format {format_language}.")
@@ -2019,29 +2086,6 @@ impl TerminalWindow {
                                         app.format_document(window, cx);
                                     })),
                             )
-                            .when(dirty || saving || formatting || has_error, |footer| {
-                                footer.child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(if has_error {
-                                            roles.status.danger_text
-                                        } else {
-                                            roles.status.warning
-                                        })
-                                        .child(error.unwrap_or_else(|| {
-                                            if saving {
-                                                "Saving…".to_owned()
-                                            } else if formatting {
-                                                "Formatting…".to_owned()
-                                            } else {
-                                                "Unsaved changes".to_owned()
-                                            }
-                                        })),
-                                )
-                            })
                             .when(transition_pending, |footer| {
                                 footer.child(
                                     zed_button("stay-in-document")
@@ -2785,11 +2829,13 @@ mod tests {
     #[test]
     fn formatter_process_bounds_both_output_streams() {
         let stdout =
-            run_formatter_process(formatter_test_command("head -c 1048577 /dev/zero")).unwrap_err();
+            run_formatter_process(formatter_test_command("head -c 1048577 /dev/zero"), None)
+                .unwrap_err();
         assert!(stdout.contains("output larger than"));
 
-        let stderr = run_formatter_process(formatter_test_command("head -c 65537 /dev/zero >&2"))
-            .unwrap_err();
+        let stderr =
+            run_formatter_process(formatter_test_command("head -c 65537 /dev/zero >&2"), None)
+                .unwrap_err();
         assert!(stderr.contains("diagnostics exceeded"));
     }
 
@@ -2798,13 +2844,14 @@ mod tests {
         let started = Instant::now();
         let result = run_formatter_process_with_timeout(
             formatter_test_command("sleep 30 & wait"),
+            None,
             Duration::from_millis(50),
         );
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
 
         let started = Instant::now();
-        let result = run_formatter_process(formatter_test_command("sleep 30 & exit 0"))
+        let result = run_formatter_process(formatter_test_command("sleep 30 & exit 0"), None)
             .expect("the formatter parent succeeded");
         assert!(result.status.success());
         assert!(started.elapsed() < Duration::from_secs(3));
@@ -2812,13 +2859,16 @@ mod tests {
 
     #[test]
     fn formatter_process_returns_success_output_and_failure_diagnostics() {
-        let output = run_formatter_process(formatter_test_command("printf formatted"))
+        let output = run_formatter_process(formatter_test_command("printf formatted"), None)
             .expect("formatter succeeds");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"formatted");
 
-        let failed = run_formatter_process(formatter_test_command("printf diagnostic >&2; exit 7"))
-            .expect("process result is collected");
+        let failed = run_formatter_process(
+            formatter_test_command("printf diagnostic >&2; exit 7"),
+            None,
+        )
+        .expect("process result is collected");
         assert!(!failed.status.success());
         assert_eq!(failed.stderr, b"diagnostic");
     }
@@ -2857,6 +2907,44 @@ mod tests {
             run_prettier_with(&executable, &safe_path, "config.json", "json", source).unwrap(),
             source,
             "the formatter reads a temp copy and cannot run the checkout's executable"
+        );
+    }
+
+    /// The daemon is what the app reaches for first, and it is a different call: it is
+    /// given the document on stdin and takes its parser as one `--parser=<name>`
+    /// argument, because a bare word after a flag is a second file path to it.
+    #[test]
+    fn a_daemon_formatter_is_preferred_and_is_given_the_document_on_stdin() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        fn install(path: &Path, script: &str) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let checkout = tempfile::tempdir().unwrap();
+        let user_bin = tempfile::tempdir().unwrap();
+        install(
+            &user_bin.path().join("prettierd"),
+            "#!/bin/sh\n[ \"$3\" = \"--parser=json\" ] || exit 31\ndocument=$(/bin/cat) || exit 32\n[ \"$document\" = '{\"name\":\"muster\"}' ] || exit 33\nprintf formatted\n",
+        );
+        // Installed and never asked for: a daemon on PATH outranks it.
+        install(&user_bin.path().join("prettier"), "#!/bin/sh\nexit 1\n");
+
+        let path = user_bin.path().as_os_str();
+        let (executable, safe_path) = prettier_executable_from_path(checkout.path(), path).unwrap();
+        assert_eq!(executable.file_name(), Some(OsStr::new("prettierd")));
+        assert_eq!(
+            run_prettier_with(
+                &executable,
+                &safe_path,
+                "config.json",
+                "json",
+                "{\"name\":\"muster\"}"
+            )
+            .unwrap(),
+            "formatted"
         );
     }
 }
