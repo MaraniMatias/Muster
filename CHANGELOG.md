@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.1
 
 - **Ctrl+Shift+<key> now reaches the program in the terminal.** xterm.js 6 answers the keys it has an
   escape for and drops the rest: `Ctrl+Shift+A` sent no bytes at all, where `Ctrl+Shift+F5` went out

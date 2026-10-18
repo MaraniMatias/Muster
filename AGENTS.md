@@ -436,7 +436,10 @@ Every version this project ships is `v0.<minor>.<patch>`. The major is `0` and
 stays `0` until someone says otherwise in a commit that also does the migration
 work described below. A `v1.0.0` is not a version bump; it is the release where
 the schema rule below has to already be in place, so it is its own deliberate
-act, not a consequence of a `--bump`.
+act, not a consequence of a `--bump`. A `v1.0.0-rc.N` tag is that act's
+candidate rather than the act: the crate carries the pre-release version the
+tag names, GitHub files the release as a pre-release, and `v1.0.0` stays
+unclaimed until the final one ships.
 
 Consequences while the version is `v0.*.*`:
 

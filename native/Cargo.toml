@@ -1,6 +1,6 @@
 [package]
 name = "muster"
-version = "0.2.0"
+version = "1.0.0-rc.1"
 # 2021, as `muster-core` is. The toolkit this app draws with is edition 2024,
 # and a crate may depend on one of a different edition, so nothing here forces
 # this one to move.
