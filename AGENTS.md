@@ -69,8 +69,9 @@ docs/             the migration plan, and what the port has to satisfy
   `native/src/theme.rs` is its only authority -- and no review storage, which
   `core::navigation` already persists. A file that does not parse is never
   written over.
-- Linux builds need the Vulkan, X11, XKB and fontconfig development packages. See
-  the `linux-build` job in `.github/workflows/ci.yml` for the current list.
+- Linux builds need the system development packages the native crate links
+  against: Vulkan, X11, xcb, XKB (and its X11 half), freetype and fontconfig. See
+  the `linux-build` job in `.github/workflows/ci.yml` for the exact list.
 
 ## Native UI design system
 

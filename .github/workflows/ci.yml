@@ -57,10 +57,15 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
-      # The Vulkan, X11 and XKB development packages GPUI links against, plus the
-      # fontconfig one it loads through `yeslogic-fontconfig-sys`: without
-      # `fontconfig.pc` the build script panics on a missing system library before
-      # any of this app's own code is compiled.
-      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev libfontconfig1-dev
+      # Every system library the native crate links against: Vulkan for wgpu, X11 and
+      # xcb for the X11 window, XKB and its X11 half for keys, freetype and
+      # fontconfig for text. Each missing one fails a different way -- fontconfig.pc
+      # makes a build script panic, the rest surface as `unable to find library` at
+      # link time -- so the list is read off what the link line actually asks for.
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libvulkan-dev libx11-dev libxcb1-dev
+          libxkbcommon-dev libxkbcommon-x11-dev
+          libfreetype6-dev libfontconfig1-dev
       - run: cargo build --locked -p muster
       - run: cargo test --locked -p muster-core
