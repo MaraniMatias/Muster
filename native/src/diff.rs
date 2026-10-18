@@ -708,12 +708,9 @@ impl TerminalWindow {
             ));
         }
         let checkout_id = checkout.clone();
-        let note_count = self.review.notes.get(checkout).map_or(0, |notes| {
-            notes
-                .iter()
-                .filter(|note| self.review.include_outdated || !note.outdated)
-                .count()
-        });
+        // Every note in the round, and not only the ones on screen: a save sends
+        // the review, not the file that happens to be open in it.
+        let note_count = self.review.notes_for(checkout, None);
         let exporting_review = self.review.exporting;
         // The file the last save wrote, when it holds this checkout's notes. The
         // toolbar names it rather than a toast saying it once: the row is where

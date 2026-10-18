@@ -371,6 +371,186 @@ fn the_open_row_stays_selected_while_the_pointer_is_on_it(cx: &mut TestAppContex
     .unwrap();
     dispose(&fixture, cx);
 }
+/// Reading a file is not unfinished work, so clicking through files leaves the
+/// panel as it was — and a file somebody types in is, without being asked for.
+#[gpui_kit::test]
+async fn only_the_files_being_edited_are_rows(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    for path in ["one.txt", "two.txt", "three.txt"] {
+        std::fs::write(fixture.root.join(path), "one line\n").unwrap();
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&checkout).unwrap().clone();
+                app.request_document(repo, checkout, path.into(), window, cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+            fixture
+                .view
+                .read(cx)
+                .open_document
+                .as_ref()
+                .is_some_and(|(id, preview)| id == &checkout && preview.path == path)
+        })
+        .await;
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-row-0").is_none(),
+            "three files read and none of them typed in is not three rows"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A draft is a row from the first keystroke, and it stops being one when the
+/// draft is settled — saved, discarded, or undone back to what the file holds.
+#[gpui_kit::test]
+async fn a_row_is_a_draft_and_not_a_file_you_are_reading(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    std::fs::write(fixture.root.join("code.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&checkout).unwrap().clone();
+            app.request_document(repo, checkout, "code.rs".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-row-0").is_none(),
+            "an open file nobody has typed in is being read, which is not a row"
+        );
+        let editor = fixture.view.read_with(cx, |app, _| {
+            app.document_view.as_ref().unwrap().state.clone()
+        });
+        window.click(("input", editor.entity_id()), cx);
+        window.input(" typed", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("select-item-code.rs (edited)").label(),
+            Some("unsaved edits in main: code.rs (edited)"),
+            "a draft is what the person is in the middle of, and the row says so"
+        );
+        assert_eq!(
+            window.find("select-item-code.rs (edited)").selected(),
+            Some(true),
+            "the draft is what the pane is showing"
+        );
+        window.press("esc", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-row-0").is_none(),
+            "discarding the draft is what settles it, and the row goes with it"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A note is a row from the moment it is written, it says how many, and it goes
+/// when the review that holds it has nothing left in it.
+#[gpui_kit::test]
+fn a_note_is_a_row_that_says_how_many(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    let note = |id: &str, path: &str, outdated: bool| muster_core::review::ReviewNote {
+        id: id.into(),
+        checkout_id: checkout.clone(),
+        path: path.into(),
+        side: muster_core::review::ReviewSide::New,
+        line_start: 1,
+        line_end: None,
+        content: "look at this".into(),
+        code: "a line".into(),
+        code_hash: muster_core::review::review_anchor_hash("a line"),
+        outdated,
+    };
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&checkout, None, cx);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-row-0").is_none(),
+            "a change set nobody has written a note on is not unfinished work"
+        );
+    })
+    .unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.review
+            .notes
+            .insert(checkout.clone(), vec![note("one", "notes.txt", false)]);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("select-item-notes.txt (note)").label(),
+            Some("review notes in main: notes.txt (note)"),
+            "a note is work the pane is not showing, and the row names it"
+        );
+    })
+    .unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.review.notes.insert(
+            checkout.clone(),
+            vec![
+                note("one", "notes.txt", false),
+                note("two", "notes.txt", false),
+                note("three", "other.txt", false),
+            ],
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("select-item-notes.txt (2 notes)").label(),
+            Some("review notes in main: notes.txt (2 notes)"),
+            "a row that said one note when there were two would be a claim nobody made"
+        );
+        assert!(
+            window.find("select-item-other.txt (note)").visible(),
+            "each file a review has notes on is a row of its own"
+        );
+    })
+    .unwrap();
+    // An outdated note is one the person has said is not part of this review, so
+    // it is not one the row counts — the same rule the diff's own count uses, or
+    // the panel and the pane would disagree about how many notes there are.
+    fixture.view.update(cx, |app, _| {
+        app.review.notes.insert(
+            checkout.clone(),
+            vec![
+                note("one", "notes.txt", true),
+                note("two", "notes.txt", true),
+            ],
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("item-row-0").is_none(),
+            "a review with nothing left in it is not a row either"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 #[gpui_kit::test]
 fn insertion_row_does_not_change_a_stationary_drag_target(cx: &mut TestAppContext) {
     let fixture = open(cx);

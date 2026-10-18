@@ -167,6 +167,48 @@ what makes the build enforce it. The two are one decision: if the floor moves,
 both move, and if a build fails with an unavailable API then that API is the real
 floor rather than the number that was written down.
 
+## The unfinished work in the sidebar
+
+A file being edited and a diff holding notes become rows of the workdir they
+belong to — under its terminals, above **New terminal**. `TerminalWindow::items_in`
+is what draws them, and it is a **read of live state, not a list kept in step
+with it**: there is no stored collection of open items, and nothing to add,
+forget or reconcile.
+
+- A **document** is a row while it is a draft — the document on screen holding
+  something the file does not, which is exactly the state the Save button is
+  drawn for. Typing makes the row; saving, discarding, or undoing back to what
+  the file holds takes it away. A file that is merely open, or merely read, is
+  not unfinished work, so clicking through ten files adds nothing.
+- A **diff** is a row while it holds a note, one row per file the notes are on,
+  from `ReviewState::noted_paths`. A whole change set is not a row of its own:
+  its notes belong to the files they were written on, and each of those is a row
+  a person can click back into. Outdated notes do not count, by the same rule the
+  diff's own count uses, so the panel and the pane cannot disagree.
+
+Both carry what is waiting on them in the row's one label string —
+`code.rs (edited)`, `notes.txt (2 notes)` — because the marker is what tells your
+typing apart from your review at a glance. The whole row is the item, so it has
+no close button: a draft is finished in the editor (Save or Cancel) and a note is
+deleted where it was written, because a quiet X that threw away unsaved edits or
+a written note would be a destructive action wearing a neutral control's clothes.
+
+Three rules the rows depend on, each pinned by a test in
+`native/src/sidebar_tests.rs`:
+
+- **One open thing, one selected row.** The item row wears the selection, and
+  the terminal row and the workdir row give it up: the workdir row stands in for
+  "this is what the pane is showing" only when nothing inside it is. `shown_by`
+  holds that the pane only shows an item while its own checkout is active, so a
+  row under any other workdir is never the selected one.
+- **Leaving a draft asks about the draft.** `request_open_item` goes through
+  `request_document_transition`, so jumping from a file being edited to a review
+  raises Save / Discard / Cancel exactly as going to a terminal does.
+- **A row is drawn only under a workdir the panel still shows.** Notes outlive
+  the worktree row they belong to, so an archived or removed workdir takes its
+  rows with it by simply not being drawn, and restoring it brings back the ones
+  its review still holds.
+
 ## The file tree
 
 `native/src/inspector.rs` owns the Files tree: a scrolling box with a window of

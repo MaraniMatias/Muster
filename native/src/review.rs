@@ -205,6 +205,52 @@ pub(crate) fn can_start_opencode_round(rounds: &[muster_core::opencode::ReviewRo
     !rounds.iter().any(|round| round.status.is_pending())
 }
 
+impl ReviewState {
+    /// The notes `checkout` holds, and of `path` within it when one is named,
+    /// counted the way the diff counts them: an outdated note is one the person
+    /// has said is not part of this review.
+    ///
+    /// A whole change set asks for every note in its checkout, because that is
+    /// what it draws and what a save sends.
+    pub(crate) fn notes_for(&self, checkout: &str, path: Option<&str>) -> usize {
+        self.notes.get(checkout).map_or(0, |notes| {
+            notes
+                .iter()
+                .filter(|note| {
+                    (self.include_outdated || !note.outdated)
+                        && path.is_none_or(|path| note.path == path)
+                })
+                .count()
+        })
+    }
+
+    /// The paths in `checkout` that hold a note, with how many of them count,
+    /// in the order the paths were first written on.
+    ///
+    /// The panel's rows are this and nothing else, so the list cannot claim a
+    /// file it has no note on, and cannot forget one it does.
+    pub(crate) fn noted_paths(&self, checkout: &str) -> Vec<(&str, usize)> {
+        let mut paths: Vec<(&str, usize)> = Vec::new();
+        for note in self
+            .notes
+            .get(checkout)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|note| self.include_outdated || !note.outdated)
+        {
+            match paths
+                .iter_mut()
+                .find(|(path, _)| *path == note.path.as_str())
+            {
+                Some(counted) => counted.1 += 1,
+                None => paths.push((note.path.as_str(), 1)),
+            }
+        }
+        paths
+    }
+}
+
 /// The notes a new OpenCode round would carry.
 ///
 /// The window's own notes, minus the ones a round already sent as they stand: a review

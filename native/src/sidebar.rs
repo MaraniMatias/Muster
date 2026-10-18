@@ -1,9 +1,10 @@
 //! The left panel: repositories, their worktrees, and the terminals in them.
 //!
-//! The sidebar is one list drawn three ways — a repository heading, a worktree
-//! row, a terminal row — and it is also the window's drag surface: a terminal
-//! can be picked up and dropped into another worktree, and the drop slot has to
-//! appear where the row would have been, not where the row happens to be.
+//! The sidebar is one list drawn four ways — a repository heading, a worktree
+//! row, a terminal row, and the rows naming the files and change sets this window
+//! has open in that workdir — and it is also the window's drag surface: a
+//! terminal can be picked up and dropped into another worktree, and the drop slot
+//! has to appear where the row would have been, not where the row happens to be.
 //!
 //! So the drag is not a decoration on top of the list. Both halves live here:
 //! the rows, and the geometry the gesture is resolved against.
@@ -32,6 +33,7 @@ use crate::app::{
     sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
     sidebar_text_width, toggle, ButtonA11y, TerminalWindow, UI_FONT_FAMILY,
 };
+use crate::file_icons;
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
 use crate::terminal::ShellState;
 use crate::theme::{zed_button, Roles};
@@ -67,6 +69,187 @@ pub(crate) fn foreground_program_icon(
 
 pub(crate) fn sidebar_scroll_step(distance: f32) -> f32 {
     distance.signum() * (distance.abs() / 2.).clamp(2., 14.)
+}
+
+/// What kind of work an item is.
+///
+/// The same path is two different things when it is being edited and when its
+/// change is being read, so an item says which: a draft in `src/main.rs` and a
+/// review of it are two rows, not two names for one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenKind {
+    Document,
+    Diff,
+}
+
+/// One piece of work this window is in the middle of.
+///
+/// Not something a person opened and not something they are looking at now: a
+/// file they only read is not unfinished work, and neither is a file they are
+/// editing somewhere else. `count` is what is waiting on it — a draft is one
+/// thing being typed, and a review is however many notes it holds.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OpenItem {
+    pub(crate) checkout_id: String,
+    pub(crate) kind: OpenKind,
+    pub(crate) path: String,
+    pub(crate) count: usize,
+}
+
+impl OpenItem {
+    /// The name the row wears: the item, and what is waiting on it.
+    ///
+    /// One string, not a label with a badge beside it, so `notes.txt (note)` is
+    /// what a shortened name, a tooltip and a screen reader all say.
+    fn label(&self) -> String {
+        match (self.kind, self.count) {
+            (OpenKind::Document, _) => format!("{} (edited)", self.path),
+            (OpenKind::Diff, 1) => format!("{} (note)", self.path),
+            (OpenKind::Diff, count) => format!("{} ({count} notes)", self.path),
+        }
+    }
+
+    /// The file whose icon the row wears, from the name it resolves.
+    fn file(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// Whether the pane is showing this item right now.
+    ///
+    /// The reading still in flight counts as showing it: the document pane is
+    /// on screen with its file being read, so the terminal underneath it is not
+    /// what this window is looking at.
+    fn shown_by(&self, app: &TerminalWindow) -> bool {
+        let document = app
+            .document_target
+            .as_ref()
+            .map(|(checkout, path)| (checkout, path.as_str()))
+            .or_else(|| {
+                app.open_document
+                    .as_ref()
+                    .map(|(checkout, preview)| (checkout, preview.path.as_str()))
+            });
+        let active = app.navigation.active_checkout.as_deref() == Some(&self.checkout_id);
+        match self.kind {
+            OpenKind::Document => {
+                active
+                    && document.is_some_and(|(checkout, path)| {
+                        checkout == &self.checkout_id && path == self.path
+                    })
+            }
+            OpenKind::Diff => {
+                active
+                    && app.open_diff.as_ref().is_some_and(|(checkout, path)| {
+                        checkout == &self.checkout_id && path.as_deref() == Some(&self.path)
+                    })
+            }
+        }
+    }
+}
+
+impl TerminalWindow {
+    /// The work in `checkout` that the panel lists, in the order it draws it:
+    /// what is being typed, then what is being reviewed.
+    ///
+    /// A read of live state rather than a list kept in step with it, which is
+    /// what makes "clicking through files adds nothing" true by construction
+    /// rather than by remembering not to add: a file is here while the document
+    /// holds something the file does not, and a diff is here while it holds a
+    /// note. Clicking ten files and typing in none of them adds nothing because
+    /// there is nothing to add.
+    ///
+    /// A whole change set is not a row of its own. Its notes belong to the files
+    /// they were written on, and naming each of those is what a person can click
+    /// back into.
+    fn items_in(&self, checkout: &str) -> Vec<OpenItem> {
+        let active = self.navigation.active_checkout.as_deref() == Some(checkout);
+        let mut items = Vec::new();
+        let document = self
+            .document_target
+            .as_ref()
+            .map(|(id, path)| (id, path.as_str()))
+            .or_else(|| {
+                self.open_document
+                    .as_ref()
+                    .map(|(id, preview)| (id, preview.path.as_str()))
+            });
+        if active
+            && self
+                .document_view
+                .as_ref()
+                .is_some_and(|view| view.is_dirty())
+        {
+            if let Some((_, path)) = document.filter(|(id, _)| id.as_str() == checkout) {
+                items.push(OpenItem {
+                    checkout_id: checkout.to_owned(),
+                    kind: OpenKind::Document,
+                    path: path.to_owned(),
+                    count: 1,
+                });
+            }
+        }
+        items.extend(
+            self.review
+                .noted_paths(checkout)
+                .into_iter()
+                .map(|(path, count)| OpenItem {
+                    checkout_id: checkout.to_owned(),
+                    kind: OpenKind::Diff,
+                    path: path.to_owned(),
+                    count,
+                }),
+        );
+        items
+    }
+
+    /// The item the pane is showing, if it is showing one of the panel's rows.
+    ///
+    /// Every checkout is asked, because the pane only shows the active one and a
+    /// row under any other workdir is by definition not it.
+    fn shown_item(&self) -> Option<OpenItem> {
+        let checkout = self.navigation.active_checkout.as_deref()?;
+        self.items_in(checkout)
+            .into_iter()
+            .find(|item| item.shown_by(self))
+    }
+
+    /// Open an item from the panel.
+    ///
+    /// The same gesture the person used to get there the first time, and
+    /// through the same decision: leaving a draft for a review asks about the
+    /// draft exactly as leaving it for a terminal does.
+    pub(crate) fn request_open_item(
+        &mut self,
+        item: OpenItem,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if item.shown_by(self) {
+            return;
+        }
+        self.request_document_transition(
+            Box::new(move |app, window, cx| app.open_item_now(item, window, cx)),
+            window,
+            cx,
+        );
+    }
+
+    fn open_item_now(
+        &mut self,
+        item: OpenItem,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repo, checkout)) = self.document_source(&item.checkout_id) else {
+            return;
+        };
+        match item.kind {
+            OpenKind::Document => self.request_document(repo, checkout, item.path, window, cx),
+            OpenKind::Diff => {
+                self.request_open_changes(&item.checkout_id, Some(item.path), window, cx)
+            }
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -588,7 +771,11 @@ impl TerminalWindow {
                 let fold_id = id.clone();
                 let select_id = id.clone();
                 let selected = self.navigation.active_checkout.as_deref() == Some(&id)
-                    && self.navigation.active_session.is_none();
+                    && self.navigation.active_session.is_none()
+                    // The workdir row stands in for "this is what the pane is
+                    // showing", which it can only be when nothing inside it is:
+                    // with an open item the item's own row wears the selection.
+                    && self.shown_item().is_none();
                 let has_close = repo.kind == RepoKind::Git
                     && !checkout.is_primary
                     && self.navigation.home.as_deref() != Some(&id);
@@ -930,6 +1117,11 @@ impl TerminalWindow {
                 }
                 let checkout_row = row.into_any_element();
                 let mut checkout_children = Vec::<AnyElement>::new();
+                // What the centre pane is showing, if it is showing one of this
+                // window's items. It is one question asked once per workdir: a
+                // row is drawn under the workdir that owns it, and the pane only
+                // shows what its own active workdir is looking at.
+                let open_is_shown = self.shown_item().is_some();
                 for (session_index, session) in checkout.sessions.iter().enumerate() {
                     let Some(terminal) = self.terminals.get(&session.id) else {
                         continue;
@@ -942,7 +1134,12 @@ impl TerminalWindow {
                         status.foreground.app.as_deref(),
                         terminal.shell.session.title().as_deref(),
                     );
-                    let selected = self.navigation.active_session.as_deref() == Some(&session.id);
+                    // A file or a change set is what the pane is showing, so a
+                    // terminal does not wear the selection with it: one open
+                    // item leaves one row reading as open, and the session that
+                    // still holds its shell is not what this window is looking at.
+                    let selected = self.navigation.active_session.as_deref() == Some(&session.id)
+                        && !open_is_shown;
                     let busy = status.foreground.running;
                     let unknown =
                         status.poll_error.is_some() || status.shell == ShellState::Unknown;
@@ -1216,6 +1413,84 @@ impl TerminalWindow {
                         )
                         .context_menu(self.terminal_menu(id, weak.clone()))
                         .into_any_element(),
+                    );
+                }
+                // The work this workdir is in the middle of, named in the workdir
+                // it belongs to: what is being typed here, and what is being
+                // reviewed here. Nothing else is a row — a file somebody only
+                // read is not unfinished work, so clicking through files leaves
+                // the panel as it was.
+                for item in self.items_in(&id) {
+                    let label = item.label();
+                    let name = sidebar_name(window, &label, self.navigation.sidebar_width - 41.);
+                    // The whole name is what the row answers to on hover and to a
+                    // screen reader, so a path the panel had to shorten is still
+                    // the path it names.
+                    let what = match item.kind {
+                        OpenKind::Document => "unsaved edits",
+                        OpenKind::Diff => "review notes",
+                    };
+                    let description = format!("{what} in {title}: {}", item.label());
+                    let selected = item.shown_by(self);
+                    let row_group = SharedString::from(format!("item-row-{label}"));
+                    checkout_children.push(
+                        div()
+                            .id(row_group.clone())
+                            .test_support()
+                            .group(row_group)
+                            .flex()
+                            .items_center()
+                            .h(px(26.))
+                            .pl(px(12.))
+                            .pr(px(8.))
+                            .gap(px(7.))
+                            // The same retained-while-hovered selection the
+                            // terminal rows wear, and for the same reason: this
+                            // row is what the pane is showing, so the pointer
+                            // crossing it must not make it look like anything else.
+                            .hover(|style| style.bg(roles.row_hover(selected)))
+                            .when(selected, |row| row.bg(roles.row_rest(true)))
+                            // The same overlay the session rows use: the row is
+                            // one target with a focus ring, a tooltip and an
+                            // accessible name, not a label and a neighbour that
+                            // happen to agree.
+                            .child(
+                                zed_button(SharedString::from(format!("select-item-{label}")))
+                                    .text()
+                                    .rounded(px(0.))
+                                    .absolute()
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .p_0()
+                                    .aria_selected(selected)
+                                    .resting_tooltip(description.clone())
+                                    .accessibility_label(description)
+                                    .on_click(cx.listener({
+                                        let item = item.clone();
+                                        move |app, _, window, cx| {
+                                            cx.stop_propagation();
+                                            app.request_open_item(item.clone(), window, cx)
+                                        }
+                                    })),
+                            )
+                            .child(file_icons::element(
+                                format!("item-icon-{label}"),
+                                item.file(),
+                                false,
+                                px(14.),
+                                &roles,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .into_any_element(),
                     );
                 }
                 for _ in self
