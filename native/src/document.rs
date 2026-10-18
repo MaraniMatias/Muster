@@ -836,16 +836,21 @@ fn grammar_menu(
                 .h(px(GRAMMAR_ROW_PX))
                 .px_2()
                 .rounded(px(4.))
-                .font_family(crate::app::SIDEBAR_FONT_FAMILY)
+                .font_family(crate::app::UI_FONT_FAMILY)
                 .text_size(px(13.))
                 .line_height(px(18.))
                 .text_color(roles.text)
-                .cursor_pointer()
                 .role(Role::ListBoxOption)
                 .aria_label(accessibility_label)
                 .aria_selected(selected)
-                .when(selected, |row| row.bg(roles.hover))
-                .hover(|style| style.bg(roles.hover))
+                .when(selected, |row| row.bg(roles.selected))
+                .hover(|style| {
+                    style.bg(if selected {
+                        roles.selected_hover
+                    } else {
+                        roles.hover
+                    })
+                })
                 .child(div().flex_1().min_w_0().text_ellipsis().child(label))
                 .when(is_choice, |row| {
                     row.child(Icon::new(IconName::Check).size_3().text_color(roles.accent))
@@ -2009,7 +2014,7 @@ impl TerminalWindow {
                                             row.child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .text_size(px(10.))
+                                                    .text_size(px(11.))
                                                     .text_color(roles.status.success)
                                                     .child(format!("+{added}")),
                                             )
@@ -2021,7 +2026,7 @@ impl TerminalWindow {
                                             row.child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .text_size(px(10.))
+                                                    .text_size(px(11.))
                                                     .text_color(roles.status.danger_text)
                                                     .child(format!("−{removed}")),
                                             )
@@ -2124,6 +2129,7 @@ impl TerminalWindow {
                                         })
                                         .child(
                                             zed_button("save-document")
+                                                .primary()
                                                 .small()
                                                 .compact()
                                                 .label(if saving {

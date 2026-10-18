@@ -60,15 +60,11 @@ const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);
 /// against the cell rather than against the band.
 const SELECTION_COLOR: (u8, u8, u8, u8) = (0x74, 0xad, 0xe8, 0x3d);
 
-/// `--muster-scrollbar` from the legacy dark theme, painted as this app's own
-/// overlay: a toolkit scrollbar reserves width the grid would have to give
-/// back as columns, so the thumb covers the right edge and takes no layout.
-const SCROLLBAR_COLOR: (u8, u8, u8, u8) = (0xc8, 0xcc, 0xd4, 0x4c);
-/// Legacy's terminal scrollbar: a six pixel thumb two pixels in from the edge.
+/// The grid overlays its thumb at the same inset and minimum size as the
+/// toolkit scrollbar, rather than reserving a text column for it.
 const SCROLLBAR_WIDTH: Pixels = px(6.);
-const SCROLLBAR_INSET: Pixels = px(2.);
-/// A thumb thinner than this cannot be aimed with a mouse.
-const MIN_SCROLLBAR_THUMB: f32 = 28.;
+const SCROLLBAR_INSET: Pixels = px(4.);
+const MIN_SCROLLBAR_THUMB: f32 = 48.;
 
 /// Where this app's scrollbar thumb sits on a track of a known height.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1467,7 +1463,7 @@ impl Frame {
                 }
             }
         }
-        self.paint_scrollbar(bounds, snapshot, rows, window);
+        self.paint_scrollbar(bounds, snapshot, rows, window, cx);
         if !composition.is_empty() {
             if let Some((row, col)) = cursor {
                 if let (Some(source), Some(width_columns)) = (
@@ -1522,6 +1518,7 @@ impl Frame {
         snapshot: &TerminalSnapshot,
         rows: u16,
         window: &mut Window,
+        cx: &App,
     ) {
         let geometry = scrollbar_geometry(
             snapshot.history_size,
@@ -1542,7 +1539,7 @@ impl Frame {
                 size: gpui_kit::size(SCROLLBAR_WIDTH, height),
             },
             px(0.0),
-            rgba(SCROLLBAR_COLOR),
+            gpui_kit::component::Theme::global(cx).scrollbar_thumb,
             px(0.0),
             gpui_kit::transparent_black(),
             Default::default(),
@@ -3316,6 +3313,10 @@ mod tests {
     fn wheel_scrolls_history_and_typing_returns_to_the_live_view(
         cx: &mut gpui_kit::TestAppContext,
     ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::install(cx);
+        });
         let session = script_session("i=0; while [ $i -lt 200 ]; do printf 'history-%s\\n' \"$i\"; i=$((i+1)); done; printf Z; cat");
         let (view, cx) = cx.add_window_view(|_, cx| {
             TerminalView::new(

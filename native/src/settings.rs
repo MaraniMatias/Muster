@@ -221,6 +221,8 @@ fn settings_row(
             div()
                 .flex_1()
                 .min_w_0()
+                // Reserve the label and help-text lines so the control column stays on a grid.
+                .min_h(px(33.))
                 .child(
                     div()
                         .text_size(px(12.))
@@ -310,6 +312,8 @@ fn select_row(
         Select::new(picker)
             .id(id)
             .small()
+            .rounded(px(4.))
+            .bg(roles.surface_base)
             .accessibility_label(label),
     )
 }
@@ -328,6 +332,7 @@ fn size_row(
         div().w(px(96.)).flex().items_center().gap(px(6.)).child(
             Input::new(input)
                 .id(id)
+                .small()
                 .bg(roles.surface_base)
                 // A field is a control, not an overlay: Zed rounds one `rounded_sm`,
                 // where the theme's own radius is the overlay's 8px.

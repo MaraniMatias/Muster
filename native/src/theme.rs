@@ -1,9 +1,9 @@
-//! Legacy's dark colour vocabulary, installed into the toolkit's theme.
+//! The native app's dark design system, installed into the toolkit's theme.
 //!
 //! Every surface, ink, hairline and state wash the window draws is named here
 //! once and taken from [`Theme`], which is the same theme GPUI Kit's own
 //! components paint with. A row drawn by hand and a menu drawn by the toolkit
-//! are therefore the same colour rather than two constants that agree today.
+//! therefore share one palette and state language.
 //!
 //! ## Shape: Zed's radii, the toolkit's sizes
 //!
@@ -18,8 +18,8 @@
 //!
 //! ## Dark only
 //!
-//! [`install`] applies the dark tokens from `legacy/src/muster.css` before the
-//! first window opens. There is no preference, switch or system follow.
+//! [`install`] applies the app's dark tokens before the first window opens.
+//! There is no preference, switch or system-appearance follow.
 //!
 //! ## Not the terminal's palette
 //!
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle, LanguageConfig};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{px, rgb, rgba, App, ElementId, Hsla};
+use gpui_kit::{px, rgb, rgba, App, ElementId, Hsla, Styled};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
@@ -242,7 +242,7 @@ const DOTENV_HIGHLIGHTS: &str = r#"
 "$" @operator
 "#;
 
-/// Install Legacy dark for both toolkit widgets and application-owned drawing.
+/// Install the native dark palette for toolkit widgets and application-owned drawing.
 /// `Theme::update` also synchronizes renderable tokens and the Base layer.
 pub fn install(cx: &mut App) {
     // C++'s upstream query contains only its additions to C. The toolkit
@@ -355,7 +355,7 @@ pub fn install(cx: &mut App) {
         theme.foreground = text;
         // One hairline everywhere the toolkit draws an edge: `border` for the
         // overlays it paints itself, `input` for a field and `sidebar_border`
-        // for the panel, all three Legacy's `--muster-border`.
+        // for the panel.
         theme.border = border;
         theme.input = border;
         theme.muted = control;
@@ -374,7 +374,7 @@ pub fn install(cx: &mut App) {
         theme.accent = hover;
         theme.accent_foreground = text;
         theme.primary = accent;
-        // Legacy's filled buttons use CSS brightness, not an HSL lightening.
+        // Keep the filled-button hover ramp subtle without changing its hue.
         let brightness = |color: Hsla, factor: f32| {
             let mut color = color.to_rgb();
             color.r = (color.r * factor).min(1.);
@@ -401,7 +401,7 @@ pub fn install(cx: &mut App) {
         theme.button_secondary_hover = hover;
         theme.button_secondary_active = pressed;
         theme.button_secondary_foreground = text;
-        // Legacy danger actions are outlined, not a solid red fill.
+        // Danger actions are outlined rather than solid red.
         theme.danger = danger;
         theme.danger_foreground = danger_text;
         theme.danger_hover = danger.alpha(0.12);
@@ -414,7 +414,7 @@ pub fn install(cx: &mut App) {
         theme.success_foreground = success;
         theme.warning = warning;
         theme.warning_foreground = warning;
-        // Legacy has no separate info token; informational chrome uses accent.
+        // Informational chrome uses the accent because it has no separate token.
         theme.info = accent;
         theme.info_foreground = accent;
         theme.ring = accent;
@@ -436,25 +436,14 @@ pub fn install(cx: &mut App) {
         theme.link_hover = accent;
         theme.link_active = accent;
         theme.window_border = border;
-        // One face for the whole app, which is what `--muster-font` is in
-        // Legacy. The toolkit's root refines every window's surface with
-        // `font_family`, so this is the one line that takes Fira Code to the
-        // chrome that names no family of its own — the diff's header, the
-        // inspector's rows, the toolbars — and to the toolkit's own widgets.
-        // `font_size` is left alone on purpose: the toolkit derives the window's
-        // `rem` from it, so moving it would rescale every `text_*` in the
-        // window at once. What has to match Legacy is written in pixels where
-        // it is drawn.
-        theme.font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
-        // The read-only document and the diff are the app's code, and Legacy
-        // drew them in this app's face rather than the toolkit's default.
-        //
-        // The size is not Legacy's: Legacy's editor read at 13px and its code
-        // looked smaller than the terminal beside it, which is the first thing
-        // a reader of both in one window notices. This is the terminal's own
-        // `FONT_SIZE`, so the grid, the document and the diff are one size of
-        // letter, and moving the grid moves all three with it.
-        theme.mono_font_family = crate::app::SIDEBAR_FONT_FAMILY.into();
+        // Interface chrome uses the platform UI face; code panes use Fira Code.
+        // Keeping these roles separate makes labels, menus and controls feel
+        // native without changing the terminal, document or diff typography.
+        theme.font_family = crate::app::UI_FONT_FAMILY.into();
+        theme.mono_font_family = crate::app::MONO_FONT_FAMILY.into();
+        // The grid, document and diff share one monospace size so adjacent code
+        // surfaces remain aligned when the terminal font size changes.
+        // `font_size` remains the toolkit's base UI scale.
         theme.mono_font_size = crate::terminal::FONT_SIZE;
         // Zed's two corner radii, in the places the toolkit keeps them. A
         // control in Zed is rounded 4px (`rounded_sm`) and an overlay — a
@@ -501,8 +490,11 @@ pub fn install(cx: &mut App) {
 /// where the default variant dimmed the fill as well. That is what every
 /// borderless variant in the toolkit does, and a dimmed label on an unchanged
 /// fill still says "not now" next to a pointer that no longer answers.
+///
+/// The native arrow cursor is explicit because the toolkit's text variant
+/// otherwise opts into a pointing hand intended for link-like content.
 pub fn zed_button(id: impl Into<ElementId>) -> Button {
-    Button::new(id).secondary().rounded(px(4.))
+    Button::new(id).secondary().rounded(px(4.)).cursor_default()
 }
 
 /// Every capture name a grammar this app compiles in can emit, and the Legacy
@@ -808,7 +800,7 @@ pub struct Roles {
     /// The role exists so the window has one name for it, and a test below
     /// stops the name and the ring from drifting apart.
     pub focus: Hsla,
-    /// The accent bar on the selected row, and the tick on a chosen crumb.
+    /// The primary action and small affirmative marks such as selected checkmarks.
     pub accent: Hsla,
     /// The wash a control that cannot be used wears instead of its own.
     pub disabled_surface: Hsla,
@@ -1024,7 +1016,7 @@ mod tests {
         })
     }
 
-    // Only the fallback dark block is read, never the light overrides.
+    // Syntax captures remain pinned to the project's previous token contract; UI chrome does not.
     fn legacy(token: &str) -> Hsla {
         let css = include_str!("../../legacy/src/muster.css");
         let dark = css.split(":root[data-theme=\"light\"]").next().unwrap();
@@ -1032,7 +1024,7 @@ mod tests {
         let value = dark
             .lines()
             .find_map(|line| line.trim().strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("missing dark token: {token}"))
+            .unwrap_or_else(|| panic!("missing syntax token: {token}"))
             .trim_end_matches(';');
         let value_number = u32::from_str_radix(value, 16).unwrap();
         if value.len() == 8 {
@@ -1043,60 +1035,48 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn every_role_matches_legacy_dark(cx: &mut TestAppContext) {
+    fn roles_follow_the_installed_native_theme(cx: &mut TestAppContext) {
         let roles = dark(cx);
-        for (role, token) in [
-            (roles.surface_base, "bg-0"),
-            (roles.surface, "bg-1"),
-            (roles.surface_raised, "bg-2"),
-            (roles.surface_inset, "bg-1"),
-            (roles.text, "text"),
-            (roles.text_muted, "text-muted"),
-            (roles.text_disabled, "text-disabled"),
-            (roles.border, "border"),
-            (roles.border_strong, "border-strong"),
-            (roles.hover, "el-hover"),
-            (roles.pressed, "el-active"),
-            (roles.selected, "el-selected"),
-            (roles.selected_hover, "el-selected"),
-            (roles.focus, "focus"),
-            (roles.accent, "accent"),
-            (roles.disabled_surface, "el"),
-            (roles.drag, "accent"),
-            (roles.status.added, "content-added"),
-            (roles.status.removed, "content-removed"),
-            (roles.status.warning, "warning"),
-            (roles.status.danger, "danger"),
-            (roles.status.danger_text, "danger-fg"),
-            (roles.status.success, "success"),
-            (roles.status.info, "accent"),
-        ] {
-            assert_eq!(role, legacy(token), "role differs from --muster-{token}");
-            assert!(role.is_opaque(), "{token} must be opaque");
-        }
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            for (role, theme_color, name) in [
+                (roles.surface_base, theme.background, "surface_base"),
+                (roles.surface, theme.sidebar, "surface"),
+                (roles.surface_raised, theme.popover, "surface_raised"),
+                (roles.text, theme.sidebar_foreground, "text"),
+                (roles.text_muted, theme.muted_foreground, "text_muted"),
+                (roles.border, theme.sidebar_border, "border"),
+                (roles.hover, theme.secondary_hover, "hover"),
+                (roles.pressed, theme.secondary_active, "pressed"),
+                (roles.selected, theme.list_active, "selected"),
+                (roles.focus, theme.ring, "focus"),
+                (roles.accent, theme.primary, "accent"),
+                (roles.status.warning, theme.warning, "warning"),
+                (roles.status.danger, theme.danger, "danger"),
+                (roles.status.success, theme.success, "success"),
+                (roles.status.info, theme.info, "info"),
+            ] {
+                assert_eq!(role, theme_color, "role diverged from theme: {name}");
+                assert!(role.is_opaque(), "{name} must be opaque");
+            }
+            assert_eq!(roles.row_hover(true), roles.selected_hover);
+            assert_eq!(roles.selected_hover, roles.selected);
+            assert_eq!(roles.disabled_surface, theme.muted);
+        });
     }
 
     #[gpui_kit::test]
-    fn the_whole_app_is_drawn_in_legacy_face_and_the_code_at_the_terminals_size(
-        cx: &mut TestAppContext,
-    ) {
+    fn interface_and_code_use_distinct_font_families(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install(cx);
         });
         cx.read(|cx| {
             let theme = Theme::global(cx);
-            // The toolkit's root refines each window's surface with this, so
-            // it is what every element that names no family of its own draws
-            // with — the same one face `--muster-font` is in Legacy.
-            assert_eq!(theme.font_family, crate::app::SIDEBAR_FONT_FAMILY);
-            assert_eq!(theme.mono_font_family, crate::app::SIDEBAR_FONT_FAMILY);
-            // The terminal's size, which the document and the diff read at as
-            // well: one size of letter in one window. Legacy's editor was
-            // 13px, and the grid is 16px.
+            assert_eq!(theme.font_family, crate::app::UI_FONT_FAMILY);
+            assert_eq!(theme.mono_font_family, crate::app::MONO_FONT_FAMILY);
+            assert_ne!(theme.font_family, theme.mono_font_family);
             assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
-            // Not changed on purpose: the toolkit derives the window's `rem`
-            // from it, so every `text_*` in the app would move with it.
             assert_eq!(theme.font_size, px(16.));
         });
     }
@@ -1195,7 +1175,6 @@ mod tests {
                 ),
                 (theme.ring, theme.tokens.ring, "focus"),
             ] {
-                assert_eq!(color, legacy(reference), "{reference}");
                 assert_eq!(token.color, color, "stale toolkit token: {reference}");
                 assert_eq!(
                     token.background,
@@ -1203,14 +1182,14 @@ mod tests {
                     "stale background: {reference}"
                 );
             }
-            assert_eq!(theme.overlay, legacy("bg-0").alpha(0.8));
-            assert_eq!(theme.button_danger_hover, legacy("danger").alpha(0.12));
-            assert_eq!(theme.button_danger_active, legacy("danger").alpha(0.20));
+            assert_eq!(theme.overlay, theme.background.alpha(0.8));
+            assert_eq!(theme.button_danger_hover, theme.danger.alpha(0.12));
+            assert_eq!(theme.button_danger_active, theme.danger.alpha(0.20));
         });
     }
 
     #[gpui_kit::test]
-    fn selection_wins_over_hover_as_in_legacy(cx: &mut TestAppContext) {
+    fn selection_wins_over_hover(cx: &mut TestAppContext) {
         let roles = dark(cx);
         assert_eq!(roles.row_rest(false), roles.surface);
         assert_eq!(roles.row_hover(false), roles.hover);
@@ -1235,8 +1214,7 @@ mod tests {
             assert!(contrast(roles.text, surface) >= 4.5);
             assert!(contrast(roles.focus, surface) >= 3.);
         }
-        // Legacy secondary text does not meet 4.5:1 on every state. Pin its
-        // exact token above instead of silently replacing it with lighter ink.
+        // Secondary text is less prominent but remains readable on the panel.
         assert!(contrast(roles.text_muted, roles.surface) >= 4.5);
     }
 
@@ -1266,35 +1244,28 @@ mod tests {
         paints(cx, renamed).and_then(|style| style.color)
     }
 
-    /// Assert that a content colour is Legacy's token, exactly.
+    /// Assert that a syntax token resolves to the expected content color.
     ///
     /// A highlight theme is installed by deserializing the toolkit's own
-    /// `#rrggbb` spelling of a colour, so a token arrives as the value Legacy
-    /// wrote rather than as a float that went somewhere and came back.
+    /// `#rrggbb` spelling, so the token arrives as the authored value rather
+    /// than as a float that went somewhere and came back.
     fn assert_token(actual: Option<Hsla>, expected: Hsla) {
         assert_eq!(actual, Some(expected));
     }
 
     #[gpui_kit::test]
-    fn content_surfaces_and_syntax_tokens_come_from_legacy(cx: &mut TestAppContext) {
+    fn content_surface_uses_grid_background_and_syntax_tokens_are_stable(cx: &mut TestAppContext) {
         let roles = dark(cx);
         cx.update(|cx| {
             let theme = Theme::global(cx);
             assert_eq!(theme.mode, ThemeMode::Dark);
             let ink = theme.highlight_theme.style.editor_foreground;
             let numbers = theme.highlight_theme.style.editor_line_number;
-            // The diff paints an added and a removed line with the toolkit's own
-            // status colours, which are these two chrome tokens.
-            assert_eq!(theme.danger, legacy("danger"));
-            assert_eq!(theme.success, legacy("success"));
             for (color, token) in [(ink, "content-text"), (numbers, "content-text-faint")] {
                 assert_token(color, legacy(token));
             }
         });
-        // The document, the diff and the terminal grid are one surface: the body
-        // of the window, which is the base the chrome is painted on. Legacy's
-        // `--muster-content-bg-0` is a well for a document drawn inside a page,
-        // and this window has no page.
+        // The document, diff and terminal grid share the window's body surface.
         let grid = crate::terminal::Palette::default().background;
         let grid = Hsla::from(rgb((grid.0 as u32) << 16
             | (grid.1 as u32) << 8

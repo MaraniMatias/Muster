@@ -40,13 +40,10 @@ pub(crate) fn file_marker(status: &str) -> &'static str {
     }
 }
 
-/// The wash a row wears, and the bar the open one carries.
+/// The row surface, with selection retained while the pointer is over it.
 ///
-/// Hover refines after the rest style, so one closure has to answer both: a row
-/// that answers the pointer with the plain hover stops looking open for
-/// exactly as long as the pointer rests on it. The bar is drawn inside the
-/// row's own box rather than as a border, so opening a row does not move the
-/// name it holds.
+/// Hover refines after the rest style, so one closure has to answer both states
+/// instead of replacing the selected surface with the plain hover surface.
 fn row_chrome(
     row: gpui_kit::Stateful<gpui_kit::Div>,
     roles: Roles,
@@ -59,17 +56,6 @@ fn row_chrome(
     row.hover(|style| style.bg(roles.row_hover(selected)).text_color(roles.text))
         .when(selected, |row| {
             row.bg(roles.row_rest(true)).text_color(roles.text)
-        })
-        .when(selected, |row| {
-            row.child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .bottom(px(0.))
-                    .w(px(2.))
-                    .bg(roles.accent),
-            )
         })
 }
 
@@ -577,7 +563,6 @@ fn sticky_row(
             .h(px(ROW_HEIGHT))
             .pl(indent)
             .pr(px(8.))
-            .cursor_pointer()
             .child(
                 div()
                     .flex_shrink_0()
@@ -1936,7 +1921,7 @@ impl TerminalWindow {
                     .px_3()
                     .py_1()
                     .text_color(roles.status.warning)
-                    .child(format!("root/: {error}")),
+                    .child(format!("Could not list the checkout root: {error}")),
             );
             let rrepo = repo.clone();
             let rcheckout = checkout.clone();
@@ -1944,7 +1929,7 @@ impl TerminalWindow {
                 zed_button("retry-list-root")
                     .ghost()
                     .small()
-                    .label("Retry root/")
+                    .label("Retry")
                     .accessibility_label("Retry listing the checkout root")
                     .on_click(cx.listener(move |app, _, window, cx| {
                         app.request_directory(

@@ -223,6 +223,46 @@ fn repo_menu_trigger_stays_visible_until_escape_dismisses_its_menu(cx: &mut Test
 }
 
 #[gpui_kit::test]
+fn repo_fold_target_covers_the_heading_height(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    for click_top_edge in [true, false] {
+        let was_folded = fixture.view.read_with(cx, |app, _| {
+            app.navigation.folded_repos.contains(&fixture.repo_id)
+        });
+        cx.update_window(fixture.handle, |_, window, cx| {
+            let fold = window
+                .find(format!("fold-repo-{}", fixture.repo_id))
+                .bounds();
+            assert!(
+                fold.size.height >= px(26.),
+                "fold hitbox spans the heading: {fold:?}"
+            );
+            let y = if click_top_edge {
+                fold.top() + px(1.)
+            } else {
+                fold.bottom() - px(1.)
+            };
+            let position = gpui_kit::point(fold.left() + px(12.), y);
+            pointer_move(window, position, None, cx);
+            pointer_down(window, position, cx);
+            pointer_up(window, position, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let is_folded = fixture.view.read_with(cx, |app, _| {
+            app.navigation.folded_repos.contains(&fixture.repo_id)
+        });
+        assert_ne!(
+            is_folded,
+            was_folded,
+            "clicking the {} edge should toggle the repository",
+            if click_top_edge { "top" } else { "bottom" }
+        );
+    }
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
 fn protected_checkouts_have_no_lifecycle_controls(cx: &mut TestAppContext) {
     let fixture = open(cx);
     let home = "checkout:home-worktree";

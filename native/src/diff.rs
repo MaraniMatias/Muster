@@ -1,6 +1,6 @@
 //! Retained, virtualized unified code review surface.
 use crate::{
-    app::{InspectorTab, TerminalWindow, SIDEBAR_FONT_FAMILY},
+    app::{InspectorTab, TerminalWindow, UI_FONT_FAMILY},
     theme::{zed_button, Roles},
     tooltip::RestingTooltip,
 };
@@ -778,7 +778,7 @@ impl TerminalWindow {
             // header row stays where it is — the letter, the path and the counts
             // answer what changed without scrolling after them.
             .soft_wrap(true)
-            .font_family(SIDEBAR_FONT_FAMILY)
+            .font_family(UI_FONT_FAMILY)
             .text_size(px(DIFF_CHROME_PX))
             .render_header(move |file, _, _| {
                 let (status, added, removed) =
@@ -803,7 +803,6 @@ impl TerminalWindow {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .cursor_pointer()
                     .on_click(move |_, _, cx| toggle.apply(cx))
                     .min_w_0()
                     .gap(px(6.))
@@ -813,7 +812,7 @@ impl TerminalWindow {
                                 .id(format!("diff-status-{}", file.path()))
                                 .test_support()
                                 .flex_shrink_0()
-                                .text_size(px(10.))
+                                .text_size(px(11.))
                                 .text_color(match marker.as_str() {
                                     "A" => roles.status.success,
                                     "D" => roles.status.danger_text,
@@ -873,7 +872,7 @@ impl TerminalWindow {
                     return div()
                         .id("review-composer-card")
                         .test_support()
-                        .font_family(SIDEBAR_FONT_FAMILY)
+                        .font_family(UI_FONT_FAMILY)
                         .text_size(px(12.))
                         // The toolkit draws every annotation inside a padded box.
                         // The composer is the one annotation that is a row of the
@@ -901,7 +900,7 @@ impl TerminalWindow {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .text_size(px(10.))
+                                .text_size(px(11.))
                                 .text_color(roles.text_muted)
                                 .child(
                                     div()
@@ -919,6 +918,8 @@ impl TerminalWindow {
                                         Select::new(picker)
                                             .id("review-range-start")
                                             .xsmall()
+                                            .rounded(px(4.))
+                                            .bg(roles.surface_base)
                                             .menu_width(px(96.))
                                             .accessibility_label("First line of the range"),
                                     ),
@@ -936,7 +937,7 @@ impl TerminalWindow {
                                 .rounded(px(4.))
                                 .px_2()
                                 .py_1()
-                                .font_family(SIDEBAR_FONT_FAMILY)
+                                .font_family(UI_FONT_FAMILY)
                                 .text_size(px(12.))
                                 .aria_label("Review note")
                                 .into_any_element(),
@@ -950,6 +951,7 @@ impl TerminalWindow {
                                 .flex_row_reverse()
                                 .child(
                                     zed_button("save-review-note")
+                                        .primary()
                                         .small()
                                         .compact()
                                         .h(px(20.))
@@ -1160,6 +1162,7 @@ impl TerminalWindow {
                                     div().id("review-export").test_support().flex().flex_none()
                                         .child(
                                             zed_button("review-primary-action")
+                                                .primary()
                                                 .small().compact().h(px(24.))
                                                 .rounded_l(px(4.)).rounded_r_none()
                                                 .label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
@@ -1170,6 +1173,7 @@ impl TerminalWindow {
                                         )
                                         .child(
                                             zed_button("review-destination")
+                                                .primary()
                                                 .small().compact().h(px(24.))
                                                 .rounded_r(px(4.)).rounded_l_none()
                                                 .dropdown_caret(true)
@@ -1218,7 +1222,7 @@ impl TerminalWindow {
                                     })),
                         )
                         .child(div().id("review-secondary-row").test_support()
-                            .flex().items_center().gap_2().min_w_0().text_size(px(9.))
+                            .flex().items_center().gap_2().min_w_0().text_size(px(11.))
                             .when(note_count > 0, |row| row.child(div().id("review-note-count").test_support()
                                 .text_color(roles.text_muted).child(format!("{note_count} {}", if note_count == 1 { "note" } else { "notes" }))))
                             .when(has_outdated, |row| {
@@ -1228,13 +1232,13 @@ impl TerminalWindow {
                                     .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
                             })
                             .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
-                                .text().small().compact().h(px(18.)).label("OpenCode session").resting_tooltip(session.clone())
+                                .text().small().compact().h(px(20.)).label("Copy session ID").resting_tooltip(session.clone())
                                 .accessibility_label("Copy the app-created OpenCode session id")
                                 .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(session.clone())))))
                             .when_some(opencode_status, |row, status| row.child(div().id("opencode-review-status").test_support()
-                                .text_size(px(9.)).text_color(roles.text_muted).child(status)))
+                                .text_size(px(11.)).text_color(roles.text_muted).child(status)))
                             .when_some(opencode_error, |row, error| row.child(div().id("opencode-review-error").test_support()
-                                .text_size(px(9.)).text_color(roles.status.danger_text).child(error)))
+                                .text_size(px(11.)).text_color(roles.status.danger_text).child(error)))
                             .when_some(opencode_rounds.iter().find(|round| opencode_selected && (round.status.is_pending()
                                 || round.status == muster_core::opencode::RoundStatus::Unknown))
                                 .map(|round| (round.id.clone(), round.status)), |row, (round_id, status)| {

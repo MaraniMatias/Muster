@@ -72,69 +72,33 @@ docs/             the migration plan, and what the port has to satisfy
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
   `linux-build` job in `.github/workflows/ci.yml` for the current list.
 
-## Colour: roles, not values
+## Native UI design system
 
-`native/src/theme.rs` is the only place this app names a chrome colour. Its
-`install` function applies Legacy's dark tokens to GPUI Kit with `Theme::update`
-before the first window opens; it must not use the toolkit's default dark
-palette. Every surface, ink, hairline and state wash is a `Roles` field, so
-application drawing and toolkit widgets share that installed palette.
-`docs/native-rust-migration/dark-colors.md` records the token equivalence and
-remaining component-level differences. Adding a `rgb(0x...)` anywhere
-else is the thing to catch in review.
+`native/src/theme.rs` owns the app's dark palette, semantic roles, and common
+control styling. UI chrome uses the platform UI font; Fira Code is reserved for
+the terminal, source editor, diff text, and other code/text previews. Do not use
+Legacy as the authority for native UI appearance. Keep product colors and state
+colors in the theme instead of adding raw color values at call sites.
 
-The states the roles have to cover, and what each one is for:
+Use the toolkit's semantic button variants consistently: default for ordinary
+actions, primary only for the commit action in a decision area, danger for
+irreversible/destructive actions, and ghost/text for quiet toolbar or inline
+actions. Disabled controls stay visibly disabled without changing a primary or
+destructive action into a misleading neutral action. Native controls and
+in-app commands use the default arrow cursor; reserve the pointing hand for
+actual external links.
 
-| role                                                         | state it paints                                                 |
-| ------------------------------------------------------------ | --------------------------------------------------------------- |
-| `surface_base`, `surface`, `surface_raised`, `surface_inset` | application/field, panel, overlay, recessed well                |
-| `text`, `text_muted`, `text_disabled`                        | primary, secondary, not actionable                              |
-| `border`, `border_strong`                                    | hairline, overlay edge                                          |
-| `hover`, `pressed`                                           | pointer on, control held                                        |
-| `selected`, `selected_hover`                                 | this window's open row, and the same row with the pointer on it |
-| `focus`                                                      | the ring a focused control wears                                |
-| `disabled_surface`                                           | a row that cannot be chosen                                     |
-| `accent`, `drag`                                             | the selection bar and a chosen crumb; a slot being dropped into |
-| `status.*`                                                   | added, removed, waiting, failed, done, worth reading            |
+Use one compact geometry system across screens: 4px corners on controls,
+8px corners on overlays, a small set of sizes for compact rows/toolbars and
+regular actions, and consistent input/select heights within a form. Prefer
+semantic toolkit sizes and shared helpers over one-off dimensions. Keep hover,
+pressed, selected and focus-visible distinct; a selected row must remain
+selected while hovered. Selected navigation uses its own surface and text
+state, not a one-sided accent bar.
 
-`Roles::row_rest` and `Roles::row_hover` are the one place a row's
-state-to-colour combination is decided, because GPUI refines a hover style
-after the rest style: a drawing that answers both in its own closure will paint
-the open row's hover over its selection for exactly as long as the pointer is
-resting on it.
-
-## Shape: Zed's radii, the toolkit's sizes
-
-GPUI Kit is **not** the widget library Zed draws with. Only the core is: the
-toolkit depends on `gpui-pre`, a snapshot of Zed's `gpui`, so the primitives and
-the focus handling are Zed's. The _widgets_ are longbridge's `gpui-component`,
-a shadcn-flavoured design system, where Zed's buttons and overlays live in Zed's
-own unpublished crate. So a control drawn here wears the toolkit's shape unless
-this app says otherwise, and `theme::install` is where it says so:
-
-| what                | where                             | value                                            |
-| ------------------- | --------------------------------- | ------------------------------------------------ |
-| an overlay's corner | `theme.radius`, `theme.radius_lg` | `8px`, Zed's `rounded_lg`                        |
-| a button's corner   | `theme::zed_button`               | `4px`, Zed's `rounded_sm`                        |
-| a button's outline  | `theme::zed_button`               | none; Zed fills a control and gives it no border |
-
-The toolkit keeps **one** radius token for both roles, so `install` gives it the
-overlay's `8px` — its dropdown menus and popovers read that one — and the
-controls name Zed's `4px` where they are built. A control must therefore not be
-left to the token: a button through `theme::zed_button`, and the dialog's own
-fields where they are.
-
-A button is built with `theme::zed_button(id)`, which is the toolkit's
-`Secondary` variant: `install` gives `button`, `button_hover`, `button_active`
-and their foregrounds to both `Default` and `Secondary`, so the fill, the
-pointer ramp and the ink are the ones already installed and only the 1px
-hairline box goes. A control that means to be one of Zed's other buttons says
-so after it — `.ghost()`, `.text()`, `.custom(..)`, `.danger()` — which is why
-those calls still exist at call sites.
-
-What no token reaches is the size ladder: the toolkit hardcodes 20/24/32px
-where Zed's is 22/28/32, so a `.small()` button here is 4px shorter than Zed's
-`Medium`. Correcting that means pinning `.h(..)` per button, which is not done.
+`Roles::row_rest` and `Roles::row_hover` are the one place a row's state-to-
+colour combination is decided. GPUI refines hover after the rest style, so a
+selected row's hover must preserve its selected treatment.
 
 ### Not the terminal's palette
 
@@ -144,11 +108,10 @@ application draws it verbatim, and no role here reaches `TerminalHost::resolve_c
 There is no terminal preference, no theme preference and no switcher: one
 appearance, dark, chosen by `main.rs` before the first window opens.
 
-The grid is the window's body, so the document and the diff share its
-background: `highlight_theme.editor.background` is `theme.background`, and
-Legacy's `--muster-content-bg-0` (`#222436`, a violet well for a document drawn
-inside a page) has no role. One background for the terminal, the editor and the
-diff is `theme::tests::content_surfaces_and_syntax_tokens_come_from_legacy`.
+The terminal grid, editor and diff share one body background:
+`highlight_theme.editor.background` is `theme.background`. Keep terminal palette
+colors separate from the UI theme; no chrome role reaches
+`TerminalHost::resolve_color`.
 
 ### Syntax: two tables, and why there are two
 
@@ -206,11 +169,11 @@ floor rather than the number that was written down.
 
 ## The file tree
 
-`native/src/inspector.rs` owns the Files tree and draws it the way Legacy does: a
-scrolling box with a window of rows built either side of the top and the rest of the tree
-accounted for as space above and below, so the scrollbar is the tree's and not the
-window's. It is deliberately **not** `gpui::uniform_list`: that does not publish where it
-is scrolled to, and the folder stack drawn over the rows it names is exactly that number.
+`native/src/inspector.rs` owns the Files tree: a scrolling box with a window of
+fixed-height rows built either side of the top and the rest of the tree accounted
+for as space above and below, so the scrollbar belongs to the tree, not the window.
+It is deliberately **not** `gpui::uniform_list`: that does not publish where it is
+scrolled to, and the folder stack drawn over the rows it names is exactly that number.
 `ScrollHandle::offset()` is.
 
 Three rules the tree depends on, each pinned by a test:
@@ -251,32 +214,27 @@ Three rules it depends on, each pinned by a test:
 ## The review composer
 
 `native/src/diff.rs` draws the note being written as a row of the diff and
-`native/src/review.rs` owns the draft. It is Legacy's composer: the range label
-and then the picker, the field that turns the accent blue while it has focus (what
-`.review-note-input:focus` did there), Legacy's sentence about what a range covers
-and its two buttons with room around them. What is _not_ Legacy's is the margin
-around it — the toolkit draws every annotation inside a `px_3 py_3` box, and the
-composer takes that padding back with `m_neg_3` so the card sits flush between the
-lines above and below it.
+`native/src/review.rs` owns the draft. It composes a range label, a `Select` over
+the line numbers a range could start on, a `Textarea`, and Save/Cancel actions.
+The picker uses the toolkit's `Vec<SharedString>` delegate so each candidate is
+only a line label. The toolkit places each annotation in a padded box; the composer
+takes back that padding with `m_neg_3` so the card sits flush between diff lines.
 
-What it wears is the toolkit's own widgets rather than a hand-rolled imitation of
-them: the range picker is a `Select` over the line numbers a range could start on
-(the delegate is the toolkit's `Vec<SharedString>`, so a candidate is a line
-number and nothing else), and the two keys the card answers are drawn with `Kbd`,
-which is what keeps the hint correct off macOS without the card spelling out a
-platform pair.
+Keyboard behavior is part of the composer contract: the platform modifier+Return
+saves by intercepting Return before the `Textarea`, plain Return inserts a newline,
+and Escape cancels. The shortcut is not currently shown in the card.
 
 Both sides of a change are sides: a note opens on a line the diff **removed** as
 readily as on one it added, widens over removed lines, is washed over them, and is
 saved and exported against `ReviewSide::Old`. Nothing about the composer treats
 the added side as the real one.
 
-**A removed line is a negative number**, and the picker and the export say the
-same thing: `review_line_label` writes `-3` for old line 3 and `3` for new line 3,
-and the Markdown fence carries the same sign (` ```js{-3,-72} `). The sign is
-the only thing in an exported document that says which side of the change a comment
-is about, and the offer and the record cannot disagree because they are one
-function's word.
+**Exported old-side lines are negative numbers**: `review_line_label` writes `-3`
+for old line 3 and `3` for new line 3, and the Markdown fence carries that side
+(` ```js{-3,-72} `). The composer's picker additionally prefixes a newly added
+line with `+` and an old-side line with `-`; unchanged new-side context stays
+unprefixed. Those picker marks help distinguish diff rows and do not change the
+export format.
 
 Five rules it depends on, each pinned by a test:
 
@@ -302,7 +260,7 @@ Five rules it depends on, each pinned by a test:
 - **⌘↵ saves, and it is an interceptor rather than a key handler.** Interceptors
   run before the input's own Return, so stopping it there is what keeps the
   keystroke from also inserting the newline a plain Return writes. Enter on its own
-  still writes one, as Legacy's textarea did, and `esc` still cancels.
+  still writes one, and `esc` still cancels.
 
 ## The preferences panel
 

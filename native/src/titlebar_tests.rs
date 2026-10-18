@@ -29,6 +29,8 @@ fn the_bar_draws_the_crumb_line_over_the_actions(cx: &mut TestAppContext) {
         let crumb = window.find("repo-crumb").bounds();
         let settings = window.find("settings").bounds();
         let action = window.find("toggle-panels").bounds();
+        assert_eq!(crumb.size.height, settings.size.height);
+        assert_eq!(settings.size.height, action.size.height);
         assert!(window.find("settings").visible());
         assert!(
             crumb.bottom() <= px(32.),

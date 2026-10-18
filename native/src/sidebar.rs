@@ -30,7 +30,7 @@ use muster_core::workspace::RepoKind;
 
 use crate::app::{
     sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
-    sidebar_text_width, toggle, ButtonA11y, TerminalWindow, SIDEBAR_FONT_FAMILY,
+    sidebar_text_width, toggle, ButtonA11y, TerminalWindow, UI_FONT_FAMILY,
 };
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
 use crate::terminal::ShellState;
@@ -56,7 +56,7 @@ pub(crate) fn foreground_program_icon(
             .size(size)
             .items_center()
             .justify_center()
-            .font_family(SIDEBAR_FONT_FAMILY)
+            .font_family(UI_FONT_FAMILY)
             .text_size(size)
             .line_height(size)
             .text_color(color)
@@ -440,7 +440,6 @@ impl TerminalWindow {
                 .flex()
                 .items_end()
                 .w_full()
-                .when(!dragging, |heading| heading.cursor_pointer())
                 .hover(|style| style.bg(roles.hover))
                 .pl(px(10.))
                 .pr(px(8.))
@@ -453,8 +452,8 @@ impl TerminalWindow {
                         .absolute()
                         .left(px(10.))
                         .right(px(if has_menu { 36. } else { 8. }))
-                        .top(px(8.))
-                        .h(px(17.))
+                        .top_0()
+                        .bottom_0()
                         .p_0()
                         .when(dragging, |button| {
                             button.cursor(gpui_kit::CursorStyle::ClosedHand)
@@ -633,7 +632,6 @@ impl TerminalWindow {
                     .h(px(26.))
                     .gap(px(7.))
                     .px(px(8.))
-                    .when(!dragging && !checkout.is_missing, |row| row.cursor_pointer())
                     .when(
                         !dragging && checkout.is_missing,
                         |row| row.cursor(gpui_kit::CursorStyle::OperationNotAllowed),
@@ -643,17 +641,6 @@ impl TerminalWindow {
                     // plain one and stays legible as the open row.
                     .hover(|style| style.bg(roles.row_hover(selected)))
                     .when(selected, |row| row.bg(roles.row_rest(true)))
-                    .when(selected, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left(px(0.))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .w(px(2.))
-                                .bg(roles.accent),
-                        )
-                    })
                     .on_click(cx.listener({
                         let row_select_id = select_id.clone();
                         move |app, _, window, cx| app.select_checkout_row(&row_select_id, window, cx)
@@ -739,7 +726,6 @@ impl TerminalWindow {
                             Some((added, removed)) => row.child(
                                 div()
                                     .id(SharedString::from(format!("diff-{id}")))
-                                    .cursor_pointer()
                                     .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener({ let id=id.clone(); move |app,_,window,cx| { cx.stop_propagation(); app.select_checkout_row(&id, window, cx); } }))
                                     .flex_none()
                                     .flex()
@@ -826,7 +812,6 @@ impl TerminalWindow {
                             zed_button(SharedString::from(format!("dismiss-missing-{id}")))
                                 .custom(sidebar_action_style(cx))
                                 .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                .when(!dragging, |button| button.cursor_pointer())
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -861,7 +846,6 @@ impl TerminalWindow {
                                 zed_button(SharedString::from(format!("worktree-actions-{id}")))
                                     .custom(sidebar_action_style(cx))
                                     .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                    .when(!dragging, |button| button.cursor_pointer())
                                     .rounded(px(0.))
                                     .absolute()
                                     .right(px(8.))
@@ -1079,7 +1063,6 @@ impl TerminalWindow {
                         .relative()
                         .pl(px(12.))
                         .pr(px(8.))
-                        .when(!dragging && row_clickable, |row| row.cursor_pointer())
                         .when(
                             self.sidebar_drag
                                 .as_ref()
@@ -1115,17 +1098,6 @@ impl TerminalWindow {
                                     }
                                 },
                             ))
-                        })
-                        .when(selected, |row| {
-                            row.child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(0.))
-                                    .bottom(px(0.))
-                                    .w(px(2.))
-                                    .bg(roles.accent),
-                            )
                         })
                         .when(!renaming, |row| {
                             row.child(
@@ -1180,7 +1152,6 @@ impl TerminalWindow {
                         .child(
                             zed_button(SharedString::from(format!("close-session-{id}")))
                                 .custom(sidebar_action_style(cx))
-                                .when(!dragging && !closing, |button| button.cursor_pointer())
                                 .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
@@ -1316,7 +1287,6 @@ impl TerminalWindow {
                         .when(dragging, |button| {
                             button.cursor(gpui_kit::CursorStyle::ClosedHand)
                         })
-                        .when(!dragging, |button| button.cursor_pointer())
                         .text_color(sidebar_faint_ink(cx))
                         .hover(|style| style.text_color(roles.text))
                         .child(
@@ -1415,7 +1385,7 @@ impl TerminalWindow {
             .flex_col()
             .min_h_0()
             .text_size(px(13.))
-            .font_family(SIDEBAR_FONT_FAMILY)
+            .font_family(UI_FONT_FAMILY)
             .text_color(roles.text)
             .when(dragging, |panel| {
                 panel.cursor(gpui_kit::CursorStyle::ClosedHand)
@@ -1474,10 +1444,11 @@ impl TerminalWindow {
                             .child(
                                 div()
                                     .id("terminal-drag-ghost")
-                                    .font_family(SIDEBAR_FONT_FAMILY)
+                                    .font_family(UI_FONT_FAMILY)
                                     .text_color(roles.text)
                                     .max_w(px(240.))
                                     .h(px(26.))
+                                    .rounded(px(4.))
                                     .flex()
                                     .items_center()
                                     .gap(px(7.))

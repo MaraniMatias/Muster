@@ -26,16 +26,21 @@ use gpui_kit::{
 use muster_core::workspace::{Repo, RepoKind};
 
 use crate::app::{
-    fitted_name, sidebar_faint_ink, sidebar_text_width, TerminalWindow, SIDEBAR_FONT_FAMILY,
+    fitted_name, sidebar_faint_ink, sidebar_text_width, TerminalWindow, UI_FONT_FAMILY,
 };
 use crate::file_icons;
 use crate::navigation::{checkout_title, foreground_program, ForegroundProgram};
 use crate::sidebar::foreground_program_icon;
 use crate::theme::{zed_button, Roles};
 use crate::tooltip::RestingTooltip;
+
+#[cfg(target_os = "macos")]
+const TOGGLE_PANELS_TOOLTIP: &str = "Toggle side panels — ⌘/";
+#[cfg(not(target_os = "macos"))]
+const TOGGLE_PANELS_TOOLTIP: &str = "Toggle side panels — Ctrl+/";
 fn crumb_separator(cx: &App) -> AnyElement {
     div()
-        .font_family(SIDEBAR_FONT_FAMILY)
+        .font_family(UI_FONT_FAMILY)
         .text_size(px(14.))
         .line_height(px(18.))
         .text_color(sidebar_faint_ink(cx))
@@ -105,7 +110,7 @@ fn titlebar_crumb(
         .rounded(px(0.))
         .h(px(22.))
         .px(px(4.))
-        .font_family(SIDEBAR_FONT_FAMILY)
+        .font_family(UI_FONT_FAMILY)
         .text_size(px(14.))
         .line_height(px(18.))
         // Held to its share, so a name the line cannot hold is clipped here
@@ -113,8 +118,7 @@ fn titlebar_crumb(
         .max_w(px(budget))
         .text_color(color)
         .resting_tooltip(label.to_owned())
-        .accessibility_label(label.to_owned())
-        .cursor_pointer();
+        .accessibility_label(label.to_owned());
     match glyph {
         CrumbGlyph::None => crumb.label(fitted),
         CrumbGlyph::Named(icon) => crumb.icon(Icon::new(*icon).size(px(12.))).label(fitted),
@@ -207,7 +211,7 @@ fn titlebar_menu_popover(cx: &App, id: &'static str) -> Popover {
         .border_1()
         .border_color(roles.border_strong)
         .rounded(px(8.))
-        .font_family(SIDEBAR_FONT_FAMILY)
+        .font_family(UI_FONT_FAMILY)
         .text_size(px(13.))
         .line_height(px(18.))
         .text_color(roles.text)
@@ -291,12 +295,12 @@ fn crumb_menu(
                         .rounded(px(4.))
                         .border_1()
                         .border_color(if selected {
-                            roles.accent
+                            roles.selected
                         } else {
                             roles.surface_raised
                         })
                         .bg(if selected && !disabled {
-                            roles.hover
+                            roles.selected
                         } else {
                             roles.surface_raised
                         })
@@ -305,11 +309,18 @@ fn crumb_menu(
                         .when(disabled, |row| {
                             row.cursor(gpui_kit::CursorStyle::OperationNotAllowed)
                         })
-                        .when(!disabled, |row| row.cursor_pointer())
                         // Hover refines after the rest style, so a selected row
                         // needs its own answer or it stops being selected for
                         // exactly as long as the pointer is on it.
-                        .when(!disabled, |row| row.hover(|style| style.bg(roles.hover)))
+                        .when(!disabled, |row| {
+                            row.hover(|style| {
+                                style.bg(if selected {
+                                    roles.selected_hover
+                                } else {
+                                    roles.hover
+                                })
+                            })
+                        })
                         .child(Icon::new(icon).size_4().text_color(if disabled {
                             roles.text_disabled
                         } else {
@@ -320,7 +331,7 @@ fn crumb_menu(
                                 .flex_1()
                                 .min_w_0()
                                 .text_ellipsis()
-                                .font_family(SIDEBAR_FONT_FAMILY)
+                                .font_family(UI_FONT_FAMILY)
                                 .text_size(px(13.))
                                 .line_height(px(18.))
                                 .text_color(if disabled {
@@ -337,7 +348,7 @@ fn crumb_menu(
                                     .min_w_0()
                                     .max_w(px(112.))
                                     .text_ellipsis()
-                                    .font_family(SIDEBAR_FONT_FAMILY)
+                                    .font_family(UI_FONT_FAMILY)
                                     .text_size(px(11.))
                                     .line_height(px(14.))
                                     .text_color(roles.text_muted)
@@ -360,7 +371,7 @@ fn crumb_menu(
         .placeholder(placeholder)
         .max_h(px(300.))
         .bordered(false)
-        .font_family(SIDEBAR_FONT_FAMILY)
+        .font_family(UI_FONT_FAMILY)
         .text_size(px(13.))
         .line_height(px(18.))
         .bg(roles.surface_raised)
@@ -390,13 +401,12 @@ fn crumb_menu(
                                 .hover(roles.hover)
                                 .active(roles.pressed),
                         )
-                        .cursor_pointer()
                         .w_full()
                         .justify_start()
                         .h(px(28.))
                         .rounded(px(4.))
                         .px(px(8.))
-                        .font_family(SIDEBAR_FONT_FAMILY)
+                        .font_family(UI_FONT_FAMILY)
                         .text_size(px(13.))
                         .line_height(px(18.)),
                 )
@@ -913,9 +923,8 @@ impl TerminalWindow {
                 .custom(crate::app::sidebar_action_style(cx))
                 .small()
                 .compact()
-                .h(px(20.))
+                .h(px(22.))
                 .mr(px(4.))
-                .cursor_pointer()
                 .icon(IconName::Settings)
                 .accessibility_label("Settings")
                 .resting_tooltip("Settings")
@@ -930,11 +939,10 @@ impl TerminalWindow {
                 .custom(crate::app::sidebar_action_style(cx))
                 .small()
                 .compact()
-                .h(px(20.))
-                .cursor_pointer()
+                .h(px(22.))
                 .icon(IconName::PanelLeftClose)
                 .accessibility_label("Toggle side panels")
-                .resting_tooltip("Toggle side panels — Cmd/Ctrl+/")
+                .resting_tooltip(TOGGLE_PANELS_TOOLTIP)
                 // The bar moves the window from the press; a press on an action
                 // is the action, not a drag that starts one.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

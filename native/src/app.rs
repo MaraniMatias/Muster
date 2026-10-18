@@ -61,12 +61,9 @@ use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
-/// The family the sidebar draws with, and the one its labels are measured in.
-///
-/// One name in both places on purpose: a path elided against a different face
-/// than the one that draws it is a fit that is a guess. This is the family the
-/// bundled faces declare in their own `name` table, not a browser alias.
-pub(crate) const SIDEBAR_FONT_FAMILY: &str = "Fira Code";
+/// The platform UI face used for app chrome and the text measured to fit it.
+pub(crate) const UI_FONT_FAMILY: &str = ".SystemUIFont";
+pub(crate) const MONO_FONT_FAMILY: &str = "Fira Code";
 
 /// Register the bundled faces on the application's text system.
 ///
@@ -87,7 +84,7 @@ pub fn load_fonts(cx: &App) {
 
 pub(crate) fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui_kit::Pixels {
     let style = gpui_kit::TextStyle {
-        font_family: SIDEBAR_FONT_FAMILY.into(),
+        font_family: UI_FONT_FAMILY.into(),
         font_size: px(size).into(),
         ..Default::default()
     };
@@ -197,11 +194,8 @@ pub(crate) fn sidebar_row_focus(
 
 /// The chrome a sidebar control wears.
 ///
-/// A custom variant keeps its own hover and press surfaces — the same ramp a
-/// hand-drawn row answers the pointer with, rather than the accent wash a ghost
-/// button paints — but it is neither text nor link, so Kit hands it the default
-/// arrow. The row and the control inside it are one target, and the hand is how
-/// that says so.
+/// A custom variant keeps the same hover and press surfaces as an application
+/// row while retaining Button's native default arrow cursor.
 pub(crate) fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
     let roles = Roles::of(cx);
     ButtonCustomVariant::new(cx)

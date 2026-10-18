@@ -261,12 +261,6 @@ impl TerminalWindow {
                                 "Create and open shell"
                             })
                             .disabled(!ready)
-                            .when(!ready, |button| {
-                                button
-                                    .bg(roles.disabled_surface)
-                                    .text_color(roles.text_disabled)
-                                    .border_color(gpui_kit::transparent_black())
-                            })
                             .on_click(move |_, window, cx| {
                                 let _ = submit_button
                                     .update(cx, |app, cx| app.submit_worktree(window, cx));
@@ -414,8 +408,9 @@ impl TerminalWindow {
                             .bg(roles.surface_inset)
                             .text_size(px(12.))
                             .child(format!(
-                                "{} uncommitted file(s) may be lost if you delete this worktree:",
-                                info.dirty_files.len()
+                                "{} uncommitted file{} may be lost if you delete this worktree:",
+                                info.dirty_files.len(),
+                                if info.dirty_files.len() == 1 { "" } else { "s" }
                             ));
                         for file in info.dirty_files.iter().take(8) {
                             preview = preview.child(
@@ -474,15 +469,17 @@ impl TerminalWindow {
                     if info.unmerged_commits > 0 {
                         let warning = if info.branch.is_some() {
                             format!(
-                                "Branch {} has {} unmerged commit(s) versus {}. The branch is kept unless you choose to delete it.",
+                                "Branch {} has {} unmerged commit{} versus {}. The branch is kept unless you choose to delete it.",
                                 info.branch.as_deref().unwrap_or_default(),
                                 info.unmerged_commits,
+                                if info.unmerged_commits == 1 { "" } else { "s" },
                                 info.default_branch.as_deref().unwrap_or("the default branch")
                             )
                         } else {
                             format!(
-                                "Detached HEAD has {} commit(s) unreachable from branches, remotes, or tags. Deleting this worktree may lose them.",
-                                info.unmerged_commits
+                                "Detached HEAD has {} commit{} unreachable from branches, remotes, or tags. Deleting this worktree may lose them.",
+                                info.unmerged_commits,
+                                if info.unmerged_commits == 1 { "" } else { "s" }
                             )
                         };
                         content = content.child(
@@ -524,7 +521,11 @@ impl TerminalWindow {
                                     "Delete local branch {}{}",
                                     branch,
                                     if info.unmerged_commits > 0 {
-                                        format!(" and its {} unmerged commit(s)", info.unmerged_commits)
+                                        format!(
+                                            " and its {} unmerged commit{}",
+                                            info.unmerged_commits,
+                                            if info.unmerged_commits == 1 { "" } else { "s" }
+                                        )
                                     } else {
                                         String::new()
                                     }
@@ -619,11 +620,6 @@ impl TerminalWindow {
                             .border_color(roles.status.danger)
                             .label(if busy { "Deleting…" } else { "Delete worktree" })
                             .disabled(!can_delete)
-                            .when(!can_delete, |button| {
-                                button.bg(roles.disabled_surface)
-                                    .text_color(roles.text_disabled)
-                                    .border_color(gpui_kit::transparent_black())
-                            })
                             .on_click(move |_, window, cx| {
                                 let _ = delete.update(cx, |app, cx| {
                                     app.submit_worktree_delete(window, cx)

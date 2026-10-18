@@ -155,11 +155,12 @@ pub(crate) struct ReviewComposer {
     _subscription: gpui_kit::Subscription,
 }
 
-/// Picker labels distinguish changed lines from unchanged context.
-fn review_start_label(line: usize, mark: char) -> SharedString {
-    match mark {
-        '+' | '-' => format!("{mark}{line}").into(),
-        _ => line.to_string().into(),
+/// Picker labels keep the old side negative and mark added lines on the new side.
+fn review_start_label(line: usize, side: ReviewSide, mark: char) -> SharedString {
+    match side {
+        ReviewSide::Old => format!("-{line}").into(),
+        ReviewSide::New if mark == '+' => format!("+{line}").into(),
+        ReviewSide::New => line.to_string().into(),
     }
 }
 
@@ -182,7 +183,7 @@ fn review_start_choices(
     (
         numbers
             .iter()
-            .map(|line| review_start_label(*line, lines[&(side, *line)].mark))
+            .map(|line| review_start_label(*line, side, lines[&(side, *line)].mark))
             .collect(),
         numbers
             .iter()
@@ -223,9 +224,8 @@ fn review_start_picker(
 /// The keystroke that finishes a note, registered for as long as the composer is open.
 ///
 /// An interceptor rather than a key handler on the card because it runs before the
-/// input's own Return: stopping it here is what keeps ⌘↵ from also inserting the
-/// newline a plain Return would, and so keeps a trailing blank line out of the
-/// saved note. Enter on its own still writes the newline Legacy's textarea did.
+/// input's own Return: stopping the platform-modifier+Enter here is what keeps it
+/// from also inserting a newline. Enter on its own still writes the newline.
 fn review_save_keys(
     input: &Entity<TextareaState>,
     cx: &mut Context<TerminalWindow>,
@@ -437,7 +437,11 @@ impl TerminalWindow {
         composer.code = code;
         // The picker is how this line is chosen, so it is told what the draft now
         // says rather than left to agree with it by itself.
-        let chosen = review_start_label(line_start, lines[&(composer.side, line_start)].mark);
+        let chosen = review_start_label(
+            line_start,
+            composer.side,
+            lines[&(composer.side, line_start)].mark,
+        );
         composer.start_picker.update(cx, |picker, cx| {
             picker.set_selected_value(&chosen, window, cx)
         });
@@ -649,7 +653,13 @@ impl TerminalWindow {
             let _ = view.update(cx, |app, cx| {
                 app.review.clearing = false;
                 match result {
-                    Ok(count) => app.push_info(format!("Cleared {count} review export(s)."), cx),
+                    Ok(count) => app.push_info(
+                        format!(
+                            "Cleared {count} review export{}.",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                        cx,
+                    ),
                     Err(error) => app.push_error(error, cx),
                 }
                 cx.notify();
@@ -1260,9 +1270,15 @@ impl TerminalWindow {
                         }
                         app.push_info(
                             if reset_duplicate_scope {
-                                format!("Forgot {forgotten} delivered review(s) and reset duplicate protection.")
+                                format!(
+                                    "Forgot {forgotten} delivered review{} and reset duplicate protection.",
+                                    if forgotten == 1 { "" } else { "s" }
+                                )
                             } else {
-                                format!("Forgot {forgotten} delivered review(s); duplicate protection is retained.")
+                                format!(
+                                    "Forgot {forgotten} delivered review{}; duplicate protection is retained.",
+                                    if forgotten == 1 { "" } else { "s" }
+                                )
                             },
                             cx,
                         );
@@ -1322,7 +1338,7 @@ impl TerminalWindow {
                         .child(
                             zed_button("confirm-reset-opencode-reviews")
                                 .danger()
-                                .label("Forget + reset")
+                                .label("Forget and reset")
                                 .on_click(move |_, window, cx| {
                                     let _ = reset.update(cx, |app, cx| {
                                         app.forget_delivered_opencode_reviews(true, window, cx);
@@ -1475,9 +1491,13 @@ mod tests {
     }
 
     #[test]
-    fn picker_labels_distinguish_added_removed_and_context_lines() {
-        for (mark, label) in [('+', "+22"), ('-', "-22"), (' ', "22")] {
-            assert_eq!(review_start_label(22, mark).as_ref(), label);
+    fn picker_labels_keep_old_lines_negative_and_mark_added_new_lines() {
+        for (side, mark, label) in [
+            (ReviewSide::Old, ' ', "-22"),
+            (ReviewSide::New, '+', "+22"),
+            (ReviewSide::New, ' ', "22"),
+        ] {
+            assert_eq!(review_start_label(22, side, mark).as_ref(), label);
             assert_eq!(review_line_number(label), Some(22));
         }
     }

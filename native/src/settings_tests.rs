@@ -353,3 +353,41 @@ fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
     .unwrap();
     dispose(&panel.fixture, cx);
 }
+
+/// The switch is compact, and the picker and number field share the same height.
+#[gpui_kit::test]
+fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    cx.update_window(panel.fixture.handle, |_, window, _| {
+        let heights = [
+            window
+                .find("settings-ui-sticky")
+                .bounds()
+                .size
+                .height
+                .as_f32(),
+            window
+                .find("settings-terminal-cursor")
+                .bounds()
+                .size
+                .height
+                .as_f32(),
+            window
+                .find("settings-terminal-font-size")
+                .bounds()
+                .size
+                .height
+                .as_f32(),
+        ];
+        assert!(
+            (heights[0] - 16.).abs() <= 1.,
+            "compact switch: {heights:?}"
+        );
+        assert!(
+            (heights[1] - heights[2]).abs() <= 1.,
+            "picker and number field should share a height: {heights:?}"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}

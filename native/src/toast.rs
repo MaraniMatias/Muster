@@ -188,6 +188,7 @@ impl TerminalWindow {
                         .gap(px(8.))
                         .w_full()
                         .max_w(px(420.))
+                        .rounded(px(8.))
                         .px(px(10.))
                         .py(px(8.))
                         .relative()
