@@ -2771,6 +2771,7 @@ impl Render for TerminalWindow {
             })
             .or_else(|| self.review_clear_dialog(cx))
             .or_else(|| self.opencode_forget_dialog(cx))
+            .or_else(|| self.review_delete_dialog(cx))
             // Last, so a confirmation raised from inside the panel is the dialog on screen
             // rather than the panel behind it.
             .or_else(|| {

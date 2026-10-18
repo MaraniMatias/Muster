@@ -35,8 +35,9 @@ use gpui_kit::component::{
     Disableable, IndexPath, Sizable,
 };
 use gpui_kit::{
-    div, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Entity, IntoElement,
-    ParentElement, SharedString, Styled, Subscription, Window,
+    div, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Div, Entity,
+    InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Subscription,
+    TestSupportExt, Window,
 };
 use muster_core::review::ReviewStorage;
 use muster_core::settings::{
@@ -48,6 +49,7 @@ use std::path::PathBuf;
 
 use crate::app::TerminalWindow;
 use crate::theme::{zed_button, Roles};
+use crate::tooltip::RestingTooltip;
 
 /// The options a closed setting offers, and the row the current one sits on.
 ///
@@ -209,6 +211,7 @@ impl SettingsDraft {
 fn settings_row(
     label: &'static str,
     description: &'static str,
+    detail: Option<(&'static str, String)>,
     roles: Roles,
     control: impl IntoElement,
 ) -> AnyElement {
@@ -217,30 +220,7 @@ fn settings_row(
         .items_start()
         .gap(px(16.))
         .py(px(5.))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                // Reserve the label and help-text lines so the control column stays on a grid.
-                .min_h(px(33.))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .line_height(px(16.))
-                        .text_color(roles.text)
-                        .child(label),
-                )
-                .when(!description.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .mt(px(2.))
-                            .text_size(px(11.))
-                            .line_height(px(15.))
-                            .text_color(roles.text_muted)
-                            .child(description),
-                    )
-                }),
-        )
+        .child(settings_row_text(label, description, detail, roles))
         .child(
             div()
                 .flex_shrink_0()
@@ -249,6 +229,87 @@ fn settings_row(
                 .flex()
                 .justify_end()
                 .child(control),
+        )
+        .into_any_element()
+}
+
+/// The half of a row that says what the setting is.
+///
+/// `detail` is where the setting writes right now — a resolved folder — carried under
+/// its help text in the same muted ink, so a path belongs to the control that chooses
+/// it rather than floating under the row on its own line. It is cut to the column and
+/// named in full once the pointer rests on it, because the tail is the half of a path
+/// that identifies it.
+fn settings_row_text(
+    label: &'static str,
+    description: &'static str,
+    detail: Option<(&'static str, String)>,
+    roles: Roles,
+) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        // Reserve the label and help-text lines so the control column stays on a grid.
+        .min_h(px(33.))
+        .child(
+            div()
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .text_color(roles.text)
+                .child(label),
+        )
+        .when(!description.is_empty(), |row| {
+            row.child(
+                div()
+                    .mt(px(2.))
+                    .text_size(px(11.))
+                    .line_height(px(15.))
+                    .text_color(roles.text_muted)
+                    .child(description),
+            )
+        })
+        .when_some(detail, |row, (id, detail)| {
+            row.child(
+                div()
+                    .id(id)
+                    .test_support()
+                    .mt(px(2.))
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .line_height(px(15.))
+                    .text_color(roles.text_muted)
+                    .child(detail.clone())
+                    .resting_tooltip(detail),
+            )
+        })
+}
+
+/// A row whose control is a group of actions.
+///
+/// The actions sit on one line of their own, right-aligned and as wide as they read.
+/// As rows of their own they would each be stretched across the panel, which is what a
+/// column of full-width text buttons is: a toolbar at the panel's width, making a
+/// maintenance command look like the panel's main one.
+fn settings_actions(
+    label: &'static str,
+    description: &'static str,
+    roles: Roles,
+    actions: Vec<AnyElement>,
+) -> AnyElement {
+    div()
+        .mt(px(2.))
+        .border_t_1()
+        .border_color(roles.border)
+        .pt(px(5.))
+        .child(settings_row_text(label, description, None, roles))
+        .child(
+            div()
+                .mt(px(8.))
+                .flex()
+                .gap(px(8.))
+                .justify_end()
+                .children(actions),
         )
         .into_any_element()
 }
@@ -285,6 +346,7 @@ fn toggle_row(
     settings_row(
         label,
         description,
+        None,
         roles,
         Switch::new(id)
             .checked(checked)
@@ -302,12 +364,14 @@ fn select_row(
     id: &'static str,
     label: &'static str,
     description: &'static str,
+    detail: Option<(&'static str, String)>,
     roles: Roles,
     picker: &Entity<SelectState<Vec<SharedString>>>,
 ) -> AnyElement {
     settings_row(
         label,
         description,
+        detail,
         roles,
         Select::new(picker)
             .id(id)
@@ -328,6 +392,7 @@ fn size_row(
     settings_row(
         label,
         description,
+        None,
         roles,
         div().w(px(96.)).flex().items_center().gap(px(6.)).child(
             Input::new(input)
@@ -642,7 +707,20 @@ impl TerminalWindow {
                 Ok(path) => path.display().to_string(),
                 Err(error) => format!("unavailable: {error}"),
             });
-        let can_clear = storage == ReviewStorage::Default && self.open_diff.is_some();
+        // The default cache is one folder under the home directory that every checkout
+        // writes to, so what clearing it needs is a checkout rather than a diff open:
+        // the panel is opened from the title bar, where no diff is open.
+        let can_clear = storage == ReviewStorage::Default
+            && (self.open_diff.is_some() || self.navigation.active_checkout.is_some());
+        // A control that cannot be pressed says why: this one is unavailable for two
+        // different reasons, and a person who cannot press it has no other way to ask.
+        let clear_reason = match (storage, can_clear) {
+            (ReviewStorage::Workdir, _) => {
+                "Rounds are written inside the checkout, so there is no cache to clear."
+            }
+            (_, false) => "Select a checkout first.",
+            _ => "",
+        };
         let can_forget = !self.review.forgetting;
 
         Dialog::new(cx)
@@ -706,6 +784,7 @@ impl TerminalWindow {
                             "settings-terminal-cursor",
                             "Cursor",
                             "The cell it fills, a line beside it, or a line under it.",
+                            None,
                             roles,
                             &cursor,
                         ),
@@ -731,6 +810,7 @@ impl TerminalWindow {
                             "settings-terminal-scrollbar",
                             "Scrollbar",
                             "",
+                            None,
                             roles,
                             &scrollbar,
                         ),
@@ -778,6 +858,7 @@ impl TerminalWindow {
                             "settings-editor-indent-with",
                             "Indent with",
                             "",
+                            None,
                             roles,
                             &indent_with,
                         ),
@@ -791,60 +872,59 @@ impl TerminalWindow {
                     ],
                 ));
 
-                let mut reviews = vec![select_row(
-                    "settings-review-storage",
-                    "Exported notes",
-                    "Where a review round is written when it is sent as a file rather than to an agent.",
-                    roles,
-                    &storage_picker,
-                )];
-                // The folder is on disk and moves with the mode, so the row asks for the one the
-                // draft is showing rather than the one on file. Nothing at all while it cannot
-                // be read: an empty row is the honest state, and a path guessed would not be.
-                if let Some(folder) = folder.clone() {
-                    reviews.push(
-                        div()
-                            .py(px(5.))
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(roles.text_muted)
-                                    .child(folder),
-                            )
-                            .into_any_element(),
-                    );
-                }
                 let clear_button = clear.clone();
-                reviews.push(
-                    zed_button("settings-review-clear")
-                        .text()
-                        .small()
-                        .label("Clear cached review exports…")
-                        .disabled(!can_clear)
-                        .when(!can_clear, |button| button.text_color(roles.text_disabled))
-                        .on_click(move |_, _, cx| {
-                            let _ = clear_button.update(cx, |app, cx| {
-                                app.open_review_clear_confirmation(cx)
-                            });
-                        })
-                        .into_any_element(),
-                );
                 let forget_button = forget.clone();
-                reviews.push(
-                    zed_button("settings-review-forget")
-                        .text()
-                        .small()
-                        .label("Forget delivered reviews…")
-                        .disabled(!can_forget)
-                        .when(!can_forget, |button| button.text_color(roles.text_disabled))
-                        .on_click(move |_, _, cx| {
-                            let _ = forget_button.update(cx, |app, cx| {
-                                app.open_opencode_forget_confirmation(cx)
-                            });
-                        })
-                        .into_any_element(),
-                );
-                body = body.child(settings_section("Review notes", roles, reviews));
+                body = body.child(settings_section(
+                    "Review notes",
+                    roles,
+                    vec![
+                        select_row(
+                            "settings-review-storage",
+                            "Exported notes",
+                            "Where a review round is written when it is sent as a file rather than to an agent.",
+                            folder.map(|folder| ("settings-review-folder", folder)),
+                            roles,
+                            &storage_picker,
+                        ),
+                        settings_actions(
+                            "Stored rounds",
+                            "Cached exports and delivered rounds stay where they are until one of these removes them.",
+                            roles,
+                            vec![
+                                zed_button("settings-review-clear")
+                                    .small()
+                                    .label("Clear cached exports")
+                                    .disabled(!can_clear)
+                                    .when(!can_clear, |button| {
+                                        button
+                                            .text_color(roles.text_disabled)
+                                            .resting_tooltip(clear_reason)
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        let _ = clear_button.update(cx, |app, cx| {
+                                            app.open_review_clear_confirmation(cx)
+                                        });
+                                    })
+                                    .into_any_element(),
+                                zed_button("settings-review-forget")
+                                    .small()
+                                    .label("Forget delivered reviews")
+                                    .disabled(!can_forget)
+                                    .when(!can_forget, |button| {
+                                        button.text_color(roles.text_disabled).resting_tooltip(
+                                            "Forgetting delivered reviews…",
+                                        )
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        let _ = forget_button.update(cx, |app, cx| {
+                                            app.open_opencode_forget_confirmation(cx)
+                                        });
+                                    })
+                                    .into_any_element(),
+                            ],
+                        ),
+                    ],
+                ));
 
                 if let Some(error) = error.clone() {
                     body = body.child(

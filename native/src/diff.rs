@@ -656,7 +656,7 @@ impl TerminalWindow {
                     ReviewSide::Old => DiffSide::Original,
                     ReviewSide::New => DiffSide::Modified,
                 },
-                note.line_start,
+                note.line_end.unwrap_or(note.line_start),
             );
             let outcome = review::anchor_outcome_hash(
                 &note,
@@ -994,6 +994,12 @@ impl TerminalWindow {
                     let edit = annotation_weak.clone();
                     let accept = annotation_weak.clone();
                     let delete = annotation_weak.clone();
+                    // What a saved note can be asked to do goes where every other row
+                    // of this app keeps its actions: at the right-hand end, on the
+                    // note's own header row. They are icons rather than labelled
+                    // buttons, so the note reads as the card's text and not as its
+                    // footer, and each one names itself for the tooltip and for a
+                    // screen reader that cannot see the drawing.
                     let mut card = div()
                         .id(format!("review-card-{}", note.id))
                         .test_support()
@@ -1001,15 +1007,63 @@ impl TerminalWindow {
                         .py_2()
                         .bg(roles.surface)
                         .text_size(px(11.))
-                        .child(div().text_color(roles.text_muted).child(format!(
-                            "{}:{}{}",
-                            note.side.as_str(),
-                            note.line_start,
-                            note.line_end
-                                .filter(|end| *end != note.line_start)
-                                .map(|end| format!("-{end}"))
-                                .unwrap_or_default()
-                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(roles.text_muted)
+                                        .child(format!(
+                                            "{}:{}{}",
+                                            note.side.as_str(),
+                                            note.line_start,
+                                            note.line_end
+                                                .filter(|end| *end != note.line_start)
+                                                .map(|end| format!("-{end}"))
+                                                .unwrap_or_default()
+                                        )),
+                                )
+                                .child({
+                                    let id = note_id.clone();
+                                    zed_button(format!("edit-review-{}", note.id))
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .h(px(20.))
+                                        .rounded(px(0.))
+                                        .icon(IconName::Pencil)
+                                        .accessibility_label("Edit this note")
+                                        .resting_tooltip("Edit this note")
+                                        .on_click(move |_, window, cx| {
+                                            let _ = edit.update(cx, |app, cx| {
+                                                app.edit_review_note(&id, window, cx);
+                                            });
+                                        })
+                                })
+                                .child({
+                                    let (checkout, id) = (checkout_id.clone(), note_id.clone());
+                                    zed_button(format!("delete-review-{}", note.id))
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .h(px(20.))
+                                        .rounded(px(0.))
+                                        .icon(IconName::X)
+                                        .accessibility_label("Delete this note")
+                                        .resting_tooltip("Delete this note")
+                                        .on_click(move |_, _, cx| {
+                                            let _ = delete.update(cx, |app, cx| {
+                                                app.request_delete_review_note(&checkout, &id, cx);
+                                            });
+                                        })
+                                }),
+                        )
                         .child(div().py_1().child(note.content.clone()));
                     if note.outdated {
                         card = card.child(div().text_color(roles.status.warning).child(
@@ -1023,50 +1077,27 @@ impl TerminalWindow {
                     } {
                         card = card.child(div().text_color(roles.text_muted).child(message));
                     }
-                    let actions = div()
-                        .flex()
-                        .gap_2()
-                        .pt_1()
-                        .when(note.outdated, |actions| {
-                            let id = note_id.clone();
-                            let checkout = checkout_id.clone();
-                            actions.child(
+                    // Accepting a drifted anchor is a decision about the note rather
+                    // than a thing to do to it, so it stays a labelled action below
+                    // the note and is drawn only when there is an anchor to accept.
+                    if note.outdated {
+                        let id = note_id.clone();
+                        let checkout = checkout_id.clone();
+                        card = card.child(
+                            div().pt_1().child(
                                 zed_button(format!("accept-review-{}", note.id))
                                     .ghost()
                                     .small()
                                     .label("Accept")
+                                    .resting_tooltip("Keep this note on the lines it names")
                                     .on_click(move |_, _, cx| {
                                         let _ = accept.update(cx, |app, cx| {
                                             app.accept_outdated_note(&checkout, &id, cx);
                                         });
                                     }),
-                            )
-                        })
-                        .child({
-                            let id = note_id.clone();
-                            zed_button(format!("edit-review-{}", note.id))
-                                .ghost()
-                                .small()
-                                .label("Edit")
-                                .on_click(move |_, window, cx| {
-                                    let _ = edit.update(cx, |app, cx| {
-                                        app.edit_review_note(&id, window, cx);
-                                    });
-                                })
-                        })
-                        .child({
-                            let id = note_id;
-                            zed_button(format!("delete-review-{}", note.id))
-                                .ghost()
-                                .small()
-                                .label("Delete")
-                                .on_click(move |_, _, cx| {
-                                    let _ = delete.update(cx, |app, cx| {
-                                        app.delete_review_note(&checkout_id, &id, cx);
-                                    });
-                                })
-                        });
-                    card = card.child(actions);
+                            ),
+                        );
+                    }
                     return card.into_any_element();
                 }
                 let path = annotation.path().to_string();

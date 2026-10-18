@@ -270,6 +270,13 @@ Five rules it depends on, each pinned by a test:
   run before the input's own Return, so stopping it there is what keeps the
   keystroke from also inserting the newline a plain Return writes. Enter on its own
   still writes one, and `esc` still cancels.
+- **A saved note is edited and removed from two icons on its header row.** They
+  are icons rather than labelled buttons so the note reads as the card's text and
+  not as its footer, and each names itself for the tooltip and for a screen
+  reader. The pencil opens the composer above with the saved text and range in it,
+  because editing a note is writing another one about the same lines; the cross
+  asks first, and the answer lives in the window (`review.delete_confirmation`)
+  rather than in the card, so the dialog is the thing on screen while it stands.
 
 ## The preferences panel
 
@@ -297,9 +304,24 @@ scrollback yet. A panel that implied otherwise would be a lie about what a
 preference does, so it says nothing about it instead.
 
 The Settings action in the title bar opens this panel, and the review storage,
-**Clear cached review exports…** and **Forget delivered reviews…** moved into its
+**Clear cached exports** and **Forget delivered reviews** moved into its
 Review notes section: they are one surface now, which is what `AGENTS.md`'s
 **Settings → Forget delivered reviews…** had been claiming.
+
+**The Review notes section is two blocks, and only the first is a preference.**
+The storage row carries the folder it currently resolves to as a third line
+under its help text, cut to the column and named in full on a rest; the two
+maintenance actions are below it on one right-aligned line, because as rows of
+their own each button stretched to the panel's width, which is a toolbar drawn
+across the dialog and makes a maintenance command look like the panel's main
+one. A disabled action says why: both are offered from the title bar, and the
+one that is unavailable is unavailable for a reason the panel states on a rest.
+
+**Clearing the cache needs a checkout, not a diff open.** The default location
+is one folder, `~/.muster/tmp/reviews`, that every checkout writes to, so which
+diff is open is not what the action acts on. It used to be disabled in exactly
+the state the panel is opened in — the A08 failure the forget route had — and
+the confirmation says so, because clearing is now reachable from anywhere.
 
 ## The tooltip
 
@@ -314,7 +336,11 @@ is `TooltipDefaults::show_delay`.
 
 A trigger is a canvas laid over the control and a window listener it registers
 as it is painted, not a hover: `Button::on_hover` is inert on a disabled
-button, and a disabled button still has to say why it is disabled. The trigger
+button, and a disabled button still has to say why it is disabled. The canvas is
+`absolute().inset_0()` and nothing else: `size_full()` on an absolute child of
+a plain element measures against a zero-height reference and lands it *below*
+the control rather than over it, which only shows up on a trigger that is not a
+button. The trigger
 is named by its bounds, which is what makes a move from one row to the next a
 new trigger rather than a switch. The window host dismisses what was up on a
 press or when the pointer leaves the window, as the managed one did.

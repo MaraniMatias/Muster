@@ -5143,6 +5143,134 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
     close(&fixture, cx);
 }
 
+/// A saved note's actions are two icons on its own header row, and the cross asks.
+///
+/// The icons are named rather than labelled, so what is pinned here is the naming
+/// and what the two of them do: the pencil opens the same composer a new note
+/// does, with the saved text in it, and the cross keeps the note until the
+/// question it asked has been answered.
+#[gpui_kit::test]
+async fn a_saved_note_is_edited_and_deleted_from_two_icons(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            )
+        });
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_value("Keep this comment", window, cx)
+        });
+        window.render_frame(cx);
+        window.click("save-review-note", cx);
+    })
+    .unwrap();
+    let note_id = fixture.view.read_with(cx, |app, _| {
+        app.review
+            .notes
+            .get(&fixture.checkout)
+            .and_then(|notes| notes.first())
+            .expect("a saved note")
+            .id
+            .clone()
+    });
+    let card = format!("review-card-{note_id}");
+    let edit = format!("edit-review-{note_id}");
+    let delete = format!("delete-review-{note_id}");
+    assert!(draw_until(&fixture, cx, &edit));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // Both are icons: a name instead of a word, on the card's own header row
+        // rather than in a row of their own below the note.
+        let header = window.find(card.clone()).bounds();
+        for (id, name) in [
+            (edit.clone(), "Edit this note"),
+            (delete.clone(), "Delete this note"),
+        ] {
+            let icon = window.find(id.clone());
+            // An icon is named rather than worded: the name is what a screen reader
+            // is given and what the tooltip says, and the control itself is a
+            // small square rather than a word with padding around it.
+            assert_eq!(icon.label(), Some(name));
+            let bounds = icon.bounds();
+            assert!(
+                bounds.size.width <= px(28.) && bounds.size.height <= px(28.),
+                "{id} is a square: {bounds:?}"
+            );
+            assert!(bounds.right() <= header.right() && bounds.top() >= header.top());
+        }
+        assert!(
+            window.find(delete.clone()).bounds().left()
+                > window.find(edit.clone()).bounds().right()
+        );
+        window.click(edit, cx);
+        window.render_frame(cx);
+        assert!(window.try_find("review-composer-card").is_some());
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        let composer = app.review.composer.as_ref().expect("the same composer");
+        assert_eq!(composer.editing_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(
+            composer.input.read(cx).value().as_str(),
+            "Keep this comment"
+        );
+        assert!(
+            composer.start_picker.read(cx).selected_value().is_some(),
+            "the range the note was saved against is still editable"
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+        window.render_frame(cx);
+        window.click(delete.clone(), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("confirm-delete-review-note").is_some());
+        window.click("cancel-delete-review-note", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("confirm-delete-review-note").is_none());
+        window.click(delete, cx);
+        window.render_frame(cx);
+        window.click("confirm-delete-review-note", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.review
+                .notes
+                .get(&fixture.checkout)
+                .is_none_or(Vec::is_empty),
+            "a cross that was not answered leaves the note alone, and an answered one removes it"
+        );
+    });
+    close(&fixture, cx);
+}
+
 /// The picker is the draft's own control for where its range starts.
 ///
 /// It is the toolkit's select over the line numbers the range could start on, so
@@ -5275,27 +5403,36 @@ async fn a_note_can_cover_lines_the_change_removed(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(draw_until(&fixture, cx, "review-range-start"));
-    cx.update_window(fixture.handle, |_, window, cx| {
-        let input = fixture
-            .view
-            .read(cx)
-            .review
-            .composer
-            .as_ref()
-            .unwrap()
-            .input
-            .clone();
-        input.update(cx, |input, cx| {
-            input.set_value("this line goes away", window, cx)
-        });
-        // The removed line above it is a start this note may be widened to, and
-        // widening says the removed side rather than the added one.
-        fixture.view.update(cx, |app, cx| {
-            app.set_review_note_start(muster_core::review::ReviewSide::Old, 2, window, cx)
-        });
-        window.render_frame(cx);
-    })
-    .unwrap();
+    let clicked_anchor_y = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            let input = fixture
+                .view
+                .read(cx)
+                .review
+                .composer
+                .as_ref()
+                .unwrap()
+                .input
+                .clone();
+            input.update(cx, |input, cx| {
+                input.set_value("this line goes away", window, cx)
+            });
+            window.render_frame(cx);
+            let clicked_anchor_y = window.find("review-composer-card").bounds().center().y;
+            // The removed line above it is a start this note may be widened to, and
+            // widening says the removed side rather than the added one.
+            fixture.view.update(cx, |app, cx| {
+                app.set_review_note_start(muster_core::review::ReviewSide::Old, 2, window, cx)
+            });
+            window.render_frame(cx);
+            assert!(
+                (window.find("review-composer-card").bounds().center().y - clicked_anchor_y).abs()
+                    <= px(2.),
+                "changing the range start must not move the composer off the clicked -3 line"
+            );
+            clicked_anchor_y
+        })
+        .unwrap();
     fixture.view.read_with(cx, |app, cx| {
         let composer = app.review.composer.as_ref().unwrap();
         assert_eq!(composer.side, muster_core::review::ReviewSide::Old);
@@ -5316,6 +5453,23 @@ async fn a_note_can_cover_lines_the_change_removed(cx: &mut TestAppContext) {
         // export writes for it.
     });
     fixture.view.update(cx, |app, cx| app.save_review_note(cx));
+    let saved_anchor_y = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let note_id = fixture.view.read_with(cx, |app, _| {
+                app.review.notes[&fixture.checkout][0].id.clone()
+            });
+            window
+                .find(format!("review-card-{note_id}"))
+                .bounds()
+                .center()
+                .y
+        })
+        .unwrap();
+    assert!(
+        (saved_anchor_y - clicked_anchor_y).abs() <= px(2.),
+        "the saved note stays at the clicked -3 line, not its selected -2 start"
+    );
     fixture.view.read_with(cx, |app, _| {
         let note = &app.review.notes[&fixture.checkout][0];
         assert_eq!(note.side, muster_core::review::ReviewSide::Old);

@@ -171,6 +171,9 @@ pub(crate) struct ReviewState {
     pub(crate) anchor_hashes: AnchorHashCache,
     pub(crate) composer: Option<ReviewComposer>,
     pub(crate) include_outdated: bool,
+    /// The note a person asked to delete, with the checkout it belongs to, until
+    /// they say whether they meant to.
+    pub(crate) delete_confirmation: Option<(String, String)>,
     pub(crate) clear_confirmation: bool,
     pub(crate) clearing: bool,
     pub(crate) forget_confirmation: bool,
@@ -653,6 +656,31 @@ impl TerminalWindow {
         cx.notify();
     }
 
+    /// A note is somebody's own writing and there is no undo behind it, so the cross
+    /// asks rather than removes. The answer lives in the window rather than in the
+    /// card, because the dialog is what is on screen while the question stands.
+    pub(crate) fn request_delete_review_note(
+        &mut self,
+        checkout_id: &str,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.review.delete_confirmation = Some((checkout_id.to_owned(), id.to_owned()));
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_review_note(&mut self, cx: &mut Context<Self>) {
+        self.review.delete_confirmation = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_delete_review_note(&mut self, cx: &mut Context<Self>) {
+        let Some((checkout_id, id)) = self.review.delete_confirmation.take() else {
+            return;
+        };
+        self.delete_review_note(&checkout_id, &id, cx);
+    }
+
     pub(crate) fn delete_review_note(
         &mut self,
         checkout_id: &str,
@@ -744,11 +772,19 @@ impl TerminalWindow {
             return;
         }
         self.review.clear_confirmation = false;
-        let Some((checkout_id, _)) = self.open_diff.as_ref() else {
+        // The default cache is one folder under the home directory that every checkout
+        // writes to, so which checkout is being cleared is not what this action acts
+        // on: it needs a checkout to resolve, and the panel is opened from the title
+        // bar, where no diff is open.
+        let checkout_id = self
+            .open_diff
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| self.navigation.active_checkout.clone());
+        let Some(checkout_id) = checkout_id else {
             cx.notify();
             return;
         };
-        let checkout_id = checkout_id.clone();
         let Some(checkout) = self.navigation.checkout(&checkout_id).cloned() else {
             self.push_error("The checkout for this review is no longer available.", cx);
             cx.notify();
@@ -808,7 +844,7 @@ impl TerminalWindow {
                 .content(|content: DialogContent, _, _| {
                     content.child(
                         div().text_size(px(12.)).child(
-                            "This deletes only timestamped Markdown exports with Muster's ownership marker in ~/.muster/tmp/reviews. Exports inside a checkout are never cleared here.",
+                            "This deletes only timestamped Markdown exports with Muster's ownership marker in ~/.muster/tmp/reviews. Every checkout writes there, so this clears the cache for all of them. Exports inside a checkout are never cleared here.",
                         ),
                     )
                 })
@@ -837,6 +873,59 @@ impl TerminalWindow {
                 .on_cancel(move |_, _, cx| {
                     let _ = cancel_for_escape.update(cx, |app, cx| {
                         app.cancel_review_clear(cx);
+                    });
+                    false
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// What deleting a note costs, said before it is done: it leaves the review, so a
+    /// later export or a sent review does not carry it, and it cannot be undone.
+    pub(crate) fn review_delete_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.review.delete_confirmation.as_ref()?;
+        let roles = Roles::of(cx);
+        let cancel = cx.weak_entity();
+        let cancel_for_escape = cx.weak_entity();
+        let delete = cx.weak_entity();
+        Some(
+            Dialog::new(cx)
+                .bg(roles.surface_raised)
+                .border_color(roles.border_strong)
+                .width(px(440.))
+                .title("Delete this note?")
+                .content(|content: DialogContent, _, _| {
+                    content.child(
+                        div().text_size(px(12.)).child(
+                            "The note is removed from this review: a later export or a sent review does not carry it, and it cannot be undone.",
+                        ),
+                    )
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            zed_button("cancel-delete-review-note")
+                                .label("Cancel")
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel.update(cx, |app, cx| {
+                                        app.cancel_delete_review_note(cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            zed_button("confirm-delete-review-note")
+                                .danger()
+                                .label("Delete note")
+                                .on_click(move |_, _, cx| {
+                                    let _ = delete.update(cx, |app, cx| {
+                                        app.confirm_delete_review_note(cx);
+                                    });
+                                }),
+                        ),
+                )
+                .on_cancel(move |_, _, cx| {
+                    let _ = cancel_for_escape.update(cx, |app, cx| {
+                        app.cancel_delete_review_note(cx);
                     });
                     false
                 })

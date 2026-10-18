@@ -177,7 +177,7 @@ pub(crate) trait RestingTooltip: ParentElement + Sized {
                 },
             )
             .absolute()
-            .size_full(),
+            .inset_0(),
         )
     }
 }

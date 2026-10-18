@@ -12,9 +12,14 @@
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{point, px, AppContext, ScrollDelta, TestAppContext};
+use muster_core::review::ReviewStorage;
 use muster_core::settings::{self, AppSettings, TerminalCursorStyle};
 
 use super::sidebar_tests::{dispose, open, Fixture};
+
+/// A short wait is not the wait: the toolkit holds a trigger's tooltip for half a
+/// second, and the panel's own triggers are the ones that say why they are disabled.
+const TOOLTIP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The panel, opened on a temporary file this test owns.
 ///
@@ -386,6 +391,131 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
         assert!(
             (heights[1] - heights[2]).abs() <= 1.,
             "picker and number field should share a height: {heights:?}"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
+/// The two maintenance actions share one line and are no wider than they read.
+///
+/// They used to be rows of their own, which stretched each of them across the whole
+/// panel: two full-width bars with a label centred in each, the width a toolbar is
+/// drawn at and the place a maintenance command must not be given.
+#[gpui_kit::test]
+fn the_review_actions_share_a_line_and_are_not_the_width_of_the_panel(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        window.scroll(
+            "settings-ui-font-size",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let row = window.find("settings-review-storage").bounds();
+        let clear = window.find("settings-review-clear").bounds();
+        let forget = window.find("settings-review-forget").bounds();
+        assert!(
+            (clear.origin.y - forget.origin.y).abs() < px(1.),
+            "the two actions are one line: {clear:?} {forget:?}"
+        );
+        // Right-aligned to the row's own edge, with only the gap between them
+        // left over: that is what two buttons as wide as they read look like.
+        let content_right = row.origin.x + row.size.width;
+        assert!(
+            clear.origin.x + clear.size.width + px(8.) + forget.size.width - content_right < px(1.),
+            "neither action was stretched across the panel: {clear:?} {forget:?} {row:?}"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
+/// The folder a round is written to is named under the row that chooses it, in full,
+/// once the pointer rests on it.
+///
+/// The path is cut to the column, and the tail is the half that identifies a
+/// checkout: a path nobody can read the end of is not a place they can go and check.
+#[gpui_kit::test]
+fn the_review_folder_is_named_in_full_after_the_pointer_rests_on_it(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        window.scroll(
+            "settings-ui-font-size",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            {
+                let folder = window.find("settings-review-folder").bounds();
+                let picker = window.find("settings-review-storage").bounds();
+                folder.origin.x + folder.size.width <= picker.origin.x - px(16.)
+            },
+            "the path is cut before the picker rather than running under it"
+        );
+        window.hover("settings-review-folder", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("tooltip").is_none(),
+            "the folder answered before its wait was up"
+        );
+    })
+    .unwrap();
+
+    cx.executor().advance_clock(TOOLTIP_WAIT);
+    cx.run_until_parked();
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("tooltip").is_some(),
+            "a path cut to the row was never named in full"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
+/// Clearing the cached exports is offered from the panel itself.
+///
+/// The cache is one folder under the home directory that every checkout writes to, so
+/// the action needed a checkout rather than a diff open: it used to be disabled in
+/// exactly the state the panel is opened in, which is a control nobody can reach and
+/// no reason on screen.
+#[gpui_kit::test]
+fn clearing_cached_exports_is_offered_with_no_diff_open(cx: &mut TestAppContext) {
+    let panel = Panel {
+        fixture: open(cx),
+        directory: tempfile::tempdir().unwrap(),
+    };
+    // The app cache, which is the one folder under the home directory that the
+    // action clears. It is not the default: rounds default to the checkout.
+    cx.update_window(panel.fixture.handle, |_, _, cx| {
+        panel.fixture.view.update(cx, |app, cx| {
+            app.navigation.review_storage = ReviewStorage::Default;
+            cx.notify();
+        });
+    })
+    .unwrap();
+    panel.reopen(cx);
+    assert!(
+        panel
+            .fixture
+            .view
+            .read_with(cx, |app, _| app.open_diff.is_none()),
+        "the panel is opened from the title bar, with no diff open"
+    );
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        window.scroll(
+            "settings-ui-font-size",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+        window.click("settings-review-clear", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-clear-review-exports").is_some(),
+            "the action did nothing, which is what a disabled control does"
         );
     })
     .unwrap();
