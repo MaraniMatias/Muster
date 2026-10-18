@@ -348,7 +348,6 @@ impl Navigation {
             active_checkout_id: self.active_checkout.clone(),
             sidebar_width: self.sidebar_width,
             review_storage: self.review_storage,
-            ..NavigationState::default()
         }
     }
 }

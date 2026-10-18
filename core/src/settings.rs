@@ -5,16 +5,17 @@
 //! sidebar is, where reviews are exported -- and this holds the choices about how things look.
 //! A window remembering the mode it is in is neither, and stays in window memory.
 //!
-//! ## Why no schema version
+//! ## Why no version
 //!
-//! The two stores this crate keeps beside it version their shape and refuse an older file,
-//! because each holds someone's work: checkouts they registered, rounds that owe a service a
-//! decision. A preference holds no work -- re-picking a font size costs nothing, and no
-//! preference can be half-read into a wrong state, since every field here is either a number
-//! inside a documented range or a closed set of spellings. So every field defaults, an unknown
-//! key is a key this build ignores, and a file this build can read is never thrown away over a
-//! version it does not have. That is the one place in this crate without a ladder, and the file
-//! is deliberately a document a person may open and edit.
+//! The two stores this crate keeps beside it refuse a file this build cannot read,
+//! because each holds someone's work: checkouts they registered, rounds that owe a
+//! service a decision. So each is one shape with every field required, and a shape
+//! that changes is changed in place -- there is no number to move. A preference
+//! holds no work: re-picking a font size costs nothing, and no preference can be
+//! half-read into a wrong state, since every field here is either a number inside a
+//! documented range or a closed set of spellings. So every field defaults, an
+//! unknown key is a key this build ignores, and this file is the one document in
+//! `~/.muster` a person may open and edit: the file is deliberately readable text.
 //!
 //! ## What is not here
 //!

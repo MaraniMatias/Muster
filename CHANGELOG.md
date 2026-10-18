@@ -8,6 +8,15 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **There is one stored shape, and the file carries no version.** Both state
+  files in `~/.muster` -- the native workspace and the review round store --
+  carry no `schemaVersion` at all: every field is required, no field is unknown,
+  and the shape itself is the whole contract. A shape is changed in place, a file
+  this build cannot read is refused by name and never written over, and nothing
+  left behind reads an older file: the navigation store no longer parses a second
+  time to accept a file that carries no version at all, and a stamped file is
+  refused like any other one this build does not know.
+
 - **A document can be edited, and a save says what it wrote.** The document pane
   is its editor: type in it, and a bar appears along the bottom with Cancel and
   Save — `Esc` and `⌘S` are the same two controls. Cancel puts the text the file

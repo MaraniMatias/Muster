@@ -56,8 +56,12 @@ docs/             the migration plan, and what the port has to satisfy
   sent again. Neither action touches queued, dispatching or unknown rounds.
   A restart creates a fresh shell in the selected checkout; it never revives
   processes that are gone.
+  Both files carry no version at all, so a stored shape is the whole contract: it is
+  what it is, a change is made in place, and a file this build cannot read is
+  refused by name rather than read through or migrated.
 - The preferences live in `~/.muster/settings.json`, written by `core::settings`.
-  This is the one store in `~/.muster` with **no schema version**: every field
+  This is the one store in `~/.muster` that reads a file it does not fully know:
+  every field
   defaults, a key this build does not have is ignored, and a size outside its
   documented range is clamped rather than refused, because a preference holds no
   work and the file is deliberately a document a person may open and edit. It
@@ -408,24 +412,32 @@ Consequences while the version is `v0.*.*`:
   rewrite, and no compatibility layer held "one release" for anyone. The old path
   goes in the same commit as the new one.
 
-## Database schema: no migrations before 1.0
+## Stored shapes: one shape, no version, and no migrations
 
-`legacy/src-tauri/src/persistence/mod.rs` carries one schema and no ladder.
-`create_schema` writes the whole schema into a file that has none and refuses a
-file stamped with any other `SCHEMA_VERSION`; a user upgrades by deleting the
-database and starting an empty workspace. That is deliberate, and while the
-version is `v0.*.*` it stays deliberate.
+There is no database in this app. What it keeps is two JSON files in `~/.muster` --
+the native workspace and the review round store -- and **neither carries a version
+number**. `SCHEMA_VERSION` and `schemaVersion` are gone from both, and the file's
+own shape is the contract: every field required, `deny_unknown_fields`, so a file
+this build cannot read simply fails to parse. This app is going out again and has
+no users but one, so there is no file written by an earlier build that anybody has a
+reason to keep working, and a number that could disagree with the shape is a second
+thing to keep true.
 
-While the version is `v0.*.*`:
+While that is true:
 
+- **There is no ladder, because there is no number.** A stored shape is what it is:
+  it is changed in place and the change is not a version bump. A file carrying a
+  `schemaVersion` key is not this build's file and is refused like any other one.
+- **A file this build cannot read is refused by name**, never read through defaults
+  and never written over. Deleting it starts an empty store.
 - **Never write a migration.** No `ALTER TABLE`, no version ladder, no back-compat
-  shim. Add the column to `create_schema`, bump `SCHEMA_VERSION`, ship it. Every
-  existing database is refused by name and starts empty.
-- **Never keep legacy code.** No deprecated variant kept readable, no
-  `#[serde(default)]` on a field nothing writes yet, no branch for a shape the
-  current build cannot produce. Delete the old path with the change.
-- A field that exists only to read what an older build wrote is a migration by
-  another name. Leave it out and fix the one place that wrote it.
+  shim, no compatibility reader, no `#[serde(default)]` on a field nothing writes.
+  Delete the old path with the change, and leave out a field that exists only to read
+  what an older build wrote.
+- `legacy/src-tauri/src/persistence/mod.rs` still carries `SCHEMA_VERSION = 15` and
+  its SQLite schema. That tree is frozen reference material, is not built here, and
+  nothing in this workspace reads it; its number is not this app's to move.
 
-The rule expires at 1.0. The first `v1.0.0` is where the ladder has to start: from
-that version someone's work lives in that database and cannot be refused.
+This is not a rule that expires at `1.0.0`. It becomes a question worth a ladder
+when somebody else's work is in those files, and that is a fact about who is using
+the app rather than about a release number.

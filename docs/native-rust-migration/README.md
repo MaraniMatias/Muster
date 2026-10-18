@@ -35,10 +35,9 @@ exactly-once delivery. Protocol tests use a mock server, not a live provider.
 Unsent note drafts remain window-local. Settings exposes only supported review
 options, not Legacy's unrelated terminal/theme preferences.
 
-Native workspace schema 2 and review-round schema 2 reject incompatible files
-without rewriting them. There is no migration: reset an incompatible state file
-explicitly, retaining a backup if needed. The native crates move to `0.1.0` for this
-stored-contract change; the frozen Legacy application remains `0.21.1`.
+Both state files refuse a file this build cannot read, without rewriting it.
+There is no migration and no version number in either file: reset an incompatible
+state file explicitly, retaining a backup if needed.
 
 ## Local build and packaging
 
@@ -452,8 +451,10 @@ Refusing a second instance safely can be the initial integration behavior. Bring
 
 - Versions remain `v0.<minor>.<patch>`.
 - No schema migration ladder or `ALTER TABLE` migration.
-- If a stored shape changes, update `create_schema`, increment `SCHEMA_VERSION`, and clearly report the reset policy.
-- Refuse a database with another schema version; do not automatically delete it.
+- There is one stored shape per file and the file carries no version at all. A shape
+  is changed in place; a change is not a version bump, and there is no number to move.
+- Refuse a file this build cannot read; do not automatically delete it, and say what
+  deleting it starts.
 - Do not introduce legacy readers or fields that only accommodate an older format.
 - Keep current config defaults because they are current behavior; do not add new back-compat shims.
 - Use the existing release script for version writes; do not bump a release during research.

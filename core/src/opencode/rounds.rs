@@ -60,15 +60,6 @@ use crate::{
     workspace::{checkout_id_for_path, Checkout},
 };
 
-/// Bumped only when the stored shape changes incompatibly. An older file is refused by
-/// name, like every other store this app keeps: nothing here is a migration.
-///
-/// `3` is the claim as one key per claimed note rather than the notes' own text, because
-/// a claim that carries the notes cannot be given up: it is the reviews themselves, held
-/// per round, for as long as the store exists. `2` was the claim as the notes' canonical
-/// strings; `1` was a digest of the whole review, which is a way for two different
-/// reviews to be spelled the same.
-const SCHEMA_VERSION: u32 = 3;
 /// The store holds rounds, not a transcript. Past this it is not this app's file.
 const STATE_CAP: u64 = 8 * 1024 * 1024;
 /// Where a write has to start giving something up rather than be refused.
@@ -179,24 +170,20 @@ impl ReviewRound {
     }
 }
 
-/// What the store holds. Every field is required: an older file is refused rather than
-/// read through defaults, because a round read as "nothing happened" would be re-sent.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the store holds. Every field is required and no field is unknown, and
+/// there is no version in the file: one shape, changed in place, so the shape
+/// itself is the whole contract and a file this build cannot read is refused by
+/// name rather than read through defaults, because a round read as "nothing
+/// happened" would be re-sent.
+///
+/// The claim is one key per claimed note, because a claim that carries the notes
+/// cannot be given up: it is the reviews themselves, held per round, for as long
+/// as the store exists.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RoundFile {
-    schema_version: u32,
     rounds: Vec<ReviewRound>,
     destinations: BTreeMap<String, Destination>,
-}
-
-impl Default for RoundFile {
-    fn default() -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            rounds: Vec::new(),
-            destinations: BTreeMap::new(),
-        }
-    }
 }
 
 impl RoundFile {
@@ -621,18 +608,12 @@ impl RoundStore {
         }
         let state: RoundFile = serde_json::from_slice(&bytes).map_err(|error| {
             DispatchError::Foreign(format!(
-                "the review round store {} could not be read: {error}",
+                "the review round store {} could not be read: {error}, and deleting {} starts an \
+                 empty review history",
+                self.path.display(),
                 self.path.display()
             ))
         })?;
-        if state.schema_version != SCHEMA_VERSION {
-            return Err(DispatchError::Foreign(format!(
-                "review round store schema {} is unsupported; expected {SCHEMA_VERSION}, and \
-                 deleting {} starts an empty review history",
-                state.schema_version,
-                self.path.display()
-            )));
-        }
         Ok(state)
     }
 

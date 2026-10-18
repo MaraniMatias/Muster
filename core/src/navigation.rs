@@ -27,7 +27,6 @@ const GIT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_OUTPUT_CAP: usize = 16 * 1024 * 1024;
 const GIT_DIAGNOSTIC_CAP: usize = 64 * 1024;
 const STATE_CAP: u64 = 1024 * 1024;
-const SCHEMA_VERSION: u32 = 2;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 mod changes;

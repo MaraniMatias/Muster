@@ -18,8 +18,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
+    div, px, Anchor, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
 use muster_core::review::{self, AnchorOutcome, ReviewSide};
 use muster_core::workspace::RepoKind;
@@ -1144,38 +1144,53 @@ impl TerminalWindow {
                                         .text_color(roles.text_muted)
                                         .child(selected.clone().unwrap_or_else(|| "All changes".into())),
                                 )
+                                // The action and the destination chooser are one
+                                // control: two halves of the same button, joined edge
+                                // to edge and rounded only at the outer corners, so
+                                // the chooser reads as part of the action rather than
+                                // as a second thing to press beside it. The inner
+                                // corners are named here because `zed_button`'s own 4px
+                                // is the control's radius — a split has to say which
+                                // corners it keeps.
                                 .child({
                                     let send_action = weak.clone();
                                     let export_action = weak.clone();
-                                    zed_button("review-primary-action")
-                                        .small().compact().h(px(24.))
-                                        .label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
-                                        .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
-                                        .disabled(note_count == 0 || exporting_review || opencode_busy || opencode_loading || (opencode_selected && has_pending_opencode))
-                                        .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
-                                        .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
-                                })
-                                .child({
                                     let choose = weak.clone();
-                                    zed_button("review-destination").text().small().compact().h(px(24.))
-                                        .label(if opencode_selected { "OpenCode ▾" } else { "Markdown ▾" })
-                                        .accessibility_label("Review destination")
-                                        .disabled(exporting_review || opencode_busy || opencode_loading)
-                                        .dropdown_menu(move |menu, _, _| {
-                                            let markdown = choose.clone();
-                                            let opencode = choose.clone();
-                                            menu.item(PopupMenuItem::new("Markdown").on_click(move |_, _, cx| {
-                                                let _ = markdown.update(cx, |app, cx| app.set_opencode_destination(muster_core::opencode::Destination::Markdown, cx));
-                                            })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
-                                                let _ = opencode.update(cx, |app, cx| {
-                                                    let destination = match app.review.opencode_destination.clone() {
-                                                        Some(value @ muster_core::opencode::Destination::Opencode { .. }) => value,
-                                                        _ => muster_core::opencode::Destination::OpencodeNew,
-                                                    };
-                                                    app.set_opencode_destination(destination, cx);
-                                                });
-                                            }))
-                                        })
+                                    let busy = exporting_review || opencode_busy || opencode_loading;
+                                    div().id("review-export").test_support().flex().flex_none()
+                                        .child(
+                                            zed_button("review-primary-action")
+                                                .small().compact().h(px(24.))
+                                                .rounded_l(px(4.)).rounded_r_none()
+                                                .label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
+                                                .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
+                                                .disabled(note_count == 0 || busy || (opencode_selected && has_pending_opencode))
+                                                .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
+                                                .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
+                                        )
+                                        .child(
+                                            zed_button("review-destination")
+                                                .small().compact().h(px(24.))
+                                                .rounded_r(px(4.)).rounded_l_none()
+                                                .dropdown_caret(true)
+                                                .accessibility_label("Review destination")
+                                                .disabled(busy)
+                                                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                                    let markdown = choose.clone();
+                                                    let opencode = choose.clone();
+                                                    menu.item(PopupMenuItem::new("Markdown").on_click(move |_, _, cx| {
+                                                        let _ = markdown.update(cx, |app, cx| app.set_opencode_destination(muster_core::opencode::Destination::Markdown, cx));
+                                                    })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
+                                                        let _ = opencode.update(cx, |app, cx| {
+                                                            let destination = match app.review.opencode_destination.clone() {
+                                                                Some(value @ muster_core::opencode::Destination::Opencode { .. }) => value,
+                                                                _ => muster_core::opencode::Destination::OpencodeNew,
+                                                            };
+                                                            app.set_opencode_destination(destination, cx);
+                                                        });
+                                                    }))
+                                                })
+                                        )
                                 })
                                 .when_some(source, |header, (repo, source_checkout, path)| {
                                     let weak = weak.clone();

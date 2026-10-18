@@ -24,7 +24,7 @@ use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
     PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
+    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 // The frame is the app's own on the targets that do not draw one: server-side
@@ -575,6 +575,10 @@ pub struct TerminalWindow {
 
 impl TerminalWindow {
     fn empty(backend: Arc<TerminalBackend>, owns_backend: bool, cx: &mut Context<Self>) -> Self {
+        // This window is where the app menu's own Quit is asked of, which is
+        // why it names itself to the application as it is built.
+        let workspace = cx.weak_entity();
+        cx.set_global(WorkspaceWindow(workspace));
         let grammar_enter = {
             let weak = cx.weak_entity();
             cx.intercept_keystrokes(move |event, window, cx| {
@@ -2791,9 +2795,6 @@ impl Render for TerminalWindow {
                 .bg(background)
                 .text_color(text)
                 .capture_key_down(cx.listener(Self::on_key))
-                .on_action(cx.listener(|app, _: &crate::menus::Quit, window, cx| {
-                    app.request_app_quit(window, cx);
-                }))
                 .child(self.titlebar(window, cx))
                 .child(content)
                 .child(self.tooltips.clone())
@@ -2945,6 +2946,38 @@ pub fn install_quit_path(cx: &mut App) {
         async {}
     })
     .detach();
+}
+
+/// The workspace window, so a quit that arrives without a focused element can
+/// still be asked of the window that owns the sessions.
+///
+/// GPUI hands an app-level action handler the application and not a window, so
+/// this is how the window is named back to itself: it registers itself here as
+/// it is built, and the last one built is the one a quit is asked of.
+pub struct WorkspaceWindow(pub WeakEntity<TerminalWindow>);
+
+impl gpui_kit::Global for WorkspaceWindow {}
+
+/// Answer the app menu's Quit wherever the focus happens to be.
+///
+/// The platform draws a menu item as offered when the action is answerable
+/// along the focused element's dispatch path, so an answer attached to one
+/// element is offered only while something inside it holds the focus — and a
+/// workspace with nothing open has nothing focused at all, which is an app menu
+/// whose Quit item is greyed out and a `⌘Q` that does nothing. That is why the
+/// answer is registered application-wide, where the platform asks about it.
+///
+/// The decision is still the window's, because a dirty document has to be
+/// preserved, so the question is asked rather than answered here. It is asked
+/// once the dispatch has unwound: a window is lent to whoever is updating it,
+/// and the window that would answer is lent to the dispatch that carries this.
+pub(crate) fn quit_workspace_window(cx: &mut App) {
+    let Some(workspace) = cx.try_global::<WorkspaceWindow>().map(|one| one.0.clone()) else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let _ = workspace.update_in(cx, |app, window, cx| app.request_app_quit(window, cx));
+    });
 }
 pub fn working_directory() -> PathBuf {
     directory_from(std::env::args_os())

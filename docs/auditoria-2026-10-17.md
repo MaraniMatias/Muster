@@ -850,3 +850,50 @@ blocked `plutil` before the combined command ran. The checks above were then run
 separately without the blocked bundle commands. No Linux run, real-window acceptance,
 distribution signing or notarization was performed. The manual matrix in §9 remains
 explicitly outstanding. No commits were created.
+
+## 15. One schema, version `1` (2026-10-18)
+
+The stored-shape numbers above record what each build did and are left as evidence.
+The decision that replaced them: this app is going out again and has no users but
+one, so there is nothing a schema ladder is for. Both stores in `~/.muster` are now
+stamped `schemaVersion: 1` -- `core::navigation`'s workspace and
+`core::opencode::rounds`' review round store -- and there is no second number to move
+to. `SCHEMA_VERSION` was `2` and `3`; both are `1`.
+
+What went with the ladder:
+
+- `NavigationState`'s `SchemaVersionProbe`, a second parse that read a file *without*
+  a version field so an unversioned store could still be loaded. The strict parse
+  refuses that file anyway, so the probe existed only to be kind to a shape no build
+  writes now, and `load` parses once.
+- The narration in `rounds.rs` of what `1`, `2` and `3` each were, which is a
+  migration history written as a doc comment.
+
+What did not change: an unreadable file is still refused by name and still never
+written over. `a_store_that_is_not_this_apps_file_is_refused_rather_than_read` now
+covers a store at another number, a store with a field this build does not know, and
+a round spelled a way this build does not read, in place of the three older schemas
+it used to enumerate.
+
+## 16. The version number is gone too (2026-10-18)
+
+§15 kept the number and stopped it moving. That was the wrong half of the fix, and
+the reason is visible in the field itself: the number in the file and the shape in
+the code were two things that had to agree, and the only thing keeping them
+agreeing was that nobody changed the shape. Renumbering was never the failure; a
+second source of truth that can drift from the shape it stamps was.
+
+So both stores in `~/.muster` carry no version at all. `SCHEMA_VERSION` and the
+`schemaVersion` field are deleted from `core::navigation`'s `NavigationState` and
+from `core::opencode::rounds`' `RoundFile`, along with the round store's check and
+the workspace's `validate` branch that compared it. The contract that remains is
+the one that was always underneath: every field required, `deny_unknown_fields`, and
+the shape itself is what a reader must find. A file carrying a `schemaVersion` key
+is now an unknown field, so it is refused by the same parse as any other file this
+build does not know -- no second code path, nothing to keep in step.
+
+What a person loses: nothing they could still be using. The refusal text keeps
+saying that deleting the file starts an empty review history, because that sentence
+now rides on the parse failure rather than on a version comparison. What changed on
+disk is one key, and the only store that had one on this machine was the round
+store with no rounds in it.

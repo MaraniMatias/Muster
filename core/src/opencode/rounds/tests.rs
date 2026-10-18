@@ -1051,26 +1051,18 @@ fn a_store_that_is_not_this_apps_file_is_refused_rather_than_read() {
     let refused =
         |error: DispatchError| assert!(matches!(error, DispatchError::Foreign(_)), "{error:?}");
 
-    // An older schema, and a file with a field this build does not know.
-    fs::write(
-        &path,
-        br#"{"schemaVersion":0,"rounds":[],"destinations":{}}"#,
-    )
-    .unwrap();
-    refused(fixture.store.rounds(&fixture.checkout.id).unwrap_err());
-    // A store whose claim was a digest rather than the notes' own canonical string is
-    // refused rather than read: two different reviews could have been spelled the same.
+    // A stamped file -- this build writes none and has no number to accept one by --
+    // a field this build does not know, a round spelled a way this build does not
+    // read, and a file that is not JSON at all.
     fs::write(
         &path,
         br#"{"schemaVersion":1,"rounds":[],"destinations":{}}"#,
     )
     .unwrap();
     refused(fixture.store.rounds(&fixture.checkout.id).unwrap_err());
-    fs::write(
-        &path,
-        br#"{"schemaVersion":2,"rounds":[],"destinations":{},"sessions":[]}"#,
-    )
-    .unwrap();
+    fs::write(&path, br#"{"rounds":[],"destinations":{},"sessions":[]}"#).unwrap();
+    refused(fixture.store.rounds(&fixture.checkout.id).unwrap_err());
+    fs::write(&path, br#"{"rounds":[{"id":"r1"}],"destinations":{}}"#).unwrap();
     refused(fixture.store.rounds(&fixture.checkout.id).unwrap_err());
     fs::write(&path, b"not json").unwrap();
     refused(fixture.store.rounds(&fixture.checkout.id).unwrap_err());

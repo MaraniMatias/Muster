@@ -83,7 +83,12 @@ pub fn install(cx: &mut App) {
     cx.on_action(|_: &About, cx| crate::about::open(cx));
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    // The focused workspace view owns the Quit decision; it can preserve a dirty document.
+    // The workspace window owns the Quit decision, because it can preserve a
+    // dirty document. It is registered application-wide rather than on one
+    // element: the platform asks what is answerable for the focused element
+    // when it draws the item, so an answer attached to the window's root is
+    // only offered while something inside that root holds the focus.
+    cx.on_action(|_: &Quit, cx| crate::app::quit_workspace_window(cx));
     cx.set_menus(menus());
 }
 

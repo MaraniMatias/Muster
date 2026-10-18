@@ -326,18 +326,16 @@ fn invalid_state_cannot_overwrite_last_good_file() {
 }
 
 #[test]
-fn unsupported_corrupt_and_oversized_files_are_refused_without_rewrite() {
+fn a_stamped_corrupt_and_oversized_file_is_refused_without_rewrite() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("native-workspace.json");
-    let unsupported = NavigationState {
-        schema_version: 999,
-        ..NavigationState::default()
-    };
-    fs::write(&path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
-    let before = fs::read(&path).unwrap();
-    assert!(load(&path).unwrap_err().contains("schema 999"));
+    // A stamped file is not this build's file: there is no number to accept and no
+    // reader left that knows what a stamped one meant.
+    let stamped = br#"{"schemaVersion":1,"roots":["/work/repo"],"archivedCheckoutIds":[],"activeCheckoutId":null,"sidebarWidth":240.0,"reviewStorage":"workdir"}"#;
+    fs::write(&path, stamped).unwrap();
+    assert!(load(&path).unwrap_err().contains("schemaVersion"));
     assert!(save(&path, &NavigationState::default()).is_err());
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&path).unwrap(), stamped);
     fs::write(&path, b"{}").unwrap();
     assert!(load(&path).is_err());
     fs::write(&path, vec![b' '; STATE_CAP as usize + 1]).unwrap();

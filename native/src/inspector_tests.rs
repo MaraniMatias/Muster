@@ -4831,9 +4831,11 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
             );
         }
         let toolbar = window.find("review-title-row").bounds();
+        let action = window.find("review-primary-action").bounds();
+        let chooser = window.find("review-destination").bounds();
         let controls = [
-            window.find("review-primary-action").bounds(),
-            window.find("review-destination").bounds(),
+            action,
+            chooser,
             window.find("diff-open-source-change.txt").bounds(),
             window.find("close-diff").bounds(),
         ];
@@ -4841,7 +4843,21 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
             assert!(control.top() >= toolbar.top() && control.bottom() <= toolbar.bottom());
             assert!(control.left() >= px(0.) && control.right() <= px(600.));
         }
-        assert!(window.find("review-primary-action").bounds().left() > toolbar.left());
+        // The chooser is the right half of the same button, not a control beside
+        // it: no gap between them, and both halves within one split's bounds.
+        assert_eq!(action.right(), chooser.left());
+        assert_eq!(action.top(), chooser.top());
+        assert_eq!(action.bottom(), chooser.bottom());
+        let split = window.find("review-export").bounds();
+        assert_eq!(split.left(), action.left());
+        assert_eq!(split.right(), chooser.right());
+        // The chooser half carries no text of its own any more — it is the
+        // caret, and it says what it is rather than which destination is chosen.
+        assert_eq!(
+            window.find("review-destination").label(),
+            Some("Review destination")
+        );
+        assert!(action.left() > toolbar.left());
         window.click("review-primary-action", cx);
     })
     .unwrap();
@@ -4849,6 +4865,13 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
         assert!(!app.review.exporting && !app.review.opencode_busy);
         assert!(app.review.opencode_rounds.is_empty());
     });
+    // The caret half is the destination menu's trigger, so opening it is what
+    // makes the split's other half a chooser at all.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("review-destination", cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "popup-menu"));
     fixture.view.update(cx, |app, cx| {
         app.review.opencode_destination = Some(muster_core::opencode::Destination::OpencodeNew);
         cx.notify();

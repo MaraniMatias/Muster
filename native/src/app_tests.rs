@@ -401,6 +401,36 @@ fn a_session_whose_shell_exited_is_closed(cx: &mut TestAppContext) {
     );
 }
 
+/// The app menu's Quit item is offered wherever the focus is.
+///
+/// The platform draws a menu item as offered when the action is answerable
+/// along the focused element's dispatch path, so a workspace with nothing
+/// focused — no terminal open, or a window whose focus has gone — has no path
+/// to answer from and the item is drawn greyed out, which is a menu that
+/// cannot quit the app.
+#[gpui_kit::test]
+fn the_app_menu_offers_quit_with_nothing_focused(cx: &mut TestAppContext) {
+    use super::sidebar_tests::{dispose, open};
+
+    let fixture = open(cx);
+    cx.update(crate::menus::install);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.blur(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        !cx.update_window(fixture.handle, |_, window, cx| window.focused(cx).is_some())
+            .unwrap(),
+        "nothing holds the focus, which is what a workspace with no terminal open is"
+    );
+    assert!(
+        cx.update(|cx| cx.is_action_available(&crate::menus::Quit)),
+        "Quit is what the app menu's last item asks about, and it must be answerable"
+    );
+    dispose(&fixture, cx);
+}
+
 #[test]
 fn an_app_quit_ends_the_shell_and_leaves_nothing_to_end_twice() {
     let backend = Arc::new(TerminalBackend::default());

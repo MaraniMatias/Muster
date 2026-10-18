@@ -1,18 +1,13 @@
 use super::*;
 use crate::review::ReviewStorage;
 
-/// Only native navigation preferences. All fields are required in the current
-/// schema; incompatible files are refused, not read through compatibility defaults.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SchemaVersionProbe {
-    schema_version: Option<u32>,
-}
-
+/// What the workspace file holds. Every field is required and no field is unknown,
+/// and there is no version in the file: one shape, changed in place, so the shape
+/// itself is the whole contract and a file this build cannot read is refused rather
+/// than read through or migrated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NavigationState {
-    pub schema_version: u32,
     pub roots: Vec<String>,
     pub archived_checkout_ids: Vec<String>,
     #[serde(deserialize_with = "required_selection")]
@@ -31,7 +26,6 @@ pub(super) fn required_selection<'de, D: serde::Deserializer<'de>>(
 impl Default for NavigationState {
     fn default() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
             roots: Vec::new(),
             archived_checkout_ids: Vec::new(),
             active_checkout_id: None,
@@ -43,12 +37,6 @@ impl Default for NavigationState {
 
 impl NavigationState {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SCHEMA_VERSION {
-            return Err(format!(
-                "native workspace schema {} is unsupported; expected {SCHEMA_VERSION}",
-                self.schema_version
-            ));
-        }
         if !self.sidebar_width.is_finite() || !(240.0..=500.0).contains(&self.sidebar_width) {
             return Err("native sidebar width must be between 240 and 500".into());
         }
@@ -123,8 +111,8 @@ pub fn state_path() -> Result<PathBuf, String> {
     Ok(home.join(".muster/native-workspace.json"))
 }
 
-/// Missing files start an empty workspace. Corruption, unsupported schemas,
-/// symlinks, non-regular files and oversized files are explicit errors.
+/// Missing files start an empty workspace. A file this build cannot read, symlinks,
+/// non-regular files and oversized files are explicit errors.
 pub fn load(path: &Path) -> Result<NavigationState, String> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -166,15 +154,6 @@ pub fn load(path: &Path) -> Result<NavigationState, String> {
         .map_err(|error| format!("could not read native workspace: {error}"))?;
     if bytes.len() as u64 > STATE_CAP {
         return Err("native workspace exceeds the 1 MiB limit".into());
-    }
-    let schema: SchemaVersionProbe = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid native workspace {}: {error}", path.display()))?;
-    if let Some(version) = schema.schema_version {
-        if version != SCHEMA_VERSION {
-            return Err(format!(
-                "native workspace schema {version} is unsupported; expected {SCHEMA_VERSION}"
-            ));
-        }
     }
     let state: NavigationState = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native workspace {}: {error}", path.display()))?;
