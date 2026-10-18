@@ -83,9 +83,7 @@ pub fn install(cx: &mut App) {
     cx.on_action(|_: &About, cx| crate::about::open(cx));
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    // `quit` runs the app's own quit path, so the terminals are stopped by the
-    // same handler the window's close path reaches.
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    // The focused workspace view owns the Quit decision; it can preserve a dirty document.
     cx.set_menus(menus());
 }
 

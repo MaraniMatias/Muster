@@ -15,11 +15,14 @@ use gpui_kit::{
 };
 use muster_core::workspace::{Checkout, Repo};
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 mod media;
 
@@ -35,6 +38,8 @@ pub(crate) struct DocumentView {
     /// kept beside the editor so the two views are one toggle rather than a second
     /// read of the file.
     pub(crate) preview: Option<Entity<TextViewState>>,
+    /// The replacement was published, but its directory entry was not confirmed durable.
+    pub(crate) durability_uncertain: bool,
     /// Whether this document is being read as a document or as its source. True
     /// for a Markdown file that opens rendered, false for everything else.
     rendered: bool,
@@ -51,9 +56,9 @@ pub(crate) struct DocumentView {
     /// holds is the end of a draft, and only a comparison says so.
     dirty: bool,
     /// A save is on its way, so the controls wait for its answer.
-    saving: bool,
+    pub(crate) saving: bool,
     /// Prettier is working on a captured copy; its answer may only replace that same text.
-    formatting: bool,
+    pub(crate) formatting: bool,
     /// Cancelling or replacing this document invalidates an in-flight formatter result.
     format_generation: u64,
     /// What the last save or format said, drawn beside the bar that caused it.
@@ -92,6 +97,7 @@ impl DocumentView {
         Self {
             state,
             preview,
+            durability_uncertain: false,
             rendered: markdown,
             path: identity.to_owned(),
             loaded: text.to_owned(),
@@ -108,6 +114,10 @@ impl DocumentView {
     ///
     /// A file that is not Markdown has no second reading, so the question only has
     /// two answers where there are two views to choose between.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     fn is_rendered(&self) -> bool {
         self.rendered && self.preview.is_some()
     }
@@ -273,6 +283,10 @@ fn prettier_parser(path: &str, language: &str) -> Option<&'static str> {
     }
 }
 
+fn formatter_navigation_is_current(current_request: u64, expected_request: u64) -> bool {
+    current_request == expected_request
+}
+
 fn formatter_result_is_current(
     current_text: &str,
     expected_text: &str,
@@ -392,15 +406,20 @@ fn run_prettier_with(
     input
         .write_all(source.as_bytes())
         .map_err(|error| format!("could not write formatter input: {error}"))?;
-    let output = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .current_dir(temp_dir.path())
         .env("PATH", safe_path)
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .args(["--no-config", "--no-editorconfig", "--parser", parser])
         .arg(input.path())
-        .output()
-        .map_err(|error| format!("could not start Prettier: {error}"))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let output = run_formatter_process(command)?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if message.is_empty() {
@@ -409,10 +428,151 @@ fn run_prettier_with(
             message
         });
     }
-    if output.stdout.len() > muster_core::files::MAX_PREVIEW_BYTES {
-        return Err("Prettier produced output larger than the editor's size limit.".into());
-    }
     String::from_utf8(output.stdout).map_err(|_| "Prettier returned non-UTF-8 output.".into())
+}
+
+const FORMATTER_TIMEOUT: Duration = Duration::from_secs(20);
+const FORMATTER_STDERR_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct FormatterOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_formatter_process(command: Command) -> Result<FormatterOutput, String> {
+    run_formatter_process_with_timeout(command, FORMATTER_TIMEOUT)
+}
+
+fn run_formatter_process_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<FormatterOutput, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start Prettier: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Prettier stdout was not piped.")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Prettier stderr was not piped.")?;
+    let (sender, receiver) = mpsc::channel();
+    let stdout_thread = read_formatter_stream(
+        stdout,
+        true,
+        muster_core::files::MAX_PREVIEW_BYTES,
+        sender.clone(),
+    );
+    let stderr_thread = read_formatter_stream(stderr, false, FORMATTER_STDERR_LIMIT, sender);
+    let deadline = Instant::now() + timeout;
+    let mut streams = [None, None];
+    let mut status = None;
+    let mut exited_pipe_deadline = None;
+    let mut failure = None;
+
+    while status.is_none() || streams.iter().any(Option::is_none) {
+        while let Ok((is_stdout, result)) = receiver.try_recv() {
+            let slot = if is_stdout { 0 } else { 1 };
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
+            {
+                failure = Some(if is_stdout {
+                    "Prettier produced output larger than the editor's size limit.".to_owned()
+                } else {
+                    "Prettier diagnostics exceeded the output limit.".to_owned()
+                });
+                break;
+            }
+            streams[slot] = Some(result);
+        }
+        if failure.is_some() {
+            break;
+        }
+        match child.try_wait() {
+            Ok(exit) => status = exit.or(status),
+            Err(error) => {
+                failure = Some(format!("could not wait for Prettier: {error}"));
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            failure = Some(format!(
+                "Prettier timed out after {} seconds.",
+                timeout.as_secs()
+            ));
+            break;
+        }
+        if status.is_some() && streams.iter().any(Option::is_none) {
+            // Give the readers a short drain window before killing a descendant
+            // that inherited either pipe from the formatter parent.
+            let deadline = *exited_pipe_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+            if Instant::now() >= deadline {
+                terminate_formatter_group(child.id());
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    if failure.is_some() {
+        terminate_formatter_group(child.id());
+        let _ = child.kill();
+    }
+    let final_status = child
+        .wait()
+        .map_err(|error| format!("could not reap Prettier: {error}"))?;
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let stdout = streams[0]
+        .take()
+        .ok_or("Prettier stdout was not collected.")?
+        .map_err(|error| format!("could not read Prettier stdout: {error}"))?;
+    let stderr = streams[1]
+        .take()
+        .ok_or("Prettier stderr was not collected.")?
+        .map_err(|error| format!("could not read Prettier stderr: {error}"))?;
+    Ok(FormatterOutput {
+        status: status.unwrap_or(final_status),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_formatter_stream<R: Read + Send + 'static>(
+    stream: R,
+    is_stdout: bool,
+    limit: usize,
+    sender: mpsc::Sender<(bool, std::io::Result<Vec<u8>>)>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(limit.min(8192));
+        let result = stream
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .and_then(|_| {
+                if bytes.len() > limit {
+                    Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge))
+                } else {
+                    Ok(bytes)
+                }
+            });
+        let _ = sender.send((is_stdout, result));
+    })
+}
+
+fn terminate_formatter_group(process_id: u32) {
+    if let Ok(process_id) = libc::pid_t::try_from(process_id) {
+        // SAFETY: a negative PID targets only the dedicated formatter process group.
+        unsafe { libc::kill(-process_id, libc::SIGKILL) };
+    }
 }
 
 fn filename_language(name: &str) -> Option<&'static str> {
@@ -601,15 +761,15 @@ fn grammar_menu(
         .enumerate()
         .map(|(position, index)| {
             let (label, language) = &choices[*index];
-            let id = format!("document-grammar-{position}");
-            let selected = *index == highlighted;
+            let id = language.as_deref().unwrap_or("auto");
+            let selected = position == highlighted;
             let is_choice = language.as_deref() == chosen.as_deref();
             let language = language.clone();
             let label = label.clone();
             let accessibility_label =
                 format!("{}{}", label, if is_choice { ", selected" } else { "" });
             div()
-                .id(SharedString::from(id))
+                .id(SharedString::from(format!("document-grammar-{id}")))
                 .flex()
                 .flex_none()
                 .items_center()
@@ -624,7 +784,7 @@ fn grammar_menu(
                 .cursor_pointer()
                 .role(Role::ListBoxOption)
                 .aria_label(accessibility_label)
-                .aria_selected(is_choice)
+                .aria_selected(selected)
                 .when(selected, |row| row.bg(roles.hover))
                 .hover(|style| style.bg(roles.hover))
                 .child(div().flex_1().min_w_0().text_ellipsis().child(label))
@@ -838,14 +998,93 @@ impl TerminalWindow {
         view.dirty = *view.state.read(cx).text() != view.loaded.as_str();
     }
 
+    /// Keep one destructive destination until its Save / Discard / Cancel decision resolves.
+    pub(crate) fn request_document_transition(
+        &mut self,
+        transition: crate::app::PendingDocumentTransition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_document_transition.is_none() {
+            self.pending_document_transition = Some(transition);
+        }
+        self.continue_document_transition(window, cx);
+    }
+
+    /// Apply a clean destination or ask for a decision once background work is idle.
+    ///
+    /// The decision is about leaving this document, so it belongs to a
+    /// destination: a completion that only finishes work where the window already
+    /// is — a format, or a save nobody queued a destination for — reaches this
+    /// helper with nothing pending, and asking there would put a draft in front of
+    /// a Save / Discard / Cancel choice about a navigation nobody asked for.
+    pub(crate) fn continue_document_transition(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_document_transition.is_none() {
+            return;
+        }
+        self.refresh_document_draft(cx);
+        let Some(document) = self.document_view.as_ref() else {
+            if let Some(transition) = self.pending_document_transition.take() {
+                transition(self, window, cx);
+            }
+            return;
+        };
+        if document.saving
+            || document.formatting
+            || document.durability_uncertain
+            || self.document_transition_prompted
+        {
+            return;
+        }
+        if !document.dirty {
+            let transition = self.pending_document_transition.take();
+            if let Some(transition) = transition {
+                transition(self, window, cx);
+            }
+            return;
+        }
+        self.document_transition_prompted = true;
+        let prompt = window.prompt(
+            gpui_kit::PromptLevel::Warning,
+            "Save changes to this document?",
+            Some("Your edits will be lost if you discard them."),
+            &["Cancel", "Save", "Discard"],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            let choice = prompt.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.document_transition_prompted = false;
+                match choice {
+                    Ok(1) => app.save_document(window, cx),
+                    Ok(2) => {
+                        let transition = app.pending_document_transition.take();
+                        app.clear_document();
+                        if let Some(transition) = transition {
+                            transition(app, window, cx);
+                        }
+                    }
+                    _ => app.pending_document_transition = None,
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Write the open document back, or say why it cannot be written.
     ///
-    /// What is written is the editor's own text and what is compared against the
-    /// file is the text it was opened with: a file somebody else wrote in the
-    /// meantime is not overwritten by a save that was decided before they did.
-    /// The answer is waited for off the UI thread, and lands on the document only
+    /// What is written is the editor's own text and the opened text is compared
+    /// against the current target, then its identity and bytes are checked again
+    /// immediately before publication. POSIX rename still leaves a narrow race
+    /// with a non-cooperating writer, and a post-rename sync failure means the
+    /// bytes are visible but durability is uncertain. The answer is waited for
+    /// off the UI thread, and lands on the document only
     /// if that document is still the one on screen.
-    pub(crate) fn save_document(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_document_draft(cx);
         let Some((checkout_id, path)) = self.document_target.clone() else {
             return;
@@ -853,11 +1092,9 @@ impl TerminalWindow {
         let Some((repo, checkout)) = self.document_source(&checkout_id) else {
             return;
         };
-        let (expected, content) = match self
-            .document_view
-            .as_ref()
-            .filter(|view| view.dirty && !view.saving && !view.formatting)
-        {
+        let (expected, content) = match self.document_view.as_ref().filter(|view| {
+            (view.dirty || view.durability_uncertain) && !view.saving && !view.formatting
+        }) {
             Some(view) => (view.loaded.clone(), view.state.read(cx).text().to_string()),
             None => return,
         };
@@ -870,10 +1107,10 @@ impl TerminalWindow {
         let worker = cx.background_executor().spawn(async move {
             muster_core::files::write_preview(&repo, &checkout, &path, &expected, &content)
         });
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let (checkout_id, path, content) = written;
-            let _ = view.update(cx, |app, cx| {
+            let _ = view.update_in(cx, |app, window, cx| {
                 // The document this save was for is not the one on screen.
                 if app.document_request != token {
                     return;
@@ -882,11 +1119,20 @@ impl TerminalWindow {
                     return;
                 };
                 document.saving = false;
+                let mut transition = None;
+                let mut reconsider_transition = false;
+                let mut refresh_git_status = false;
                 match result {
                     Ok(()) => {
+                        let current = document.state.read(cx).text().to_string();
                         document.loaded = content.clone();
-                        document.dirty = false;
-                        document.error = None;
+                        document.durability_uncertain = false;
+                        document.dirty = current != content;
+                        let saved_cleanly = !document.dirty;
+                        document.error = document.dirty.then(|| {
+                            "The document changed while saving; the newer edits remain unsaved."
+                                .into()
+                        });
                         // The reading is a parse of the text as saved, and the
                         // saved text is the only one it can be right about.
                         if is_markdown(&path) {
@@ -909,12 +1155,53 @@ impl TerminalWindow {
                         app.git_diff_request
                             .remove(&(checkout_id.clone(), path.clone()));
                         app.request_git_status(&checkout_id, cx);
+                        if saved_cleanly {
+                            transition = app.pending_document_transition.take();
+                        } else {
+                            reconsider_transition = app.pending_document_transition.is_some();
+                        }
                         cx.notify();
                     }
-                    Err(error) => {
+                    Err(muster_core::files::WritePreviewError::PublishedButNotDurable(error)) => {
+                        // The rename is visible, but durability was not confirmed. Treat
+                        // those bytes as the new baseline so Retry cannot overwrite a
+                        // newer external edit using the stale pre-save expectation.
+                        document.loaded = content.clone();
+                        document.durability_uncertain = true;
+                        document.dirty = *document.state.read(cx).text() != content.as_str();
+                        if is_markdown(&path) {
+                            document.preview =
+                                Some(cx.new(|cx| TextViewState::markdown(&content, cx)));
+                        }
+                        if let Some(preview) = app
+                            .open_document
+                            .as_mut()
+                            .filter(|(id, preview)| *id == checkout_id && preview.path == path)
+                            .map(|(_, preview)| preview)
+                        {
+                            preview.text = content.clone();
+                        }
+                        app.git_diff.remove(&(checkout_id.clone(), path.clone()));
+                        app.git_diff_request
+                            .remove(&(checkout_id.clone(), path.clone()));
+                        refresh_git_status = true;
+                        document.error = Some(format!(
+                            "Save is visible but may not survive a system failure: {error}"
+                        ));
+                        cx.notify();
+                    }
+                    Err(muster_core::files::WritePreviewError::BeforePublication(error)) => {
                         document.error = Some(error);
                         cx.notify();
                     }
+                }
+                if refresh_git_status {
+                    app.request_git_status(&checkout_id, cx);
+                }
+                if let Some(transition) = transition {
+                    transition(app, window, cx);
+                } else if reconsider_transition {
+                    app.continue_document_transition(window, cx);
                 }
             });
         })
@@ -971,7 +1258,7 @@ impl TerminalWindow {
             let result = worker.await;
             let mut install = None;
             let _ = view.update_in(cx, |app, _, cx| {
-                if app.document_request != request {
+                if !formatter_navigation_is_current(app.document_request, request) {
                     return;
                 }
                 let current_language = app
@@ -1058,6 +1345,11 @@ impl TerminalWindow {
                     cx.notify();
                 });
             }
+            let _ = view.update_in(cx, |app, window, cx| {
+                if app.document_request == request {
+                    app.continue_document_transition(window, cx);
+                }
+            });
         })
         .detach();
         cx.notify();
@@ -1216,7 +1508,7 @@ impl TerminalWindow {
             key.modifiers.control && !key.modifiers.platform
         };
         if app_modifier && !key.modifiers.alt && key.key.eq_ignore_ascii_case("s") {
-            self.save_document(cx);
+            self.save_document(window, cx);
             return true;
         }
         if key.key == "escape" {
@@ -1237,7 +1529,13 @@ impl TerminalWindow {
         }
         self.open_document = None;
         self.document_view = None;
+        self.pending_document_transition = None;
+        self.document_transition_prompted = false;
         self.document_grammar_open = false;
+        self.document_grammar_query = None;
+        self.document_grammar_query_watch = None;
+        self.document_grammar_query_seen.clear();
+        self.document_grammar_highlight = 0;
         self.document_request = self.document_request.wrapping_add(1);
     }
 
@@ -1437,14 +1735,23 @@ impl TerminalWindow {
                     .expect("asked for");
                 (file.additions, file.deletions)
             });
-        // Code always has its footer for Format. Save and Cancel appear only for a
-        // dirty editor, as in Legacy's Code view.
+        // Code always has its Format footer. Save and Cancel appear for a draft;
+        // Cancel is only for edits, while an uncertain published save offers retry.
         let identity = format!("{checkout_id}\0{path}\0{}", self.document_request);
         let code_footer = self
             .document_view
             .as_ref()
             .filter(|view| view.path == identity && !rendered)
-            .map(|view| (view.dirty, view.saving, view.formatting, view.error.clone()));
+            .map(|view| {
+                (
+                    view.dirty,
+                    view.dirty || view.durability_uncertain,
+                    view.saving,
+                    view.formatting,
+                    view.error.clone(),
+                    self.pending_document_transition.is_some(),
+                )
+            });
         let format_language = self
             .document_language_overrides
             .get(&grammar_key)
@@ -1620,7 +1927,12 @@ impl TerminalWindow {
                                         .accessibility_label(format!("Show the changes to {path}"))
                                         .tooltip("Show this file's changes")
                                         .on_click(cx.listener(move |app, _, window, cx| {
-                                            app.open_changes(&checkout_id, Some(path.clone()), cx);
+                                            app.request_open_changes(
+                                                &checkout_id,
+                                                Some(path.clone()),
+                                                window,
+                                                cx,
+                                            );
                                             app.focus_terminal(window, cx);
                                         })),
                                 )
@@ -1660,14 +1972,20 @@ impl TerminalWindow {
                                 .accessibility_label("Close preview")
                                 .tooltip("Close preview")
                                 .on_click(cx.listener(|app, _, window, cx| {
-                                    app.clear_document();
-                                    app.focus_terminal(window, cx);
-                                    cx.notify();
+                                    app.request_document_transition(
+                                        Box::new(|app, window, cx| {
+                                            app.clear_document();
+                                            app.focus_terminal(window, cx);
+                                            cx.notify();
+                                        }),
+                                        window,
+                                        cx,
+                                    );
                                 })),
                         ),
                 )
                 .child(div().flex_1().min_w_0().min_h_0().child(body))
-                .when_some(code_footer, |pane, (dirty, saving, formatting, error)| {
+                .when_some(code_footer, |pane, (dirty, save_needed, saving, formatting, error, transition_pending)| {
                     let has_error = error.is_some();
                     pane.child(
                         div()
@@ -1723,41 +2041,70 @@ impl TerminalWindow {
                                         })),
                                 )
                             })
-                            .when(dirty, |footer| {
+                            .when(transition_pending, |footer| {
+                                footer.child(
+                                    zed_button("stay-in-document")
+                                        .ghost()
+                                        .small()
+                                        .compact()
+                                        .label("Stay here")
+                                        .accessibility_label("Cancel the pending navigation and stay in this document")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.pending_document_transition = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(save_needed, |footer| {
                                 footer.child(
                                     div()
                                         .id("document-draft-actions")
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .child(
-                                            zed_button("cancel-document")
-                                                .ghost()
-                                                .small()
-                                                .compact()
-                                                .label("Cancel")
-                                                .accessibility_label("Discard the unsaved changes")
-                                                .tooltip("Discard the unsaved changes (Esc)")
-                                                .disabled(saving)
-                                                .on_click(cx.listener(|app, _, window, cx| {
-                                                    app.cancel_document(window, cx);
-                                                })),
-                                        )
+                                        .when(dirty, |actions| {
+                                            actions.child(
+                                                zed_button("cancel-document")
+                                                    .ghost()
+                                                    .small()
+                                                    .compact()
+                                                    .label("Cancel")
+                                                    .accessibility_label("Discard the unsaved changes")
+                                                    .tooltip("Discard the unsaved changes (Esc)")
+                                                    .disabled(saving)
+                                                    .on_click(cx.listener(|app, _, window, cx| {
+                                                        app.cancel_document(window, cx);
+                                                    })),
+                                            )
+                                        })
                                         .child(
                                             zed_button("save-document")
                                                 .small()
                                                 .compact()
-                                                .label(if saving { "Saving…" } else { "Save" })
-                                                .accessibility_label("Save this file")
+                                                .label(if saving {
+                                                    "Saving…"
+                                                } else if save_needed && !dirty {
+                                                    "Retry"
+                                                } else {
+                                                    "Save"
+                                                })
+                                                .accessibility_label(if save_needed && !dirty {
+                                                    "Retry confirming the save is durable"
+                                                } else {
+                                                    "Save this file"
+                                                })
                                                 .tooltip(if saving || formatting {
                                                     "Save unavailable while an operation is running"
+                                                        .to_owned()
+                                                } else if save_needed && !dirty {
+                                                    "Retry syncing the published file to confirm durability"
                                                         .to_owned()
                                                 } else {
                                                     format!("Save this file ({})", save_key())
                                                 })
                                                 .disabled(saving || formatting)
-                                                .on_click(cx.listener(|app, _, _, cx| {
-                                                    app.save_document(cx);
+                                                .on_click(cx.listener(|app, _, window, cx| {
+                                                    app.save_document(window, cx);
                                                 })),
                                         ),
                                 )
@@ -2367,6 +2714,12 @@ mod tests {
     }
 
     #[test]
+    fn formatter_result_is_discarded_after_navigation() {
+        assert!(formatter_navigation_is_current(4, 4));
+        assert!(!formatter_navigation_is_current(5, 4));
+    }
+
+    #[test]
     fn formatter_result_is_discarded_after_text_or_language_changes() {
         assert!(formatter_result_is_current(
             "draft", "draft", "json", "json"
@@ -2383,6 +2736,58 @@ mod tests {
             "json",
             "typescript"
         ));
+    }
+
+    fn formatter_test_command(script: &str) -> Command {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        command
+    }
+
+    #[test]
+    fn formatter_process_bounds_both_output_streams() {
+        let stdout =
+            run_formatter_process(formatter_test_command("head -c 1048577 /dev/zero")).unwrap_err();
+        assert!(stdout.contains("output larger than"));
+
+        let stderr = run_formatter_process(formatter_test_command("head -c 65537 /dev/zero >&2"))
+            .unwrap_err();
+        assert!(stderr.contains("diagnostics exceeded"));
+    }
+
+    #[test]
+    fn formatter_process_times_out_and_reaps_descendants() {
+        let started = Instant::now();
+        let result = run_formatter_process_with_timeout(
+            formatter_test_command("sleep 30 & wait"),
+            Duration::from_millis(50),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let started = Instant::now();
+        let result = run_formatter_process(formatter_test_command("sleep 30 & exit 0"))
+            .expect("the formatter parent succeeded");
+        assert!(result.status.success());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn formatter_process_returns_success_output_and_failure_diagnostics() {
+        let output = run_formatter_process(formatter_test_command("printf formatted"))
+            .expect("formatter succeeds");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"formatted");
+
+        let failed = run_formatter_process(formatter_test_command("printf diagnostic >&2; exit 7"))
+            .expect("process result is collected");
+        assert!(!failed.status.success());
+        assert_eq!(failed.stderr, b"diagnostic");
     }
 
     #[test]

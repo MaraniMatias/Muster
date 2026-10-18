@@ -104,6 +104,20 @@ pub(crate) fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui
 /// name up is an allocation per row per frame — which is most of what a remembered
 /// width would cost.
 pub(crate) type WidthCache = HashMap<u32, HashMap<String, f32>>;
+const MAX_WIDTH_CACHE_SIZES: usize = 4;
+const MAX_WIDTH_CACHE_ENTRIES_PER_SIZE: usize = 8192;
+
+fn bound_width_cache(widths: &mut WidthCache, size: u32) {
+    if !widths.contains_key(&size) && widths.len() >= MAX_WIDTH_CACHE_SIZES {
+        widths.clear();
+    }
+    if widths
+        .get(&size)
+        .is_some_and(|texts| texts.len() >= MAX_WIDTH_CACHE_ENTRIES_PER_SIZE)
+    {
+        widths.remove(&size);
+    }
+}
 
 /// The width a piece of text is at a size, remembered.
 ///
@@ -122,6 +136,7 @@ pub(crate) fn measured_width(
         return *width;
     }
     let width = sidebar_text_width(window, text, size).as_f32();
+    bound_width_cache(widths, at_size);
     widths
         .entry(at_size)
         .or_default()
@@ -416,6 +431,9 @@ pub(crate) enum InspectorTab {
     Changes,
 }
 
+pub(crate) type PendingDocumentTransition =
+    Box<dyn FnOnce(&mut TerminalWindow, &mut Window, &mut Context<TerminalWindow>) + 'static>;
+
 pub struct TerminalWindow {
     pub(crate) navigation: Navigation,
     pub(crate) terminals: HashMap<String, LiveTerminal>,
@@ -448,6 +466,8 @@ pub struct TerminalWindow {
     pub(crate) open_document: Option<(String, FilePreview)>,
     pub(crate) document_target: Option<(String, String)>,
     pub(crate) document_view: Option<crate::document::DocumentView>,
+    pub(crate) pending_document_transition: Option<PendingDocumentTransition>,
+    pub(crate) document_transition_prompted: bool,
     /// File-local syntax choices, kept only for this window's lifetime.
     pub(crate) document_language_overrides: HashMap<String, String>,
     pub(crate) document_grammar_open: bool,
@@ -576,6 +596,8 @@ impl TerminalWindow {
             open_document: None,
             document_target: None,
             document_view: None,
+            pending_document_transition: None,
+            document_transition_prompted: false,
             document_language_overrides: HashMap::new(),
             document_grammar_open: false,
             document_grammar_highlight: 0,
@@ -748,6 +770,20 @@ impl TerminalWindow {
     }
 
     pub(crate) fn request_terminal(
+        &mut self,
+        checkout_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout_id = checkout_id.to_owned();
+        self.request_document_transition(
+            Box::new(move |app, window, cx| app.request_terminal_now(&checkout_id, window, cx)),
+            window,
+            cx,
+        );
+    }
+
+    fn request_terminal_now(
         &mut self,
         checkout_id: &str,
         window: &mut Window,
@@ -1288,7 +1324,24 @@ impl TerminalWindow {
         cx.notify();
     }
 
+    pub(crate) fn request_app_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_document_transition(Box::new(|_, _, cx| cx.quit()), window, cx);
+    }
+
     pub(crate) fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_document_draft(cx);
+        if self
+            .document_view
+            .as_ref()
+            .is_some_and(crate::document::DocumentView::is_dirty)
+        {
+            self.request_document_transition(
+                Box::new(|app, window, cx| app.request_window_close(window, cx)),
+                window,
+                cx,
+            );
+            return;
+        }
         if self.closing {
             return;
         }
@@ -2484,6 +2537,21 @@ impl TerminalWindow {
         let Some(shortcut) = shortcut(&event.keystroke) else {
             return;
         };
+        if shortcut == Shortcut::FocusTerminal {
+            let overlay_open = self.editing.is_some()
+                || self.worktree.is_some()
+                || self.worktree_removal.is_some()
+                || self.document_grammar_open;
+            let terminal_focused = self
+                .terminal()
+                .is_some_and(|terminal| terminal.read(cx).focus_handle(cx).is_focused(window));
+            if !overlay_open && !terminal_focused && self.terminal().is_some() {
+                self.focus_terminal(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
         if self.opening || self.closing || self.injected {
             return;
         }
@@ -2508,6 +2576,7 @@ impl TerminalWindow {
                     self.request_terminal(&id, window, cx);
                 }
             }
+            Shortcut::FocusTerminal => unreachable!("handled before the workspace shortcuts"),
         }
         cx.notify();
     }
@@ -2687,7 +2756,8 @@ impl Render for TerminalWindow {
                     .as_ref()
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
             })
-            .or_else(|| self.review_clear_dialog(cx));
+            .or_else(|| self.review_clear_dialog(cx))
+            .or_else(|| self.opencode_forget_dialog(cx));
         // On a target whose window has no frame of its own, the frame is this
         // one: it insets the content out of the shadow, draws the border and
         // owns the resize band. It is a pass-through everywhere else.
@@ -2701,6 +2771,9 @@ impl Render for TerminalWindow {
                 .bg(background)
                 .text_color(text)
                 .capture_key_down(cx.listener(Self::on_key))
+                .on_action(cx.listener(|app, _: &crate::menus::Quit, window, cx| {
+                    app.request_app_quit(window, cx);
+                }))
                 .child(self.titlebar(window, cx))
                 .child(content)
                 .when_some(self.toast_element(cx), |root, toasts| root.child(toasts))
@@ -2720,6 +2793,7 @@ impl Drop for TerminalWindow {
 enum Shortcut {
     Panels,
     Terminal,
+    FocusTerminal,
 }
 fn shortcut(key: &gpui_kit::Keystroke) -> Option<Shortcut> {
     let app_modifier = if cfg!(target_os = "macos") {
@@ -2734,6 +2808,7 @@ fn shortcut(key: &gpui_kit::Keystroke) -> Option<Shortcut> {
         "/" | "slash" => Some(Shortcut::Panels),
         "7" if key.modifiers.shift => Some(Shortcut::Panels),
         "n" => Some(Shortcut::Terminal),
+        "escape" if key.modifiers.shift => Some(Shortcut::FocusTerminal),
         _ => None,
     }
 }

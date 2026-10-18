@@ -971,6 +971,23 @@ impl TerminalWindow {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
+        self.request_document_transition(
+            Box::new(move |app, window, cx| {
+                app.request_document_now(repo, checkout, path, window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn request_document_now(
+        &mut self,
+        repo: Repo,
+        checkout: Checkout,
+        path: String,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
         self.clear_document();
         let token = self.document_request;
         let checkout_id = checkout.id.clone();
@@ -1428,8 +1445,10 @@ impl TerminalWindow {
                         None,
                         all_selected,
                         None,
-                        move |_, _, cx| {
-                            let _ = weak.update(cx, |app, cx| app.open_changes(&id, None, cx));
+                        move |_, window, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.request_open_changes(&id, None, window, cx)
+                            });
                         },
                     )),
                 roles,
@@ -1591,11 +1610,12 @@ impl TerminalWindow {
                                                     Some(tooltip),
                                                     selected,
                                                     None,
-                                                    move |_, _, cx| {
+                                                    move |_, window, cx| {
                                                         let _ = weak.update(cx, |app, cx| {
-                                                            app.open_changes(
+                                                            app.request_open_changes(
                                                                 &id,
                                                                 Some(path.clone()),
+                                                                window,
                                                                 cx,
                                                             )
                                                         });

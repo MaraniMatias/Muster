@@ -256,6 +256,20 @@ impl TerminalWindow {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
+        let checkout = checkout.to_owned();
+        self.request_document_transition(
+            Box::new(move |app, window, cx| app.select_checkout_row_now(&checkout, window, cx)),
+            window,
+            cx,
+        );
+    }
+
+    fn select_checkout_row_now(
+        &mut self,
+        checkout: &str,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.navigation.select_checkout(checkout) {
             return;
         }
@@ -282,6 +296,21 @@ impl TerminalWindow {
             }
         }
         cx.notify();
+    }
+
+    pub(crate) fn request_open_changes(
+        &mut self,
+        checkout: &str,
+        path: Option<String>,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout = checkout.to_owned();
+        self.request_document_transition(
+            Box::new(move |app, _, cx| app.open_changes(&checkout, path, cx)),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn open_changes(

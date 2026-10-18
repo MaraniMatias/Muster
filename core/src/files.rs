@@ -23,10 +23,11 @@
 //!   redirecting the rest of it, and a directory that moves after it was opened
 //!   keeps the handle that named it.
 //!
-//! Reading and writing share one boundary. A write adds the two rules only a
-//! writer has: the file must still hold the bytes the caller read
-//! ([`write_preview`] compares rather than overwrites), and a read-only file is
-//! refused rather than quietly made writable.
+//! Reading and writing share one boundary. A write compares the file against the
+//! caller's expected text and revalidates identity and bytes just before rename;
+//! POSIX still permits a narrow race with a non-cooperating writer between that
+//! check and publication. A read-only file is refused rather than quietly made
+//! writable.
 //!
 //! What is deliberately not offered yet, so a caller is not surprised by it:
 //!
@@ -163,6 +164,8 @@ fn descriptor(fd: libc::c_int) -> io::Result<OwnedFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: each caller passes a fresh, open descriptor from `openat` or `dup`; this is the
+    // unique ownership transfer, and no caller closes or wraps the raw descriptor separately.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -471,6 +474,23 @@ pub fn read_preview(repo: &Repo, checkout: &Checkout, path: &str) -> Result<File
 /// names the way out rather than the state.
 const CHANGED_ON_DISK: &str = "file changed on disk; reload it before saving";
 
+/// A write failure, including whether replacement was already published.
+#[derive(Debug)]
+pub enum WritePreviewError {
+    BeforePublication(String),
+    PublishedButNotDurable(String),
+}
+
+impl std::fmt::Display for WritePreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforePublication(message) | Self::PublishedButNotDurable(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
 /// Replace one text file inside a checkout, or refuse it.
 ///
 /// The same walk a read is [(`read_preview`)] answered by — the registered
@@ -478,71 +498,118 @@ const CHANGED_ON_DISK: &str = "file changed on disk; reload it before saving";
 /// descriptor of the one before it with `O_NOFOLLOW`, and an entry that has to
 /// still be a regular file — plus the two rules a writer owes on top of it:
 ///
-/// - **The bytes on disk are still the bytes that were read.** `expected` is
-///   what the caller was shown, compared against the file itself rather than
-///   against anything the caller kept: an edit made in another window, or by the
-///   tool this document was opened from, is somebody else's text and is not
-///   overwritten by this save.
+/// - **The file still matches at the checks this operation can make.** `expected`
+///   is compared with the current bytes and the original file identity is checked
+///   again just before publication. A non-cooperating writer can still change the
+///   name in the small interval between that check and `renameat`; POSIX does not
+///   provide a portable compare-and-swap rename for this operation.
 /// - **A read-only file stays read-only.** The replacement is a rename into the
 ///   directory, which needs write access to the *directory* rather than to the
 ///   file, so a save would quietly undo the bit somebody set. It is refused
 ///   instead.
 ///
-/// The write itself is atomic: the bytes go to a fresh file beside it and that
-/// file is renamed over the name. A reader therefore sees the old text or the
-/// new one, never half of either, and a failure part way through leaves the
-/// original as it was.
+/// The replacement is atomic: readers see the old name or the complete new
+/// file, never a partial write. Failures before rename leave the original intact;
+/// after rename, directory-sync failure is reported as
+/// [`WritePreviewError::PublishedButNotDurable`], because the new bytes are visible
+/// but persistence across a system failure was not confirmed.
 pub fn write_preview(
     repo: &Repo,
     checkout: &Checkout,
     path: &str,
     expected: &str,
     content: &str,
-) -> Result<(), String> {
-    let root = root(repo, checkout)?;
-    let relative = relative(path)?;
+) -> Result<(), WritePreviewError> {
+    write_preview_with_hooks(
+        repo,
+        checkout,
+        path,
+        expected,
+        content,
+        || {},
+        |fd| unsafe { libc::fsync(fd) },
+    )
+}
+
+fn write_preview_with_hooks(
+    repo: &Repo,
+    checkout: &Checkout,
+    path: &str,
+    expected: &str,
+    content: &str,
+    before_publish: impl FnOnce(),
+    sync_directory: impl FnOnce(std::os::fd::RawFd) -> i32,
+) -> Result<(), WritePreviewError> {
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _save = SAVE_LOCK.lock().map_err(|_| {
+        WritePreviewError::BeforePublication("could not serialize file saves".into())
+    })?;
+    let root = root(repo, checkout).map_err(WritePreviewError::BeforePublication)?;
+    let relative = relative(path).map_err(WritePreviewError::BeforePublication)?;
     let too_large = "file is larger than the 1 MiB preview limit";
-    // The bound is the preview's, because the file being written is a file that
-    // could be previewed: a save cannot make a file this app cannot open.
     if content.len() > MAX_PREVIEW_BYTES || content.contains('\0') {
-        return Err(if content.contains('\0') {
-            "binary files cannot be previewed".into()
-        } else {
-            too_large.into()
-        });
+        return Err(WritePreviewError::BeforePublication(
+            if content.contains('\0') {
+                "binary files cannot be previewed".into()
+            } else {
+                too_large.into()
+            },
+        ));
     }
-    let name = relative.file_name().ok_or(NOT_REGULAR)?;
-    let root_handle = open_root(&root).map_err(|e| e.to_string())?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| WritePreviewError::BeforePublication(NOT_REGULAR.into()))?;
+    let root_handle = open_root(&root)
+        .map_err(|error| WritePreviewError::BeforePublication(error.to_string()))?;
     let parent = open_directory(&root_handle, relative.parent().unwrap_or(Path::new("")))
-        .map_err(|e| e.to_string())?;
-    let name = name_of(name).map_err(|e| e.to_string())?;
-    // Opened through the walk rather than by path, so a link exchanged for the
-    // file is refused instead of being written through.
-    let file = open_file(&parent, &name).map_err(|e| e.to_string())?;
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("could not inspect file: {error}"))?;
+        .map_err(|error| WritePreviewError::BeforePublication(error.to_string()))?;
+    let name =
+        name_of(name).map_err(|error| WritePreviewError::BeforePublication(error.to_string()))?;
+    let file = open_file(&parent, &name)
+        .map_err(|error| WritePreviewError::BeforePublication(error.to_string()))?;
+    let opened = file.metadata().map_err(|error| {
+        WritePreviewError::BeforePublication(format!("could not inspect file: {error}"))
+    })?;
     if !opened.is_file() {
-        return Err(NOT_REGULAR.into());
+        return Err(WritePreviewError::BeforePublication(NOT_REGULAR.into()));
     }
     if opened.len() > MAX_PREVIEW_BYTES as u64 {
-        return Err(too_large.into());
+        return Err(WritePreviewError::BeforePublication(too_large.into()));
     }
-    // `O_NOFOLLOW` opened a real file rather than a link, so what follows reads
-    // and writes the file this walk validated.
     let mode = opened.permissions().mode() & 0o7777;
     if mode & 0o222 == 0 {
-        return Err("file is read-only".into());
+        return Err(WritePreviewError::BeforePublication(
+            "file is read-only".into(),
+        ));
     }
-    let current = read_whole(file, MAX_PREVIEW_BYTES, too_large)?;
+    let current = read_whole(file, MAX_PREVIEW_BYTES, too_large)
+        .map_err(WritePreviewError::BeforePublication)?;
     if current.contains(&0) {
-        return Err("binary files cannot be previewed".into());
+        return Err(WritePreviewError::BeforePublication(
+            "binary files cannot be previewed".into(),
+        ));
     }
-    let current = String::from_utf8(current).map_err(|_| "file is not valid UTF-8".to_owned())?;
+    let current = String::from_utf8(current)
+        .map_err(|_| WritePreviewError::BeforePublication("file is not valid UTF-8".into()))?;
     if current != expected {
-        return Err(CHANGED_ON_DISK.into());
+        return Err(WritePreviewError::BeforePublication(CHANGED_ON_DISK.into()));
     }
-    replace(&parent, &name, content.as_bytes(), mode)
+    replace(
+        &parent,
+        &name,
+        content.as_bytes(),
+        mode,
+        &opened,
+        expected,
+        (before_publish, sync_directory),
+    )
+    .map_err(|error| {
+        if error.starts_with("published but directory sync failed:") {
+            WritePreviewError::PublishedButNotDurable(error)
+        } else {
+            WritePreviewError::BeforePublication(error)
+        }
+    })
 }
 
 /// Create a new Markdown review export without following a path outside its owner.
@@ -846,7 +913,16 @@ const ORPHANED: &str = "could not replace file";
 /// The temporary file is created under the directory handle the walk already
 /// validated, exclusively and without following anything, so a name that is
 /// already there is a failure rather than a file somebody else's bytes land in.
-fn replace(parent: &OwnedFd, name: &CStr, bytes: &[u8], mode: u32) -> Result<(), String> {
+fn replace(
+    parent: &OwnedFd,
+    name: &CStr,
+    bytes: &[u8],
+    mode: u32,
+    original: &std::fs::Metadata,
+    expected: &str,
+    hooks: (impl FnOnce(), impl FnOnce(std::os::fd::RawFd) -> i32),
+) -> Result<(), String> {
+    let (before_publish, sync_directory) = hooks;
     let temporary = temporary_name()?;
     let held = name_of(OsStr::new(&temporary)).map_err(|error| error.to_string())?;
     let fd = unsafe {
@@ -879,9 +955,14 @@ fn replace(parent: &OwnedFd, name: &CStr, bytes: &[u8], mode: u32) -> Result<(),
         unsafe { libc::unlinkat(parent.as_raw_fd(), held.as_ptr(), 0) };
         return Err(error);
     }
-    // `renameat` replaces the name itself and never follows it, so a link that
-    // replaced the file while the bytes were being written is replaced by them
-    // rather than written through.
+    // Re-open and compare both inode identity and contents as late as possible.
+    // A non-cooperating writer can still race the following rename; POSIX rename
+    // has no portable compare-and-swap form on both supported platforms.
+    before_publish();
+    if let Err(error) = revalidate_target(parent, name, original, expected) {
+        unsafe { libc::unlinkat(parent.as_raw_fd(), held.as_ptr(), 0) };
+        return Err(error);
+    }
     if unsafe {
         libc::renameat(
             parent.as_raw_fd(),
@@ -894,6 +975,37 @@ fn replace(parent: &OwnedFd, name: &CStr, bytes: &[u8], mode: u32) -> Result<(),
         let error = io::Error::last_os_error();
         unsafe { libc::unlinkat(parent.as_raw_fd(), held.as_ptr(), 0) };
         return Err(format!("{ORPHANED}: {error}"));
+    }
+    if sync_directory(parent.as_raw_fd()) != 0 {
+        return Err(format!(
+            "published but directory sync failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck the target name's identity and bytes immediately before publication.
+fn revalidate_target(
+    parent: &OwnedFd,
+    name: &CStr,
+    original: &std::fs::Metadata,
+    expected: &str,
+) -> Result<(), String> {
+    let current = open_file(parent, name).map_err(|_| CHANGED_ON_DISK.to_owned())?;
+    let metadata = current
+        .metadata()
+        .map_err(|error| format!("could not inspect file: {error}"))?;
+    if metadata.dev() != original.dev() || metadata.ino() != original.ino() {
+        return Err(CHANGED_ON_DISK.into());
+    }
+    let current = read_whole(
+        current,
+        MAX_PREVIEW_BYTES,
+        "file is larger than the 1 MiB preview limit",
+    )?;
+    if current != expected.as_bytes() {
+        return Err(CHANGED_ON_DISK.into());
     }
     Ok(())
 }
@@ -1630,7 +1742,9 @@ mod tests {
 
         // Somebody else wrote between the read and the save.
         assert_eq!(
-            write_preview(&repo, &checkout, "other.txt", "what was read", "mine").unwrap_err(),
+            write_preview(&repo, &checkout, "other.txt", "what was read", "mine")
+                .unwrap_err()
+                .to_string(),
             CHANGED_ON_DISK
         );
         assert_eq!(
@@ -1640,7 +1754,9 @@ mod tests {
         );
         // Even the empty expected value is a claim about the bytes.
         assert_eq!(
-            write_preview(&repo, &checkout, "other.txt", "", "mine").unwrap_err(),
+            write_preview(&repo, &checkout, "other.txt", "", "mine")
+                .unwrap_err()
+                .to_string(),
             CHANGED_ON_DISK
         );
         // And the file that was saved can be saved again from what it now holds.
@@ -1649,6 +1765,54 @@ mod tests {
             fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
             "again"
         );
+    }
+
+    #[test]
+    fn replacement_interleaved_before_publication_is_refused_by_write_preview() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        fs::write(&path, "expected").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let result = write_preview_with_hooks(
+            &repo,
+            &checkout,
+            "hello.txt",
+            "expected",
+            "mine",
+            || {
+                let replacement = dir.path().join("replacement");
+                fs::write(&replacement, "external replacement").unwrap();
+                fs::rename(replacement, &path).unwrap();
+            },
+            |fd| unsafe { libc::fsync(fd) },
+        );
+        assert!(matches!(
+            result,
+            Err(WritePreviewError::BeforePublication(ref error)) if error == CHANGED_ON_DISK
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "external replacement");
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_visible_published_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        fs::write(&path, "expected").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let result = write_preview_with_hooks(
+            &repo,
+            &checkout,
+            "hello.txt",
+            "expected",
+            "published",
+            || {},
+            |_| -1,
+        );
+        assert!(matches!(
+            result,
+            Err(WritePreviewError::PublishedButNotDurable(_))
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "published");
     }
 
     /// Everything a read refuses, a write refuses too, because the boundary that
@@ -1751,7 +1915,9 @@ mod tests {
         {
             fs::set_permissions(&made, std::fs::Permissions::from_mode(0o444)).unwrap();
             assert_eq!(
-                write_preview(&repo, &checkout, "script.sh", "echo new", "echo again").unwrap_err(),
+                write_preview(&repo, &checkout, "script.sh", "echo new", "echo again")
+                    .unwrap_err()
+                    .to_string(),
                 "file is read-only"
             );
             assert_eq!(fs::read_to_string(&made).unwrap(), "echo new");

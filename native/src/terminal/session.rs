@@ -1541,6 +1541,21 @@ impl TerminalSession {
         self.snapshot_inner(false)
     }
 
+    /// The mouse-reporting inputs used by pointer events, without building a grid snapshot.
+    pub(crate) fn mouse_state(&self) -> (bool, bool, bool) {
+        let core = self.inner.shared().core();
+        (
+            core.is_alt_screen(),
+            core.is_mouse_tracking(),
+            core.modes().alternate_scroll,
+        )
+    }
+
+    /// The cursor geometry requested by the native input system, without copying visible rows.
+    pub(crate) fn cursor_snapshot(&self) -> CursorSnapshot {
+        self.inner.shared().core().cursor()
+    }
+
     /// Read the current title without copying the grid.
     pub fn title(&self) -> Option<String> {
         self.inner.shared().core().title().map(str::to_owned)

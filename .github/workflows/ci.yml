@@ -27,11 +27,13 @@ jobs:
       - run: cargo test --locked --workspace
 
       # The audit is the one thing here that is not `cargo`: it reads the locked graph, refuses any
-      # path package it cannot hash-pin, and queries OSV. Node is needed for that alone.
+      # path package it cannot hash-pin, and queries OSV. Node is needed for that alone, and for
+      # the release command tests `scripts/release.sh check` runs beside the audit -- same two files,
+      # so a release profile or command that breaks is caught here rather than at packaging.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - run: node --test scripts/audit-rust.test.mjs
+      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs
       - run: node scripts/audit-rust.mjs
 
       - run: cargo build --locked --release -p muster

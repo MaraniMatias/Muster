@@ -1,6 +1,6 @@
 [package]
 name = "muster-core"
-version = "0.1.0"
+version = "0.2.0"
 # 2021, matching the sources this crate took over from `src-tauri`. Those files
 # are edition 2021 and `muster` -- the only consumer -- does not have to
 # cross editions to depend on them.
@@ -28,3 +28,4 @@ ureq = { version = "3", default-features = false, features = ["json"] }
 base64 = "0.22"
 # Secure, automatically removed scratch files for Git diff snapshots.
 tempfile = "3"
+sha2 = "0.10"

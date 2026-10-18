@@ -45,6 +45,15 @@ docs/             the migration plan, and what the port has to satisfy
   `~/.muster/opencode-rounds.json` so a sent review can be shown and settled
   later. That file is app state like the workspace file, under the same lock and
   the same bounded, non-symlink read.
+  It is also capped, and a cap is not a wall: a write that gets close gives up
+  what no reader can ask for again, which is the prompt of a settled round, and a
+  person can forget delivered reviews from **Settings → Forget delivered
+  reviews…** (from any window state; the store is one file). The ordinary action
+  keeps SHA-256 fingerprints of canonical note snapshots as `id:digest` claims,
+  so unchanged notes remain deduplicated with collision resistance, not mathematical
+  certainty. The same confirmation also offers an explicit last-resort reset that
+  removes settled rounds and their claims; unchanged delivered notes can then be
+  sent again. Neither action touches queued, dispatching or unknown rounds.
   A restart creates a fresh shell in the selected checkout; it never revives
   processes that are gone.
 - Linux builds need the Vulkan, X11 and XKB development packages. See the
@@ -209,13 +218,15 @@ draft owns the pane's last row until it is saved or cancelled.
 
 Three rules it depends on, each pinned by a test:
 
-- A **save compares, it does not overwrite**. `core::files::write_preview` is
-  handed the text the document was opened with and refuses anything else, so an
-  edit made in another window — or by the tool this document was opened from — is
-  never written over by a save decided before it happened. A read-only file is
-  refused for the same reason Legacy refused one: the replacement is a rename into
-  the *directory*, which needs the directory's write access and would quietly undo
-  the bit somebody set.
+- A **save compares before replacing**. `core::files::write_preview` compares
+  against the text the document was opened with and rechecks target identity and
+  bytes just before rename; a detected change is refused, but POSIX rename leaves
+  a narrow race with a non-cooperating writer, so this is not an unconditional
+  compare-and-swap guarantee. A pre-publication failure leaves the original in
+  place. If directory sync fails after rename, the bytes are already visible but
+  durability is uncertain: the pane keeps the draft/intent, updates its baseline,
+  and offers a retry rather than navigating. A read-only file is refused because
+  replacing it needs the directory's write access and would otherwise undo its bit.
 - **A draft is edited in its source.** The reading is a parse of the text as it
   was read, so drawing it while the editor holds another one shows a document
   that is no longer there. The reading is rebuilt from the saved text, which is

@@ -38,6 +38,7 @@
 //! review names the session it targets, and the caller owns that choice.
 
 use std::{
+    ffi::OsStr,
     fs::{self, OpenOptions},
     io::{self, Read},
     net::SocketAddr,
@@ -173,9 +174,22 @@ struct ApiSession {
 }
 
 /// Where the service may have registered itself, most specific first.
+///
+/// The environment is read here and nowhere else in this module, so a caller
+/// that wants to check the paths themselves can hand [`registration_files_in`] the
+/// state directory it means rather than the one the process happens to carry.
 pub fn registration_files(home: &Path) -> Vec<PathBuf> {
+    registration_files_in(home, std::env::var_os(STATE_DIR_ENV).as_deref())
+}
+
+/// [`registration_files`] for a state directory the caller names, or for none.
+///
+/// The split is so the path this builds can be asserted against a directory the
+/// test chooses. Setting the process's own `XDG_STATE_HOME` to get there would
+/// write to every other test running beside it.
+fn registration_files_in(home: &Path, state: Option<&OsStr>) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Some(state) = std::env::var_os(STATE_DIR_ENV).filter(|state| !state.is_empty()) {
+    if let Some(state) = state.filter(|state| !state.is_empty()) {
         files.push(PathBuf::from(state).join(SERVICE_DIR).join(SERVICE_FILE));
     }
     files.push(
@@ -733,27 +747,55 @@ mod tests {
     #[test]
     fn the_registration_path_follows_the_state_directory_when_one_is_set() {
         let home = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os(STATE_DIR_ENV);
-        // The variable is read from the process environment, so this asserts against a
-        // path this test controls rather than against whatever the machine has.
-        unsafe { std::env::set_var(STATE_DIR_ENV, home.path().join("state")) };
-        let files = registration_files(home.path());
-        match previous {
-            Some(value) => unsafe { std::env::set_var(STATE_DIR_ENV, value) },
-            None => unsafe { std::env::remove_var(STATE_DIR_ENV) },
-        }
+        let state = home.path().join("state");
 
-        assert!(
-            files[0].ends_with(Path::new("state").join(SERVICE_DIR).join(SERVICE_FILE)),
-            "{files:?}"
+        let files = super::registration_files_in(home.path(), Some(state.as_os_str()));
+
+        assert_eq!(
+            files,
+            vec![
+                state.join(SERVICE_DIR).join(SERVICE_FILE),
+                home.path()
+                    .join(STATE_DIR_FROM_HOME)
+                    .join(SERVICE_DIR)
+                    .join(SERVICE_FILE),
+            ]
         );
-        assert!(
-            files[1].ends_with(
-                Path::new(STATE_DIR_FROM_HOME)
+    }
+
+    #[test]
+    fn a_state_directory_that_is_unset_or_empty_leaves_only_the_home_one() {
+        let home = tempfile::tempdir().unwrap();
+        let expected = home
+            .path()
+            .join(STATE_DIR_FROM_HOME)
+            .join(SERVICE_DIR)
+            .join(SERVICE_FILE);
+
+        for unset in [None, Some(OsStr::new(""))] {
+            assert_eq!(
+                super::registration_files_in(home.path(), unset),
+                vec![expected.clone()],
+                "{unset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_registration_files_the_environment_chooses_always_include_the_home_one() {
+        // The entry point still reads the environment, so whichever directory
+        // this machine sets -- or does not -- the fallback the service registers
+        // itself under is the last place discovery looks.
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            registration_files(home.path()).pop(),
+            Some(
+                home.path()
+                    .join(STATE_DIR_FROM_HOME)
                     .join(SERVICE_DIR)
                     .join(SERVICE_FILE)
-            ),
-            "{files:?}"
+            )
         );
     }
 

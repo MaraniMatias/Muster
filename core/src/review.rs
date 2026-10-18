@@ -134,9 +134,8 @@ pub fn review_anchor_hash(code: &str) -> String {
 
 /// Every byte of `text`, as one digest.
 ///
-/// The same FNV-1a the anchor hash uses, over the whole string rather than its first
-/// line. It answers "has this line drifted", and that is all: whether a note is the one a
-/// round already claimed is answered by the note's own canonical string, compared exactly.
+/// FNV-1a over the whole string rather than its first line. It answers whether a line
+/// has drifted; it is not used for persistent review deduplication.
 pub fn digest_text(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
@@ -183,6 +182,23 @@ pub fn review_note_snapshot(note: &ReviewNote) -> String {
     snapshot
 }
 
+/// What a round that claimed `note` keeps about it.
+///
+/// The note's id and a digest of the canonical string above, which is equality
+/// compressed: what a duplicate send is decided against is whether two notes are the
+/// same note, and a key carries that without carrying the comment and the captured
+/// source the note is made of. That is the whole difference between a store that can
+/// give bytes back and one that cannot: the canonical string is unbounded per note, so
+/// keeping it per round is keeping the reviews themselves forever.
+///
+/// The canonical snapshot is hashed with SHA-256: unlike a short drift fingerprint,
+/// this key is used to decide whether a persistent user review may be sent again.
+pub fn review_note_key(note: &ReviewNote) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(review_note_snapshot(note).as_bytes());
+    format!("{}:{digest:x}", note.id)
+}
+
 /// Refuses a note that could not be delivered as a comment about a line.
 ///
 /// Asked where a note becomes durable and where the review goes on the wire, so a note
@@ -190,7 +206,10 @@ pub fn review_note_snapshot(note: &ReviewNote) -> String {
 /// comment, a file that is not inside the checkout, a range no diff line has, or a body
 /// too big to send as one message.
 pub fn check_review_note(note: &ReviewNote) -> Result<(), String> {
-    if note.id.trim().is_empty() || note.id.len() > 256 {
+    // The id is one line of one field in the store: a round's claim is its ids beside
+    // their digests, one per line, and an id with a line break in it would split a key
+    // in half and leave a delivered note looking unsent.
+    if note.id.trim().is_empty() || note.id.len() > 256 || note.id.chars().any(char::is_control) {
         return Err("a review note needs an identifier".into());
     }
     if note.checkout_id.is_empty() {
@@ -393,7 +412,8 @@ pub fn build_review_markdown(notes: &[ReviewNote], context: &ReviewContext<'_>) 
                 let code = if note.code.is_empty() {
                     String::new()
                 } else {
-                    format!("```{language}{{{lines}}}\n{}\n```\n", note.code)
+                    let fence = code_fence(&note.code);
+                    format!("{fence}{language}{{{lines}}}\n{}\n{fence}\n", note.code)
                 };
                 let quote = note
                     .content
@@ -416,6 +436,32 @@ pub fn build_review_markdown(notes: &[ReviewNote], context: &ReviewContext<'_>) 
         if notes.len() == 1 { "note" } else { "notes" },
         sections.join("\n\n"),
     )
+}
+
+/// The backtick run that fences `code`.
+///
+/// A closing fence only has to be at least as long as the opening one, so a
+/// three-backtick fence is closed by the first three backticks inside the
+/// captured source -- a reviewed Markdown file, a generated string, anything
+/// that quotes code -- and everything after it renders as the document rather
+/// than as the code that was reviewed. The fence is therefore always longer
+/// than the longest run the code holds, and never shorter than three.
+///
+/// The language and the range notation stay on the opening line: an info string
+/// that carried a backtick would not open a fence at all, and the language comes
+/// from the host's own filename resolver.
+fn code_fence(code: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in code.chars() {
+        if character == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
 }
 
 #[cfg(test)]
@@ -527,6 +573,79 @@ mod tests {
                 ..note
             })
         );
+    }
+
+    #[test]
+    fn a_key_says_the_same_thing_about_a_note_as_the_note_itself_does() {
+        let note = ReviewNote {
+            id: "n1".into(),
+            checkout_id: "checkout:/work".into(),
+            path: "src/main.rs".into(),
+            side: ReviewSide::New,
+            line_start: 10,
+            line_end: None,
+            content: "check this".into(),
+            code: "let x = 1;".into(),
+            code_hash: review_anchor_hash("let x = 1;"),
+            outdated: false,
+        };
+
+        // The key is what equality is decided on, so it must not move when anything
+        // that is not the note moves.
+        assert_eq!(review_note_key(&note), review_note_key(&note.clone()));
+        assert_eq!(
+            review_note_key(&ReviewNote {
+                outdated: true,
+                ..note.clone()
+            }),
+            review_note_key(&note),
+            "drift bookkeeping is not what the note said"
+        );
+        // And it must not be the same key for anything else: the fields that make a
+        // comment a comment about a line all count.
+        for other in [
+            ReviewNote {
+                content: "check that".into(),
+                ..note.clone()
+            },
+            ReviewNote {
+                line_start: 11,
+                ..note.clone()
+            },
+            ReviewNote {
+                side: ReviewSide::Old,
+                ..note.clone()
+            },
+            ReviewNote {
+                code: "let x = 2;".into(),
+                ..note.clone()
+            },
+            ReviewNote {
+                id: "n2".into(),
+                ..note.clone()
+            },
+        ] {
+            assert_ne!(review_note_key(&other), review_note_key(&note), "{other:?}");
+        }
+
+        // The point of a key rather than the canonical string: it does not grow with
+        // the note it stands for, which is what lets a round that has given its notes
+        // up still be judged by them.
+        let base = ReviewNote {
+            content: "c".repeat(MAX_NOTE_CONTENT_BYTES),
+            code: "x".repeat(MAX_NOTE_CODE_BYTES),
+            ..note
+        };
+        let shorter = ReviewNote {
+            content: "c".repeat(MAX_NOTE_CONTENT_BYTES - 1),
+            ..base.clone()
+        };
+        assert!(
+            review_note_key(&base).len() < 80,
+            "{}",
+            review_note_key(&base)
+        );
+        assert_ne!(review_note_key(&base), review_note_key(&shorter));
     }
 
     #[test]
@@ -662,5 +781,67 @@ function handleUser(user) {
 "#
         );
         assert_eq!(build_review_markdown(&[], &ReviewContext::default()), "");
+    }
+
+    #[test]
+    fn code_that_quotes_a_fence_gets_a_longer_one() {
+        let note = |code: &str| ReviewNote {
+            id: "n1".into(),
+            checkout_id: "checkout:/work".into(),
+            path: "README.md".into(),
+            side: ReviewSide::New,
+            line_start: 3,
+            line_end: None,
+            content: "the fence inside this code".into(),
+            code: code.into(),
+            code_hash: review_anchor_hash(code),
+            outdated: false,
+        };
+        let exported = |code: &str| {
+            build_review_markdown(
+                &[note(code)],
+                &ReviewContext {
+                    branch: Some("feature"),
+                    default_branch: Some("main"),
+                    date: "2026-03-14",
+                    language: |_| "md",
+                },
+            )
+        };
+
+        // Source that closes a three-backtick fence: the opening fence has to be
+        // longer than the longest run inside the code, or the rest of the
+        // reviewed document renders as the review rather than as its code.
+        assert_eq!(
+            exported("```rust\nlet x = 1;\n```\n```\nrest of it"),
+            "<!-- muster-review-export -->\n\
+             # Code Review 2026-03-14\n\
+             \n\
+             > `main..feature` — 1 file, 1 note\n\
+             \n\
+             ## README.md\n\
+             \n\
+             ````md{3}\n\
+             ```rust\n\
+             let x = 1;\n\
+             ```\n\
+             ```\n\
+             rest of it\n\
+             ````\n\
+             \n\
+             > the fence inside this code\n"
+        );
+
+        // A run longer than three escalates the same way, and the range notation
+        // and the language stay on the opening line.
+        assert_eq!(code_fence("`"), "```");
+        assert_eq!(code_fence("no backticks here"), "```");
+        assert_eq!(code_fence("``````"), "```````");
+        assert_eq!(code_fence("`` and `"), "```");
+        assert!(
+            exported("``````js").contains("\n```````md{3}\n"),
+            "{:?}",
+            exported("``````js")
+        );
     }
 }

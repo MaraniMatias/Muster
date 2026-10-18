@@ -851,12 +851,12 @@ fn signal_group_with(
         // loud and the caller keeps an error to retry with. Any other errno is not an answer about
         // liveness either, and stays loud.
         //
-        // The check and the signal are two syscalls apart, so a pid freed in between can have
-        // been reused and the group this lands on can be a stranger's. Nothing here closes that
-        // window and nothing below waits to widen it: the permission check the kernel does per
-        // member at the moment of the kill is what stops a signal reaching a stranger, and the
-        // guarantee this function owes its caller is the one that holds either way, which is that
-        // no signal goes to a group that did not verify as this session's a moment earlier.
+        // Membership verification and `kill` are separate syscalls. A foreground group can exit
+        // between them and its numeric ID can be reused; the kernel's permission check is about
+        // credentials, not session membership, so it does not protect a same-user replacement.
+        // This is therefore a best-effort check immediately before signalling, not an atomic proof
+        // of the target at delivery time. The owned shell child is held unreaped by the caller, but
+        // that does not pin an arbitrary foreground process-group ID.
         Err(error)
             if error.raw_os_error() == Some(libc::ESRCH)
                 || (REFUSAL_IS_AN_EMPTY_GROUP && error.raw_os_error() == Some(libc::EPERM)) =>

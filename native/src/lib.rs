@@ -11,7 +11,8 @@ pub mod app;
 /// The About panel the macOS app menu's first item opens.
 pub mod about;
 
-/// Read-only central document surface.
+/// The central document surface: an editor, the draft it holds, and the save it
+/// writes through `muster_core::files`.
 pub mod document;
 
 /// Central checkout diff previews.

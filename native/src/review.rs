@@ -94,6 +94,8 @@ pub(crate) struct ReviewState {
     pub(crate) include_outdated: bool,
     pub(crate) clear_confirmation: bool,
     pub(crate) clearing: bool,
+    pub(crate) forget_confirmation: bool,
+    pub(crate) forgetting: bool,
     pub(crate) exporting: bool,
     pub(crate) opencode_busy: bool,
     pub(crate) opencode_loading: bool,
@@ -1171,6 +1173,177 @@ impl TerminalWindow {
             });
         })
         .detach();
+    }
+
+    /// Opens the confirmation for giving up the reviews Muster has already delivered.
+    ///
+    /// The store refuses to grow past 8 MiB and gives up a delivered review's prompt on
+    /// its own; this is the deliberate half, for a store whose notes are the weight.
+    ///
+    /// What it gives up is every checkout's, not one diff's, and it has to be reachable
+    /// from anywhere: the moment a person needs room is usually when no diff is open,
+    /// which is when a route that needed one would leave the store full for good.
+    pub(crate) fn open_opencode_forget_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.review.forgetting {
+            return;
+        }
+        self.review.forget_confirmation = true;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_opencode_forget(&mut self, cx: &mut Context<Self>) {
+        self.review.forget_confirmation = false;
+        cx.notify();
+    }
+
+    /// Forgets the reviews the service has already answered for, and says how many.
+    ///
+    /// Nothing unresolved is touched and nothing already sent is sent again: what each
+    /// forgotten review took stays in its claim as a key rather than as the review, so
+    /// the notes a person still has on screen are still not offered as a new review.
+    pub(crate) fn forget_delivered_opencode_reviews(
+        &mut self,
+        reset_duplicate_scope: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.review.forgetting {
+            return;
+        }
+        self.review.forget_confirmation = false;
+        // The store is one file for the whole workspace, so this is not about a diff;
+        // an open one is only re-read afterwards, to show what is left of it.
+        let checkout_id = self.open_diff.as_ref().map(|(id, _)| id.clone());
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+        else {
+            self.review.opencode_error =
+                Some("HOME is unavailable for OpenCode review storage.".into());
+            cx.notify();
+            return;
+        };
+        let worker_checkout_id = checkout_id.clone();
+        self.review.forgetting = true;
+        self.review.opencode_error = None;
+        cx.notify();
+        let worker = cx.background_executor().spawn(async move {
+            let store = muster_core::opencode::RoundStore::open(&home)?;
+            let forgotten = if reset_duplicate_scope {
+                store.reset_settled_duplicate_scope()?
+            } else {
+                store.forget_settled_history()?
+            };
+            // Re-read what the open diff shows, if it was showing anything to begin with.
+            let rounds = match &worker_checkout_id {
+                Some(id) => Some(store.rounds(id)?),
+                None => None,
+            };
+            Ok::<_, muster_core::opencode::DispatchError>((forgotten, rounds))
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update(cx, |app, cx| {
+                app.review.forgetting = false;
+                let still_open = app.open_diff.as_ref().map(|(id, _)| id.as_str());
+                let ours = checkout_id.is_some() && still_open == checkout_id.as_deref();
+                match result {
+                    Ok((forgotten, rounds)) => {
+                        if ours {
+                            // This result supersedes any restore started while the
+                            // store was read.
+                            app.review.opencode_generation =
+                                app.review.opencode_generation.wrapping_add(1);
+                            app.review.opencode_loading = false;
+                            if let Some(rounds) = rounds {
+                                app.review.opencode_rounds = rounds;
+                            }
+                            app.review.opencode_error = None;
+                        } else if let Some((active, _)) = app.open_diff.clone() {
+                            // The diff this was asked about is closed or is another one,
+                            // so what was forgotten is not what it is showing.
+                            app.restore_opencode_review(&active, cx);
+                        }
+                        app.push_info(
+                            if reset_duplicate_scope {
+                                format!("Forgot {forgotten} delivered review(s) and reset duplicate protection.")
+                            } else {
+                                format!("Forgot {forgotten} delivered review(s); duplicate protection is retained.")
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What forgetting costs, said before it is done: what goes, what stays, and what
+    /// cannot be undone.
+    pub(crate) fn opencode_forget_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.review.forget_confirmation {
+            return None;
+        }
+        let roles = Roles::of(cx);
+        let cancel = cx.weak_entity();
+        let cancel_for_escape = cx.weak_entity();
+        let forget = cx.weak_entity();
+        let reset = cx.weak_entity();
+        Some(
+            Dialog::new(cx)
+                .bg(roles.surface_raised)
+                .border_color(roles.border_strong)
+                .width(px(440.))
+                .title("Forget delivered reviews?")
+                .content(|content: DialogContent, _, _| {
+                    content.child(
+                        div().text_size(px(12.)).child(
+                            "Forget delivered reviews to remove their notes while keeping duplicate protection, or reset duplicate protection to remove settled records entirely. Resetting means unchanged delivered notes can be sent again. Queued, dispatching, and unresolved reviews are kept. This cannot be undone.",
+                        ),
+                    )
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            zed_button("cancel-forget-opencode-reviews")
+                                .label("Cancel")
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel.update(cx, |app, cx| {
+                                        app.cancel_opencode_forget(cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            zed_button("confirm-forget-opencode-reviews")
+                                .label("Forget notes")
+                                .on_click(move |_, window, cx| {
+                                    let _ = forget.update(cx, |app, cx| {
+                                        app.forget_delivered_opencode_reviews(false, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            zed_button("confirm-reset-opencode-reviews")
+                                .danger()
+                                .label("Forget + reset")
+                                .on_click(move |_, window, cx| {
+                                    let _ = reset.update(cx, |app, cx| {
+                                        app.forget_delivered_opencode_reviews(true, window, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .on_cancel(move |_, _, cx| {
+                    let _ = cancel_for_escape.update(cx, |app, cx| {
+                        app.cancel_opencode_forget(cx);
+                    });
+                    false
+                })
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn export_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {

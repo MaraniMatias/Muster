@@ -111,6 +111,28 @@ fn settle(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     }
 }
 
+#[test]
+fn measured_width_cache_has_fixed_size_and_font_cardinality_limits() {
+    let mut widths = WidthCache::new();
+    widths.insert(
+        12,
+        (0..MAX_WIDTH_CACHE_ENTRIES_PER_SIZE)
+            .map(|index| (index.to_string(), index as f32))
+            .collect(),
+    );
+    bound_width_cache(&mut widths, 12);
+    assert!(
+        widths.is_empty(),
+        "a full text cache is discarded before insertion"
+    );
+
+    for size in 0..MAX_WIDTH_CACHE_SIZES as u32 {
+        widths.insert(size, HashMap::new());
+    }
+    bound_width_cache(&mut widths, u32::MAX);
+    assert_eq!(widths.len(), 0, "new size keys cannot grow without bound");
+}
+
 #[gpui_kit::test]
 fn the_terminal_renders_at_every_window_size(cx: &mut TestAppContext) {
     let backend = Arc::new(TerminalBackend::default());
@@ -153,6 +175,42 @@ fn the_terminal_renders_at_every_window_size(cx: &mut TestAppContext) {
     }
 
     session.close().wait().expect("the test session closes");
+}
+
+#[gpui_kit::test]
+fn chrome_focus_shortcut_returns_to_the_terminal_without_using_tab(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "cat");
+    let (handle, app_entity) = open(cx, size(px(800.), px(600.)), &backend, &session);
+    cx.update_window(handle, |_, window, _| window.activate_window())
+        .expect("the window activates");
+    settle(cx, handle);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.focus_next(cx);
+        window.render_frame(cx);
+        let terminal = app_entity.read_with(cx, |app, _| {
+            app.terminal().expect("terminal is open").clone()
+        });
+        let terminal_focused = terminal.read(cx).focus_handle(cx).is_focused(window);
+        assert!(!terminal_focused, "the test did not move focus into chrome");
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-shift-escape"
+        } else {
+            "ctrl-shift-escape"
+        };
+        window.press(shortcut, cx);
+        let terminal = app_entity.read_with(cx, |app, _| {
+            app.terminal().expect("terminal is open").clone()
+        });
+        let terminal_focused = terminal.read(cx).focus_handle(cx).is_focused(window);
+        assert!(
+            terminal_focused,
+            "the shortcut did not return focus to the PTY"
+        );
+    })
+    .expect("the window remains open");
+    let _ = session.close().wait();
 }
 
 #[gpui_kit::test]

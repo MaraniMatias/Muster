@@ -401,6 +401,43 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_punctuation_reaches_the_terminal_as_the_character_it_types() {
+        // The other half of the encoder's Ctrl punctuation table: an encoder
+        // test cannot prove that the platform reports these as characters at
+        // all, and Ctrl arrives with no `key_char` on more than one layout, so
+        // both ways a character can arrive are checked here.
+        for punctuation in [' ', '[', '\\', ']', '^', '_'] {
+            let typed = keystroke(
+                &punctuation.to_string(),
+                Some(&punctuation.to_string()),
+                Modifiers {
+                    control: true,
+                    ..Modifiers::none()
+                },
+            );
+            let named = keystroke(
+                &punctuation.to_string(),
+                None,
+                Modifiers {
+                    control: true,
+                    ..Modifiers::none()
+                },
+            );
+            for source in [typed, named] {
+                let Input::Press(press) = press(&source) else {
+                    panic!("Ctrl+{punctuation:?} was taken by the application");
+                };
+                assert_eq!(
+                    press.key,
+                    Key::Char(punctuation),
+                    "Ctrl+{punctuation:?} with {source:?}"
+                );
+                assert!(press.ctrl, "Ctrl has to reach the encoder");
+            }
+        }
+    }
+
+    #[test]
     fn a_layout_that_puts_the_character_elsewhere_still_types_it() {
         let press = press(&keystroke("s", Some("ß"), Modifiers::none()));
         let Input::Press(press) = press else {

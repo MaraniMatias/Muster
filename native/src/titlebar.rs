@@ -447,6 +447,9 @@ impl TerminalWindow {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
         let storage = self.navigation.review_storage;
         let can_clear = storage == ReviewStorage::Default && self.open_diff.is_some();
+        // Every checkout's delivered reviews, from any state: the store is one file, and
+        // the moment it needs room is usually a moment with no diff open.
+        let can_forget = !self.review.forgetting;
         let checkout_id = self
             .open_diff
             .as_ref()
@@ -466,6 +469,7 @@ impl TerminalWindow {
             let home_view = view.clone();
             let checkout_view = view.clone();
             let clear_view = view.clone();
+            let forget_view = view.clone();
             menu.min_w(px(224.))
                 .item(PopupMenuItem::new(folder.clone()).disabled(true))
                 .separator()
@@ -502,6 +506,14 @@ impl TerminalWindow {
                                 .update(cx, |app, cx| app.open_review_clear_confirmation(cx));
                         }),
                 )
+                .item(
+                    PopupMenuItem::new("Forget delivered reviews…")
+                        .disabled(!can_forget)
+                        .on_click(move |_, _, cx| {
+                            let _ = forget_view
+                                .update(cx, |app, cx| app.open_opencode_forget_confirmation(cx));
+                        }),
+                )
         }
     }
 
@@ -536,6 +548,20 @@ impl TerminalWindow {
     }
 
     fn select_crumb_target(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = target.to_owned();
+        self.request_document_transition(
+            Box::new(move |app, window, cx| app.select_crumb_target_now(&target, window, cx)),
+            window,
+            cx,
+        );
+    }
+
+    fn select_crumb_target_now(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_crumb_menu(cx);
         if !self.navigation.select_session(target) && !self.navigation.select_checkout(target) {
             return;

@@ -161,6 +161,22 @@ pub(crate) fn sidebar_drag_dispatcher(
 }
 
 impl TerminalWindow {
+    fn select_session_after_document_decision(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation.select_session(id) {
+            self.clear_document();
+            self.open_diff = None;
+            self.persist();
+            self.refresh_diff_totals(cx);
+            self.focus_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn repo_menu(
         &self,
         id: String,
@@ -1084,13 +1100,17 @@ impl TerminalWindow {
                                     }
                                     if event.click_count() == 2 {
                                         app.start_rename(&row_click_id, window, cx);
-                                    } else if app.navigation.select_session(&row_click_id) {
-                                        app.clear_document();
-                                        app.open_diff = None;
-                                        app.persist();
-                                        app.refresh_diff_totals(cx);
-                                        app.focus_terminal(window, cx);
-                                        cx.notify();
+                                    } else {
+                                        let id = row_click_id.clone();
+                                        app.request_document_transition(
+                                            Box::new(move |app, window, cx| {
+                                                app.select_session_after_document_decision(
+                                                    &id, window, cx,
+                                                );
+                                            }),
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 },
                             ))
@@ -1139,13 +1159,17 @@ impl TerminalWindow {
                                             }
                                             if event.click_count() == 2 {
                                                 app.start_rename(&click_id, window, cx);
-                                            } else if app.navigation.select_session(&click_id) {
-                                                app.clear_document();
-                                                app.open_diff = None;
-                                                app.persist();
-                                                app.refresh_diff_totals(cx);
-                                                app.focus_terminal(window, cx);
-                                                cx.notify();
+                                            } else {
+                                                let id = click_id.clone();
+                                                app.request_document_transition(
+                                                    Box::new(move |app, window, cx| {
+                                                        app.select_session_after_document_decision(
+                                                            &id, window, cx,
+                                                        );
+                                                    }),
+                                                    window,
+                                                    cx,
+                                                );
                                             }
                                         },
                                     )),

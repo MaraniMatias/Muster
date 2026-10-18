@@ -1484,6 +1484,88 @@ async fn clearing_review_exports_requires_confirmation(cx: &mut TestAppContext) 
     close(&fixture, cx);
 }
 
+/// Forgetting delivered reviews is a person's decision, so it is asked for before it
+/// happens and it is not on offer where there is nothing to forget.
+#[gpui_kit::test]
+async fn forgetting_delivered_reviews_asks_first_and_says_what_it_costs(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+
+    // Reachable with no diff open: the store is one file for the whole workspace, and a
+    // person who has to open a diff to get its delivered reviews back is a person whose
+    // store stays full.
+    fixture
+        .view
+        .update(cx, |app, cx| app.open_opencode_forget_confirmation(cx));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-forget-opencode-reviews").is_some(),
+            "the decision is asked for without a diff open"
+        );
+        assert!(
+            window.try_find("confirm-reset-opencode-reviews").is_some(),
+            "the last-resort duplicate-scope reset is available"
+        );
+        window.click("cancel-forget-opencode-reviews", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-forget-opencode-reviews").is_none(),
+            "and cancelling removes it"
+        );
+    })
+    .unwrap();
+
+    std::fs::write(fixture.root.join("change.txt"), "review\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+
+    fixture.view.update(cx, |app, _| {
+        app.review.opencode_rounds = vec![muster_core::opencode::ReviewRound {
+            id: "r1".into(),
+            checkout_id: fixture.checkout.clone(),
+            session_id: "ses_review".into(),
+            status: muster_core::opencode::RoundStatus::Dispatched,
+            marker: "muster-review:r1".into(),
+            prompt: "# Code Review\n".into(),
+            note_ids: vec!["note-1".into()],
+            claim: String::new(),
+            notes: Vec::new(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        }];
+    });
+
+    // The route a menu item calls, with a diff open: the decision itself is a dialog
+    // rather than an immediate deletion.
+    fixture.view.update(cx, |app, cx| {
+        app.open_opencode_forget_confirmation(cx);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-forget-opencode-reviews").is_some(),
+            "the decision is asked for"
+        );
+        window.click("cancel-forget-opencode-reviews", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-forget-opencode-reviews").is_none(),
+            "and cancelling removes it"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// Retry answers the failure it is showing.
 ///
 /// A directory that could not be listed and a file that could not be read are
@@ -1892,15 +1974,15 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         let search = window.find("document-grammar-search");
-        let auto = window.find("document-grammar-0");
-        let plain = window.find("document-grammar-1");
+        let auto = window.find("document-grammar-auto");
+        let plain = window.find("document-grammar-plaintext");
         assert_eq!(
-            window.find("document-grammar-0").label(),
+            window.find("document-grammar-auto").label(),
             Some("Auto · no highlighting, selected"),
             "the first row is Auto and it is what this file wears"
         );
         assert_eq!(
-            window.find("document-grammar-1").label(),
+            window.find("document-grammar-plaintext").label(),
             Some("Plain text"),
             "Plain text is the second row, not a row of its own above the search"
         );
@@ -1915,7 +1997,7 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
             "rows share one column"
         );
         assert_eq!(
-            window.find("document-grammar-1").selected(),
+            window.find("document-grammar-plaintext").selected(),
             Some(false),
             "Plain text is not the choice this file wears"
         );
@@ -1930,12 +2012,13 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
     // The keyboard walks the list, and the row it lands on is the one it wears.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        window.press("down", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(fixture.handle, |_, window, cx| {
-        window.render_frame(cx);
+        window.click("document-grammar-search", cx);
+        window.input("yaml", cx);
+        assert_eq!(
+            window.find("document-grammar-yaml").selected(),
+            Some(true),
+            "the filtered keyboard target is visibly selected"
+        );
         window.press("enter", cx);
     })
     .unwrap();
@@ -1946,8 +2029,8 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
                 .values()
                 .next()
                 .map(String::as_str),
-            Some("plaintext"),
-            "the keyboard chose the row it was on"
+            Some("yaml"),
+            "the filtered keyboard target is the language that Enter confirms"
         );
     });
     close(&fixture, cx);
@@ -2090,11 +2173,11 @@ async fn a_reader_can_force_the_grammar_a_file_wears(cx: &mut TestAppContext) {
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find("document-grammar-0").label(),
+            window.find("document-grammar-plaintext").label(),
             Some("Plain text"),
             "the search leaves the row it names"
         );
-        window.click("document-grammar-0", cx);
+        window.click("document-grammar-plaintext", cx);
     })
     .unwrap();
     let plain_text = fixture.view.read_with(cx, |app, _| {
@@ -2118,7 +2201,7 @@ async fn a_reader_can_force_the_grammar_a_file_wears(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     cx.update_window(fixture.handle, |_, window, cx| {
-        window.click("document-grammar-0", cx);
+        window.click("document-grammar-auto", cx);
     })
     .unwrap();
     let restored = fixture.view.read_with(cx, |app, _| {
@@ -3223,6 +3306,576 @@ async fn open(cx: &mut TestAppContext, fixture: &GitFixture, path: &str) {
             .is_some_and(|(_, preview)| preview.path == path)
     })
     .await;
+}
+
+#[gpui_kit::test]
+async fn dirty_document_navigation_waits_for_cancel_or_discard(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    let open_path = |path: &'static str, cx: &mut TestAppContext| {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+                app.request_document(repo, checkout, path.to_owned(), window, cx);
+            });
+        })
+        .unwrap();
+    };
+    open_path("first.txt", cx);
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" edited", cx);
+    })
+    .unwrap();
+    open_path("second.txt", cx);
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        fixture.view.read_with(cx, |app, cx| app
+            .document_view
+            .as_ref()
+            .unwrap()
+            .state
+            .read(cx)
+            .text()
+            .to_string()),
+        "original edited"
+    );
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.document_target.as_ref().unwrap().1.clone()),
+        "first.txt"
+    );
+
+    open_path("second.txt", cx);
+    cx.simulate_prompt_answer("Discard");
+    cx.run_until_parked();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "second.txt")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "original"
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn app_quit_waits_for_dirty_document_decisions(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+    })
+    .unwrap();
+    cx.update(crate::menus::install);
+    cx.update_window(fixture.handle, |_, window, cx| window.press("cmd-q", cx))
+        .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.document_view.as_ref().unwrap().is_dirty()));
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn dirty_document_window_close_can_be_cancelled(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.document_view.as_ref().unwrap().is_dirty()));
+    assert_eq!(
+        fixture.view.read_with(cx, |app, cx| app
+            .document_view
+            .as_ref()
+            .unwrap()
+            .state
+            .read(cx)
+            .text()
+            .to_string()),
+        "original draft"
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn dirty_document_save_conflict_keeps_draft_and_pending_destination(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "second.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    std::fs::write(fixture.root.join("first.txt"), "external edit").unwrap();
+    cx.simulate_prompt_answer("Save");
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, cx| {
+        assert_eq!(app.document_target.as_ref().unwrap().1, "first.txt");
+        assert!(app.document_view.as_ref().unwrap().is_dirty());
+        assert!(app.pending_document_transition.is_some());
+        assert_eq!(
+            app.document_view
+                .as_ref()
+                .unwrap()
+                .state
+                .read(cx)
+                .text()
+                .to_string(),
+            "original draft"
+        );
+    });
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "external edit"
+    );
+    assert!(draw_until(&fixture, cx, "stay-in-document"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click(gpui_kit::ElementId::from("stay-in-document"), cx);
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.pending_document_transition.is_none()));
+    cx.update_window(fixture.handle, |_, _, cx| {
+        assert_eq!(editor_text(&fixture, cx), "original draft");
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn uncertain_publication_blocks_navigation_until_durability_retry(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    let open = |path: &'static str, cx: &mut TestAppContext| {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+                app.request_document(repo, checkout, path.into(), window, cx);
+            });
+        })
+        .unwrap();
+    };
+    open("first.txt", cx);
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().durability_uncertain = true;
+    });
+    open("second.txt", cx);
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.document_target.as_ref().unwrap().1.clone()),
+        "first.txt"
+    );
+    assert!(draw_until(&fixture, cx, "save-document"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click(gpui_kit::ElementId::from("save-document"), cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "second.txt")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "original"
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn dirty_document_navigation_applies_only_after_successful_save(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    let open = |path: &'static str, cx: &mut TestAppContext| {
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+                app.request_document(repo, checkout, path.to_owned(), window, cx);
+            });
+        })
+        .unwrap();
+    };
+    open("first.txt", cx);
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" saved", cx);
+    })
+    .unwrap();
+    open("second.txt", cx);
+    cx.simulate_prompt_answer("Save");
+    cx.run_until_parked();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "second.txt")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "original saved"
+    );
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn navigation_requested_while_saving_keeps_newer_edits_until_decided(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" first edit", cx);
+        fixture.view.update(cx, |app, _| {
+            app.document_view.as_mut().unwrap().saving = true
+        });
+        window.input(" newer edit", cx);
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "second.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    assert!(!cx.has_pending_prompt());
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().saving = false
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, _, cx| {
+        assert_eq!(editor_text(&fixture, cx), "original first edit newer edit");
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn navigation_requested_during_formatting_is_deferred_until_idle(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    std::fs::write(fixture.root.join("second.txt"), "destination").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture.view.update(cx, |app, _| {
+            app.document_view.as_mut().unwrap().formatting = true
+        });
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "second.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    assert!(!cx.has_pending_prompt());
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().formatting = false
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    assert!(cx.has_pending_prompt());
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.document_target.as_ref().unwrap().1.clone()),
+        "first.txt"
+    );
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, _, cx| {
+        assert_eq!(editor_text(&fixture, cx), "original draft");
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A draft with nowhere to go is not a decision anybody has to make.
+///
+/// The helper is also how a format finishes, and a format navigates nowhere, so
+/// without a pending destination it has nothing to apply and nothing to ask
+/// about: the draft stays exactly where the person left it.
+#[gpui_kit::test]
+async fn a_document_transition_with_no_destination_asks_nothing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.update(cx, |app, _| {
+        assert!(app.document_view.as_ref().unwrap().is_dirty());
+        assert!(app.pending_document_transition.is_none());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt());
+    fixture.view.update(cx, |app, _| {
+        assert!(app.document_view.as_ref().unwrap().is_dirty());
+        assert!(app.pending_document_transition.is_none());
+        assert_eq!(app.document_target.as_ref().unwrap().1, "first.txt");
+    });
+    cx.update_window(fixture.handle, |_, _, cx| {
+        assert_eq!(editor_text(&fixture, cx), "original draft");
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Finishing a format is not leaving the document, however the format went.
+///
+/// Whether the formatter installed its text or refused to run, its completion
+/// asks the same helper a pending navigation would, and a draft nobody was
+/// navigating away from has to survive that without a prompt. The answer does
+/// not depend on whether a Prettier happens to be installed, so the check is
+/// the decision rather than the formatter's own outcome.
+#[gpui_kit::test]
+async fn a_finished_format_with_no_destination_asks_nothing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.ts"), "const a = 1;\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.ts".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.ts")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input("const b = 2;", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.format_document(window, cx));
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        !fixture
+            .view
+            .read(cx)
+            .document_view
+            .as_ref()
+            .expect("a document is open")
+            .formatting
+    })
+    .await;
+    assert!(!cx.has_pending_prompt());
+    fixture.view.update(cx, |app, _| {
+        assert!(app.document_view.as_ref().unwrap().is_dirty());
+        assert!(app.pending_document_transition.is_none());
+        assert_eq!(app.document_target.as_ref().unwrap().1, "first.ts");
+    });
+    close(&fixture, cx);
 }
 
 /// Put the caret in the open document's editor, which is where a person types.

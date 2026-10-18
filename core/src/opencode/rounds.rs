@@ -31,6 +31,14 @@
 //! service calls too, so two windows cannot both offer the same round — and each is
 //! written to a private temporary file and renamed into place, so a reader never sees
 //! half a file and a crash never leaves one behind.
+//!
+//! It is also bounded, and the bound is a policy rather than a wall. A write that gets
+//! close to the cap gives up what nothing can ask for again — the prompt of a round the
+//! service has already answered for — and a person can forget delivered notes from
+//! **Settings → Forget delivered reviews…**. The same dialog offers a deliberate last
+//! resort that also removes settled claims; after that, unchanged notes can be sent again.
+//! Neither action touches a round that still owes the service a decision. Claims use a
+//! SHA-256 fingerprint of each canonical note snapshot, not a mathematical equality proof.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -46,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use super::{same_directory, validate_session_id, Client, DispatchError};
 use crate::{
     review::{
-        build_round_prompt, check_review_note, check_round_prompt, review_note_snapshot,
+        build_round_prompt, check_review_note, check_round_prompt, review_note_key,
         review_round_marker, ReviewNote, MAX_ROUND_NOTES,
     },
     workspace::{checkout_id_for_path, Checkout},
@@ -55,11 +63,20 @@ use crate::{
 /// Bumped only when the stored shape changes incompatibly. An older file is refused by
 /// name, like every other store this app keeps: nothing here is a migration.
 ///
-/// `2` is the claim as the notes' own canonical string: at `1` it was a digest, and a
-/// digest is a way for two different reviews to be spelled the same.
-const SCHEMA_VERSION: u32 = 2;
+/// `3` is the claim as one key per claimed note rather than the notes' own text, because
+/// a claim that carries the notes cannot be given up: it is the reviews themselves, held
+/// per round, for as long as the store exists. `2` was the claim as the notes' canonical
+/// strings; `1` was a digest of the whole review, which is a way for two different
+/// reviews to be spelled the same.
+const SCHEMA_VERSION: u32 = 3;
 /// The store holds rounds, not a transcript. Past this it is not this app's file.
 const STATE_CAP: u64 = 8 * 1024 * 1024;
+/// Where a write has to start giving something up rather than be refused.
+///
+/// Three quarters of the cap, because what a settled round gives up is only the prompt
+/// it will never be offered again: giving it up early costs nothing observable, and a
+/// review that cannot be stored is a review that never goes out.
+const COMPACT_ABOVE: u64 = STATE_CAP / 4 * 3;
 const STORE_FILE: &str = "opencode-rounds.json";
 const LOCK_FILE: &str = "opencode-rounds.lock";
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -104,6 +121,15 @@ impl RoundStatus {
     pub fn is_pending(self) -> bool {
         matches!(self, Self::Queued | Self::Dispatching)
     }
+
+    /// Whether the service has answered for this round and nothing is owed for it.
+    ///
+    /// The opposite of pending in the sense that matters for storage rather than for
+    /// sending: a settled round is never offered, never reconciled and never read back by
+    /// a person, so its prompt is a payload nothing can ask for again.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Dispatched | Self::Acked)
+    }
 }
 
 /// One batch of notes, as recorded before it was offered to the service.
@@ -124,15 +150,33 @@ pub struct ReviewRound {
     /// The notes this round claims, sorted. The claim is what stops two windows from
     /// sending one set of notes as two rounds.
     pub note_ids: Vec<String>,
-    /// What the claimed notes said when they were claimed, as their canonical strings.
-    /// The same notes, edited, are a different claim: that is a new comment on the same
-    /// line, not the review already delivered.
+    /// One key per claimed note ([`review_note_key`]), one per line.
+    ///
+    /// This is the whole of what a duplicate send is decided against, and it is kept
+    /// after the notes are gone: what a note said is unbounded, a key is not, so a
+    /// round that has given its notes up still fingerprints what it took. SHA-256 makes
+    /// accidental or adversarial collisions impractical, though not mathematically
+    /// impossible. The same notes, edited, produce a different key.
     pub claim: String,
     /// The notes the review was built from, captured when the round was recorded, so a
     /// sent review can still be shown and exported without re-reading the diff.
     pub notes: Vec<ReviewNote>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl ReviewRound {
+    /// The notes this round already took, as the key each one is judged by.
+    ///
+    /// Answered the same way whether the round still carries its notes or has given
+    /// them up, because a key is derived from a note rather than being the note: a
+    /// round that can no longer show a review still cannot send it twice.
+    pub fn claimed_keys(&self) -> Vec<String> {
+        if !self.notes.is_empty() {
+            return self.notes.iter().map(review_note_key).collect();
+        }
+        self.claim.lines().map(str::to_owned).collect()
+    }
 }
 
 /// What the store holds. Every field is required: an older file is refused rather than
@@ -152,6 +196,27 @@ impl Default for RoundFile {
             rounds: Vec::new(),
             destinations: BTreeMap::new(),
         }
+    }
+}
+
+impl RoundFile {
+    /// Gives up what no round in this state can be asked for again, and answers whether
+    /// that released anything.
+    ///
+    /// A settled round keeps everything it is judged by — the notes it took, the keys they
+    /// are judged by, its marker, its id and where it went — and drops only the prompt it
+    /// will never be offered again. A round that still owes the service a decision is not
+    /// touched at all: `queued` may be offered, `dispatching` and `unknown` are questions
+    /// a person settles by reading the round, and all three need their exact bytes.
+    fn compact(&mut self) -> bool {
+        let mut released = false;
+        for round in &mut self.rounds {
+            if round.status.is_settled() && !round.prompt.is_empty() {
+                round.prompt.clear();
+                released = true;
+            }
+        }
+        released
     }
 }
 
@@ -244,7 +309,7 @@ impl RoundStore {
         state
             .destinations
             .insert(checkout_id.to_string(), destination);
-        self.write(&state)
+        self.write(&mut state)
     }
 
     /// Claims `request`'s notes and sends the review, as one locked step.
@@ -288,7 +353,7 @@ impl RoundStore {
         // claim and the answer has to leave a question rather than a retry, which is what
         // offering a still-`queued` round and then dying would have done.
         set_status(&mut state, index, RoundStatus::Dispatching);
-        self.write(&state)?;
+        self.write(&mut state)?;
         let round = state.rounds[index].clone();
         let sent = client.prompt(&round.session_id, &round.prompt);
         match &sent {
@@ -300,11 +365,58 @@ impl RoundStore {
             Err(_) => {}
         }
         let stored = state.rounds[index].clone();
-        self.write(&state)?;
+        self.write(&mut state)?;
         // The error is the caller's report and the round is already durable, so a caller
         // that wants to draw the outcome reads the rounds back rather than being handed a
         // copy that could disagree with the file.
         sent.map(|()| stored)
+    }
+
+    /// Gives up the notes of every round the service has already answered for, in every
+    /// checkout, and reports how many rounds were reduced.
+    ///
+    /// The deliberate half of capacity recovery, for the store the automatic one cannot
+    /// relieve: automatic compaction gives up a settled round's prompt, and this gives up
+    /// what the prompt was standing in for. What each forgotten review took stays in the
+    /// round's claim, which is one key per note rather than a copy of the note, so the
+    /// same review asked for again is answered from that round rather than sent a second
+    /// time with SHA-256 collision resistance — what is lost is being able to show or
+    /// export those reviews, which is the person's decision to make and is said so where
+    /// they make it.
+    ///
+    /// A round that still owes the service a decision is never touched.
+    pub fn forget_settled_history(&self) -> Result<usize, DispatchError> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let mut forgotten = 0;
+        for round in &mut state.rounds {
+            if !round.status.is_settled() || round.notes.is_empty() {
+                continue;
+            }
+            round.prompt.clear();
+            round.notes.clear();
+            forgotten += 1;
+        }
+        if forgotten > 0 {
+            self.write(&mut state)?;
+        }
+        Ok(forgotten)
+    }
+
+    /// Last-resort recovery: remove settled rounds and their duplicate-protection keys.
+    ///
+    /// This deliberately resets duplicate scope: unchanged delivered notes can be sent
+    /// again afterward. Queued, dispatching, and unknown rounds are never removed.
+    pub fn reset_settled_duplicate_scope(&self) -> Result<usize, DispatchError> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let before = state.rounds.len();
+        state.rounds.retain(|round| !round.status.is_settled());
+        let removed = before - state.rounds.len();
+        if removed > 0 {
+            self.write(&mut state)?;
+        }
+        Ok(removed)
     }
 
     /// Puts a blocked round back in line to be offered, because a person asked for it.
@@ -379,7 +491,7 @@ impl RoundStore {
             },
         );
         let stored = state.rounds[index].clone();
-        self.write(&state)?;
+        self.write(&mut state)?;
         Ok(stored)
     }
 
@@ -410,13 +522,13 @@ impl RoundStore {
             // Already there: this round went out and its answer was lost.
             if client.session_mentions(&round.session_id, &round.marker)? {
                 set_status(&mut state, index, RoundStatus::Dispatched);
-                self.write(&state)?;
+                self.write(&mut state)?;
                 continue;
             }
             // Claim before the call, and write the claim before making it: a crash
             // between here and the answer leaves `dispatching`, which is a question.
             set_status(&mut state, index, RoundStatus::Dispatching);
-            self.write(&state)?;
+            self.write(&mut state)?;
             let offered = client.prompt(&round.session_id, &round.prompt);
             match &offered {
                 Ok(()) => {
@@ -431,7 +543,7 @@ impl RoundStore {
                 // Left `dispatching`: requeueing a send that may have landed duplicates it.
                 Err(_) => {}
             }
-            self.write(&state)?;
+            self.write(&mut state)?;
             offered?;
         }
         Ok(sent)
@@ -455,7 +567,7 @@ impl RoundStore {
         }
         set_status(&mut state, index, to);
         let stored = state.rounds[index].clone();
-        self.write(&state)?;
+        self.write(&mut state)?;
         Ok(stored)
     }
 
@@ -515,8 +627,10 @@ impl RoundStore {
         })?;
         if state.schema_version != SCHEMA_VERSION {
             return Err(DispatchError::Foreign(format!(
-                "review round store schema {} is unsupported; expected {SCHEMA_VERSION}",
-                state.schema_version
+                "review round store schema {} is unsupported; expected {SCHEMA_VERSION}, and \
+                 deleting {} starts an empty review history",
+                state.schema_version,
+                self.path.display()
             )));
         }
         Ok(state)
@@ -555,14 +669,23 @@ impl RoundStore {
         Ok(file)
     }
 
-    /// Validate, write privately in the same directory, sync, then atomically replace.
-    fn write(&self, state: &RoundFile) -> Result<(), DispatchError> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
-            DispatchError::Failed(format!("could not encode the store: {error}"))
-        })?;
+    /// Validate, give up what nothing can read again if the cap is close, then write
+    /// privately in the same directory, sync and atomically replace.
+    ///
+    /// `state` is compacted in place rather than only on the way to the file, so a caller
+    /// that goes on using it is looking at the same rounds the next reader will see.
+    fn write(&self, state: &mut RoundFile) -> Result<(), DispatchError> {
+        let mut bytes = encode(state)?;
+        if bytes.len() as u64 > COMPACT_ABOVE && state.compact() {
+            bytes = encode(state)?;
+        }
         if bytes.len() as u64 > STATE_CAP {
+            // Refused before the temporary file is opened, so the store on disk is the
+            // file that was there and nothing was truncated trying to write this.
             return Err(DispatchError::Failed(
-                "the review round store exceeds the 8 MiB limit".into(),
+                "the review round store is full at 8 MiB; in Settings, forget delivered reviews, \
+                 or reset duplicate protection if their notes were already forgotten"
+                    .into(),
             ));
         }
         let name = self.path.file_name().ok_or_else(|| {
@@ -611,34 +734,30 @@ impl RoundStore {
 /// review is asked for again after somebody fixed what the first one said. This is what the
 /// window offers, so restoring a checkout's rounds cannot put an already-sent review back on
 /// the wire.
+///
+/// The comparison is on each note's key ([`review_note_key`]), which a round keeps
+/// whether or not it still carries the note: an unchanged note a delivered round already
+/// took is not offered again, and an edited one still is.
 pub fn unsent_notes(notes: &[ReviewNote], rounds: &[ReviewRound]) -> Vec<ReviewNote> {
-    let sent: HashSet<(&str, String)> = rounds
-        .iter()
-        .flat_map(|round| round.notes.iter())
-        .map(|note| (note.id.as_str(), review_note_snapshot(note)))
-        .collect();
+    let claimed: HashSet<String> = rounds.iter().flat_map(ReviewRound::claimed_keys).collect();
     notes
         .iter()
-        .filter(|note| !sent.contains(&(note.id.as_str(), review_note_snapshot(note))))
+        .filter(|note| !claimed.contains(&review_note_key(note)))
         .cloned()
         .collect()
 }
 
 /// What one batch of notes claims, as a single string.
 ///
-/// Sorted by id, so the order the caller happened to hand them over is not part of the
-/// claim: two windows looking at one review produce the same string, which is the whole
-/// reason a claim can be compared at all. Each note writes its own length first, so the
-/// concatenation cannot spell two different reviews the same way, and nothing is digested:
-/// this is the notes themselves, compared exactly.
+/// Sorted, so the order the caller happened to hand them over is not part of the claim:
+/// two windows looking at one review produce the same string, which is the whole
+/// reason a claim can be compared at all. What is compared is one key per note rather
+/// than the notes, because a claim that carries the notes is a claim that can never be
+/// given up.
 fn round_claim(notes: &[ReviewNote]) -> String {
-    let mut ordered: Vec<&ReviewNote> = notes.iter().collect();
-    ordered.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut claim = String::new();
-    for note in ordered {
-        claim.push_str(&review_note_snapshot(note));
-    }
-    claim
+    let mut keys: Vec<String> = notes.iter().map(review_note_key).collect();
+    keys.sort();
+    keys.join("\n")
 }
 
 /// Claims `request`'s notes in `state`, or answers with the round that already holds them.
@@ -680,11 +799,6 @@ fn claim_round(
         ));
     }
     let claim = round_claim(request.notes);
-    let claimed: HashSet<(&str, String)> = request
-        .notes
-        .iter()
-        .map(|note| (note.id.as_str(), review_note_snapshot(note)))
-        .collect();
     for (index, round) in state.rounds.iter().enumerate() {
         if round.checkout_id == checkout_id && round.claim == claim {
             // One review is one round: the second window is handed the first one's answer
@@ -699,10 +813,11 @@ fn claim_round(
         // A note another round holds *as it stands* is that round's review, and sending it
         // again delivers the same comment twice. A note edited since is a new comment on
         // the same line, which is not this, and is what asking for a review again means.
-        if let Some(held) = round
+        let claimed = round.claimed_keys();
+        if let Some(held) = request
             .notes
             .iter()
-            .find(|held| claimed.contains(&(held.id.as_str(), review_note_snapshot(held))))
+            .find(|note| claimed.contains(&review_note_key(note)))
         {
             return Err(DispatchError::Foreign(format!(
                 "note {} is already part of review round {}",
@@ -859,6 +974,13 @@ fn private_directory(directory: &Path) -> Result<(), DispatchError> {
         }
     }
     Ok(())
+}
+
+/// The file exactly as it is written, so its size can be asked twice: once of what the
+/// state says, and once of what it says once the state has given something up.
+fn encode(state: &RoundFile) -> Result<Vec<u8>, DispatchError> {
+    serde_json::to_vec_pretty(state)
+        .map_err(|error| DispatchError::Failed(format!("could not encode the store: {error}")))
 }
 
 fn now_millis() -> String {

@@ -25,12 +25,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::component::input::{Copy as EditCopy, Paste as EditPaste};
+#[cfg(test)]
+use gpui_kit::test::TestSupportExt;
 use gpui_kit::{
     canvas, div, point, px, quad, App, Bounds, Context, FocusHandle, FontStyle, FontWeight, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Render,
-    Rgba, SharedString, StrikethroughStyle, Styled, Task, TextAlign, TextStyle, UnderlineStyle,
-    Window, WindowTextSystem,
+    Rgba, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, Task, TextAlign,
+    TextStyle, UnderlineStyle, Window, WindowTextSystem,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::input::{self, FocusState};
 use super::{
@@ -113,6 +116,99 @@ fn scrollbar_geometry(history: usize, offset: usize, rows: usize, track: f32) ->
         scrollable: true,
     }
 }
+/// Display columns occupied by an IME preedit at the terminal cursor.
+///
+/// Composition is Unicode text, not a sequence of VT cells yet. Use the same
+/// Unicode display-width model as terminal rendering and keep the returned span
+/// inside the grid, even when the cursor is at its final column.
+fn composition_columns(columns: usize, cursor_column: usize, text: &str) -> Option<usize> {
+    let remaining = columns.checked_sub(cursor_column)?;
+    if remaining == 0 {
+        return None;
+    }
+    Some(UnicodeWidthStr::width(text).max(1).min(remaining))
+}
+
+const MAX_ACCESSIBLE_TERMINAL_CELLS: usize = 65_536;
+
+struct AccessibleTerminalText {
+    text: String,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+}
+
+/// A bounded text view of the visible grid, with VT-cell positions translated
+/// into character offsets for AccessKit's text selection.
+fn accessible_terminal_text(
+    snapshot: &TerminalSnapshot,
+    columns: usize,
+    rows: usize,
+) -> AccessibleTerminalText {
+    if columns == 0 || rows == 0 {
+        return AccessibleTerminalText {
+            text: String::new(),
+            cursor: None,
+            selection: None,
+        };
+    }
+    let columns = columns.min(MAX_ACCESSIBLE_TERMINAL_CELLS);
+    let row_limit = rows.min(MAX_ACCESSIBLE_TERMINAL_CELLS / columns);
+    let mut text = String::new();
+    let mut positions = Vec::with_capacity(row_limit);
+    let mut character_count = 0usize;
+
+    for (row_index, row) in snapshot.rows.iter().take(row_limit).enumerate() {
+        if character_count == MAX_ACCESSIBLE_TERMINAL_CELLS {
+            break;
+        }
+        let mut row_positions = Vec::with_capacity(columns + 1);
+        for column in 0..columns {
+            row_positions.push(character_count);
+            if let Some(cell) = row.cells.get(column) {
+                if cell.width != 0 && character_count < MAX_ACCESSIBLE_TERMINAL_CELLS {
+                    let character = if cell.c == '\0' { ' ' } else { cell.c };
+                    text.push(character);
+                    character_count += 1;
+                    for combining in cell
+                        .zerowidth
+                        .iter()
+                        .take(MAX_ACCESSIBLE_TERMINAL_CELLS - character_count)
+                    {
+                        text.push(*combining);
+                        character_count += 1;
+                    }
+                }
+            } else if character_count < MAX_ACCESSIBLE_TERMINAL_CELLS {
+                text.push(' ');
+                character_count += 1;
+            }
+        }
+        row_positions.push(character_count);
+        positions.push(row_positions);
+        if row_index + 1 < row_limit
+            && row_index + 1 < snapshot.rows.len()
+            && character_count < MAX_ACCESSIBLE_TERMINAL_CELLS
+        {
+            text.push('\n');
+            character_count += 1;
+        }
+    }
+
+    let point_offset =
+        |(row, column): (usize, usize)| positions.get(row).map(|row| row[column.min(columns)]);
+    let cursor = point_offset((snapshot.cursor.row, snapshot.cursor.col));
+    let selection = snapshot.selection_range.and_then(|(start, end)| {
+        let start = point_offset(start)?;
+        let end = point_offset((end.0, end.1.saturating_add(1)))?;
+        Some((start.min(end), start.max(end)))
+    });
+    AccessibleTerminalText {
+        text,
+        cursor,
+        selection,
+    }
+}
+
 fn load_bundled_fonts(window: &mut Window) -> Result<bool, String> {
     // The app registers these faces before its first window so the sidebar is
     // already measured with them. A standalone terminal view (including a
@@ -553,8 +649,6 @@ pub struct TerminalView {
     modified_click: bool,
     left_mouse: Option<(f32, f32)>,
     dragged: bool,
-    /// Selection currently shown in the last rendered frame.
-    selection_range: Cell<Option<GridRange>>,
     canvas_origin: Rc<Cell<gpui_kit::Point<Pixels>>>,
 
     /// The size the PTY has last been told about, shared with the paint pass.
@@ -684,7 +778,6 @@ impl TerminalView {
             modified_click: false,
             left_mouse: None,
             dragged: false,
-            selection_range: Cell::new(None),
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
         }
     }
@@ -890,7 +983,6 @@ impl TerminalView {
         }
         if !modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.platform {
             self.session.clear_selection();
-            self.selection_range.set(None);
             cx.stop_propagation();
             cx.notify();
         }
@@ -1056,16 +1148,14 @@ impl TerminalView {
         if cols == 0 || rows == 0 {
             return;
         }
-        let snapshot = self.session.snapshot();
-        if self.gesture_screen != snapshot.alt_screen
-            || self.gesture_tracking != snapshot.mouse_tracking
-        {
+        let (alt_screen, mouse_tracking, _) = self.session.mouse_state();
+        if self.gesture_screen != alt_screen || self.gesture_tracking != mouse_tracking {
             self.last_click = None;
         }
-        self.gesture_screen = snapshot.alt_screen;
-        self.gesture_tracking = snapshot.mouse_tracking;
+        self.gesture_screen = alt_screen;
+        self.gesture_tracking = mouse_tracking;
         self.gesture_size = self.applied.get();
-        if snapshot.mouse_tracking && !event.modifiers.shift {
+        if mouse_tracking && !event.modifiers.shift {
             if let Some(button) = mouse_button(event.button) {
                 self.mouse_buttons[button as usize] = true;
                 self.report_mouse(event.position, button, false, false, event.modifiers);
@@ -1097,7 +1187,6 @@ impl TerminalView {
                     _ => super::SelectionKind::Simple,
                 },
             );
-            self.selection_range.set(self.session.selection_range());
         }
         self.reset_blink();
         cx.notify();
@@ -1122,7 +1211,6 @@ impl TerminalView {
             self.drag_point = point;
             if self.dragging || self.click_count > 1 || self.dragged {
                 self.session.update_selection(point);
-                self.selection_range.set(self.session.selection_range());
             }
             cx.notify();
             cx.stop_propagation();
@@ -1151,10 +1239,8 @@ impl TerminalView {
         if event.button != MouseButton::Left {
             return;
         }
-        let snapshot = self.session.snapshot();
-        if snapshot.alt_screen != self.gesture_screen
-            || snapshot.mouse_tracking != self.gesture_tracking
-        {
+        let (alt_screen, mouse_tracking, _) = self.session.mouse_state();
+        if alt_screen != self.gesture_screen || mouse_tracking != self.gesture_tracking {
             self.click_origin = None;
         }
         if let Some(point) = self.click_origin.take() {
@@ -1193,8 +1279,8 @@ impl TerminalView {
         };
         let lines = self.scroll_remainder.trunc().clamp(-100.0, 100.0) as i32;
         self.scroll_remainder -= lines as f32;
-        let snapshot = self.session.snapshot();
-        if snapshot.mouse_tracking && !event.modifiers.shift {
+        let (alt_screen, mouse_tracking, alternate_scroll) = self.session.mouse_state();
+        if mouse_tracking && !event.modifiers.shift {
             for _ in 0..lines.unsigned_abs() {
                 self.report_mouse(
                     event.position,
@@ -1204,7 +1290,7 @@ impl TerminalView {
                     event.modifiers,
                 );
             }
-        } else if snapshot.alt_screen && snapshot.modes.alternate_scroll && !event.modifiers.shift {
+        } else if alt_screen && alternate_scroll && !event.modifiers.shift {
             let key = if lines > 0 {
                 super::Key::Up
             } else {
@@ -1384,7 +1470,10 @@ impl Frame {
         self.paint_scrollbar(bounds, snapshot, rows, window);
         if !composition.is_empty() {
             if let Some((row, col)) = cursor {
-                if let Some(source) = snapshot.rows.get(row).and_then(|r| r.cells.get(col)) {
+                if let (Some(source), Some(width_columns)) = (
+                    snapshot.rows.get(row).and_then(|r| r.cells.get(col)),
+                    composition_columns(columns as usize, col, composition),
+                ) {
                     let mut source = source.clone();
                     source.underline = true;
                     source.inverse = false;
@@ -1393,31 +1482,33 @@ impl Frame {
                             bounds.origin.x + cell.width * col as f32,
                             bounds.origin.y + cell.height * row as f32,
                         ),
-                        size: gpui_kit::size(
-                            cell.width * composition.chars().count().max(1) as f32,
-                            cell.height,
-                        ),
+                        size: gpui_kit::size(cell.width * width_columns as f32, cell.height),
                     };
-                    window.paint_quad(quad(
-                        span,
-                        px(0.0),
-                        self.palette.background(source.bg),
-                        px(0.0),
-                        gpui_kit::transparent_black(),
-                        Default::default(),
-                    ));
-                    self.paint_text_run(
-                        TextRun {
-                            bounds: span,
-                            cell: &source,
-                            text: composition,
-                            at_cursor: false,
-                            selected: false,
+                    window.with_content_mask(
+                        Some(gpui_kit::ContentMask { bounds: span }),
+                        |window| {
+                            window.paint_quad(quad(
+                                span,
+                                px(0.0),
+                                self.palette.background(source.bg),
+                                px(0.0),
+                                gpui_kit::transparent_black(),
+                                Default::default(),
+                            ));
+                            self.paint_text_run(
+                                TextRun {
+                                    bounds: span,
+                                    cell: &source,
+                                    text: composition,
+                                    at_cursor: false,
+                                    selected: false,
+                                },
+                                snapshot,
+                                focus,
+                                window,
+                                cx,
+                            );
                         },
-                        snapshot,
-                        focus,
-                        window,
-                        cx,
                     );
                 }
             }
@@ -1843,7 +1934,6 @@ impl Render for TerminalView {
         if blink_enabled && !self.blink_visible {
             snapshot.cursor.visible = false;
         }
-        self.selection_range.set(snapshot.selection_range);
         let frame = self.frame();
         let canvas_origin = Rc::clone(&self.canvas_origin);
         let applied = Rc::clone(&self.applied);
@@ -1851,9 +1941,60 @@ impl Render for TerminalView {
         let input_view = cx.entity();
         let input_focus = self.focus.clone();
         let composition = self.marked_text.clone();
+        let (columns, rows) = self.applied.get();
+        let accessible = accessible_terminal_text(&snapshot, columns as usize, rows as usize);
+        let terminal = div().id("muster-terminal");
+        #[cfg(test)]
+        let terminal = terminal.test_support();
 
-        div()
-            .id("muster-terminal")
+        terminal
+            .role(gpui_kit::Role::MultilineTextInput)
+            .aria_label("Terminal")
+            .aria_description("The visible terminal screen, including output, caret, and selection. From app chrome, press the application modifier plus Shift+Escape to focus the terminal.")
+            .aria_keyshortcuts(if cfg!(target_os = "macos") {
+                "Meta+Shift+Escape"
+            } else {
+                "Control+Shift+Escape"
+            })
+            .a11y_synthetic_children(move |builder| {
+                let text_id = builder.synthetic_node_id("terminal-visible-text");
+                let mut text_node = gpui_kit::accesskit::Node::new(gpui_kit::Role::TextRun);
+                text_node.set_value(accessible.text.clone());
+                text_node.set_character_lengths(
+                    accessible
+                        .text
+                        .chars()
+                        .map(|character| character.len_utf8() as u8)
+                        .collect::<Vec<_>>(),
+                );
+                if builder.push_child(text_id, text_node) {
+                    if let Some((start, end)) = accessible.selection {
+                        builder.parent_node().set_text_selection(
+                            gpui_kit::accesskit::TextSelection {
+                                anchor: gpui_kit::accesskit::TextPosition {
+                                    node: text_id,
+                                    character_index: start,
+                                },
+                                focus: gpui_kit::accesskit::TextPosition {
+                                    node: text_id,
+                                    character_index: end,
+                                },
+                            },
+                        );
+                    } else if let Some(cursor) = accessible.cursor {
+                        let caret = gpui_kit::accesskit::TextPosition {
+                            node: text_id,
+                            character_index: cursor,
+                        };
+                        builder.parent_node().set_text_selection(
+                            gpui_kit::accesskit::TextSelection {
+                                anchor: caret,
+                                focus: caret,
+                            },
+                        );
+                    }
+                }
+            })
             .size_full()
             .key_context(super::TAB_CONTEXT)
             .track_focus(&self.focus)
@@ -2051,7 +2192,7 @@ impl gpui_kit::EntityInputHandler for TerminalView {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let cell = self.cell?;
-        let cursor = self.session.snapshot().cursor;
+        let cursor = self.session.cursor_snapshot();
         Some(Bounds {
             origin: point(
                 self.canvas_origin.get().x + cell.width * cursor.col as f32,
@@ -2262,6 +2403,12 @@ mod tests {
         let (root, cx) = cx.add_window_view(|_, _| WindowRoot { view });
         let view = root.read_with(cx, |root, _| root.view.clone());
         focus_grid(cx, &view);
+        cx.update(|window, _| {
+            let terminal = window.find("muster-terminal");
+            assert_eq!(terminal.role(), Some(gpui_kit::Role::MultilineTextInput));
+            assert_eq!(terminal.label(), Some("Terminal"));
+            assert_eq!(terminal.focused(), Some(true));
+        });
         assert!(
             wait_for_char(&session, 'R'),
             "the child never drew its marker"
@@ -2944,6 +3091,63 @@ mod tests {
         let answer = wait_for_line(&session, "GOT:");
         let _ = session.close().wait();
         answer
+    }
+
+    #[test]
+    fn terminal_accessible_text_is_bounded_and_tracks_cursor_and_selection() {
+        let mut wide = cell('界');
+        wide.width = 2;
+        let mut spacer = cell(' ');
+        spacer.width = 0;
+        let mut base = cell('e');
+        base.zerowidth.push('\u{301}');
+        let snapshot = TerminalSnapshot {
+            rows: vec![super::super::RowSnapshot {
+                cells: vec![wide, spacer, base, cell(' ')],
+            }],
+            selection: Some("e\u{301}".into()),
+            selection_range: Some(((0, 2), (0, 2))),
+            cursor: super::super::CursorSnapshot {
+                row: 0,
+                col: 3,
+                visible: true,
+                shape: CursorShapeSnapshot::Block,
+                blinking: false,
+                color: None,
+            },
+            modes: Default::default(),
+            title: None,
+            alt_screen: false,
+            mouse_tracking: false,
+            display_offset: 0,
+            history_size: 0,
+            background: None,
+            prompt_anchor: None,
+        };
+        let accessible = accessible_terminal_text(&snapshot, 4, 1);
+        assert_eq!(accessible.text, "界e\u{301} ");
+        assert_eq!(accessible.cursor, Some(3));
+        assert_eq!(accessible.selection, Some((1, 3)));
+
+        let oversized = TerminalSnapshot {
+            rows: vec![super::super::RowSnapshot {
+                cells: vec![cell('x'); MAX_ACCESSIBLE_TERMINAL_CELLS * 2],
+            }],
+            ..snapshot
+        };
+        let bounded = accessible_terminal_text(&oversized, MAX_ACCESSIBLE_TERMINAL_CELLS * 2, 1);
+        assert_eq!(bounded.text.chars().count(), MAX_ACCESSIBLE_TERMINAL_CELLS);
+    }
+
+    #[test]
+    fn ime_preedit_uses_terminal_display_columns_and_stays_inside_the_grid() {
+        assert_eq!(composition_columns(80, 4, "abc"), Some(3));
+        assert_eq!(composition_columns(80, 4, "界"), Some(2));
+        assert_eq!(composition_columns(80, 4, "e\u{301}"), Some(1));
+        assert_eq!(composition_columns(80, 79, "界"), Some(1));
+        assert_eq!(composition_columns(80, 80, "x"), None);
+        assert_eq!(composition_columns(80, 81, "x"), None);
+        assert_eq!(composition_columns(80, 4, "\u{301}"), Some(1));
     }
 
     #[test]

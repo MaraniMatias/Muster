@@ -1,12 +1,12 @@
 [package]
 name = "muster"
-version = "0.1.0"
-# 2021, matching `src-tauri`. The reused `src-tauri` sources are edition 2021 and
-# an in-crate dependency cannot cross editions; GPUI Kit being edition 2024 does
-# not force this crate to be.
+version = "0.2.0"
+# 2021, as `muster-core` is. The toolkit this app draws with is edition 2024,
+# and a crate may depend on one of a different edition, so nothing here forces
+# this one to move.
 edition = "2021"
 publish = false
-description = "Muster's native GPUI shell. The terminal milestone lives here; the Tauri app stays the shipping build until cutover."
+description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer. The Tauri app under legacy/ is parked and is not built from here."
 # Read by the About panel, the same way Legacy's read it: `env!` is resolved by
 # rustc, so the URL lands in the binary, where a field read off the bundle config
 # at runtime would not.
@@ -103,6 +103,7 @@ portable-pty = "0.9"
 libc = "0.2"
 log = "0.4"
 alacritty_terminal = "0.26.0"
+unicode-width = "0.2"
 # The shell-integration scripts are written to a private directory that has to
 # outlive the spawn and disappear with the session; nothing else owns that.
 tempfile = "3"

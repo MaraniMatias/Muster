@@ -1899,3 +1899,28 @@ The integration owner should finish with one consolidated report, not a concaten
 7. Verification: exact command outcomes, test counts, platform/manual checks, and unresolved limitations.
 
 This document is complete as a plan when its assignments are clear and delegable. The implementation is complete only when the task acceptance evidence exists; neither the plan's length nor a clean test baseline substitutes for that evidence.
+
+## Final A08 safety corrections — 2026-10-17
+
+This section supersedes the earlier A08 statements that deduplication was exact and that forgetting delivered reviews could always recover store capacity. Historical audit entries remain as records of what was believed and verified then; they are not the current contract.
+
+- Persistent review claims now pair the exact note id with a SHA-256 digest of the canonical snapshot (`sha2` 0.10.9, already present in the locked graph). This makes collisions computationally impractical, not impossible; the id does not prevent a same-id edited note from colliding. The non-security FNV fingerprint remains only for line-drift bookkeeping.
+- Ordinary **Forget notes** removes settled note payloads while retaining claims. The same Settings confirmation also exposes **Forget + reset**, a deliberate last-resort action that removes settled rounds and their claims. The dialog warns that unchanged delivered notes may be sent again. Queued, dispatching, and unknown rounds are retained. This enables real recovery after compacted tombstones alone fill the file; ordinary cleanup still preserves deduplication.
+- The new `reset_duplicate_scope_recovers_a_full_store_but_keeps_unresolved_rounds` test fills the store with settled tombstones, verifies a refused write leaves disk byte-identical, resets settled history, then verifies a send succeeds and unresolved rounds remain. `forgetting_delivered_reviews_keeps_them_from_being_sent_again` continues to pin normal dedup behavior.
+- The incompatible rounds schema remains 3 and both workspace crates are now `0.2.0`, as required for this persistent-shape change; historical `0.1.0` report values describe earlier state only.
+- `read_formatter_stream` now receives stdout identity explicitly rather than inferring it from a size limit. Each reader still consumes at most `limit + 1` bytes; process cleanup and join behavior are unchanged. A missing-pipe early return is not reachable with the command's explicit `Stdio::piped()` setup, so no speculative lifecycle change was added.
+
+Verification for the A08 corrections alone, on the pinned Rust/Cargo 1.97.1: `cargo test --locked -p muster-core` passed 170 unit tests and 4 instance-lock tests; `cargo test --locked -p muster` passed 383 tests with 3 ignored. `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` passed. No release build, real-window interaction pass, or manual UI check was run for it.
+
+## Final correction: a document transition asks only when a destination is pending — 2026-10-17
+
+`continue_document_transition` decided a draft's fate without checking that anything was being navigated to. `format_document` calls it unconditionally when the formatter finishes, so ordinary formatting of a dirty document — and a formatter that failed, with only the error text changing — raised "Save changes to this document?" although the window was already where the person asked to be. `refresh_document_draft` also ran first, so a keystroke-free call still settled the draft flag. The helper now returns early when `pending_document_transition` is `None`. Every destination is requested through `request_document_transition`, which fills that field first, so the decision still happens for a navigation, a quit and a window close; only the destination-less callers are affected.
+
+Two tests in `native/src/inspector_tests.rs` pin it: `a_document_transition_with_no_destination_asks_nothing` calls the helper on a dirty document with nothing pending and checks that no prompt appears and the text, draft and target are untouched, and `a_finished_format_with_no_destination_asks_nothing` runs the real `format_document` completion over a dirty `.ts` document and checks the same thing. The second test asserts the decision rather than the formatter's outcome, so it holds whether or not a Prettier is installed. Both fail on the unfixed helper with `assertion failed: !cx.has_pending_prompt()`.
+
+Verification on the pinned Rust/Cargo 1.97.1, by run:
+
+- This run: `cargo test --locked -p muster --lib` passed 385 tests with 3 ignored (383 before this correction, plus the two above); the focused `navigation_requested`/`dirty_document`/`transition`/`format` subset passed 17 of 17, including `navigation_requested_during_formatting_is_deferred_until_idle` and `dirty_document_save_conflict_keeps_draft_and_pending_destination`; `cargo fmt --all --check` and `cargo clippy --locked -p muster --all-targets -- -D warnings` are clean.
+- The parent's independent run, not repeated here: the workspace test run passed 383 native and 170 core tests plus the 4 instance-lock tests, the Node suites passed 23, `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` were clean, the release application build succeeded, and the 3 ignored release performance checks passed. Those counts predate this correction's two tests.
+
+Still not run: any real-window interaction pass, manual VoiceOver or IME checking, a Linux build, or macOS bundle inspection.

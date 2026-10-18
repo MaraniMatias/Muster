@@ -19,12 +19,123 @@ use tempfile::TempDir;
 use super::*;
 use crate::{
     opencode::mock::{self, Mock, Request},
-    review::{review_anchor_hash, ReviewSide},
+    review::{
+        review_anchor_hash, review_note_key, review_note_snapshot, ReviewSide, MAX_NOTE_CODE_BYTES,
+        MAX_NOTE_CONTENT_BYTES, MAX_ROUND_PROMPT_BYTES,
+    },
     workspace::Repo,
 };
 
 const SESSION: &str = "ses_review";
 const ELSEWHERE: &str = "checkout:/somewhere/else";
+
+/// A round as heavy as the app allows one to be: a note at both of its byte limits and a
+/// prompt at the message limit. This is what months of real reviews add up to, and it is
+/// why the store has to have somewhere to give bytes back.
+fn heavy_round(checkout_id: &str, id: &str, status: RoundStatus) -> ReviewRound {
+    let note = ReviewNote {
+        id: format!("note-{id}"),
+        checkout_id: checkout_id.into(),
+        path: "src/main.rs".into(),
+        side: ReviewSide::New,
+        line_start: 10,
+        line_end: None,
+        content: "c".repeat(MAX_NOTE_CONTENT_BYTES),
+        code: "x".repeat(MAX_NOTE_CODE_BYTES),
+        code_hash: review_anchor_hash("anchor"),
+        outdated: false,
+    };
+    ReviewRound {
+        id: id.into(),
+        checkout_id: checkout_id.into(),
+        session_id: SESSION.into(),
+        status,
+        marker: review_round_marker(id),
+        prompt: format!("{id}\n{}", "p".repeat(MAX_ROUND_PROMPT_BYTES)),
+        note_ids: vec![note.id.clone()],
+        claim: round_claim(std::slice::from_ref(&note)),
+        notes: vec![note],
+        created_at: "1".into(),
+        updated_at: "1".into(),
+    }
+}
+
+/// A round that carries no notes: the filler that brings a nearly full store down to the
+/// few kilobytes a test can reason about, instead of one whole review's worth of slack.
+fn filler_round(checkout_id: &str, id: &str, status: RoundStatus, prompt: usize) -> ReviewRound {
+    ReviewRound {
+        id: id.into(),
+        checkout_id: checkout_id.into(),
+        session_id: SESSION.into(),
+        status,
+        marker: review_round_marker(id),
+        prompt: "f".repeat(prompt),
+        note_ids: Vec::new(),
+        claim: String::new(),
+        notes: Vec::new(),
+        created_at: "1".into(),
+        updated_at: "1".into(),
+    }
+}
+
+/// Fills the store on disk the way a build that had not yet given anything up would have
+/// written it: as many rounds of real weight as fit, the first `unresolved` of them still
+/// owing the service a decision, and then enough empty rounds to leave a few kilobytes
+/// free rather than a whole review's worth.
+///
+/// Returns the bytes planted. Nothing here goes through the store, because the point is
+/// the file this build has to recover from, not the file it would have written.
+fn plant_store(store: &RoundStore, checkout_id: &str, unresolved: usize) -> u64 {
+    const FREE_AFTER: u64 = 4096;
+    const FILL_TO: u64 = 4 * MAX_ROUND_PROMPT_BYTES as u64;
+    let mut state = RoundFile::default();
+    let mut index = 0;
+    while STATE_CAP - encode(&state).unwrap().len() as u64 > FILL_TO {
+        let status = if index < unresolved {
+            RoundStatus::Queued
+        } else {
+            RoundStatus::Dispatched
+        };
+        state
+            .rounds
+            .push(heavy_round(checkout_id, &format!("r{index}"), status));
+        index += 1;
+    }
+    while STATE_CAP - encode(&state).unwrap().len() as u64 > FREE_AFTER {
+        let status = if index < unresolved {
+            RoundStatus::Queued
+        } else {
+            RoundStatus::Dispatched
+        };
+        let free = STATE_CAP - encode(&state).unwrap().len() as u64;
+        state.rounds.push(filler_round(
+            checkout_id,
+            &format!("r{index}"),
+            status,
+            (free - FREE_AFTER) as usize,
+        ));
+        index += 1;
+    }
+    assert!(!state.rounds.is_empty(), "the cap fits some rounds");
+    let bytes = encode(&state).unwrap();
+    assert!(
+        bytes.len() as u64 <= STATE_CAP,
+        "the store can still be read"
+    );
+    assert!(
+        bytes.len() as u64 > COMPACT_ABOVE,
+        "a store this full is the one that has to recover: {}",
+        bytes.len()
+    );
+    fs::write(store.path(), &bytes).unwrap();
+    bytes.len() as u64
+}
+
+/// A review the store has no room for: every byte the file left free, and the round
+/// around it.
+fn review_bigger_than(free: u64) -> String {
+    "r".repeat(free as usize)
+}
 
 /// An OpenCode service that behaves like the real one for one checkout: it answers
 /// every session it is asked about, records the prompts it takes in that session's
@@ -152,7 +263,7 @@ impl Service {
 
 fn take_one(counter: &AtomicUsize) -> bool {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             left.checked_sub(1)
         })
         .is_ok()
@@ -793,7 +904,8 @@ fn a_note_that_only_drifted_is_the_review_that_was_already_delivered() {
 fn two_notes_a_field_separator_cannot_tell_apart_are_two_different_reviews() {
     let fixture = Fixture::start();
     // One note's path ends with the separator and the other's comment begins with it, so
-    // a joined string spells both the same way and a digest of it cannot see them apart.
+    // a joined string spells both the same way and a digest of it could not see them apart
+    // at all. The length-prefixed snapshot is what tells them apart before it is digested.
     let mut in_comment = note(&fixture.checkout.id, "note-1");
     in_comment.content = "\u{1}src/main.rs".into();
     let mut in_path = note(&fixture.checkout.id, "note-1");
@@ -803,6 +915,11 @@ fn two_notes_a_field_separator_cannot_tell_apart_are_two_different_reviews() {
         review_note_snapshot(&in_comment),
         review_note_snapshot(&in_path),
         "each field writes its own length, so the two cannot be spelled alike"
+    );
+    assert_ne!(
+        review_note_key(&in_comment),
+        review_note_key(&in_path),
+        "so they are two keys, and two rounds"
     );
 
     let sent = fixture.send(&[in_comment]).unwrap();
@@ -816,11 +933,14 @@ fn two_notes_a_field_separator_cannot_tell_apart_are_two_different_reviews() {
 fn a_note_that_could_not_be_delivered_is_refused_before_it_is_claimed() {
     let fixture = Fixture::start();
     let notes = fixture.notes();
-    let undeliverable: [fn(&mut ReviewNote); 4] = [
+    let undeliverable: [fn(&mut ReviewNote); 5] = [
         |note| note.content = "   ".into(),
         |note| note.content = "x".repeat(crate::review::MAX_NOTE_CONTENT_BYTES + 1),
         |note| note.code = "x".repeat(crate::review::MAX_NOTE_CODE_BYTES + 1),
         |note| note.path = "../../outside.rs".into(),
+        // An id is one line of the store's claim, so one with a line break in it is a
+        // key that splits in half and leaves this note eligible to be sent again.
+        |note| note.id = "note-1\nnote-2".into(),
     ];
     for break_it in undeliverable {
         let mut note = notes[0].clone();
@@ -1050,4 +1170,350 @@ fn an_acked_round_is_finished_and_a_round_only_moves_forward() {
             .unwrap_err(),
         DispatchError::Failed(_)
     ));
+}
+
+#[test]
+fn a_store_near_its_cap_gives_up_what_nothing_can_read_again_instead_of_refusing_a_send() {
+    let fixture = Fixture::start();
+    // History a person built up: delivered reviews at their heaviest, and one round that
+    // still owes the service a send and therefore still owes it its exact bytes.
+    let queued = heavy_round(&fixture.checkout.id, "r0", RoundStatus::Queued);
+    let planted = plant_store(&fixture.store, &fixture.checkout.id, 1);
+    let markdown = review_bigger_than(STATE_CAP - planted);
+
+    // The review the cap had no room for.
+    let notes = fixture.notes();
+    let sent = fixture
+        .store
+        .send_round(&fixture.client, fixture.request(&notes, &markdown))
+        .unwrap();
+
+    assert_eq!(sent.status, RoundStatus::Dispatched);
+    assert!(
+        fs::metadata(fixture.store.path()).unwrap().len() <= STATE_CAP,
+        "the send fit"
+    );
+
+    let rounds = fixture.store.rounds(&fixture.checkout.id).unwrap();
+    assert!(
+        rounds.len() > 2,
+        "the store recovered rather than losing history: {}",
+        rounds.len()
+    );
+    // What the service was asked to send is still what the round holds, and the round
+    // that just went out keeps its prompt: compaction is what a full store does, not
+    // something a send does to the review it is sending.
+    assert_eq!(fixture.service.prompts(), vec![sent.prompt.clone()]);
+    assert!(
+        rounds
+            .iter()
+            .find(|round| round.id == sent.id)
+            .is_some_and(|round| round.prompt == sent.prompt),
+        "the review just sent is still readable in full"
+    );
+
+    // A round that still owes the service a decision is untouched: its prompt and notes
+    // are what it would be offered with, and what a person reads before settling it.
+    let still_queued = rounds
+        .iter()
+        .find(|round| round.id == "r0")
+        .expect("the queued round is still recorded");
+    assert_eq!(still_queued.status, RoundStatus::Queued);
+    assert_eq!(still_queued.prompt, queued.prompt);
+    assert_eq!(still_queued.notes, queued.notes);
+
+    // A delivered round gave up only what can never be asked for again, and still says
+    // exactly what it took: nothing it sent is offered again.
+    let delivered: Vec<_> = rounds
+        .iter()
+        .filter(|round| {
+            round.id != sent.id && round.status == RoundStatus::Dispatched && round.notes.len() == 1
+        })
+        .collect();
+    assert!(
+        delivered.len() > 1,
+        "there is history to have recovered from"
+    );
+    for round in delivered {
+        assert!(
+            round.prompt.is_empty(),
+            "{} cannot be offered again, so its prompt is dead weight",
+            round.id
+        );
+        assert!(
+            unsent_notes(&round.notes, std::slice::from_ref(round)).is_empty(),
+            "{} still holds the notes it sent",
+            round.id
+        );
+        let mut edited = round.notes[0].clone();
+        edited.content = "look again".into();
+        assert_eq!(
+            unsent_notes(std::slice::from_ref(&edited), std::slice::from_ref(round)),
+            vec![edited],
+            "an edited note is a new comment, whatever the round gave up"
+        );
+    }
+}
+
+#[test]
+fn a_store_with_nothing_left_to_give_up_refuses_the_send_and_is_left_exactly_as_it_was() {
+    let fixture = Fixture::start();
+    // Every round here still owes the service a decision, so there is nothing this store
+    // may give up: the cap is answered with a refusal, not with a lost review.
+    let planted = plant_store(&fixture.store, &fixture.checkout.id, usize::MAX);
+    let markdown = review_bigger_than(STATE_CAP - planted);
+    let before = fs::read(fixture.store.path()).unwrap();
+
+    let error = fixture
+        .store
+        .send_round(
+            &fixture.client,
+            fixture.request(&fixture.notes(), &markdown),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, DispatchError::Failed(_)), "{error:?}");
+    assert!(error.to_string().contains("full"), "{error}");
+    assert_eq!(
+        fs::read(fixture.store.path()).unwrap(),
+        before,
+        "a refused write leaves the file that was there, byte for byte"
+    );
+    assert_eq!(before.len() as u64, planted);
+    assert!(
+        fixture
+            .store
+            .rounds(&fixture.checkout.id)
+            .unwrap()
+            .iter()
+            .all(|round| round.status == RoundStatus::Queued
+                && (round.notes.is_empty() || !round.prompt.is_empty())),
+        "and every round is still exactly what it was"
+    );
+    assert!(
+        fixture.service.prompt_posts().is_empty(),
+        "a review that could not be stored never goes out"
+    );
+}
+
+#[test]
+fn forgetting_delivered_reviews_keeps_them_from_being_sent_again() {
+    let fixture = Fixture::start();
+    let sent = fixture.send(&fixture.notes()).unwrap();
+    fixture
+        .store
+        .ack_round(&fixture.checkout.id, &sent.id)
+        .unwrap();
+
+    // A second review, one that may or may not have landed: the round nobody may throw
+    // away is the one whose delivery nobody can say.
+    fixture.service.swallow_next(1);
+    let unsettled_notes = vec![note(&fixture.checkout.id, "note-2")];
+    assert!(fixture.send(&unsettled_notes).is_err());
+    let unsettled = fixture.store.rounds(&fixture.checkout.id).unwrap();
+    let unsettled = unsettled
+        .into_iter()
+        .find(|round| round.notes.iter().any(|note| note.id == "note-2"))
+        .expect("the unsettled round is recorded");
+    assert_eq!(fixture.settle(&unsettled.id).status, RoundStatus::Unknown);
+
+    assert_eq!(fixture.store.forget_settled_history().unwrap(), 1);
+    assert_eq!(
+        fixture.store.forget_settled_history().unwrap(),
+        0,
+        "forgetting is not a thing to do twice"
+    );
+
+    let rounds = fixture.store.rounds(&fixture.checkout.id).unwrap();
+    let forgotten = rounds
+        .iter()
+        .find(|round| round.id == sent.id)
+        .expect("the round is still recorded, and still says it was delivered");
+    assert_eq!(forgotten.status, RoundStatus::Acked);
+    assert!(
+        forgotten.notes.is_empty(),
+        "the notes are the weight the person agreed to give up"
+    );
+    assert!(forgotten.prompt.is_empty());
+
+    // What it gave up is not what it claimed: the same review asked for again is that
+    // round, an unchanged note is not offered, and a new note cannot ride along with one
+    // that was already delivered.
+    assert!(
+        unsent_notes(&fixture.notes(), &rounds).is_empty(),
+        "an unchanged note is still not offered again"
+    );
+    let posts = fixture.service.prompt_posts().len();
+    assert_eq!(fixture.send(&fixture.notes()).unwrap().id, sent.id);
+    let mixed = vec![
+        fixture.notes()[0].clone(),
+        note(&fixture.checkout.id, "note-3"),
+    ];
+    let error = fixture.send(&mixed).unwrap_err();
+    assert!(matches!(error, DispatchError::Foreign(_)), "{error}");
+    assert!(error.to_string().contains(&sent.id), "{error}");
+    assert_eq!(fixture.service.prompt_posts().len(), posts);
+
+    // And the round nobody can settle on their own kept everything settling it needs.
+    let kept = rounds
+        .iter()
+        .find(|round| round.id == unsettled.id)
+        .expect("an unresolved round is never forgotten");
+    assert_eq!(kept.status, RoundStatus::Unknown);
+    assert_eq!(kept.notes, unsettled.notes);
+    assert_eq!(kept.prompt, unsettled.prompt);
+    assert_eq!(
+        fixture.settle(&kept.id).status,
+        RoundStatus::Unknown,
+        "and it is still settled against the transcript, not by being thrown away"
+    );
+}
+
+#[test]
+fn reset_duplicate_scope_recovers_a_full_store_but_keeps_unresolved_rounds() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let new_notes = vec![note(&fixture.checkout.id, "fresh-note")];
+    let mut state = RoundFile::default();
+    let mut settled = heavy_round(&fixture.checkout.id, "delivered", RoundStatus::Acked);
+    settled.prompt.clear();
+    settled.notes.clear();
+    settled.claim = round_claim(&notes);
+    state.rounds.push(settled);
+    state.rounds.push(filler_round(
+        &fixture.checkout.id,
+        "queued",
+        RoundStatus::Queued,
+        0,
+    ));
+    state.rounds.push(filler_round(
+        &fixture.checkout.id,
+        "unknown",
+        RoundStatus::Unknown,
+        0,
+    ));
+    let mut index = 0;
+    while (encode(&state).unwrap().len() as u64) < STATE_CAP - 1500 {
+        let mut tombstone = filler_round(
+            &fixture.checkout.id,
+            &format!("tombstone-{index}"),
+            RoundStatus::Acked,
+            0,
+        );
+        tombstone.marker = "m".repeat(900);
+        state.rounds.push(tombstone);
+        index += 1;
+    }
+    let before = encode(&state).unwrap();
+    assert!(before.len() as u64 > COMPACT_ABOVE);
+    assert!(before.len() as u64 <= STATE_CAP);
+    fs::write(fixture.store.path(), &before).unwrap();
+
+    let oversized_review = "x".repeat(MAX_ROUND_PROMPT_BYTES / 2);
+    let result = fixture.store.send_round(
+        &fixture.client,
+        fixture.request(&new_notes, &oversized_review),
+    );
+    assert!(
+        result.is_err(),
+        "the full tombstone store refuses another send"
+    );
+    assert!(result.unwrap_err().to_string().contains("full"));
+    assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+
+    assert!(fixture.store.reset_settled_duplicate_scope().unwrap() > 1);
+    let rounds = fixture.store.rounds(&fixture.checkout.id).unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert!(rounds.iter().all(|round| !round.status.is_settled()));
+    assert_eq!(
+        rounds
+            .iter()
+            .find(|round| round.id == "queued")
+            .unwrap()
+            .status,
+        RoundStatus::Queued
+    );
+    assert_eq!(
+        rounds
+            .iter()
+            .find(|round| round.id == "unknown")
+            .unwrap()
+            .status,
+        RoundStatus::Unknown
+    );
+    assert_eq!(
+        fixture
+            .store
+            .send_round(&fixture.client, fixture.request(&notes, "review"))
+            .unwrap()
+            .status,
+        RoundStatus::Dispatched
+    );
+}
+
+#[test]
+fn what_a_forgotten_review_keeps_does_not_grow_with_the_review_it_sent() {
+    // The property that makes recovery long-term rather than a one-off: giving up the
+    // delivered reviews leaves something whose size is about how many reviews there
+    // were, not about how large they were. A claim that kept the notes would make every
+    // further round a permanent write refusal, with nothing left to release.
+    let fixture = Fixture::start();
+
+    // Sixty-four delivered reviews, each given up. What is left has to be about how many
+    // reviews there were, not about how large they were: a claim that kept the notes
+    // would make every later round a permanent write refusal instead.
+    let given_up = |content: usize, code: usize| {
+        let mut state = RoundFile::default();
+        for index in 0..64 {
+            let mut review = note(&fixture.checkout.id, &format!("note-{index}"));
+            review.content = "c".repeat(content);
+            review.code = "x".repeat(code);
+            let mut round = heavy_round(
+                &fixture.checkout.id,
+                &format!("r{index}"),
+                RoundStatus::Acked,
+            );
+            round.claim = round_claim(std::slice::from_ref(&review));
+            round.note_ids = vec![review.id.clone()];
+            round.notes = vec![review];
+            round.prompt.clear();
+            round.notes.clear();
+            assert!(round.claim.len() < 128, "{}", round.claim);
+            state.rounds.push(round);
+        }
+        state
+    };
+    let at_the_limit = encode(&given_up(MAX_NOTE_CONTENT_BYTES, MAX_NOTE_CODE_BYTES)).unwrap();
+    let one_byte_each = encode(&given_up(1, 1)).unwrap();
+    assert_ne!(
+        at_the_limit, one_byte_each,
+        "the keys left are of different notes"
+    );
+    assert_eq!(
+        at_the_limit.len(),
+        one_byte_each.len(),
+        "what a forgotten review keeps is the same size however large the review was"
+    );
+    assert!(
+        at_the_limit.len() < 64 * 512,
+        "and it is a key per note, not a review"
+    );
+
+    // And the key that is left is still what a duplicate send is decided against, so
+    // the space was not bought by letting a delivered note go out again.
+    let delivered = heavy_round(&fixture.checkout.id, "r0", RoundStatus::Acked);
+    let mut round = delivered.clone();
+    round.prompt.clear();
+    round.notes.clear();
+    assert!(
+        unsent_notes(&delivered.notes, std::slice::from_ref(&round)).is_empty(),
+        "an unchanged note a forgotten review sent is still not offered again"
+    );
+    let mut edited = delivered.notes[0].clone();
+    edited.content = "look again".into();
+    assert_eq!(
+        unsent_notes(std::slice::from_ref(&edited), std::slice::from_ref(&round)),
+        vec![edited],
+        "an edited note is still a new comment"
+    );
 }

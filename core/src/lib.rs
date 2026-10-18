@@ -29,10 +29,13 @@ pub mod pty;
 /// else in the old tree.
 pub mod workspace;
 
-/// Read-only folder/worktree discovery and the native host's isolated navigation state.
+/// Checkout and worktree discovery, the Git diffs they answer with, the worktree
+/// mutations, and the native host's isolated navigation state.
 pub mod navigation;
 
-/// Safe, bounded read-only checkout file listing and previews.
+/// Safe, bounded checkout file listing and previews, and the writes a document
+/// save and a review export go through. Reading a file and replacing one are the
+/// same path policy on purpose, so there is one of them.
 pub mod files;
 
 /// Hands a file or a link to the application this machine has for it.

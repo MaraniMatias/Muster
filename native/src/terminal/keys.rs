@@ -268,10 +268,11 @@ fn home_end_key(final_byte: char, modes: &TerminalModes, modifier: Option<u8>) -
 
 /// The `CSI <number> ~` number for each of F5..F12.
 ///
-/// A table rather than `number + 10`, because the xterm sequence this encoding
-/// comes from leaves 22 and 23 to something else: a child reading `CSI 22 ~`
-/// is reading a key most terminal emulators have never sent.
-const FUNCTION_KEY_NUMBERS: [u8; 8] = [15, 16, 17, 18, 19, 20, 21, 24];
+/// A table rather than `number + 10`, because the xterm numbering this encoding
+/// comes from is not contiguous: 16 and 22 belong to no key, so F6 is 17 and F11
+/// is 23. A `number + 10` would answer F6 with the bytes a child reads as
+/// another key, which in a TUI means running that key's action for this one.
+const FUNCTION_KEY_NUMBERS: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
 
 /// `CSI <number> ~` for Insert, Delete, PageUp, PageDown and F5-F12.
 ///
@@ -301,19 +302,38 @@ fn arrow_final_byte(key: Key) -> char {
     }
 }
 
-/// The one byte a terminal has for "Ctrl was held with this letter".
+/// The one byte a terminal has for "Ctrl was held with this key".
 ///
 /// Uppercase folds down before the subtraction: Ctrl+Shift+C is the same key as
 /// Ctrl+C, and a view reporting the shifted character has not asked for a
-/// different one. A character that is not a letter has no control byte, which
-/// is what makes `Ctrl` plus a non-letter an unanswered press rather than a
+/// different one.
+///
+/// The six punctuation keys that name a C0 control in every terminal are listed
+/// as well, because no letter can reach the four below ESC and a child binding
+/// Ctrl+Space or Ctrl+`[` would otherwise never hear the press at all. They are
+/// bytes rather than parameters under the keyboard protocol for the reason the
+/// letters are: a control byte is one byte in every terminal.
+///
+/// `None` is still the answer for a character with no control byte, which is
+/// what makes Ctrl plus an arbitrary character an unanswered press rather than a
 /// guess.
 fn control_byte(c: char) -> Option<u8> {
     let lower = c.to_ascii_lowercase();
     // `then` rather than `then_some`, which evaluates its argument either way:
     // `lower as u8` on a non-ASCII character is a truncated code point, and
     // subtracting 0x60 from that underflows rather than failing to be a letter.
-    lower.is_ascii_lowercase().then(|| lower as u8 - 0x60)
+    if lower.is_ascii_lowercase() {
+        return Some(lower as u8 - 0x60);
+    }
+    match c {
+        ' ' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
+    }
 }
 
 /// The single character of a `KeyPress::text`, or nothing for anything longer.
@@ -568,10 +588,9 @@ mod tests {
             Some(vec![0x03])
         );
 
-        // A character that is not a letter has no control byte. Sending the
-        // character instead would put a `€` in a Ctrl press, and answering with
-        // nothing at all would look like a dropped key, so the caller is told
-        // instead.
+        // A character with no control byte has none. Sending the character
+        // instead would put a `€` in a Ctrl press, and answering with nothing at
+        // all would look like a dropped key, so the caller is told instead.
         assert_eq!(
             encode_key(&with_ctrl(press(Key::Char('€'))), &unnegotiated()),
             None
@@ -611,6 +630,50 @@ mod tests {
                 &with_meta(with_ctrl(press(Key::Char('€')))),
                 &unnegotiated()
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_punctuation_answers_with_the_control_byte_every_terminal_gives_it() {
+        // The six keys whose Ctrl combination names a C0 control, asserted as
+        // the exact byte rather than as "something was sent": a child binding
+        // Ctrl+Space reads NUL and a child binding Ctrl+`[` reads ESC, and the
+        // four below ESC are the only bytes no letter can reach.
+        for (punctuation, byte) in [
+            (' ', 0x00_u8),
+            ('[', 0x1b),
+            ('\\', 0x1c),
+            (']', 0x1d),
+            ('^', 0x1e),
+            ('_', 0x1f),
+        ] {
+            assert_eq!(
+                encode_key(&with_ctrl(press(Key::Char(punctuation))), &unnegotiated()),
+                Some(vec![byte]),
+                "Ctrl+{punctuation:?}"
+            );
+        }
+
+        // These follow the letters, so the negotiation does not change them
+        // either: a control byte is one byte in every terminal.
+        assert_eq!(
+            encoded(&with_ctrl(press(Key::Char(' '))), &negotiated()),
+            b"\x00"
+        );
+        // Meta is still a prefix in front of it, not a second ESC.
+        assert_eq!(
+            encoded(
+                &with_meta(with_ctrl(press(Key::Char(' ')))),
+                &unnegotiated()
+            ),
+            b"\x1b\x00"
+        );
+
+        // Punctuation outside that table still has no control byte, so the six
+        // are the six rather than a rule about every symbol.
+        assert_eq!(
+            encode_key(&with_ctrl(press(Key::Char('-'))), &unnegotiated()),
             None
         );
     }
@@ -729,9 +792,35 @@ mod tests {
         }
 
         // F5 and up have one encoding and application keypad does not touch it.
-        assert_eq!(encoded(&press(Key::F(5)), &unnegotiated()), b"\x1b[15~");
-        assert_eq!(encoded(&press(Key::F(5)), &app_keypad), b"\x1b[15~");
-        assert_eq!(encoded(&press(Key::F(12)), &unnegotiated()), b"\x1b[24~");
+        // Every key's own number is spelled out rather than derived, because the
+        // xterm numbering skips 16 and 22 and a test that computed the
+        // expectation would agree with any table.
+        for (number, legacy, disambiguated) in [
+            (5_u8, b"\x1b[15~".as_slice(), b"\x1b[15;2~".as_slice()),
+            (6, b"\x1b[17~", b"\x1b[17;2~"),
+            (7, b"\x1b[18~", b"\x1b[18;2~"),
+            (8, b"\x1b[19~", b"\x1b[19;2~"),
+            (9, b"\x1b[20~", b"\x1b[20;2~"),
+            (10, b"\x1b[21~", b"\x1b[21;2~"),
+            (11, b"\x1b[23~", b"\x1b[23;2~"),
+            (12, b"\x1b[24~", b"\x1b[24;2~"),
+        ] {
+            assert_eq!(encoded(&press(Key::F(number)), &unnegotiated()), legacy);
+            assert_eq!(encoded(&press(Key::F(number)), &app_keypad), legacy);
+            // Unmodified is unmodified under the negotiation too: the parameter
+            // belongs to a modifier that is not there.
+            assert_eq!(encoded(&press(Key::F(number)), &negotiated()), legacy);
+            assert_eq!(
+                encoded(&with_shift(press(Key::F(number))), &negotiated()),
+                disambiguated
+            );
+            // Without it there is nowhere to put a modifier, so a modified key
+            // is the unmodified one.
+            assert_eq!(
+                encoded(&with_shift(press(Key::F(number))), &unnegotiated()),
+                legacy
+            );
+        }
         assert_eq!(
             encoded(&with_ctrl(press(Key::F(12))), &negotiated()),
             b"\x1b[24;5~"
