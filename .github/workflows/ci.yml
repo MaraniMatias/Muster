@@ -57,7 +57,10 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
-      # The Vulkan, X11 and Wayland development packages GPUI links against.
-      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev
+      # The Vulkan, X11 and XKB development packages GPUI links against, plus the
+      # fontconfig one it loads through `yeslogic-fontconfig-sys`: without
+      # `fontconfig.pc` the build script panics on a missing system library before
+      # any of this app's own code is compiled.
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev libx11-dev libxkbcommon-dev libfontconfig1-dev
       - run: cargo build --locked -p muster
       - run: cargo test --locked -p muster-core
