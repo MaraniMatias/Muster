@@ -954,6 +954,55 @@ fn the_workspace_panels_reach_both_edges_of_every_window_size(cx: &mut TestAppCo
     close(&fixture, cx);
 }
 
+/// The empty state belongs to the middle of the panel it is drawn in.
+///
+/// A checkout with no terminal open leaves the middle panel holding one
+/// sentence and the action that fills it, and that pair belongs in the middle
+/// of a panel rather than pinned under the title bar of a window 800px tall.
+/// The state says so with `justify_center`, which centres nothing unless it is
+/// as tall as the panel it centres itself in -- and `flex_1` was asking for that
+/// height from a parent that lays its children out as blocks, where a flex
+/// property grows nothing. Both rectangles are read off the drawn window: the
+/// state, and the panel it has to cover, whose edges are the sidebar's and the
+/// inspector's.
+#[gpui_kit::test]
+fn the_empty_state_sits_in_the_middle_of_the_main_panel(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(size(px(1280.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        let empty = window.find("empty-state").bounds();
+        let action = window.find("empty-action").bounds();
+        let panel = gpui_kit::point(
+            px((sidebar.right().as_f32() + inspector.origin.x.as_f32()) / 2.),
+            sidebar.center().y,
+        );
+        assert!(
+            (empty.center().x - panel.x).abs() <= px(1.)
+                && (empty.center().y - panel.y).abs() <= px(1.),
+            "the empty state covers the panel between the sidebar and the \
+             inspector, so its middle is the panel's: {empty:?} is centred at \
+             {:?}, not {:?}",
+            empty.center(),
+            panel,
+        );
+        assert!(
+            (action.center().x - panel.x).abs() <= px(1.),
+            "and the action in it is centred on the panel's middle rather than \
+             beside its left edge: {action:?} against {:?}",
+            panel,
+        );
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
 /// The grid is the middle panel, so it is what the middle panel is given.
 ///
 /// A window that only grows is not a window the parser was told about: the PTY

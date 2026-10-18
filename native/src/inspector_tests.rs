@@ -4814,10 +4814,7 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
     assert!(draw_until(&fixture, cx, "review-primary-action"));
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(
-            window.find("review-primary-action").label(),
-            Some("Export as Markdown")
-        );
+        assert_eq!(window.find("review-primary-action").label(), Some("Save"));
         for id in [
             "review-storage",
             "clear-review-exports",
@@ -4883,6 +4880,68 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
             Some("Send to OpenCode")
         );
         assert!(window.try_find("copy-opencode-session-id").is_none());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// Where the notes went is a row beside the button that put them there, not a
+/// message that was true for a moment: the file is the answer to "did my Save do
+/// anything", and it is the thing somebody hands to a teammate, so it is copyable.
+#[gpui_kit::test]
+async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        let app = fixture.view.read(cx);
+        !app.review.opencode_loading
+            && app
+                .git_diff
+                .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    let path = fixture.root.join(".muster/reviews/2026-03-14-1532.md");
+    let written = path.display().to_string();
+    fixture.view.update(cx, |app, cx| {
+        app.review.exported = Some(crate::review::ExportedReview {
+            checkout_id: fixture.checkout.clone(),
+            path,
+        });
+        cx.notify();
+    });
+    assert!(draw_until(&fixture, cx, "review-exported-path"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("review-exported-path").visible(),
+            "the file the save wrote is on screen beside the button that saved it"
+        );
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "something else".to_owned(),
+        ));
+        window.click("copy-review-export-path", cx);
+        assert_eq!(
+            cx.read_from_clipboard().map(|item| item.text()),
+            Some(Some(written.clone())),
+            "the icon beside the path is what puts it on the clipboard"
+        );
+    })
+    .unwrap();
+    // The file outlives the diff it came from, so a save for another checkout is
+    // not this change set's file and is not named by this toolbar.
+    fixture.view.update(cx, |app, cx| {
+        app.review.exported = Some(crate::review::ExportedReview {
+            checkout_id: "checkout:/somewhere/else".into(),
+            path: std::path::PathBuf::from("/elsewhere/2026-03-14-1532.md"),
+        });
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("review-exported-path").is_none());
     })
     .unwrap();
     close(&fixture, cx);
@@ -5231,9 +5290,9 @@ async fn a_note_can_cover_lines_the_change_removed(cx: &mut TestAppContext) {
         });
         // The removed line above it is a start this note may be widened to, and
         // widening says the removed side rather than the added one.
-        fixture
-            .view
-            .update(cx, |app, cx| app.set_review_note_start(2, window, cx));
+        fixture.view.update(cx, |app, cx| {
+            app.set_review_note_start(muster_core::review::ReviewSide::Old, 2, window, cx)
+        });
         window.render_frame(cx);
     })
     .unwrap();
@@ -5263,6 +5322,104 @@ async fn a_note_can_cover_lines_the_change_removed(cx: &mut TestAppContext) {
         assert_eq!((note.line_start, note.line_end), (2, Some(3)));
         assert_eq!(note.code, "two\nthree");
         assert_eq!(note.content, "this line goes away");
+    });
+    close(&fixture, cx);
+}
+
+/// A note opened on a line the change added may still start on a line it removed
+/// above it: the removal is part of the same change, so the range covers it and
+/// the note is saved against the side the start is on.
+#[gpui_kit::test]
+async fn a_note_on_an_added_line_may_start_on_a_removed_one_above_it(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::component::select::SelectEvent;
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
+    commit_all(&fixture.root, "base");
+    std::fs::write(fixture.root.join("change.txt"), "one\nTWO\nTHREE\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The `+` is a control on a drawn diff, so the diff is on screen before
+        // the note opens: the lines it covers are washed in that view.
+        window.render_frame(cx);
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(draw_until(&fixture, cx, "review-range-start"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_value("this line replaces two", window, cx)
+        });
+        let picker = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .start_picker
+            .clone();
+        // The removed line above the added one is a start this note may be
+        // widened to, and the picker says so in the export's own language.
+        picker.update(cx, |_, cx| {
+            cx.emit(SelectEvent::Confirm(Some(gpui_kit::SharedString::from(
+                "-2",
+            ))))
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        let composer = app.review.composer.as_ref().unwrap();
+        assert_eq!(composer.side, muster_core::review::ReviewSide::Old);
+        assert_eq!((composer.line_start, composer.line_end), (2, 3));
+        assert_eq!(composer.code, "two\nthree");
+        // The card does not travel with the range: the comment is still being
+        // written where it was opened.
+        assert_eq!(composer.anchor, (muster_core::review::ReviewSide::New, 3));
+        assert_eq!(
+            composer.start_picker.read(cx).selected_value().cloned(),
+            Some(gpui_kit::SharedString::from("-2"))
+        );
+        // The lines the note now covers are the lines it is saved against.
+        let state = &app.diff_view.as_ref().unwrap().state;
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Original, 2, 3))
+        );
+    });
+    fixture.view.update(cx, |app, cx| app.save_review_note(cx));
+    fixture.view.read_with(cx, |app, _| {
+        let note = &app.review.notes[&fixture.checkout][0];
+        assert_eq!(note.side, muster_core::review::ReviewSide::Old);
+        assert_eq!((note.line_start, note.line_end), (2, Some(3)));
+        assert_eq!(note.code, "two\nthree");
     });
     close(&fixture, cx);
 }

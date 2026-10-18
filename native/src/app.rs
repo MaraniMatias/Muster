@@ -24,8 +24,8 @@ use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
     PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 // The frame is the app's own on the targets that do not draw one: server-side
 // decorations would stack a caption and a set of window controls over the bar
@@ -2678,7 +2678,9 @@ impl Render for TerminalWindow {
                 .and_then(|id| self.navigation.checkout(id))
                 .is_some_and(|checkout| !checkout.is_missing);
             div()
-                .flex_1()
+                .id("empty-state")
+                .test_support()
+                .size_full()
                 .flex()
                 .flex_col()
                 .items_center()

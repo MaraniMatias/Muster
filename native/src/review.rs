@@ -1,6 +1,7 @@
 //! The window's line-anchored review drafts and their Markdown export.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,31 +27,109 @@ static NEXT_NOTE_ID: AtomicU64 = AtomicU64::new(0);
 type AnchorHashes = HashMap<(ReviewSide, usize), Option<String>>;
 type AnchorHashCache = HashMap<(String, String), (String, AnchorHashes)>;
 
-/// Candidate first lines for a note range, limited to lines present on its side and not past its end.
+/// Candidate first lines for a note range: every line from the top of its own hunk down to the
+/// line it ends on, on either side.
+///
+/// A change that removed the lines above an added one is part of the same range, so a note that
+/// ends on a `+` may still start on a `−`. An untouched line is one line of both sides and is
+/// named on the side the note is anchored to, which is what keeps the same text from being offered
+/// twice under two numbers.
 pub(crate) fn review_start_lines(
     lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
-    side: ReviewSide,
-    end: usize,
-) -> Vec<usize> {
-    if end == 0 {
+    anchor: (ReviewSide, usize),
+) -> Vec<(ReviewSide, usize)> {
+    if anchor.1 == 0 || !lines.contains_key(&anchor) {
         return Vec::new();
     }
+    let drawn = drawn_line(lines, anchor);
+    let Some(run) = review_drawn_lines(lines)
+        .into_iter()
+        .find(|run| run.contains(&drawn))
+    else {
+        return Vec::new();
+    };
+    let Some(index) = run.iter().position(|line| *line == drawn) else {
+        return Vec::new();
+    };
     let mut starts = Vec::new();
-    let mut expected = end;
     let mut bytes = 0;
-    for ((_, number), line) in lines.range((side, 1)..=(side, end)).rev() {
-        if *number != expected {
-            break;
-        }
-        bytes += line.text.len() + usize::from(!starts.is_empty());
+    for (at, line) in run[..=index].iter().enumerate().rev() {
+        let side = match lines[line].mark {
+            '-' => ReviewSide::Old,
+            '+' => ReviewSide::New,
+            _ => anchor.0,
+        };
+        bytes += lines[line].text.len() + usize::from(at != index);
         if bytes > MAX_NOTE_CODE_BYTES {
             break;
         }
-        starts.push(*number);
-        expected = number.saturating_sub(1);
+        starts.push((side, line.1));
     }
     starts.reverse();
     starts
+}
+
+/// The line of the drawing a line of the diff belongs to: an untouched line is one line of both
+/// sides, so it is drawn once, on the new side's numbering.
+fn drawn_line(
+    lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
+    line: (ReviewSide, usize),
+) -> (ReviewSide, usize) {
+    match lines[&line].mark {
+        ' ' => (ReviewSide::New, line.1),
+        _ => line,
+    }
+}
+
+/// The lines a diff draws, in order, one run per hunk.
+///
+/// The old and the new side are two numbered copies of the same hunk, so the drawing is their
+/// merge: a removed line is only in the old one, an added line only in the new one, and an
+/// untouched line is in both. A removal is written before the addition that replaced it, and a gap
+/// in either side's numbering is where one hunk ends and the next begins.
+fn review_drawn_lines(
+    lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
+) -> Vec<Vec<(ReviewSide, usize)>> {
+    let next_of = |side: ReviewSide, after: usize| {
+        lines
+            .range((side, after + 1)..)
+            .next()
+            .map(|((_, line), _)| *line)
+    };
+    let mut runs = Vec::new();
+    let (mut old, mut new) = (0usize, 0usize);
+    while let (Some(next_old), Some(next_new)) =
+        (next_of(ReviewSide::Old, old), next_of(ReviewSide::New, new))
+    {
+        old = next_old - 1;
+        new = next_new - 1;
+        let mut run = Vec::new();
+        loop {
+            let old_mark = lines.get(&(ReviewSide::Old, old + 1)).map(|line| line.mark);
+            let new_mark = lines.get(&(ReviewSide::New, new + 1)).map(|line| line.mark);
+            if old_mark == Some('-') {
+                old += 1;
+                run.push((ReviewSide::Old, old));
+            } else if new_mark == Some('+') {
+                new += 1;
+                run.push((ReviewSide::New, new));
+            } else if old_mark == Some(' ') && new_mark == Some(' ') {
+                old += 1;
+                new += 1;
+                run.push((ReviewSide::New, new));
+            } else if old_mark.is_some() {
+                old += 1;
+                run.push((ReviewSide::Old, old));
+            } else if new_mark.is_some() {
+                new += 1;
+                run.push((ReviewSide::New, new));
+            } else {
+                break;
+            }
+        }
+        runs.push(run);
+    }
+    runs
 }
 
 pub(crate) fn cached_anchor_hashes(
@@ -97,6 +176,9 @@ pub(crate) struct ReviewState {
     pub(crate) forget_confirmation: bool,
     pub(crate) forgetting: bool,
     pub(crate) exporting: bool,
+    /// Where the notes were last saved, so the toolbar can keep naming the file
+    /// instead of a toast saying it once and losing it.
+    pub(crate) exported: Option<ExportedReview>,
     pub(crate) opencode_busy: bool,
     pub(crate) opencode_loading: bool,
     pub(crate) opencode_destination: Option<muster_core::opencode::Destination>,
@@ -104,6 +186,16 @@ pub(crate) struct ReviewState {
     pub(crate) opencode_error: Option<String>,
     opencode_checkout: Option<String>,
     opencode_generation: u64,
+}
+
+/// The file a save wrote, with the checkout whose notes went into it.
+///
+/// The checkout is part of it because the file outlives the diff: a review saved
+/// for one checkout is still on disk after another checkout's change set is opened,
+/// and only the first of the two is what that file holds.
+pub(crate) struct ExportedReview {
+    pub(crate) checkout_id: String,
+    pub(crate) path: PathBuf,
 }
 
 pub(crate) fn can_start_opencode_round(rounds: &[muster_core::opencode::ReviewRound]) -> bool {
@@ -142,6 +234,10 @@ pub(crate) fn opencode_round_state(status: muster_core::opencode::RoundStatus) -
 pub(crate) struct ReviewComposer {
     pub(crate) checkout_id: String,
     pub(crate) path: String,
+    /// The line the note was opened on, which is where the composer card hangs
+    /// and where the picker counts back from. Choosing a start on the other side
+    /// of the change moves the range, never the card.
+    pub(crate) anchor: (ReviewSide, usize),
     pub(crate) side: ReviewSide,
     pub(crate) line_start: usize,
     pub(crate) line_end: usize,
@@ -164,28 +260,33 @@ fn review_start_label(line: usize, side: ReviewSide, mark: char) -> SharedString
     }
 }
 
-/// The line a picker item stands for, without its change marker.
-fn review_line_number(label: &str) -> Option<usize> {
-    label.trim_start_matches(['+', '-']).parse().ok()
+/// The side and line a picker item stands for, without its change marker.
+fn review_line_label(label: &str) -> Option<(ReviewSide, usize)> {
+    if let Some(line) = label.strip_prefix('-') {
+        return Some((ReviewSide::Old, line.parse().ok()?));
+    }
+    Some((
+        ReviewSide::New,
+        label.strip_prefix('+').unwrap_or(label).parse().ok()?,
+    ))
 }
 
-/// The line numbers a note range could start on, and the one this note starts at.
+/// The lines a note range could start on, and the one this note starts at.
 ///
 /// The delegate is the toolkit's own `Vec<SharedString>`, so a candidate is a
 /// line number with its change marker, without a code preview.
 fn review_start_choices(
     lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
-    side: ReviewSide,
-    start: usize,
-    end: usize,
+    start: (ReviewSide, usize),
+    anchor: (ReviewSide, usize),
 ) -> (Vec<SharedString>, Option<IndexPath>) {
-    let numbers = review_start_lines(lines, side, end);
+    let starts = review_start_lines(lines, anchor);
     (
-        numbers
+        starts
             .iter()
-            .map(|line| review_start_label(*line, side, lines[&(side, *line)].mark))
+            .map(|(side, line)| review_start_label(*line, *side, lines[&(*side, *line)].mark))
             .collect(),
-        numbers
+        starts
             .iter()
             .position(|line| *line == start)
             .map(|row| IndexPath::default().row(row)),
@@ -199,23 +300,22 @@ fn review_start_choices(
 /// and nothing else, which is what keeps the two one state rather than two.
 fn review_start_picker(
     lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
-    side: ReviewSide,
-    start: usize,
-    end: usize,
+    start: (ReviewSide, usize),
+    anchor: (ReviewSide, usize),
     window: &mut Window,
     cx: &mut Context<TerminalWindow>,
 ) -> (
     Entity<SelectState<Vec<SharedString>>>,
     gpui_kit::Subscription,
 ) {
-    let (items, selected) = review_start_choices(lines, side, start, end);
+    let (items, selected) = review_start_choices(lines, start, anchor);
     let picker = cx.new(|cx| SelectState::new(items, selected, window, cx));
     let events = cx.subscribe_in(&picker, window, |app, _, event, window, cx| {
         let SelectEvent::Confirm(Some(line)) = event else {
             return;
         };
-        if let Some(line) = review_line_number(line) {
-            app.set_review_note_start(line, window, cx);
+        if let Some((side, line)) = review_line_label(line) {
+            app.set_review_note_start(side, line, window, cx);
         }
     });
     (picker, events)
@@ -285,10 +385,10 @@ impl TerminalWindow {
             composer.editing_id.is_none()
                 && composer.checkout_id == *checkout_id
                 && composer.path == path
-                && composer.side == side
-                && start < composer.line_end
+                && composer.anchor.0 == side
+                && start < composer.anchor.1
         }) {
-            self.set_review_note_start(start, window, cx);
+            self.set_review_note_start(side, start, window, cx);
             return;
         }
         let lines = review::read_diff_lines(&diff.patch);
@@ -307,12 +407,13 @@ impl TerminalWindow {
         });
         input.read(cx).focus_handle(cx).focus(window, cx);
         let (start_picker, picker_events) =
-            review_start_picker(&lines, side, start, end, window, cx);
+            review_start_picker(&lines, (side, start), (side, end), window, cx);
         let save_keys = review_save_keys(&input, cx);
         let subscription = cx.observe(&input, |_, _, cx| cx.notify());
         self.review.composer = Some(ReviewComposer {
             checkout_id: checkout_id.clone(),
             path,
+            anchor: (side, end),
             side,
             line_start: start,
             line_end: end,
@@ -357,13 +458,19 @@ impl TerminalWindow {
             .map(|diff| review::read_diff_lines(&diff.patch))
             .unwrap_or_default();
         let line_end = note.line_end.unwrap_or(note.line_start);
-        let (start_picker, picker_events) =
-            review_start_picker(&lines, note.side, note.line_start, line_end, window, cx);
+        let (start_picker, picker_events) = review_start_picker(
+            &lines,
+            (note.side, note.line_start),
+            (note.side, line_end),
+            window,
+            cx,
+        );
         let save_keys = review_save_keys(&input, cx);
         let subscription = cx.observe(&input, |_, _, cx| cx.notify());
         self.review.composer = Some(ReviewComposer {
             checkout_id: note.checkout_id,
             path: note.path,
+            anchor: (note.side, line_end),
             side: note.side,
             line_start: note.line_start,
             line_end,
@@ -408,46 +515,60 @@ impl TerminalWindow {
 
     pub(crate) fn set_review_note_start(
         &mut self,
+        start_side: ReviewSide,
         line_start: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(composer) = self.review.composer.as_mut() else {
+        let Some(composer) = self.review.composer.as_ref() else {
             return;
         };
-        if line_start > composer.line_end || line_start == 0 {
+        if line_start == 0 {
             return;
         }
-        let Some(diff) = self
-            .git_diff
-            .get(&(composer.checkout_id.clone(), composer.path.clone()))
-        else {
+        let (checkout_id, path, anchor) = (
+            composer.checkout_id.clone(),
+            composer.path.clone(),
+            composer.anchor,
+        );
+        let Some(diff) = self.git_diff.get(&(checkout_id.clone(), path.clone())) else {
             return;
         };
         let lines = review::read_diff_lines(&diff.patch);
-        let Some(code) =
-            review::review_range_code(&lines, composer.side, line_start, composer.line_end)
+        // The range is read on the side its start is on, so a start the change
+        // removed turns the note to the removed side and ends it on the last line
+        // of that side the range covers. The anchor is where it was clicked, so
+        // the card stays where the comment is being written.
+        let Some(line_end) = review_start_lines(&lines, anchor)
+            .into_iter()
+            .rev()
+            .find(|(side, _)| *side == start_side)
+            .map(|(_, line)| line)
         else {
+            return;
+        };
+        let Some(code) = review::review_range_code(&lines, start_side, line_start, line_end) else {
             return;
         };
         if code.len() > MAX_NOTE_CODE_BYTES {
             return;
         }
-        composer.line_start = line_start;
-        composer.code = code;
         // The picker is how this line is chosen, so it is told what the draft now
         // says rather than left to agree with it by itself.
         let chosen = review_start_label(
             line_start,
-            composer.side,
-            lines[&(composer.side, line_start)].mark,
+            start_side,
+            lines[&(start_side, line_start)].mark,
         );
+        let composer = self.review.composer.as_mut().expect("composer was read");
+        composer.side = start_side;
+        composer.line_start = line_start;
+        composer.line_end = line_end;
+        composer.code = code;
         composer.start_picker.update(cx, |picker, cx| {
             picker.set_selected_value(&chosen, window, cx)
         });
-        self.review
-            .anchor_hashes
-            .remove(&(composer.checkout_id.clone(), composer.path.clone()));
+        self.review.anchor_hashes.remove(&(checkout_id, path));
         self.sync_review_note_selection(cx);
         cx.notify();
     }
@@ -483,11 +604,13 @@ impl TerminalWindow {
             if let Some(note) = notes.iter_mut().find(|note| note.id == id) {
                 let line_end =
                     (composer.line_end != composer.line_start).then_some(composer.line_end);
-                let reanchored = note.line_start != composer.line_start
+                let reanchored = note.side != composer.side
+                    || note.line_start != composer.line_start
                     || note.line_end != line_end
                     || note.code != composer.code;
                 note.content = content;
                 if reanchored {
+                    note.side = composer.side;
                     note.line_start = composer.line_start;
                     note.line_end = line_end;
                     note.code_hash = review_anchor_hash(&composer.code);
@@ -1438,7 +1561,14 @@ impl TerminalWindow {
                             app.review.opencode_destination =
                                 Some(muster_core::opencode::Destination::Markdown);
                         }
-                        app.push_info(format!("Review exported to {}", path.display()), cx);
+                        // The path stays in the toolbar for as long as this
+                        // review is on screen, which is where somebody looks for
+                        // where their notes went and where they can be copied
+                        // from. A toast says it once and is gone before it is read.
+                        app.review.exported = Some(ExportedReview {
+                            checkout_id: checkout_id.clone(),
+                            path,
+                        });
                     }
                     Err(error) => app.push_error(error, cx),
                 }
@@ -1454,7 +1584,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composer_start_choices_stay_on_the_selected_side_and_inside_the_range() {
+    fn a_note_may_start_on_a_line_the_change_removed_above_the_line_it_ends_on() {
+        // Two untouched lines, two the change removed, one it added: the note ends
+        // on the added one and may start on any line the diff draws above it.
+        let lines = review::read_diff_lines("@@ -1,4 +1,3 @@\n one\n two\n-three\n-four\n+THREE");
+        let starts = review_start_lines(&lines, (ReviewSide::New, 3));
+        assert_eq!(
+            starts,
+            vec![
+                (ReviewSide::New, 1),
+                (ReviewSide::New, 2),
+                (ReviewSide::Old, 3),
+                (ReviewSide::Old, 4),
+                (ReviewSide::New, 3),
+            ]
+        );
+        assert_eq!(
+            review_start_choices(&lines, (ReviewSide::New, 2), (ReviewSide::New, 3))
+                .0
+                .iter()
+                .map(|label| label.as_ref())
+                .collect::<Vec<_>>(),
+            ["1", "2", "-3", "-4", "+3"]
+        );
+        // A note that ends on a removed line is offered the untouched lines above
+        // it on that side, because they are the numbers a range on it is written
+        // in.
+        assert_eq!(
+            review_start_lines(&lines, (ReviewSide::Old, 4)),
+            vec![
+                (ReviewSide::Old, 1),
+                (ReviewSide::Old, 2),
+                (ReviewSide::Old, 3),
+                (ReviewSide::Old, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_range_never_reaches_over_the_gap_into_the_next_hunk() {
         let lines = BTreeMap::from([
             (
                 (ReviewSide::Old, 3),
@@ -1486,8 +1654,18 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(review_start_lines(&lines, ReviewSide::Old, 5), vec![5]);
-        assert_eq!(review_start_lines(&lines, ReviewSide::New, 4), vec![4]);
+        assert_eq!(
+            review_start_lines(&lines, (ReviewSide::Old, 5)),
+            vec![(ReviewSide::Old, 5)]
+        );
+        assert_eq!(
+            review_start_lines(&lines, (ReviewSide::New, 4)),
+            vec![(ReviewSide::Old, 3), (ReviewSide::New, 4)]
+        );
+        assert_eq!(
+            review_start_lines(&lines, (ReviewSide::New, 7)),
+            vec![(ReviewSide::Old, 5), (ReviewSide::New, 7)]
+        );
     }
 
     #[test]
@@ -1498,7 +1676,9 @@ mod tests {
             (ReviewSide::New, ' ', "22"),
         ] {
             assert_eq!(review_start_label(22, side, mark).as_ref(), label);
-            assert_eq!(review_line_number(label), Some(22));
+            // The label is the whole of what the picker reports, so the side the
+            // note ends up on has to come back out of it too.
+            assert_eq!(review_line_label(label), Some((side, 22)));
         }
     }
 

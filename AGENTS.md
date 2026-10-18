@@ -246,17 +246,26 @@ Five rules it depends on, each pinned by a test:
   was saved against.
 - **Where the range ends was decided by the `+`.** Only the picker moves it, and
   it is offered from the moment the note opens rather than after a range exists.
-  Its confirm is routed back through `set_review_note_start`, so the picker and
-  the draft are one state rather than two.
+  Its candidates are every line the diff draws from the top of the note's own hunk
+  down to the line it ends on, **on either side**: a change that removed the lines
+  above an added one is part of the same range, so a note that ends on a `+` may
+  start on a `−`. An untouched line is one line of both sides and is named on the
+  side the note is anchored to. Its confirm is routed back through
+  `set_review_note_start`, so the picker and the draft are one state rather than
+  two.
 - **The box does not move, and the lines do.** The card is attached to the
-  composer's **end** line, so choosing another start leaves the box where the
-  person is typing; and the range is driven onto `DiffState::set_selected_lines`
-  by one helper, so the lines the note covers are washed in the diff's own
-  selection — visible while the note is open, re-marked when the diff is rebuilt
-  underneath it, and cleared when it is saved, cancelled or deleted.
+  composer's **anchor** — the line the `+` or `−` was clicked on — so choosing
+  another start leaves the box where the person is typing; and the range is driven
+  onto `DiffState::set_selected_lines` by one helper, so the lines the note covers
+  are washed in the diff's own selection — visible while the note is open,
+  re-marked when the diff is rebuilt underneath it, and cleared when it is saved,
+  cancelled or deleted.
 - **Both sides are sides.** `begin_review_note` opens a draft on a `−` line as
   readily as on a `+` one, the picker offers the removed lines above it, the wash
-  is drawn over them, and the saved note and its export say `old`.
+  is drawn over them, and the saved note and its export say `old`. A note is a
+  range on **one** side, so choosing a start on the other side turns the note to
+  that side and ends it on the last line of that side the range covers; a note
+  that covers both sides is two notes.
 - **⌘↵ saves, and it is an interceptor rather than a key handler.** Interceptors
   run before the input's own Return, so stopping it there is what keeps the
   keystroke from also inserting the newline a plain Return writes. Enter on its own

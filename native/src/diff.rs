@@ -699,11 +699,11 @@ impl TerminalWindow {
                 "review-composer",
                 DiffLinePosition::new(
                     composer.path.clone(),
-                    match composer.side {
+                    match composer.anchor.0 {
                         ReviewSide::Old => DiffSide::Original,
                         ReviewSide::New => DiffSide::Modified,
                     },
-                    composer.line_end,
+                    composer.anchor.1,
                 ),
             ));
         }
@@ -715,6 +715,15 @@ impl TerminalWindow {
                 .count()
         });
         let exporting_review = self.review.exporting;
+        // The file the last save wrote, when it holds this checkout's notes. The
+        // toolbar names it rather than a toast saying it once: the row is where
+        // the Save button is, so it is where somebody looks for the answer.
+        let exported = self
+            .review
+            .exported
+            .as_ref()
+            .filter(|export| export.checkout_id == *checkout)
+            .map(|export| export.path.display().to_string());
         let has_pending_opencode =
             !crate::review::can_start_opencode_round(&self.review.opencode_rounds);
         let include_outdated = self.review.include_outdated;
@@ -1165,8 +1174,13 @@ impl TerminalWindow {
                                                 .primary()
                                                 .small().compact().h(px(24.))
                                                 .rounded_l(px(4.)).rounded_r_none()
-                                                .label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
-                                                .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Export as Markdown" })
+                                                // Markdown is the default destination, so the
+                                                // action says what it does and the chooser
+                                                // beside it says where it goes. Naming the
+                                                // format here would make the default read as a
+                                                // special case of itself.
+                                                .label(if opencode_selected { "Send to OpenCode" } else { "Save" })
+                                                .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Save" })
                                                 .disabled(note_count == 0 || busy || (opencode_selected && has_pending_opencode))
                                                 .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
                                                 .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
@@ -1230,6 +1244,28 @@ impl TerminalWindow {
                                 row.child(gpui_kit::component::checkbox::Checkbox::new("review-outdated")
                                     .checked(include_outdated).label("Include outdated notes")
                                     .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
+                            })
+                            .when_some(exported, |row, path| {
+                                let copy = path.clone();
+                                row.child(div().flex().items_center().gap_1().min_w_0()
+                                    .child(div().id("review-exported-path").test_support()
+                                        // Bounded, and shrinkable below that bound: a home
+                                        // directory is longer than this row is wide, and a
+                                        // path that pushes the rest of the row off the pane
+                                        // is a path nobody could read. The icon beside it
+                                        // never shrinks, so the path is what gives way.
+                                        .max_w(px(320.)).min_w_0().truncate()
+                                        .child(path.clone()))
+                                    // Legacy's document toolbar: the path, and the icon that
+                                    // puts it on the clipboard beside it.
+                                    .child(zed_button("copy-review-export-path")
+                                        .text().small().compact().h(px(20.)).rounded(px(0.))
+                                        .icon(IconName::Copy)
+                                        .accessibility_label("Copy the saved review's path")
+                                        .resting_tooltip(path.clone())
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+                                        })))
                             })
                             .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
                                 .text().small().compact().h(px(20.)).label("Copy session ID").resting_tooltip(session.clone())
