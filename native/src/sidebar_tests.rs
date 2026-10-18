@@ -795,7 +795,7 @@ pub(super) fn dispose(fixture: &Fixture, cx: &mut TestAppContext) {
     fixture.view.update(cx, |app, _| app.owner.stop());
 }
 
-fn pointer_move(
+pub(super) fn pointer_move(
     window: &mut Window,
     position: Point<Pixels>,
     pressed_button: Option<MouseButton>,

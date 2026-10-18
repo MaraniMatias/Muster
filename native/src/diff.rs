@@ -2,6 +2,7 @@
 use crate::{
     app::{InspectorTab, TerminalWindow, SIDEBAR_FONT_FAMILY},
     theme::{zed_button, Roles},
+    tooltip::RestingTooltip,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants;
@@ -1238,7 +1239,7 @@ impl TerminalWindow {
                                     header.child(zed_button(format!("diff-open-source-{path}"))
                                         .text().small().compact().h(px(24.)).rounded(px(0.))
                                         .label("Source").accessibility_label(format!("Show the source of {path}"))
-                                        .tooltip("Show this file's source")
+                                        .resting_tooltip("Show this file's source")
                                         .on_click(move |_, window, cx| {
                                             let (repo, checkout, path) = (repo.clone(), source_checkout.clone(), path.clone());
                                             let _ = weak.update(cx, |app, cx| app.request_document(repo, checkout, path, window, cx));
@@ -1247,7 +1248,7 @@ impl TerminalWindow {
                                 .child(zed_button("close-diff")
                                     .custom(crate::app::sidebar_action_style(cx))
                                     .small().compact().h(px(24.)).rounded(px(0.))
-                                    .icon(IconName::X).accessibility_label("Close preview").tooltip("Close preview")
+                                    .icon(IconName::X).accessibility_label("Close preview").resting_tooltip("Close preview")
                                     .on_click(move |_, window, cx| {
                                         let _ = close.update(cx, |app, cx| {
                                             app.open_diff = None;
@@ -1269,7 +1270,7 @@ impl TerminalWindow {
                                     .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
                             })
                             .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
-                                .text().small().compact().h(px(18.)).label("OpenCode session").tooltip(session.clone())
+                                .text().small().compact().h(px(18.)).label("OpenCode session").resting_tooltip(session.clone())
                                 .accessibility_label("Copy the app-created OpenCode session id")
                                 .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(session.clone())))))
                             .when_some(opencode_status, |row, status| row.child(div().id("opencode-review-status").test_support()
@@ -1288,7 +1289,7 @@ impl TerminalWindow {
                                             let _ = weak.update(cx, |app, cx| app.retry_queued_opencode_rounds(window, cx));
                                         }),
                                         muster_core::opencode::RoundStatus::Unknown => button.label("Allow retry (may duplicate)")
-                                            .tooltip("This review may already have been delivered. Sending it again may deliver it twice.")
+                                            .resting_tooltip("This review may already have been delivered. Sending it again may deliver it twice.")
                                             .on_click(move |_, window, cx| {
                                                 let round_id = round_id.clone();
                                                 let _ = weak.update(cx, |app, cx| app.resend_unknown_opencode_round(&round_id, window, cx));

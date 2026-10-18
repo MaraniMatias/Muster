@@ -35,6 +35,7 @@ use crate::app::{
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
 use crate::terminal::ShellState;
 use crate::theme::{zed_button, Roles};
+use crate::tooltip::RestingTooltip;
 
 pub(crate) const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
 pub(crate) const SIDEBAR_SCROLL_EDGE: f32 = 36.0;
@@ -459,7 +460,7 @@ impl TerminalWindow {
                             button.cursor(gpui_kit::CursorStyle::ClosedHand)
                         })
                         .aria_expanded(!folded)
-                        .tooltip(repo.root.clone())
+                        .resting_tooltip(repo.root.clone())
                         .accessibility_label(format!(
                             "{} repository {} — {}",
                             if folded { "Expand" } else { "Collapse" },
@@ -705,7 +706,7 @@ impl TerminalWindow {
                             } else {
                                 format!("Select worktree {title}")
                             })
-                            .tooltip(format!("{title} — {}", checkout.path))
+                            .resting_tooltip(format!("{title} — {}", checkout.path))
                             .disabled(checkout.is_missing)
                             .when(dragging && !checkout.is_missing, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
                             .when(checkout.is_missing, |button| button.cursor(gpui_kit::CursorStyle::OperationNotAllowed))
@@ -840,7 +841,7 @@ impl TerminalWindow {
                                 .accessibility_label(format!(
                                     "Dismiss missing checkout {title}; no files are deleted; Git metadata and branch are retained"
                                 ))
-                                .tooltip(
+                                .resting_tooltip(
                                     "Hide this missing checkout only; no files are deleted, and Git metadata and branch are retained",
                                 )
                                 .on_click(cx.listener(move |app, _, window, cx| {
@@ -875,7 +876,7 @@ impl TerminalWindow {
                                     .accessibility_label(format!(
                                         "Archive or delete worktree {title}"
                                     ))
-                                    .tooltip("Archive or delete worktree")
+                                    .resting_tooltip("Archive or delete worktree")
                                     .on_click(cx.listener(move |app, _, window, cx| {
                                         cx.stop_propagation();
                                         app.open_worktree_removal_dialog(
@@ -1138,7 +1139,7 @@ impl TerminalWindow {
                                     .bottom(px(0.))
                                     .p_0()
                                     .aria_selected(selected)
-                                    .tooltip(state_label.clone())
+                                    .resting_tooltip(state_label.clone())
                                     .accessibility_label(state_label)
                                     .disabled(closing)
                                     .when(dragging && !closing, |button| {
@@ -1191,7 +1192,7 @@ impl TerminalWindow {
                                 .group_hover(row_group.clone(), |style| style.opacity(1.))
                                 .focus(|style| style.opacity(1.))
                                 .icon(Icon::new(IconName::X).size(px(14.)))
-                                .tooltip("Close terminal")
+                                .resting_tooltip("Close terminal")
                                 .accessibility_label(format!("Close terminal session: {title}"))
                                 .disabled(closing)
                                 .when(closing, |button| {
@@ -1447,7 +1448,7 @@ impl TerminalWindow {
                         .icon(IconName::FolderPlus)
                         .label("Open directory")
                         .accessibility_label("Open directory")
-                        .tooltip("Open directory")
+                        .resting_tooltip("Open directory")
                         .disabled(self.opening || self.closing)
                         .when(self.opening || self.closing, |button| {
                             button

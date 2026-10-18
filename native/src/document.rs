@@ -1,6 +1,7 @@
 //! The central document: read as a reading, edited as its source.
 use crate::app::TerminalWindow;
 use crate::theme::{zed_button, Roles};
+use crate::tooltip::RestingTooltip;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
@@ -1817,7 +1818,7 @@ impl TerminalWindow {
                                 "Choose syntax highlighting language, currently {trigger_label}"
                             ))
                             .dropdown_caret(true)
-                            .tooltip("Choose syntax highlighting language"),
+                            .resting_tooltip("Choose syntax highlighting language"),
                     )
                     .content({
                         let view = view.clone();
@@ -1890,7 +1891,7 @@ impl TerminalWindow {
                                     } else {
                                         "Read this document rendered"
                                     })
-                                    .tooltip(if rendered {
+                                    .resting_tooltip(if rendered {
                                         "Read the Markdown source"
                                     } else {
                                         "Read the rendered document"
@@ -1925,7 +1926,7 @@ impl TerminalWindow {
                                         .rounded(px(0.))
                                         .label("Changes")
                                         .accessibility_label(format!("Show the changes to {path}"))
-                                        .tooltip("Show this file's changes")
+                                        .resting_tooltip("Show this file's changes")
                                         .on_click(cx.listener(move |app, _, window, cx| {
                                             app.request_open_changes(
                                                 &checkout_id,
@@ -1970,7 +1971,7 @@ impl TerminalWindow {
                                 .compact()
                                 .icon(IconName::X)
                                 .accessibility_label("Close preview")
-                                .tooltip("Close preview")
+                                .resting_tooltip("Close preview")
                                 .on_click(cx.listener(|app, _, window, cx| {
                                     app.request_document_transition(
                                         Box::new(|app, window, cx| {
@@ -2005,7 +2006,7 @@ impl TerminalWindow {
                                     .compact()
                                     .icon(IconName::WandSparkles)
                                     .accessibility_label("Format with Prettier")
-                                    .tooltip(if !format_supported {
+                                    .resting_tooltip(if !format_supported {
                                         format!("Prettier does not format {format_language}.")
                                     } else if formatting {
                                         "Formatting…".to_owned()
@@ -2070,7 +2071,7 @@ impl TerminalWindow {
                                                     .compact()
                                                     .label("Cancel")
                                                     .accessibility_label("Discard the unsaved changes")
-                                                    .tooltip("Discard the unsaved changes (Esc)")
+                                                    .resting_tooltip("Discard the unsaved changes (Esc)")
                                                     .disabled(saving)
                                                     .on_click(cx.listener(|app, _, window, cx| {
                                                         app.cancel_document(window, cx);
@@ -2093,7 +2094,7 @@ impl TerminalWindow {
                                                 } else {
                                                     "Save this file"
                                                 })
-                                                .tooltip(if saving || formatting {
+                                                .resting_tooltip(if saving || formatting {
                                                     "Save unavailable while an operation is running"
                                                         .to_owned()
                                                 } else if save_needed && !dirty {

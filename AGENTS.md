@@ -291,6 +291,28 @@ Five rules it depends on, each pinned by a test:
   keystroke from also inserting the newline a plain Return writes. Enter on its own
   still writes one, as Legacy's textarea did, and `esc` still cancels.
 
+## The tooltip
+
+`native/src/tooltip.rs` is the window's tooltips, and every trigger in the app
+goes through its `RestingTooltip` rather than the toolkit's managed one. The
+managed tooltip switches: a trigger entered while the last tooltip is still up
+takes its place at once, so the wait is paid once per session rather than once
+per row, and browsing the Files tree paints the path of every row the pointer
+crosses. Here each trigger pays the wait — `Tooltips::rest` clears the overlay
+before it asks for the next one, so nothing is inherited — and the wait itself
+is `TooltipDefaults::show_delay`.
+
+A trigger is a canvas laid over the control and a window listener it registers
+as it is painted, not a hover: `Button::on_hover` is inert on a disabled
+button, and a disabled button still has to say why it is disabled. The trigger
+is named by its bounds, which is what makes a move from one row to the next a
+new trigger rather than a switch. The window host dismisses what was up on a
+press or when the pointer leaves the window, as the managed one did.
+`tooltip_tests` pins the wait: `every_trigger_waits_its_own_time` on the
+sidebar, `a_file_row_names_its_path_after_the_pointer_rests_on_it` on the Files
+tree, and `a_disabled_row_still_names_itself` on a button that cannot be
+hovered.
+
 ## The vendored parser
 
 `native/vendor/alacritty_terminal-0.26.0` is a security backport, not vendored

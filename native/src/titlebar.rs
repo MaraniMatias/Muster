@@ -34,6 +34,7 @@ use crate::file_icons;
 use crate::navigation::{checkout_title, foreground_program, ForegroundProgram};
 use crate::sidebar::foreground_program_icon;
 use crate::theme::{zed_button, Roles};
+use crate::tooltip::RestingTooltip;
 fn crumb_separator(cx: &App) -> AnyElement {
     div()
         .font_family(SIDEBAR_FONT_FAMILY)
@@ -113,7 +114,7 @@ fn titlebar_crumb(
         // rather than pushing the actions at the far end out of the window.
         .max_w(px(budget))
         .text_color(color)
-        .tooltip(label.to_owned())
+        .resting_tooltip(label.to_owned())
         .accessibility_label(label.to_owned())
         .cursor_pointer();
     match glyph {
@@ -994,7 +995,7 @@ impl TerminalWindow {
                 .cursor_pointer()
                 .icon(IconName::Settings)
                 .accessibility_label("Settings")
-                .tooltip("Settings")
+                .resting_tooltip("Settings")
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .dropdown_menu(self.settings_menu(view.clone()))
                 .into_any_element(),
@@ -1008,7 +1009,7 @@ impl TerminalWindow {
                 .cursor_pointer()
                 .icon(IconName::PanelLeftClose)
                 .accessibility_label("Toggle side panels")
-                .tooltip("Toggle side panels — Cmd/Ctrl+/")
+                .resting_tooltip("Toggle side panels — Cmd/Ctrl+/")
                 // The bar moves the window from the press; a press on an action
                 // is the action, not a drag that starts one.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

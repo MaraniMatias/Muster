@@ -56,6 +56,7 @@ use crate::state_writer::StateWriter;
 use crate::terminal::{ShellState, TerminalSession, TerminalSessionConfig, TerminalView};
 use crate::theme::{zed_button, Roles};
 use crate::titlebar::Crumb;
+use crate::tooltip::Tooltips;
 use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
@@ -542,6 +543,8 @@ pub struct TerminalWindow {
     pub(crate) suppress_sidebar_click: bool,
     pub(crate) resize: Entity<ResizableState>,
     pub(crate) scroll: ScrollHandle,
+    /// The window's tooltips: what a trigger waited for, and what it wears.
+    pub(crate) tooltips: Entity<Tooltips>,
     /// Where the file tree is scrolled to.
     ///
     /// Its own, apart from the sidebar's, because two things read it that nothing else
@@ -642,6 +645,7 @@ impl TerminalWindow {
             suppress_sidebar_click: false,
             resize: cx.new(|_| ResizableState::default()),
             scroll: ScrollHandle::new(),
+            tooltips: cx.new(Tooltips::new),
             files_scroll: ScrollHandle::new(),
             focus_pending: true,
             visible: true,
@@ -2776,6 +2780,7 @@ impl Render for TerminalWindow {
                 }))
                 .child(self.titlebar(window, cx))
                 .child(content)
+                .child(self.tooltips.clone())
                 .when_some(self.toast_element(cx), |root, toasts| root.child(toasts))
                 .when_some(dialog, |root, dialog| root.child(dialog)),
         )
@@ -2974,3 +2979,7 @@ mod sidebar_tests;
 #[cfg(test)]
 #[path = "titlebar_tests.rs"]
 mod titlebar_tests;
+
+#[cfg(test)]
+#[path = "tooltip_tests.rs"]
+mod tooltip_tests;

@@ -51,6 +51,9 @@ pub mod state_writer;
 /// Short-lived, dismissible messages raised by the workspace window.
 mod toast;
 
+/// The window's tooltips: the wait a trigger pays, and the popup it wears.
+pub mod tooltip;
+
 /// The application's semantic colour roles, read from the toolkit theme.
 pub mod theme;
 

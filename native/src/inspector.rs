@@ -19,6 +19,7 @@ use crate::{
     app::{measured_width, ButtonA11y, InspectorTab, TerminalWindow, WidthCache},
     file_icons,
     theme::{zed_button, Roles},
+    tooltip::RestingTooltip,
 };
 
 /// The size the panel's own rows draw their names at.
@@ -183,7 +184,7 @@ fn row_control(
         .aria_selected(selected)
         .when_some(expanded, |button, expanded| button.aria_expanded(expanded))
         .accessibility_label(label)
-        .when_some(tooltip, |button, tooltip| button.tooltip(tooltip))
+        .when_some(tooltip, |button, tooltip| button.resting_tooltip(tooltip))
         .on_click(on_click)
         .into_any_element()
 }
