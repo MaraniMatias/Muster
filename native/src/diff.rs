@@ -9,7 +9,6 @@ use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
 };
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::select::Select;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
@@ -20,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    Keystroke, ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
+    ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
 };
 use muster_core::review::{self, AnchorOutcome, ReviewSide};
 use muster_core::workspace::RepoKind;
@@ -689,9 +688,6 @@ impl TerminalWindow {
         let composer_can_save =
             composer.is_some_and(|composer| !composer.input.read(cx).value().trim().is_empty());
         let composer_start = composer.map(|composer| composer.line_start).unwrap_or(1);
-        let composer_end = composer
-            .map(|composer| composer.line_end)
-            .unwrap_or(composer_start);
         let composer_side = composer
             .map(|composer| composer.side.as_str())
             .unwrap_or("new");
@@ -872,7 +868,6 @@ impl TerminalWindow {
                     let save = annotation_weak.clone();
                     let cancel = annotation_weak.clone();
                     let start = composer_start;
-                    let end = composer_end;
                     let side = composer_side;
                     let cancel_escape = annotation_weak.clone();
                     return div()
@@ -901,13 +896,7 @@ impl TerminalWindow {
                             }
                         })
                         .child(
-                            // Legacy's row, read left to right: what the range
-                            // is, then the one thing about it that is still a
-                            // choice. The `+` fixed where it ends, so the picker
-                            // moves where it starts and says nothing but a line
-                            // number — a removed one carries the minus the export
-                            // writes, so the picker offers the word the export
-                            // uses.
+                            // Keep the range label and its start picker together.
                             div()
                                 .flex()
                                 .items_center()
@@ -919,13 +908,8 @@ impl TerminalWindow {
                                         .id("review-composer-range")
                                         .test_support()
                                         .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .child(if start == end {
-                                            format!("{side} line {end}")
-                                        } else {
-                                            format!("{side} lines {start}-{end}")
-                                        }),
+                                        .flex_shrink_0()
+                                        .child(format!("{side} line {start}")),
                                 )
                                 .child(
                                     // The select fills whatever the wrapper is,
@@ -957,34 +941,20 @@ impl TerminalWindow {
                                 .aria_label("Review note")
                                 .into_any_element(),
                         )
-                        // Legacy's sentence, for the notes it is about: it says
-                        // what a range is about to be saved as.
-                        .when(start != end, |card| {
-                            card.child(
-                                div()
-                                    .mt_2()
-                                    .text_size(px(10.))
-                                    .text_color(roles.text_muted)
-                                    .child("This note covers the selected lines. Cancel to start over."),
-                            )
-                        })
-                        // Legacy's footer: the buttons on the left, where the
-                        // hand puts them, and the keys at the far end. The keys
-                        // come from the toolkit, which is what spells the pair
-                        // for the platform instead of the card spelling it out.
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_1()
                                 .mt_2()
+                                .flex_row_reverse()
                                 .child(
                                     zed_button("save-review-note")
                                         .small()
                                         .compact()
                                         .h(px(20.))
                                         .text_size(px(12.))
-                                        .label("Save note")
+                                        .label("Save")
                                         .disabled(!composer_can_save)
                                         .on_click(move |_, _, cx| {
                                             let _ =
@@ -1003,33 +973,6 @@ impl TerminalWindow {
                                             let _ = cancel
                                                 .update(cx, |app, cx| app.cancel_review_note(cx));
                                         }),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .min_w_0()
-                                        .justify_end()
-                                        .text_size(px(10.))
-                                        .text_color(roles.text_muted)
-                                        .child(
-                                            Kbd::new(
-                                                Keystroke::parse("escape")
-                                                    .expect("a literal keystroke"),
-                                            )
-                                            .appearance(false),
-                                        )
-                                        .child("cancels ·")
-                                        .child(
-                                            Kbd::new(
-                                                Keystroke::parse("secondary-enter")
-                                                    .expect("a literal keystroke"),
-                                            )
-                                            .appearance(false),
-                                        )
-                                        .child("saves"),
                                 ),
                         )
                         .into_any_element();

@@ -21,7 +21,7 @@ docs/             the migration plan, and what the port has to satisfy
   `dirname "$(rustup which --toolchain 1.97.1 rustc)"` first on `PATH`, then
   confirm both `rustc --version` and `cargo --version` are 1.97.1.
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
-  --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
+--all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.
 - Current test counts and exact run evidence live in
   `docs/native-rust-migration/audit-action-plan.md` under AP-11; earlier task
@@ -81,17 +81,17 @@ else is the thing to catch in review.
 
 The states the roles have to cover, and what each one is for:
 
-| role | state it paints |
-| --- | --- |
-| `surface_base`, `surface`, `surface_raised`, `surface_inset` | application/field, panel, overlay, recessed well |
-| `text`, `text_muted`, `text_disabled` | primary, secondary, not actionable |
-| `border`, `border_strong` | hairline, overlay edge |
-| `hover`, `pressed` | pointer on, control held |
-| `selected`, `selected_hover` | this window's open row, and the same row with the pointer on it |
-| `focus` | the ring a focused control wears |
-| `disabled_surface` | a row that cannot be chosen |
-| `accent`, `drag` | the selection bar and a chosen crumb; a slot being dropped into |
-| `status.*` | added, removed, waiting, failed, done, worth reading |
+| role                                                         | state it paints                                                 |
+| ------------------------------------------------------------ | --------------------------------------------------------------- |
+| `surface_base`, `surface`, `surface_raised`, `surface_inset` | application/field, panel, overlay, recessed well                |
+| `text`, `text_muted`, `text_disabled`                        | primary, secondary, not actionable                              |
+| `border`, `border_strong`                                    | hairline, overlay edge                                          |
+| `hover`, `pressed`                                           | pointer on, control held                                        |
+| `selected`, `selected_hover`                                 | this window's open row, and the same row with the pointer on it |
+| `focus`                                                      | the ring a focused control wears                                |
+| `disabled_surface`                                           | a row that cannot be chosen                                     |
+| `accent`, `drag`                                             | the selection bar and a chosen crumb; a slot being dropped into |
+| `status.*`                                                   | added, removed, waiting, failed, done, worth reading            |
 
 `Roles::row_rest` and `Roles::row_hover` are the one place a row's
 state-to-colour combination is decided, because GPUI refines a hover style
@@ -103,16 +103,16 @@ resting on it.
 
 GPUI Kit is **not** the widget library Zed draws with. Only the core is: the
 toolkit depends on `gpui-pre`, a snapshot of Zed's `gpui`, so the primitives and
-the focus handling are Zed's. The *widgets* are longbridge's `gpui-component`,
+the focus handling are Zed's. The _widgets_ are longbridge's `gpui-component`,
 a shadcn-flavoured design system, where Zed's buttons and overlays live in Zed's
 own unpublished crate. So a control drawn here wears the toolkit's shape unless
 this app says otherwise, and `theme::install` is where it says so:
 
-| what | where | value |
-| --- | --- | --- |
-| an overlay's corner | `theme.radius`, `theme.radius_lg` | `8px`, Zed's `rounded_lg` |
-| a button's corner | `theme::zed_button` | `4px`, Zed's `rounded_sm` |
-| a button's outline | `theme::zed_button` | none; Zed fills a control and gives it no border |
+| what                | where                             | value                                            |
+| ------------------- | --------------------------------- | ------------------------------------------------ |
+| an overlay's corner | `theme.radius`, `theme.radius_lg` | `8px`, Zed's `rounded_lg`                        |
+| a button's corner   | `theme::zed_button`               | `4px`, Zed's `rounded_sm`                        |
+| a button's outline  | `theme::zed_button`               | none; Zed fills a control and gives it no border |
 
 The toolkit keeps **one** radius token for both roles, so `install` gives it the
 overlay's `8px` — its dropdown menus and popovers read that one — and the
@@ -250,7 +250,7 @@ Three rules it depends on, each pinned by a test:
 `native/src/review.rs` owns the draft. It is Legacy's composer: the range label
 and then the picker, the field that turns the accent blue while it has focus (what
 `.review-note-input:focus` did there), Legacy's sentence about what a range covers
-and its two buttons with room around them. What is *not* Legacy's is the margin
+and its two buttons with room around them. What is _not_ Legacy's is the margin
 around it — the toolkit draws every annotation inside a `px_3 py_3` box, and the
 composer takes that padding back with `m_neg_3` so the card sits flush between the
 lines above and below it.
@@ -269,7 +269,7 @@ the added side as the real one.
 
 **A removed line is a negative number**, and the picker and the export say the
 same thing: `review_line_label` writes `-3` for old line 3 and `3` for new line 3,
-and the Markdown fence carries the same sign (```` ```js{-3,-72} ````). The sign is
+and the Markdown fence carries the same sign (` ```js{-3,-72} `). The sign is
 the only thing in an exported document that says which side of the change a comment
 is about, and the offer and the record cannot disagree because they are one
 function's word.

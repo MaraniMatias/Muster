@@ -28,7 +28,7 @@
 
 use gpui_kit::component::{
     button::ButtonVariants,
-    dialog::{Dialog, DialogContent, DialogFooter},
+    dialog::{Dialog, DialogFooter},
     input::{Input, InputState},
     select::{Select, SelectEvent, SelectState},
     switch::Switch,
@@ -645,8 +645,11 @@ impl TerminalWindow {
             .border_color(roles.border_strong)
             .width(px(520.))
             .title("Settings")
-            .content(move |content: DialogContent, _, _| {
-                let mut body = content.child(
+            // The rows are taller than the dialog is allowed to be, so the body goes in as a
+            // child rather than through `content`: a child is the dialog's own scroll area,
+            // and a content column is only ever cut off at the footer.
+            .child({
+                let mut body = div().flex_col().gap(px(16.)).child(
                     div()
                         .text_size(px(11.))
                         .text_color(roles.text_muted)

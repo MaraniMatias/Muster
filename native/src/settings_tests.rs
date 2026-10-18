@@ -11,7 +11,7 @@
 //! running these cannot touch a person's preferences.
 
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext, TestAppContext};
+use gpui_kit::{point, px, AppContext, ScrollDelta, TestAppContext};
 use muster_core::settings::{self, AppSettings, TerminalCursorStyle};
 
 use super::sidebar_tests::{dispose, open, Fixture};
@@ -282,6 +282,36 @@ fn a_size_out_of_range_is_clamped_and_the_field_is_told(cx: &mut TestAppContext)
     dispose(&panel.fixture, cx);
 }
 
+/// The panel is taller than a dialog is allowed to be, so its body is a scroll area: the last
+/// row is off the bottom until the wheel reaches it, and a body that cannot scroll would leave
+/// the rows under the footer with no way to them at all.
+#[gpui_kit::test]
+fn the_body_scrolls_to_the_rows_that_do_not_fit(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        assert!(
+            window.find("settings-ui-font-size").visible(),
+            "the panel opens at its first row"
+        );
+        assert!(
+            !window.find("settings-review-storage").visible(),
+            "and its last row is below the fold, which is what has to be reachable"
+        );
+        // GPUI's sign: a negative delta is down.
+        window.scroll(
+            "settings-ui-font-size",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+        assert!(
+            window.find("settings-review-storage").visible(),
+            "the wheel reaches the rows the dialog could not show"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
 /// Every preference this build keeps has a row, and nothing it has no answer for is offered.
 #[gpui_kit::test]
 fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
@@ -306,8 +336,6 @@ fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
         ] {
             assert!(window.try_find(id).is_some(), "{id} is a row of the panel");
         }
-        // The body scrolls, so the rows at the top are the ones on screen and the rest are
-        // one scroll down; every one of them is a row either way.
         assert!(window.find("settings-ui-font-size").visible());
         // The theme, the editor background and the interface scale are not preferences this
         // build has: one appearance is dark and `theme.rs` is its only authority.

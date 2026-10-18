@@ -5115,6 +5115,12 @@ async fn review_range_picker_moves_the_start_line(cx: &mut TestAppContext) {
             range.right() <= picker.left(),
             "the range label comes before the picker: {range:?} then {picker:?}"
         );
+        assert!(picker.left() - range.right() <= px(8.));
+        let card = window.find("review-composer-card").bounds();
+        let save = window.find("save-review-note").bounds();
+        let cancel = window.find("cancel-review-note").bounds();
+        assert!(cancel.right() <= save.left());
+        assert!(card.right() - save.right() <= px(12.));
         let select = fixture
             .view
             .read(cx)
@@ -5126,7 +5132,7 @@ async fn review_range_picker_moves_the_start_line(cx: &mut TestAppContext) {
             .clone();
         select.update(cx, |_, cx| {
             cx.emit(SelectEvent::Confirm(Some(gpui_kit::SharedString::from(
-                "2",
+                "+2",
             ))))
         });
         window.render_frame(cx);
@@ -5140,7 +5146,7 @@ async fn review_range_picker_moves_the_start_line(cx: &mut TestAppContext) {
         // draft now says rather than left to agree with it by itself.
         assert_eq!(
             composer.start_picker.read(cx).selected_value().cloned(),
-            Some(gpui_kit::SharedString::from("2"))
+            Some(gpui_kit::SharedString::from("+2"))
         );
         // The lines the note now covers are the ones it will be saved against.
         let state = &app.diff_view.as_ref().unwrap().state;

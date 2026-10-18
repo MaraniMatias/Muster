@@ -155,29 +155,23 @@ pub(crate) struct ReviewComposer {
     _subscription: gpui_kit::Subscription,
 }
 
-/// A line as this app spells it: a removed line is a negative number.
-///
-/// The export says a note about a removed line with the same minus, so `{-3}`
-/// means old line 3 and `{10}` means new line 10. One convention in the picker
-/// and in the Markdown is what lets a reader of the export tell the two apart.
-pub(crate) fn review_line_label(line: usize, side: ReviewSide) -> SharedString {
-    SharedString::from(match side {
-        ReviewSide::Old => format!("-{line}"),
-        ReviewSide::New => line.to_string(),
-    })
+/// Picker labels distinguish changed lines from unchanged context.
+fn review_start_label(line: usize, mark: char) -> SharedString {
+    match mark {
+        '+' | '-' => format!("{mark}{line}").into(),
+        _ => line.to_string().into(),
+    }
 }
 
-/// The line a picker item stands for, with the minus a removed line carries.
+/// The line a picker item stands for, without its change marker.
 fn review_line_number(label: &str) -> Option<usize> {
-    label.trim_start_matches('-').parse().ok()
+    label.trim_start_matches(['+', '-']).parse().ok()
 }
 
 /// The line numbers a note range could start on, and the one this note starts at.
 ///
 /// The delegate is the toolkit's own `Vec<SharedString>`, so a candidate is a
-/// line number and nothing else: the mark and a code preview would put a word
-/// beside an address, and the header row already says which lines the range
-/// covers.
+/// line number with its change marker, without a code preview.
 fn review_start_choices(
     lines: &BTreeMap<(ReviewSide, usize), muster_core::review::DiffLine>,
     side: ReviewSide,
@@ -188,7 +182,7 @@ fn review_start_choices(
     (
         numbers
             .iter()
-            .map(|line| review_line_label(*line, side))
+            .map(|line| review_start_label(*line, lines[&(side, *line)].mark))
             .collect(),
         numbers
             .iter()
@@ -443,7 +437,7 @@ impl TerminalWindow {
         composer.code = code;
         // The picker is how this line is chosen, so it is told what the draft now
         // says rather than left to agree with it by itself.
-        let chosen = review_line_label(line_start, composer.side);
+        let chosen = review_start_label(line_start, lines[&(composer.side, line_start)].mark);
         composer.start_picker.update(cx, |picker, cx| {
             picker.set_selected_value(&chosen, window, cx)
         });
@@ -1478,6 +1472,14 @@ mod tests {
 
         assert_eq!(review_start_lines(&lines, ReviewSide::Old, 5), vec![5]);
         assert_eq!(review_start_lines(&lines, ReviewSide::New, 4), vec![4]);
+    }
+
+    #[test]
+    fn picker_labels_distinguish_added_removed_and_context_lines() {
+        for (mark, label) in [('+', "+22"), ('-', "-22"), (' ', "22")] {
+            assert_eq!(review_start_label(22, mark).as_ref(), label);
+            assert_eq!(review_line_number(label), Some(22));
+        }
     }
 
     #[test]
