@@ -10,7 +10,7 @@ Cargo.toml        workspace: core + native, and the [patch.crates-io] table
 core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
 native/           muster            the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
 legacy/           the Tauri 2 + Vue 3 app, frozen at v0.22.0. Not built here.
-scripts/          the RustSec audit, the macOS bundle and the vendored-crate hash pins
+scripts/          release gate and packaging for both platforms, the RustSec audit and the vendored-crate hash pins (README's Scripts table lists each one)
 docs/             the migration plan, and what the port has to satisfy
 ```
 

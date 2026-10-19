@@ -140,6 +140,28 @@ scripts/perf-native.sh                      # the terminal hot-path cost table
 and what it could not do. Without a sink installed every one of those records
 would be discarded, so the app installs one before anything that can log.
 
+### Scripts
+
+Everything in `scripts/` belongs to the native tree; the Tauri scripts under
+`legacy/scripts/` are frozen reference and are not run from here.
+
+| Script | What it does | When you run it |
+| --- | --- | --- |
+| `release.sh` | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle | The entry point for every local build. `release` is macOS-only |
+| `bundle-macos.sh` | Assembles `dist/Muster.app` with the icon, name and version | Called by `release.sh release` and by CI |
+| `package-linux-deb.sh` | Builds `dist/muster_<version>_amd64.deb`, deriving runtime dependencies from the ELF | On Ubuntu, after `release.sh build` |
+| `debian-version.sh` | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`) | Internal to packaging |
+| `linux-package-smoke.sh` | Installs the `.deb` in a clean Ubuntu container and launches it under Xvfb | Internal to CI; run it directly to reproduce the CI check |
+| `linux-window-smoke.sh` | The window and liveness half of that check | Internal to `linux-package-smoke.sh` |
+| `finalize-native-release.mjs` | Checks the built macOS and Linux payloads together before publication | Internal to the release workflow |
+| `audit-rust.mjs` | RustSec audit of the locked graph over OSV, refusing unpinned path packages | `release.sh check` and CI |
+| `perf-native.sh` | Runs the ignored terminal hot-path benchmarks | Development only |
+| `generate-native-file-icons.mjs` | Regenerates `native/src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |
+| `patched-alacritty.mjs`, `patched-gitignore.mjs` | Hash-pin the vendored crates so the audit can trust them | Internal to `audit-rust.mjs` |
+| `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs` | Tests for the audit, the release commands and the packaging/publish gate | Run by `release.sh check` and CI |
+
+The full release procedure is in [release safety](docs/release-safety.md).
+
 ## State
 
 The native app is a **terminal with the workspace panel around it**:
