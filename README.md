@@ -38,7 +38,7 @@ The `/latest` link may still select the frozen Legacy release. Existing candidat
 may contain only a macOS archive; the new workflow adds Linux packages to future releases.
 
 - **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
-- **Ubuntu 24.04 x86_64:** When the release includes a `.deb`, install it with `sudo apt install ./muster_<version>_amd64.deb`. RC versions use Debian's `~` notation, e.g. `1.0.0~rc.3`. Linux ARM64 and AppImage are not provided by the native release path.
+- **Ubuntu 24.04 x86_64:** When the release includes a `.deb`, install it with `sudo apt install ./muster_<version>_amd64.deb`. Download filenames use `-rc.3`; the package's internal Debian version uses `~rc.3` for correct upgrade ordering. Linux ARM64 and AppImage are not provided by the native release path.
 - **Other Linux:** No native package is currently provided.
 
 For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.

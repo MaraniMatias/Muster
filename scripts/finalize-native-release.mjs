@@ -20,6 +20,8 @@ export function finalize(base, sha, version, output) {
   assert.match(version, /^(?:0\.\d+\.\d+|1\.0\.0-rc\.\d+)$/, 'unsupported release version');
   const debVersion = version.replace('-', '~');
   const deb = `muster_${debVersion}_amd64.deb`;
+  // GitHub replaces '~' in asset names; keep Debian ordering inside the package only.
+  const publishedDeb = `muster_${version}_amd64.deb`;
   const mac = `Muster_${version}_arm64.zip`;
   const linuxDir = path.join(base, `linux-${sha}`);
   const macDir = path.join(base, `macos-${sha}`);
@@ -42,9 +44,10 @@ export function finalize(base, sha, version, output) {
   assert.equal(executable.readUInt32LE(0), 0xfeedfacf, 'not a 64-bit Mach-O');
   assert.equal(executable.readUInt32LE(4), 0x100000c, 'not macOS arm64');
   mkdirSync(output, { recursive: true });
-  for (const [directory, filename] of [[linuxDir, deb], [macDir, mac]]) copyFileSync(path.join(directory, filename), path.join(output, filename));
+  copyFileSync(debPath, path.join(output, publishedDeb));
+  copyFileSync(macPath, path.join(output, mac));
   writeFileSync(path.join(output, 'SOURCE_SHA'), `${sha}\n`);
-  writeFileSync(path.join(output, 'SHA256SUMS'), [deb, mac].map(filename => `${createHash('sha256').update(readFileSync(path.join(output, filename))).digest('hex')}  ${filename}\n`).join(''));
+  writeFileSync(path.join(output, 'SHA256SUMS'), [publishedDeb, mac].map(filename => `${createHash('sha256').update(readFileSync(path.join(output, filename))).digest('hex')}  ${filename}\n`).join(''));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

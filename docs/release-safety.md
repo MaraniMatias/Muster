@@ -30,6 +30,9 @@ The package derives shared-library dependencies from the ELF with
 explicit runtime dependencies. An appropriate Vulkan driver must be available on
 the desktop. A Cargo version such as `1.0.0-rc.3` becomes Debian `1.0.0~rc.3`,
 which upgrades correctly to `1.0.0` without implying that final release is approved.
+Finalization keeps `-rc.3` in the public download filename because GitHub rewrites
+`~` in asset names; checksums refer to the public filenames, not the intermediate
+Debian package filename. The package bytes and internal version are unchanged.
 
 ## Validate without publishing
 

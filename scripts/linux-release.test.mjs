@@ -77,7 +77,8 @@ test('finalization validates both package formats and refuses wrong bundle versi
   record(macDir, mac);
   const output = path.join(dir, 'final');
   finalize(dir, sha, version, output);
-  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /muster_1\.0\.0~rc\.2_amd64\.deb/);
+  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /muster_1\.0\.0-rc\.2_amd64\.deb/);
+  assert.deepEqual(readFileSync(path.join(output, 'muster_1.0.0-rc.2_amd64.deb')), readFileSync(path.join(linuxDir, deb)));
   writeFileSync(path.join(contents, 'Info.plist'), plist.replace('1.0.0-rc.2', '1.0.0-rc.1'));
   run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
   record(macDir, mac);
@@ -129,17 +130,6 @@ test('an outer deadline bounds a stalled window query', { skip: process.platform
   const result = smoke(dir, 'exec /bin/sleep 10', 'exec /bin/sleep 10', true);
   assert.equal(result.status, 124, result.stderr);
 }));
-
-test('publication preserves the literal Debian prerelease separator in Bash', () => {
-  const workflow = read('.github/workflows/linux-release.yml');
-  const conversion = workflow.match(/^\s*deb_version=.*$/m)?.[0];
-  assert.ok(conversion, 'publication version conversion is missing');
-  for (const shell of ['bash', '/bin/bash']) {
-    const result = spawnSync(shell, ['-c', `TAG=v1.0.0-rc.3\n${conversion}\nprintf '%s' "$deb_version"`], { encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, '1.0.0~rc.3', shell);
-  }
-});
 
 test('publication is downstream of read-only finalization and never rebuilds source', () => {
   const workflow = read('.github/workflows/linux-release.yml');
