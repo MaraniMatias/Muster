@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use gpui_kit::{
-    base::{Root, TooltipDefaults, TooltipOverlay, TooltipRequest, TooltipTransition},
+    base::{Root, TooltipOverlay, TooltipRequest, TooltipTransition},
     canvas,
     component::{
         animation::{ease_out_cubic, EffectTransition},
@@ -30,6 +30,14 @@ use crate::app::TerminalWindow;
 
 /// The slide-down an arriving tooltip takes.
 const ARRIVAL: Duration = Duration::from_millis(150);
+
+/// How long the pointer must rest on a trigger before its tooltip shows.
+///
+/// The toolkit's own wait is half a second, which reads as immediate while
+/// the pointer is travelling a list of rows it has not settled on yet. This
+/// app's triggers are mostly the ones a pointer crosses on its way somewhere
+/// else, so they wait longer than the toolkit's.
+pub(crate) const SHOW_DELAY: Duration = Duration::from_millis(800);
 
 /// The window's tooltips: the trigger the pointer is resting on, and the
 /// overlay that draws it. One per window, because a trigger belongs to the
@@ -64,14 +72,13 @@ impl Tooltips {
             return;
         }
         self.resting = Some(bounds);
-        let delay = TooltipDefaults::global(cx).show_delay();
         self.overlay.update(cx, |overlay, cx| {
             overlay.hide(cx);
             overlay.request_show(
                 TooltipRequest::new(bounds, move |window, cx| {
                     Tooltip::new(text.clone()).build(window, cx)
                 })
-                .with_show_delay(delay),
+                .with_show_delay(SHOW_DELAY),
                 window,
                 cx,
             );

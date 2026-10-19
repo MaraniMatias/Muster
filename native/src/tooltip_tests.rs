@@ -12,9 +12,10 @@ use muster_core::files::FileEntry;
 
 use super::sidebar_tests::{dispose, open, pointer_move};
 use super::*;
+use crate::tooltip::SHOW_DELAY;
 
-/// One millisecond short of the wait the toolkit installs for a trigger.
-const BEFORE: Duration = Duration::from_millis(499);
+/// One millisecond short of the wait a trigger pays.
+const BEFORE: Duration = Duration::from_millis(SHOW_DELAY.as_millis() as u64 - 1);
 
 /// Let the simulated clock run, and everything the wait woke with it.
 fn clock(cx: &TestAppContext, by: Duration) {

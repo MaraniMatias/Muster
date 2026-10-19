@@ -723,9 +723,16 @@ impl TerminalWindow {
                 )
                 .child(
                     div()
+                        .id(SharedString::from(format!("heading-content-{id}")))
+                        .test_support()
                         .flex_1()
                         .min_w_0()
                         .flex()
+                        // The name and the path are the heading's whole text and
+                        // the heading is as wide as the panel, so the pair sits
+                        // in the middle of the room it has rather than against
+                        // the left edge of it.
+                        .justify_center()
                         // Bottom, not baseline: the flex engine is handed no
                         // baseline to align, so `items_baseline` degrades to the
                         // top, and a 14px name and an 11px path each sit half
@@ -737,6 +744,8 @@ impl TerminalWindow {
                         .gap(px(8.))
                         .child(
                             div()
+                                .id(SharedString::from(format!("repo-name-{id}")))
+                                .test_support()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
@@ -746,6 +755,8 @@ impl TerminalWindow {
                         )
                         .child(
                             div()
+                                .id(SharedString::from(format!("repo-path-{id}")))
+                                .test_support()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()

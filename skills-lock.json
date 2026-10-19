@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "gpui-kit": {
+      "source": "longbridge/gpui-kit",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit/SKILL.md",
+      "computedHash": "e401812a1269fd2caa07d307867f25c38c974f706f34bd52a8da8465b85ddd75"
+    },
+    "gpui-kit-design-guides": {
+      "source": "longbridge/gpui-kit",
+      "sourceType": "github",
+      "skillPath": "skills/gpui-kit-design-guides/SKILL.md",
+      "computedHash": "cc144ee0cc35978c387e6a13e8bc2cd25bfac45363ad25235d5b9cf09f8fa017"
+    },
+    "improve-codebase-architecture": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/improve-codebase-architecture/SKILL.md",
+      "computedHash": "ac2c94885f34ff8492dc12aa4543182f661f32ea1722b8d6b6c2c7045af33ae3"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "a3db351ec552ed9d36b59e547d6c1d94077867eb5bcb98b3f802dfebb0a8a248"
+    }
+  }
+}

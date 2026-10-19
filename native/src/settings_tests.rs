@@ -16,10 +16,12 @@ use muster_core::review::ReviewStorage;
 use muster_core::settings::{self, AppSettings, TerminalCursorStyle};
 
 use super::sidebar_tests::{dispose, open, Fixture};
+use crate::tooltip::SHOW_DELAY;
 
-/// A short wait is not the wait: the toolkit holds a trigger's tooltip for half a
-/// second, and the panel's own triggers are the ones that say why they are disabled.
-const TOOLTIP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// A short wait is not the wait: the app holds a trigger's tooltip for
+/// `tooltip::SHOW_DELAY`, and the panel's own triggers are the ones that say
+/// why they are disabled.
+const TOOLTIP_WAIT: std::time::Duration = SHOW_DELAY;
 
 /// The panel, opened on a temporary file this test owns.
 ///

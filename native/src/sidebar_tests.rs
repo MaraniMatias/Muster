@@ -262,6 +262,37 @@ fn repo_fold_target_covers_the_heading_height(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
+/// The repository heading's name and path sit in the middle of the row.
+///
+/// The heading is as wide as the panel and the pair is what it says, so the
+/// pair is centred in the room the heading has rather than held against its
+/// left edge.
+#[gpui_kit::test]
+fn the_repository_heading_centres_its_name_and_path(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let repo = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.repos[0].id.clone());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let content = window.find(format!("heading-content-{repo}")).bounds();
+        let name = window.find(format!("repo-name-{repo}")).bounds();
+        let path = window.find(format!("repo-path-{repo}")).bounds();
+        assert!(
+            path.size.width > px(0.),
+            "the fixture's repository has no path to centre"
+        );
+        let left = name.left().as_f32() - content.left().as_f32();
+        let right = content.right().as_f32() - path.right().as_f32();
+        assert!(
+            (left - right).abs() <= 1.,
+            "the heading's texts sit {left}px from the left and {right}px from the right"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
 #[gpui_kit::test]
 fn protected_checkouts_have_no_lifecycle_controls(cx: &mut TestAppContext) {
     let fixture = open(cx);

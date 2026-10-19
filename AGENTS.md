@@ -425,7 +425,9 @@ takes its place at once, so the wait is paid once per session rather than once
 per row, and browsing the Files tree paints the path of every row the pointer
 crosses. Here each trigger pays the wait — `Tooltips::rest` clears the overlay
 before it asks for the next one, so nothing is inherited — and the wait itself
-is `TooltipDefaults::show_delay`.
+is the app's own `tooltip::SHOW_DELAY`, longer than the toolkit's half second
+because most of these triggers are ones the pointer crosses on its way
+somewhere else.
 
 A trigger is a canvas laid over the control and a window listener it registers
 as it is painted, not a hover: `Button::on_hover` is inert on a disabled
