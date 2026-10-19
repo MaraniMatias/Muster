@@ -8,6 +8,19 @@ here still gets its generated notes.
 
 ## Unreleased
 
+## 1.0.0-rc.3
+
+- Ship both the native macOS Apple Silicon ZIP and an Ubuntu 24.04 x86_64
+  Debian package. Linux ARM64, AppImage and older distributions are not included.
+- Validate formatting, clippy, workspace tests, the RustSec audit and release
+  builds on both platforms before publishing. Install the Linux package in a
+  clean runtime-only container and require the app to open a window under Xvfb.
+- Publish the exact checksummed artifacts built from the tagged source commit,
+  with matching versions and architectures. Candidate releases remain prereleases
+  and do not replace the latest stable release.
+- Correct Linux clipboard tests to use Ctrl+Shift+V and give the Git shared-budget
+  test realistic CI scheduling margins without changing production read limits.
+
 ## 1.0.0-rc.2
 
 - **The native app compiles and links on Linux.** The `linux-build` job installs
