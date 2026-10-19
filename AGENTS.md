@@ -210,6 +210,23 @@ Three rules the rows depend on, each pinned by a test in
   rows with it by simply not being drawn, and restoring it brings back the ones
   its review still holds.
 
+A row's label is **one line**. The room a name has is not the same all the
+time: the pointer on a worktree row gives it to the figures and to the close
+button, so a name that fitted a moment ago no longer does. It is then cut with
+an ellipsis, never wrapped onto a second line, which would spill out of the
+row and over the one below it. The same holds for the heading's name and path,
+for the terminal rows, and for the row that says a terminal is starting: that
+one is also held inside the panel rather than running under its edge.
+
+The heading's name and path are **one line of text**, and one line of text has
+one baseline. The name is 14px and the path 11px, and a smaller text's
+baseline sits nearer the foot of its own box, so aligning the two boxes at the
+foot leaves the path hanging below the name. The path is lifted by the
+difference — computed from the font's own metrics, because the UI font differs
+per platform — so the two share the name's baseline and the path's caps start
+where the name's lowercase starts. `the_repository_heading_shares_one_baseline`
+in `native/src/sidebar_tests.rs` pins it.
+
 ## The file tree
 
 `native/src/inspector.rs` owns the Files tree: a scrolling box with a window of

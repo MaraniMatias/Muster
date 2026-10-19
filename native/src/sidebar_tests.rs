@@ -3,6 +3,7 @@
 use std::process::Command;
 
 use super::*;
+use crate::sidebar::{HEADING_NAME_SIZE, HEADING_PATH_SIZE};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{
     AnyWindowHandle, App, InputEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
@@ -287,6 +288,133 @@ fn the_repository_heading_centres_its_name_and_path(cx: &mut TestAppContext) {
         assert!(
             (left - right).abs() <= 1.,
             "the heading's texts sit {left}px from the left and {right}px from the right"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// The heading's name and path are one line of text, and one line of text has
+/// one baseline.
+///
+/// The path is drawn smaller than the name, and a smaller text's baseline sits
+/// nearer the foot of its own box: aligning the two boxes at the foot would
+/// leave the path hanging below the name. The path is lifted by the
+/// difference, so the two share the name's baseline.
+#[gpui_kit::test]
+fn the_repository_heading_shares_one_baseline(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let repo = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.repos[0].id.clone());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let name = window.find(format!("repo-name-{repo}")).bounds();
+        let path = window.find(format!("repo-path-{repo}")).bounds();
+        let name_baseline = name.bottom()
+            - px(baseline_from_bottom(
+                window,
+                HEADING_NAME_SIZE,
+                gpui_kit::FontWeight::MEDIUM,
+            ));
+        let path_baseline = path.bottom()
+            - px(baseline_from_bottom(
+                window,
+                HEADING_PATH_SIZE,
+                gpui_kit::FontWeight::NORMAL,
+            ));
+        let gap = (name_baseline - path_baseline).as_f32();
+        assert!(
+            gap.abs() <= 0.25,
+            "the path hangs {gap}px below the name's baseline"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// A worktree's name is one line, whatever the row has to make room for.
+///
+/// The pointer on the row gives the room to the figures and to the close
+/// button, so a name that fitted a moment ago no longer does. It is cut with
+/// an ellipsis; it never takes a second line, which would spill out of the
+/// row and over the one below it.
+#[gpui_kit::test]
+fn a_worktree_name_that_does_not_fit_stays_on_one_line(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let repo = fixture.view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == fixture.repo_id)
+            .unwrap()
+            .clone()
+    });
+    let opened =
+        navigation::create_worktree(&repo, "native-opencode", "feat/native-opencode", "").unwrap();
+    let worktree = opened.checkout_id.clone();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.sidebar_width = 240.;
+        app.diff_totals.insert(
+            worktree.clone(),
+            DiffTotals {
+                additions: 7674,
+                deletions: 265,
+            },
+        );
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let row = window.find(format!("select-checkout-{worktree}")).bounds();
+        pointer_move(window, row.center(), None, cx);
+        window.render_frame(cx);
+        let name = window.find(format!("checkout-name-{worktree}")).bounds();
+        assert!(
+            name.size.height <= px(22.),
+            "the name took a second line: {name:?}"
+        );
+        assert!(
+            name.right() <= row.right(),
+            "the name runs out of the row: {name:?} {row:?}"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A row that says a terminal is starting keeps its words inside the panel.
+///
+/// The row is as wide as the panel and the sentence is longer than the room
+/// left of it, so the sentence is cut with an ellipsis rather than running
+/// under the panel's edge.
+#[gpui_kit::test]
+fn a_pending_terminal_row_stays_inside_the_panel(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    fixture.view.update(cx, |app, cx| {
+        app.navigation.repos[0].name =
+            "a-directory-name-longer-than-the-panel-it-is-drawn-in".into();
+        app.navigation
+            .pending
+            .insert("pending-1".into(), fixture.checkout.clone());
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let panel = window.find("navigation-panel").bounds();
+        let text = window
+            .find(format!("pending-{}", fixture.checkout))
+            .bounds();
+        assert!(
+            text.right() <= panel.right(),
+            "the row runs out of the panel: {text:?} {panel:?}"
+        );
+        assert!(
+            text.size.height <= px(22.),
+            "the sentence took a second line: {text:?}"
         );
     })
     .unwrap();

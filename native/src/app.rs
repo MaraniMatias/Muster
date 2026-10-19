@@ -95,6 +95,39 @@ pub(crate) fn sidebar_text_width(window: &Window, text: &str, size: f32) -> gpui
         .width()
 }
 
+/// How far the baseline of a line of text sits above the foot of its box.
+///
+/// A text's box is a line box, and the baseline sits inside it: the larger the
+/// text, the further its baseline is from the foot. Two texts of different
+/// sizes whose boxes are aligned at the foot therefore do not share a
+/// baseline — the smaller one hangs below the larger one by the difference of
+/// these two numbers.
+pub(crate) fn baseline_from_bottom(
+    window: &Window,
+    size: f32,
+    weight: gpui_kit::FontWeight,
+) -> f32 {
+    let style = gpui_kit::TextStyle {
+        font_family: UI_FONT_FAMILY.into(),
+        font_size: px(size).into(),
+        font_weight: weight,
+        ..Default::default()
+    };
+    let line_height = style
+        .line_height
+        .to_pixels(style.font_size, window.rem_size());
+    let font_id = window.text_system().resolve_font(&gpui_kit::Font {
+        family: UI_FONT_FAMILY.into(),
+        features: Default::default(),
+        fallbacks: None,
+        weight,
+        style: gpui_kit::FontStyle::Normal,
+    });
+    let ascent = window.text_system().ascent(font_id, px(size));
+    let descent = window.text_system().descent(font_id, px(size));
+    ((line_height - ascent + descent) / 2.).as_f32()
+}
+
 /// A width per text at one size, by the size it was measured at.
 ///
 /// Two maps rather than one keyed by `(text, size)`: the tree asks for the same

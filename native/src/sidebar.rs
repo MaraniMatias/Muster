@@ -31,8 +31,8 @@ use gpui_kit::{
 use muster_core::workspace::RepoKind;
 
 use crate::app::{
-    sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
-    sidebar_text_width, toggle, ButtonA11y, TerminalWindow, UI_FONT_FAMILY,
+    baseline_from_bottom, sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path,
+    sidebar_row_focus, sidebar_text_width, toggle, ButtonA11y, TerminalWindow, UI_FONT_FAMILY,
 };
 use crate::file_icons;
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
@@ -42,6 +42,13 @@ use crate::tooltip::RestingTooltip;
 
 pub(crate) const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
 pub(crate) const SIDEBAR_SCROLL_EDGE: f32 = 36.0;
+
+/// The sizes the repository heading's name and path are drawn at.
+///
+/// The two are one line of text, so their baselines have to meet: the sizes
+/// are named here because the baseline of the pair is computed from them.
+pub(crate) const HEADING_NAME_SIZE: f32 = 14.;
+pub(crate) const HEADING_PATH_SIZE: f32 = 11.;
 
 pub(crate) fn foreground_program_icon(
     program: ForegroundProgram,
@@ -670,6 +677,14 @@ impl TerminalWindow {
             })
         });
         let mut rows = Vec::<AnyElement>::new();
+        // The heading's name and path are one line of text, and one line of
+        // text has one baseline. The two boxes are aligned at the foot, and a
+        // smaller text's baseline sits nearer its own foot, so the path
+        // hangs below the name by the difference of the two. This is that
+        // difference, and it lifts the path back onto the name's baseline.
+        let path_lift =
+            baseline_from_bottom(window, HEADING_NAME_SIZE, gpui_kit::FontWeight::MEDIUM)
+                - baseline_from_bottom(window, HEADING_PATH_SIZE, gpui_kit::FontWeight::NORMAL);
         for repo in &self.navigation.repos {
             let id = repo.id.clone();
             let folded = self.navigation.folded_repos.contains(&id);
@@ -736,10 +751,9 @@ impl TerminalWindow {
                         // Bottom, not baseline: the flex engine is handed no
                         // baseline to align, so `items_baseline` degrades to the
                         // top, and a 14px name and an 11px path each sit half
-                        // their own leading below the line they share. Measured
-                        // against the reference, the path hung about 2.5px low;
-                        // aligning their boxes at the foot puts the two
-                        // baselines within a fifth of a pixel.
+                        // their own leading below the line they share. The two
+                        // boxes are aligned at the foot here, and the path's own
+                        // margin is what puts its baseline on the name's.
                         .items_end()
                         .gap(px(8.))
                         .child(
@@ -749,7 +763,11 @@ impl TerminalWindow {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
-                                .text_size(px(14.))
+                                // One line, always: a name that does not fit is
+                                // cut with an ellipsis, never wrapped onto a
+                                // second line that spills out of the row.
+                                .whitespace_nowrap()
+                                .text_size(px(HEADING_NAME_SIZE))
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .child(repo.name.clone()),
                         )
@@ -760,8 +778,14 @@ impl TerminalWindow {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_ellipsis()
-                                .text_size(px(11.))
+                                .whitespace_nowrap()
+                                .text_size(px(HEADING_PATH_SIZE))
                                 .text_color(roles.text_muted)
+                                // Onto the name's baseline, which the foot of
+                                // this box is not: the path is smaller, and a
+                                // smaller text's baseline is nearer its own
+                                // foot. See `path_lift`.
+                                .mb(px(path_lift))
                                 .child(sidebar_repo_path(
                                     window,
                                     &repo.root,
@@ -977,10 +1001,19 @@ impl TerminalWindow {
                     }))
                     .child(
                         div()
+                            .id(SharedString::from(format!("checkout-name-{id}")))
+                            .test_support()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
+                            // One line, always: the pointer on the row takes
+                            // the room the figures and the close button need,
+                            // and a name that no longer fits is cut with an
+                            // ellipsis rather than wrapped onto a second line
+                            // that spills out of the row and over the one
+                            // below it.
+                            .whitespace_nowrap()
                             .when(checkout.is_missing, |label| {
                                 label.text_color(roles.text_disabled)
                             })
@@ -1338,6 +1371,7 @@ impl TerminalWindow {
                                         .min_w_0()
                                         .overflow_hidden()
                                         .text_ellipsis()
+                                        .whitespace_nowrap()
                                         .child(sidebar_name(
                                             window,
                                             &title,
@@ -1585,6 +1619,7 @@ impl TerminalWindow {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
+                                    .whitespace_nowrap()
                                     .child(name),
                             )
                             .into_any_element(),
@@ -1605,7 +1640,17 @@ impl TerminalWindow {
                             .gap(px(7.))
                             .text_color(roles.text_muted)
                             .child(Icon::new(IconName::LoaderCircle).size(px(14.)))
-                            .child(format!("Starting terminal in {title}…"))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("pending-{id}")))
+                                    .test_support()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(format!("Starting terminal in {title}…")),
+                            )
                             .into_any_element(),
                     );
                 }
