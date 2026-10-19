@@ -43,11 +43,17 @@ state file explicitly, retaining a backup if needed.
 
 `scripts/release.sh check` runs the Rust formatting, clippy and workspace test
 checks plus the RustSec audit. `build` adds the optimized native build; `release`
-packages that build as `dist/Muster.app` on macOS. The entry point requires
+packages that build as `dist/Muster.app` on macOS. Linux native builds require
+Rust/rustup 1.97.1, Node.js, and the Ubuntu development libraries listed in
+`docs/release-safety.md`; the first Linux release target is Ubuntu 24.04 x86_64
+as a `.deb` only. The manual Linux release workflow validates a requested SHA,
+installs the package and runs a bounded Xvfb window-startup smoke before retaining
+the artifact; publish mode uses that validated artifact. The entry point requires
 Rust/rustup 1.97.1 and Node.js. It is local-only: it does not create tags, publish,
 sign with a distribution identity or notarize. See `scripts/release.sh --help`.
-AP-12 integration/platform acceptance remains pending; real GPU/IME, image pixels,
-Linux runtime and release measurements are not established by headless tests.
+AP-12 integration/platform acceptance remains pending; real interactive GPU/IME,
+image-pixel and full Linux desktop acceptance are not established by headless tests
+or the bounded automated Xvfb smoke.
 
 **Application baseline:** Muster `v0.21.1`, commit `4412f63bd385bdb3b9eb12b829858578a2009f81`.  
 **Research snapshots:** retrieved on 2026-10-11 UTC; exact upstream revisions are recorded below.  

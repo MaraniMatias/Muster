@@ -5,16 +5,18 @@ use tempfile::tempdir;
 #[test]
 fn a_shared_read_budget_does_not_restart_for_each_command_or_checkout() {
     let temp = tempdir().unwrap();
-    let within = GitReadBudget::new(Duration::from_millis(300));
+    // Leave room for process startup and loaded CI workers; the second command
+    // still exceeds the same deadline because both sleeps share this budget.
+    let within = GitReadBudget::new(Duration::from_secs(2));
     git_success(
         temp.path(),
-        &["-c", "alias.delay=!sleep 0.2", "delay"],
+        &["-c", "alias.delay=!sleep 1.2", "delay"],
         within,
     )
     .unwrap();
     let error = git_success(
         temp.path(),
-        &["-c", "alias.delay=!sleep 0.2", "delay"],
+        &["-c", "alias.delay=!sleep 1.2", "delay"],
         within,
     )
     .unwrap_err();

@@ -1,28 +1,87 @@
-# Release safety
+# Native release safety
 
-The release path is staged so no version is tagged until every check and final bundle has passed.
+## Supported targets
 
-## Commands
+- macOS 15+, Apple Silicon: ad-hoc signed `.app` in a versioned ZIP, not notarized.
+- Ubuntu 24.04, x86_64: `.deb`. No native ARM64 Linux or AppImage promise yet.
 
-- <code>bun run release:preview v0.20.0</code> shows the four manifest edits without changing files.
-- <code>bun run release:validate</code> runs release:check, fmt:check, lint, typecheck, lint:rust, and the complete test suite on the current host. GitHub Actions is the canonical Linux and packaging gate.
-- <code>bash scripts/validate-linux.sh</code> optionally builds x86_64 .deb/AppImage packages in Docker; each long container phase has a timeout.
-- <code>bun run release v0.20.0 --dry-run</code> prepares the version, validates it locally, pushes the version commit to main, and runs checks plus every final GitHub bundle build. It never creates a tag or GitHub release.
-- <code>bun run release v0.20.0</code> performs the same gates, then creates the remote tag and publishes the exact validated artifacts.
+The Tauri scripts under `legacy/` are reference material, not this release path.
+Existing native candidates may contain only macOS; this workflow adds the Linux
+package to future releases. It never changes an existing release or version.
 
-A dry run is not a local-only preview: it can push a version commit and start actual GitHub builds. Use release:preview for a no-mutation preview.
+## Local checks
 
-## Release sequence
+Use Rust/rustup 1.97.1 and Node 22. On Ubuntu install:
 
-1. From a clean main worktree, release.mjs prepares all four version records before local validation. release:check and the remaining gates therefore validate the requested version.
-2. Validation may leave only those four expected manifest edits; any additional tracked or untracked change, staged change, HEAD movement, or branch change stops the release. If validation fails, the prepared version edits remain uncommitted for inspection; nothing is reset, committed, pushed, or tagged. Before retrying, restore any uncommitted manifest edits and remove validation-generated changes so the initial clean-worktree requirement is met.
-3. After validation succeeds, release.sh commits only the version records and pushes the version commit to main without a tag. A non-fast-forward push stops safely; rebase or retry rather than resetting the branch.
-4. The script dispatches the release workflow with the full commit SHA, version, mode, and a unique correlation ID. Every CI check and final build checks out that exact SHA even if main advances.
-5. GitHub validates nonempty versioned artifacts for macOS ARM64 DMG and Ubuntu 22.04 x86_64/ARM64 .deb plus AppImage outputs. It rejects missing targets, duplicate names, version/architecture mismatches, and checksum or SHA manifest mismatches.
-6. Only after all checks and builds succeed does the write-enabled publish job create the annotated tag and upload the already-validated payload. The workflow has no tag-push publication trigger.
+```sh
+sudo apt-get update
+sudo apt-get install -y libvulkan-dev libx11-dev libxcb1-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libfreetype6-dev libfontconfig1-dev dpkg-dev zip unzip
+scripts/release.sh build
+scripts/package-linux-deb.sh
+```
 
-## Retry and Docker behavior
+`release.sh check` runs fmt, clippy, workspace tests, release-script tests and the
+RustSec audit. `build` adds the locked release build. On macOS, `release` also
+assembles `dist/Muster.app`; these local commands never tag or publish.
 
-A failed untagged build can be retried with the same version; it reuses the prepared commit and does not make a tag. If publication fails after tagging, rerun the original workflow's failed jobs so successful build artifacts are reused. A tagged same-run recovery skips checks and every build/finalization job, and publishes only from that run's retained final artifact; a missing or expired artifact fails before tag/release writes. Validation-only dispatch refuses any tagged version. The workflow validates the exact tag subject/run identity and never moves or deletes an existing tag. If artifacts cannot be recovered, stop and investigate rather than rebuilding an already-tagged version.
+The package derives shared-library dependencies from the ELF with
+`dpkg-shlibdeps`. Git, `xdg-utils` and the dynamically loaded Vulkan loader are
+explicit runtime dependencies. An appropriate Vulkan driver must be available on
+the desktop. A Cargo version such as `1.0.0-rc.3` becomes Debian `1.0.0~rc.3`,
+which upgrades correctly to `1.0.0` without implying that final release is approved.
 
-The optional local Linux check requires Docker. On Apple Silicon it runs Linux amd64 under emulation to match the Ubuntu x86_64 release runner. Source is streamed into an ephemeral container; host node_modules, Cargo targets, credentials, and Docker sockets are not mounted. The Docker image is only a local package-build smoke test; Linux tests run in GitHub Actions on the native runner. The release itself does not depend on a local Docker daemon; GitHub Actions validates and builds the exact pushed SHA before publishing.
+## Validate without publishing
+
+`.github/workflows/linux-release.yml` is named **Native release**. After the new
+workflow has been merged to the default branch, it can also be dispatched using
+an implementation branch as `--ref` for validation. All jobs build the exact
+40-character commit SHA requested, not a moving branch tip.
+
+```sh
+gh workflow run linux-release.yml --ref main \
+  -f sha=<full-commit-sha> -f mode=validate
+```
+
+Both platforms run the checks and create their bundles. Linux installs and launches
+the `.deb` in a fresh Ubuntu 24.04 container, with no development libraries, as an
+unprivileged user with an isolated HOME. Xvfb and Mesa lavapipe provide the test
+display and software Vulkan driver. The bounded check requires an application
+window and a process that remains alive; it is **not** a pixel-render or full
+interaction test. The ordinary pull-request CI exercises Linux packaging and
+this runtime check too, before this manual workflow is available on `main`.
+
+A read-only finalization job checks source SHA, exact file lists, checksums,
+Debian version/architecture/payload and macOS bundle version/architecture. It
+retains one `native-release-<sha>` artifact with the `.deb`, ZIP, `SHA256SUMS`
+and `SOURCE_SHA`. Validation never creates a tag or release.
+
+Before publishing, inspect that artifact and manually verify real desktop
+rendering, terminal input/process shutdown, clipboard and links. Real GPU/IME,
+Wayland and broader distribution acceptance are not implied by the Xvfb check.
+
+## Publish
+
+Prepare a new version in `native/Cargo.toml` and `Cargo.lock`, update the changelog,
+and merge it to `main`. Do not reuse `v1.0.0-rc.2` or move an existing tag.
+
+```sh
+gh workflow run linux-release.yml --ref main \
+  -f sha=<full-commit-sha> -f mode=publish -f tag=v1.0.0-rc.3
+```
+
+Publication must be dispatched from `main`, for a commit on `main`, and the new
+tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`
+or `v1.0.0-rc.N`; final `v1.0.0` remains a separate deliberate decision.
+
+Publish mode builds and validates both platforms in the same run, then downloads
+the final artifact without rebuilding it. Only this last job has write permission;
+it never checks out or executes source. It rechecks checksums and the source SHA,
+refuses existing tags (including a concurrent creation), creates an annotated tag,
+uploads a draft release and exposes it only after the uploads succeed. RCs are
+prereleases and never replace Latest. Network errors fail closed.
+
+If upload/publication fails after tag creation, stop: do not delete/move the tag
+or rebuild under it. Recover the exact retained final artifact from that run,
+verify its checksums/source and finish the draft/upload manually. Expired or
+missing artifacts require investigation, not an automatic tagged-version rebuild.

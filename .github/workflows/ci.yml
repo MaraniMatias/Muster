@@ -33,7 +33,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs
+      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs scripts/linux-release.test.mjs
       - run: node scripts/audit-rust.mjs
 
       - run: cargo build --locked --release -p muster
@@ -66,6 +66,14 @@ jobs:
           sudo apt-get update && sudo apt-get install -y
           libvulkan-dev libx11-dev libxcb1-dev
           libxkbcommon-dev libxkbcommon-x11-dev
-          libfreetype6-dev libfontconfig1-dev
-      - run: cargo build --locked -p muster
-      - run: cargo test --locked -p muster-core
+          libfreetype6-dev libfontconfig1-dev dpkg-dev zip unzip
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: scripts/release.sh build
+      - run: scripts/package-linux-deb.sh
+      - name: Install and launch in a clean runtime container
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/dist:/artifacts:ro" -v "$PWD/scripts:/smoke:ro" \
+            ubuntu:24.04 bash /smoke/linux-package-smoke.sh /artifacts/$(basename dist/*.deb)

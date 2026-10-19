@@ -40,7 +40,7 @@ check() {
   cargo fmt --all --check
   cargo clippy --locked --workspace --all-targets -- -D warnings
   cargo test --locked --workspace
-  node --test scripts/audit-rust.test.mjs scripts/release.test.mjs
+  node --test scripts/audit-rust.test.mjs scripts/release.test.mjs scripts/linux-release.test.mjs
   node scripts/audit-rust.mjs
 }
 
