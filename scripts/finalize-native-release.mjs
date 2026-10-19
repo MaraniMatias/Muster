@@ -32,7 +32,7 @@ export function finalize(base, sha, version, output) {
     assert.equal(run('dpkg-deb', ['-f', debPath, field]).trim(), expected);
   }
   const contents = run('dpkg-deb', ['--contents', debPath]);
-  for (const file of ['usr/bin/Muster', 'usr/share/applications/muster.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
+  for (const file of ['usr/bin/Muster', 'usr/share/applications/dev.muster.workspace.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
     assert.ok(contents.includes(`./${file}`), `missing ${file}`);
   }
   assert.ok(!contents.includes('./debian/'), 'source metadata leaked into package');

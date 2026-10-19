@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
-import { verifyPayload } from './finalize-native-release.mjs';
+import { finalize, verifyPayload } from './finalize-native-release.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => readFileSync(path.join(root, file), 'utf8');
@@ -40,7 +40,51 @@ test('finalization refuses wrong SHA, tampering, missing targets and unexpected 
   assert.throws(() => verifyPayload(dir, sha, filename), /unexpected artifact files/);
 }));
 
-function smoke(dir, app, window) {
+test('finalization validates both package formats and refuses wrong bundle versions', { skip: process.platform !== 'linux' }, () => temporary(dir => {
+  const version = '1.0.0-rc.2';
+  const linuxDir = path.join(dir, `linux-${sha}`);
+  const macDir = path.join(dir, `macos-${sha}`);
+  const stage = path.join(dir, 'stage');
+  mkdirSync(path.join(stage, 'DEBIAN'), { recursive: true });
+  for (const file of ['usr/bin/Muster', 'usr/share/applications/dev.muster.workspace.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
+    mkdirSync(path.dirname(path.join(stage, file)), { recursive: true });
+    writeFileSync(path.join(stage, file), 'fixture');
+  }
+  writeFileSync(path.join(stage, 'DEBIAN/control'), 'Package: muster\nVersion: 1.0.0~rc.2\nArchitecture: amd64\nMaintainer: Test <test@example.test>\nDescription: Test fixture\n');
+  mkdirSync(linuxDir);
+  mkdirSync(macDir);
+  const deb = 'muster_1.0.0~rc.2_amd64.deb';
+  const mac = 'Muster_1.0.0-rc.2_arm64.zip';
+  const run = (command, args, options = {}) => {
+    const result = spawnSync(command, args, { encoding: 'utf8', ...options });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  run('dpkg-deb', ['--build', stage, path.join(linuxDir, deb)]);
+  const contents = path.join(dir, 'Muster.app/Contents');
+  mkdirSync(path.join(contents, 'MacOS'), { recursive: true });
+  const header = Buffer.alloc(32);
+  header.writeUInt32LE(0xfeedfacf, 0);
+  header.writeUInt32LE(0x100000c, 4);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), header);
+  const plist = '<plist><dict><key>CFBundleShortVersionString</key><string>1.0.0-rc.2</string></dict></plist>';
+  writeFileSync(path.join(contents, 'Info.plist'), plist);
+  const record = (directory, filename) => {
+    writeFileSync(path.join(directory, 'SOURCE_SHA'), `${sha}\n`);
+    writeFileSync(path.join(directory, 'SHA256SUMS'), `${createHash('sha256').update(readFileSync(path.join(directory, filename))).digest('hex')}  ${filename}\n`);
+  };
+  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
+  record(linuxDir, deb);
+  record(macDir, mac);
+  const output = path.join(dir, 'final');
+  finalize(dir, sha, version, output);
+  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /muster_1\.0\.0~rc\.2_amd64\.deb/);
+  writeFileSync(path.join(contents, 'Info.plist'), plist.replace('1.0.0-rc.2', '1.0.0-rc.1'));
+  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
+  record(macDir, mac);
+  assert.throws(() => finalize(dir, sha, version, output));
+}));
+
+function smoke(dir, app, window, deadline = false) {
   const executable = (name, body) => {
     const file = path.join(dir, name);
     writeFileSync(file, `#!/bin/bash\n${body}\n`, { mode: 0o755 });
@@ -51,7 +95,10 @@ function smoke(dir, app, window) {
   executable('timeout', 'shift; exec "$@"');
   executable('sleep', '/bin/sleep 0.03');
   executable('xwininfo', window);
-  return spawnSync('bash', [path.join(root, 'scripts/linux-window-smoke.sh'), path.join(dir, 'log'), appPath], {
+  const command = deadline ? '/usr/bin/timeout' : 'bash';
+  const args = [path.join(root, 'scripts/linux-window-smoke.sh'), path.join(dir, 'log'), appPath];
+  if (deadline) args.unshift('--kill-after=1s', '0.2s', 'bash');
+  return spawnSync(command, args, {
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}` }, encoding: 'utf8', timeout: 5000,
   });
 }
@@ -76,6 +123,11 @@ test('startup smoke requires a window, not just a live process', () => temporary
 test('startup smoke accepts a window only while the process remains alive', () => temporary(dir => {
   const result = smoke(dir, 'exec /bin/sleep 10', 'echo Muster');
   assert.equal(result.status, 0, result.stderr);
+}));
+
+test('an outer deadline bounds a stalled window query', { skip: process.platform !== 'linux' }, () => temporary(dir => {
+  const result = smoke(dir, 'exec /bin/sleep 10', 'exec /bin/sleep 10', true);
+  assert.equal(result.status, 124, result.stderr);
 }));
 
 test('publication is downstream of read-only finalization and never rebuilds source', () => {

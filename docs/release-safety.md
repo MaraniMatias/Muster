@@ -16,7 +16,7 @@ Use Rust/rustup 1.97.1 and Node 22. On Ubuntu install:
 ```sh
 sudo apt-get update
 sudo apt-get install -y libvulkan-dev libx11-dev libxcb1-dev \
-  libxkbcommon-dev libxkbcommon-x11-dev libfreetype6-dev libfontconfig1-dev dpkg-dev
+  libxkbcommon-dev libxkbcommon-x11-dev libfreetype6-dev libfontconfig1-dev dpkg-dev zip unzip
 scripts/release.sh build
 scripts/package-linux-deb.sh
 ```

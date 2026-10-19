@@ -23,13 +23,14 @@ metadata="$tmp/source"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/512x512/apps" "$stage/usr/share/doc/muster" "$metadata/debian"
 install -m 0755 "$binary" "$stage/usr/bin/Muster"
 install -m 0644 "$root/native/assets/icon.png" "$stage/usr/share/icons/hicolor/512x512/apps/muster.png"
-cat >"$stage/usr/share/applications/muster.desktop" <<'DESKTOP'
+cat >"$stage/usr/share/applications/dev.muster.workspace.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Muster
 Comment=Desktop workspace for coding agents in Git worktrees
 Exec=/usr/bin/Muster
 Icon=muster
+StartupWMClass=dev.muster.workspace
 Categories=Development;IDE;
 Terminal=false
 DESKTOP
@@ -70,7 +71,7 @@ dpkg-deb --root-owner-group --build "$stage" "$artifact" >/dev/null
 [[ "$(dpkg-deb -f "$artifact" Version)" == "$version" ]]
 [[ "$(dpkg-deb -f "$artifact" Architecture)" == amd64 ]]
 contents="$(dpkg-deb --contents "$artifact")"
-for file in './usr/bin/Muster' './usr/share/applications/muster.desktop' './usr/share/icons/hicolor/512x512/apps/muster.png' './usr/share/doc/muster/copyright'; do
+for file in './usr/bin/Muster' './usr/share/applications/dev.muster.workspace.desktop' './usr/share/icons/hicolor/512x512/apps/muster.png' './usr/share/doc/muster/copyright'; do
   [[ "$contents" == *"$file"* ]] || { echo "package-linux-deb: missing payload $file" >&2; exit 1; }
 done
 [[ "$contents" != *'./debian/'* ]] || { echo 'package-linux-deb: source metadata leaked into payload' >&2; exit 1; }
