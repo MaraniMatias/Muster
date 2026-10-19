@@ -6,6 +6,27 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+## 1.0.0-rc.2
+
+- **The native app compiles and links on Linux.** The `linux-build` job installs
+  every system library the native crate links against -- Vulkan for wgpu, X11 and
+  xcb for the window, XKB and its X11 half for keys, freetype for text -- plus
+  `libfontconfig1-dev`, which is the one that fails as a build-script panic on a
+  missing `fontconfig.pc` rather than as a link error anybody can read. That job
+  is the reason the workflow carries one: macOS never compiles the Linux branches
+  of the code, so without it nothing here would notice them rotting until
+  somebody tried to build on Linux.
+
+- **Closing a busy terminal asks, and the test that pins it waits for the
+  answer it is about.** The prompt is the last status poll's reading of the
+  foreground process group, and the test clicked close without waiting for that
+  reading. On a loaded runner the poll had not seen the foreground process yet,
+  the terminal read as idle, and a close that correctly asked nothing failed a
+  test that asserted a prompt. It waits for the busy answer now -- the premise
+  the assertion rests on -- rather than assuming it.
+
 ## 1.0.0-rc.1
 
 - **Ctrl+Shift+<key> now reaches the program in the terminal.** xterm.js 6 answers the keys it has an
