@@ -19,6 +19,7 @@ use gpui_kit::component::{
     input::Input,
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
+    spinner::Spinner,
     Disableable, Icon, Sizable,
 };
 use gpui_kit::{
@@ -35,7 +36,7 @@ use crate::app::{
 };
 use crate::file_icons;
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
-use crate::terminal::ShellState;
+use crate::terminal::{PiTaskState, ShellState};
 use crate::theme::{zed_button, Roles};
 use crate::tooltip::RestingTooltip;
 
@@ -64,6 +65,72 @@ pub(crate) fn foreground_program_icon(
             .text_color(color)
             .child("π")
             .into_any_element(),
+    }
+}
+
+/// The glyph a terminal row wears in front of its name.
+///
+/// The program's own, unless a turn is running: that is the one state that
+/// moves, and a static list cannot say that about itself.
+fn session_glyph(
+    program: Option<ForegroundProgram>,
+    working: bool,
+    size: Pixels,
+    color: Hsla,
+) -> AnyElement {
+    if working {
+        return Spinner::new()
+            .with_size(size)
+            .color(color)
+            .into_any_element();
+    }
+    program.map_or_else(
+        || {
+            Icon::new(IconName::SquareTerminal)
+                .size(size)
+                .text_color(color)
+                .into_any_element()
+        },
+        |program| foreground_program_icon(program, size, color),
+    )
+}
+
+/// What a terminal row wearing Pi's glyph says about the task in front of it.
+///
+/// Three answers and two inks: a turn that is running moves and wears the
+/// accent, a turn that failed wears the danger ink, and everything else is
+/// neutral. A turn that stopped to ask something is neutral too: the panel has
+/// no shape for a question this program asked, so the row says nothing about
+/// it rather than inventing a state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PiRowState {
+    /// The words the row says beside its name.
+    pub(crate) note: &'static str,
+    /// Whether a turn is running, which is the one state that moves.
+    pub(crate) working: bool,
+    /// Whether the last turn failed.
+    pub(crate) failed: bool,
+}
+
+/// What a row says about the task in front of it, given what Pi reported.
+pub(crate) fn pi_row_state(task: Option<PiTaskState>) -> PiRowState {
+    let note = crate::terminal::pi_task_note(task);
+    match task {
+        Some(PiTaskState::Working) => PiRowState {
+            note,
+            working: true,
+            failed: false,
+        },
+        Some(PiTaskState::Error) => PiRowState {
+            note,
+            working: false,
+            failed: true,
+        },
+        _ => PiRowState {
+            note,
+            working: false,
+            failed: false,
+        },
     }
 }
 
@@ -1146,7 +1213,15 @@ impl TerminalWindow {
                     let program =
                         crate::navigation::foreground_program(status.foreground.app.as_deref());
                     let agent = program == Some(ForegroundProgram::OpenCode);
+                    // Pi's own state, read only while Pi is what is in front of
+                    // the shell: a report left over from a process that is gone
+                    // is not a report about this row.
+                    let pi = program == Some(ForegroundProgram::Pi);
+                    let pi_task = pi.then_some(status.pi_task).flatten();
+                    let pi_state = pi_row_state(pi_task);
+                    let pi_note = pi_state.note;
                     let failed = !agent
+                        && !pi
                         && matches!(status.shell, ShellState::Running)
                         && terminal
                             .shell
@@ -1158,22 +1233,28 @@ impl TerminalWindow {
                     let drag_id = id.clone();
                     let close_id = id.clone();
                     let row_click_id = id.clone();
-                    let state_label = format!(
-                        "Terminal session: {title}{}",
-                        if unknown {
-                            ", state unavailable"
-                        } else if failed {
-                            ", last command failed"
-                        } else if matches!(status.shell, ShellState::Exited { .. }) {
-                            ", shell exited"
-                        } else if agent {
-                            ", agent session state not identified"
-                        } else if busy {
-                            ", process running"
-                        } else {
-                            ", idle"
-                        }
-                    );
+                    // The state, in the words the row is read out in. The colour
+                    // and the glyph say the same thing, and a colour is not
+                    // something a screen reader reads.
+                    let state_note: &str = if unknown {
+                        "state unavailable"
+                    } else if failed {
+                        "last command failed"
+                    } else if matches!(status.shell, ShellState::Exited { .. }) {
+                        "shell exited"
+                    } else if !pi_note.is_empty() {
+                        // What Pi is doing. A blocked turn says nothing here:
+                        // the panel has no shape for a question this program
+                        // asked, so the row stays neutral.
+                        pi_note
+                    } else if agent {
+                        "agent session state not identified"
+                    } else if busy {
+                        "process running"
+                    } else {
+                        "idle"
+                    };
+                    let state_label = format!("Terminal session: {title}, {state_note}");
                     let closing = self.closing_sessions.contains(&id);
                     let renaming = self.editing.as_ref().is_some_and(|edit| edit.id == id);
                     let row_clickable = !closing && !renaming;
@@ -1218,6 +1299,19 @@ impl TerminalWindow {
                                 .child({
                                     let color = if unknown {
                                         roles.status.warning
+                                    } else if pi {
+                                        // What Pi is doing, in the panel's own
+                                        // colours: the accent for a turn that is
+                                        // running, the danger ink for one that
+                                        // failed, and the muted ink for
+                                        // everything else.
+                                        if pi_state.working {
+                                            roles.accent
+                                        } else if pi_state.failed {
+                                            roles.status.danger_text
+                                        } else {
+                                            roles.text_muted
+                                        }
                                     } else if failed {
                                         roles.status.danger_text
                                     } else if busy && !agent {
@@ -1225,15 +1319,7 @@ impl TerminalWindow {
                                     } else {
                                         roles.text_muted
                                     };
-                                    program.map_or_else(
-                                        || {
-                                            Icon::new(IconName::SquareTerminal)
-                                                .size(px(14.))
-                                                .text_color(color)
-                                                .into_any_element()
-                                        },
-                                        |program| foreground_program_icon(program, px(14.), color),
-                                    )
+                                    session_glyph(program, pi && pi_state.working, px(14.), color)
                                 })
                                 .child(
                                     div()

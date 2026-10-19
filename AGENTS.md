@@ -321,6 +321,56 @@ Five rules it depends on, each pinned by a test:
   asks first, and the answer lives in the window (`review.delete_confirmation`)
   rather than in the card, so the dialog is the thing on screen while it stands.
 
+## The Pi integration
+
+Pi is an agent this app can watch and can send a review to. It is not OpenCode
+and it does not work the same way, and the difference is worth naming.
+
+**What Pi says.** Pi reports through two escape sequences, and they are not
+the same claim. OSC 7501 is Pi's own: it names a state, and it is the only
+thing that can say *which* state. OSC 9;4 is the progress indicator every
+terminal understands, and it can only say that something is running. So an
+explicit state wins over the progress, and the progress is what is left when Pi
+has said nothing more precise. The payload is bounded: a status longer than
+4096 characters, a field that is not one of the four, a field named twice or a
+malformed message is refused whole, because half a status is not a status.
+
+**The handshake.** Pi asks `OSC 7501;?`, and the answer is the same question
+back. Without it Pi keeps its state to itself. The reply is bounded per
+session, because a program that keeps asking is not a program asking once.
+
+**What may be believed.** A terminal's output is not Pi's output: another
+program in front of the shell can print whatever it likes. What says a report
+came from Pi is that the operating system names Pi as the process in front of
+the shell, so that is the only thing a report is believed against -- and a
+report is forgotten the moment the OS says something else is in front, or the
+moment the shell runs something else. The panel's own list of terminals cannot
+answer this, which is why the OS is asked.
+
+**What the row says.** The row wears Pi's glyph, a spinner while a turn is
+running, and the words `working`, `task complete` or `last task failed`. A
+blocked turn says nothing: the panel has no shape for a question this program
+asked, so the row stays neutral rather than inventing a state.
+
+**A review to Pi.** The review is written to a private file under the app's own
+folder -- `~/.muster/pi/prompts`, owner-only, swept after a day -- and handed
+to a new Pi terminal in the checkout as one argument after `--`. A long review
+is not a long command line, and nothing in the path is ever read by a shell.
+The terminal is opened only once the prompt is on disk: a terminal that opened
+with nothing to read would be a terminal that opened wrong. The prompt is
+owned from the moment it is written and is removed unless a live Pi takes it:
+a terminal that failed to start, an app that refused the session, a window
+that went away before the terminal opened -- each of them leaves no prompt
+behind, and a prompt removed before Pi reads it is a review Pi never saw.
+
+**A worktree Pi is working in.** A live Pi process whose directory is inside a
+worktree keeps that worktree from being archived or deleted, even when the
+terminal it runs in belongs to another worktree. The *directory* fails closed:
+a process whose directory the operating system will not name protects the
+worktree it might be in. The *identity* does not: a process the OS will not
+name is not counted as Pi at all, which is what the parked app does too and is
+not changed here.
+
 ## The preferences panel
 
 `native/src/settings.rs` is the panel, and the shape it draws is

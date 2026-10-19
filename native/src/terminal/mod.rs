@@ -23,6 +23,7 @@ mod input;
 mod keys;
 mod modes;
 mod paste;
+mod pi_status;
 mod session;
 mod view;
 mod write_queue;
@@ -35,6 +36,7 @@ pub use self::input::{FocusState, Input, MouseReport};
 pub use self::keys::{encode_key, Key, KeyPress};
 pub use self::modes::TerminalModes;
 pub use self::paste::{encode_paste, PasteError, MAX_PASTE_BYTES};
+pub use self::pi_status::{pi_task_note, PiTaskState};
 pub use self::session::{
     login_shell, shutdown, CellMetrics, CloseHandle, CloseReport, Foreground, GridRange,
     SessionError, SessionStatus, ShellState, StreamState, TerminalHost, TerminalSession,

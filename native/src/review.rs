@@ -182,11 +182,11 @@ pub(crate) struct ReviewState {
     /// Where the notes were last saved, so the toolbar can keep naming the file
     /// instead of a toast saying it once and losing it.
     pub(crate) exported: Option<ExportedReview>,
-    pub(crate) opencode_busy: bool,
+    pub(crate) destination_busy: bool,
     pub(crate) opencode_loading: bool,
-    pub(crate) opencode_destination: Option<muster_core::opencode::Destination>,
+    pub(crate) destination: Option<muster_core::opencode::Destination>,
     pub(crate) opencode_rounds: Vec<muster_core::opencode::ReviewRound>,
-    pub(crate) opencode_error: Option<String>,
+    pub(crate) destination_error: Option<String>,
     opencode_checkout: Option<String>,
     opencode_generation: u64,
 }
@@ -988,27 +988,40 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    pub(crate) fn set_opencode_destination(
+    pub(crate) fn set_destination(
         &mut self,
         destination: muster_core::opencode::Destination,
         cx: &mut Context<Self>,
     ) {
-        if self.review.opencode_busy || self.review.opencode_loading || self.review.exporting {
+        if self.review.destination_busy || self.review.opencode_loading || self.review.exporting {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
             return;
         };
+        // A destination that cannot be reached is not a destination. Pi is
+        // looked for here rather than at the send, because a person who is
+        // told now can pick something else, and a person told after the send
+        // has a review that went nowhere.
+        if destination == muster_core::opencode::Destination::Pi
+            && muster_core::pi::resolve_program().is_none()
+        {
+            // The toast, not the review's error row: the destination did not
+            // change, so the row would have nothing to sit under.
+            self.push_error("Pi is not installed in a location Muster can run.", cx);
+            cx.notify();
+            return;
+        }
         let checkout_id = checkout_id.clone();
-        self.review.opencode_busy = true;
-        self.review.opencode_error = None;
+        self.review.destination_busy = true;
+        self.review.destination_error = None;
         cx.notify();
         let Some(home) = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .filter(|path| path.is_absolute())
         else {
-            self.review.opencode_busy = false;
-            self.review.opencode_error =
+            self.review.destination_busy = false;
+            self.review.destination_error =
                 Some("HOME is unavailable for OpenCode review storage.".into());
             cx.notify();
             return;
@@ -1022,7 +1035,7 @@ impl TerminalWindow {
         cx.spawn(async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.opencode_busy = false;
+                app.review.destination_busy = false;
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1034,10 +1047,10 @@ impl TerminalWindow {
                 app.review.opencode_loading = false;
                 match result {
                     Ok(()) => {
-                        app.review.opencode_destination = Some(destination);
-                        app.review.opencode_error = None;
+                        app.review.destination = Some(destination);
+                        app.review.destination_error = None;
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1055,7 +1068,7 @@ impl TerminalWindow {
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute())
         else {
-            self.review.opencode_error =
+            self.review.destination_error =
                 Some("HOME is unavailable for OpenCode review storage.".into());
             return;
         };
@@ -1065,8 +1078,8 @@ impl TerminalWindow {
             self.review.opencode_checkout = Some(checkout_id.clone());
             self.review.opencode_rounds.clear();
             self.review.opencode_loading = false;
-            self.review.opencode_destination = None;
-            self.review.opencode_error = None;
+            self.review.destination = None;
+            self.review.destination_error = None;
         }
         if self.review.opencode_loading {
             return;
@@ -1095,7 +1108,7 @@ impl TerminalWindow {
                 }
                 match result {
                     Ok((destination, rounds)) => {
-                        app.review.opencode_destination = destination;
+                        app.review.destination = destination;
                         // Restore immutable round snapshots without overwriting live edits
                         // or colliding with a draft id created since this read began.
                         let notes = app.review.notes.entry(checkout_id.clone()).or_default();
@@ -1106,7 +1119,7 @@ impl TerminalWindow {
                         }
                         app.review.opencode_rounds = rounds;
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1114,12 +1127,43 @@ impl TerminalWindow {
         .detach();
     }
 
-    pub(crate) fn send_review_to_opencode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.opencode_busy
-            || self.review.opencode_loading
-            || self.review.exporting
-            || !can_start_opencode_round(&self.review.opencode_rounds)
-        {
+    /// Opens a new interactive Pi terminal in this checkout with the review as
+    /// its first prompt.
+    ///
+    /// No queue, no session to choose and nothing marked as sent: a send opens
+    /// a terminal, and the terminal is the whole of what happened. The review
+    /// is written to a private file and handed to Pi as one argument, so a long
+    /// review is not a long command line and nothing in it is read by a shell.
+    pub(crate) fn send_review_to_pi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review.destination_busy || self.review.opencode_loading || self.review.exporting {
+            return;
+        }
+        // Where Pi is, and where the prompt is written, are the machine's
+        // answers; what a send does with them is this window's.
+        let Some(program) = muster_core::pi::resolve_program() else {
+            self.review.destination_error =
+                Some("Pi is not installed in a location Muster can run.".into());
+            cx.notify();
+            return;
+        };
+        let Some(app_dir) = muster_core::pi::app_dir() else {
+            self.review.destination_error =
+                Some("HOME is unavailable for Pi review prompts.".into());
+            cx.notify();
+            return;
+        };
+        self.send_review_to_pi_with(program, app_dir, window, cx);
+    }
+
+    /// The send itself, with the machine's answers handed in.
+    pub(crate) fn send_review_to_pi_with(
+        &mut self,
+        program: std::path::PathBuf,
+        app_dir: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.review.destination_busy || self.review.opencode_loading || self.review.exporting {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
@@ -1127,7 +1171,7 @@ impl TerminalWindow {
         };
         let checkout_id = checkout_id.clone();
         let Some(checkout) = self.navigation.checkout(&checkout_id).cloned() else {
-            self.review.opencode_error =
+            self.review.destination_error =
                 Some("The checkout for this review is no longer available.".into());
             cx.notify();
             return;
@@ -1139,7 +1183,125 @@ impl TerminalWindow {
             .find(|repo| repo.id == checkout.repo_id)
             .cloned()
         else {
-            self.review.opencode_error =
+            self.review.destination_error =
+                Some("The repository for this review is no longer available.".into());
+            cx.notify();
+            return;
+        };
+        // Every note in this review, and not only the ones on screen: a send
+        // sends the review, not the file that happens to be open in it. Nothing
+        // is marked as sent, so the same notes are here the next time.
+        let notes = self
+            .review
+            .notes
+            .get(&checkout_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|note| self.review.include_outdated || !note.outdated)
+            .cloned()
+            .collect::<Vec<_>>();
+        if notes.is_empty() {
+            self.review.destination_error = Some("There are no review notes to send.".into());
+            cx.notify();
+            return;
+        }
+        let (date, _) = match review::local_review_timestamp() {
+            Ok(time) => time,
+            Err(error) => {
+                self.review.destination_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let markdown = review::build_review_markdown(
+            &notes,
+            &ReviewContext {
+                branch: checkout.branch.as_deref(),
+                default_branch: repo.default_branch.as_deref(),
+                date: &date,
+                language: crate::document::syntax_language,
+            },
+        );
+        // The instructions the review is read with, and the bound it has to
+        // fit inside: one prompt is one message.
+        let prompt = format!("{}{}", muster_core::review::AGENT_PROMPT_PREFIX, markdown);
+        if let Err(error) = muster_core::review::check_round_prompt(&prompt) {
+            self.review.destination_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.review.destination_busy = true;
+        self.review.destination_error = None;
+        cx.notify();
+        // The prompt is written on a worker, and it is owned from the moment it
+        // is written: a prompt nobody read is removed rather than left lying
+        // in a private folder holding somebody's review.
+        let worker = cx
+            .background_executor()
+            .spawn(async move { muster_core::pi::write_prompt(&app_dir, &prompt) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = worker.await;
+            let _ = view.update_in(cx, move |app, window, cx| {
+                app.review.destination_busy = false;
+                let prompt_file = match result {
+                    Ok(prompt_file) => prompt_file,
+                    Err(error) => {
+                        app.review.destination_error = Some(error);
+                        cx.notify();
+                        return;
+                    }
+                };
+                // The terminal is opened only once the prompt it will read is
+                // on disk: a terminal that opened with nothing to read would be
+                // a terminal that opened wrong.
+                let Some(mut request) = app.prepare_terminal(&checkout_id, cx) else {
+                    // No terminal will read the prompt, and it is removed with
+                    // this closure.
+                    cx.notify();
+                    return;
+                };
+                request.program = Some(program);
+                request.args = Some(muster_core::pi::arguments(prompt_file.path()));
+                request.name = "Pi".into();
+                request.session_type = muster_core::workspace::SessionType::Agent;
+                // The prompt travels with the request: the terminal that reads
+                // it is the one that takes it, and a terminal that never
+                // starts leaves it to be removed.
+                request.prompt = Some(prompt_file);
+                app.start_terminal(request, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn send_review_to_opencode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review.destination_busy
+            || self.review.opencode_loading
+            || self.review.exporting
+            || !can_start_opencode_round(&self.review.opencode_rounds)
+        {
+            return;
+        }
+        let Some((checkout_id, _)) = self.open_diff.as_ref() else {
+            return;
+        };
+        let checkout_id = checkout_id.clone();
+        let Some(checkout) = self.navigation.checkout(&checkout_id).cloned() else {
+            self.review.destination_error =
+                Some("The checkout for this review is no longer available.".into());
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == checkout.repo_id)
+            .cloned()
+        else {
+            self.review.destination_error =
                 Some("The repository for this review is no longer available.".into());
             cx.notify();
             return;
@@ -1151,7 +1313,7 @@ impl TerminalWindow {
             .filter(|note| self.review.include_outdated || !note.outdated)
             .collect::<Vec<_>>();
         if notes.is_empty() {
-            self.review.opencode_error =
+            self.review.destination_error =
                 Some("There are no review notes to send: every note here was already sent.".into());
             cx.notify();
             return;
@@ -1160,7 +1322,7 @@ impl TerminalWindow {
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute())
         else {
-            self.review.opencode_error =
+            self.review.destination_error =
                 Some("HOME is unavailable for OpenCode review storage.".into());
             cx.notify();
             return;
@@ -1168,7 +1330,7 @@ impl TerminalWindow {
         let (date, _) = match review::local_review_timestamp() {
             Ok(value) => value,
             Err(error) => {
-                self.review.opencode_error = Some(error);
+                self.review.destination_error = Some(error);
                 cx.notify();
                 return;
             }
@@ -1186,8 +1348,8 @@ impl TerminalWindow {
             "Muster review · {}",
             checkout.branch.as_deref().unwrap_or(&checkout.id)
         );
-        self.review.opencode_busy = true;
-        self.review.opencode_error = None;
+        self.review.destination_busy = true;
+        self.review.destination_error = None;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
             use muster_core::opencode::{rounds::RoundRequest, Client, Destination, RoundStore};
@@ -1201,7 +1363,7 @@ impl TerminalWindow {
                     store.set_destination(&checkout.id, destination.clone())?;
                     destination
                 }
-                None | Some(Destination::Markdown) => {
+                None | Some(Destination::Markdown) | Some(Destination::Pi) => {
                     return Err(muster_core::opencode::DispatchError::Failed(
                         "OpenCode is not the selected review destination.".into(),
                     ));
@@ -1209,7 +1371,7 @@ impl TerminalWindow {
             };
             let session_id = match &destination {
                 Destination::Opencode { session_id } => session_id.clone(),
-                Destination::OpencodeNew | Destination::Markdown => {
+                Destination::OpencodeNew | Destination::Markdown | Destination::Pi => {
                     unreachable!("resolved destination")
                 }
             };
@@ -1235,7 +1397,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.opencode_busy = false;
+                app.review.destination_busy = false;
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1248,11 +1410,11 @@ impl TerminalWindow {
                 app.review.opencode_loading = false;
                 match result {
                     Ok((destination, rounds, dispatch_error)) => {
-                        app.review.opencode_destination = Some(destination);
+                        app.review.destination = Some(destination);
                         app.review.opencode_rounds = rounds;
-                        app.review.opencode_error = dispatch_error;
+                        app.review.destination_error = dispatch_error;
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1265,7 +1427,7 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.review.opencode_busy || self.review.opencode_loading {
+        if self.review.destination_busy || self.review.opencode_loading {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
@@ -1281,7 +1443,7 @@ impl TerminalWindow {
         else {
             return;
         };
-        self.review.opencode_busy = true;
+        self.review.destination_busy = true;
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
             let client = muster_core::opencode::Client::connect(
@@ -1295,7 +1457,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.opencode_busy = false;
+                app.review.destination_busy = false;
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1309,9 +1471,9 @@ impl TerminalWindow {
                 match result {
                     Ok((flush, rounds)) => {
                         app.review.opencode_rounds = rounds;
-                        app.review.opencode_error = flush.err().map(|error| error.to_string());
+                        app.review.destination_error = flush.err().map(|error| error.to_string());
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1325,7 +1487,7 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.review.opencode_busy {
+        if self.review.destination_busy {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
@@ -1342,7 +1504,7 @@ impl TerminalWindow {
             return;
         };
         let round_id = round_id.to_owned();
-        self.review.opencode_busy = true;
+        self.review.destination_busy = true;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
@@ -1356,7 +1518,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.opencode_busy = false;
+                app.review.destination_busy = false;
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1370,9 +1532,9 @@ impl TerminalWindow {
                 match result {
                     Ok(rounds) => {
                         app.review.opencode_rounds = rounds;
-                        app.review.opencode_error = None;
+                        app.review.destination_error = None;
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1386,7 +1548,7 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.review.opencode_busy {
+        if self.review.destination_busy {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
@@ -1403,7 +1565,7 @@ impl TerminalWindow {
             return;
         };
         let round_id = round_id.to_owned();
-        self.review.opencode_busy = true;
+        self.review.destination_busy = true;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
@@ -1413,7 +1575,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.opencode_busy = false;
+                app.review.destination_busy = false;
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1427,9 +1589,9 @@ impl TerminalWindow {
                 match result {
                     Ok(rounds) => {
                         app.review.opencode_rounds = rounds;
-                        app.review.opencode_error = None;
+                        app.review.destination_error = None;
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1480,14 +1642,14 @@ impl TerminalWindow {
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute())
         else {
-            self.review.opencode_error =
+            self.review.destination_error =
                 Some("HOME is unavailable for OpenCode review storage.".into());
             cx.notify();
             return;
         };
         let worker_checkout_id = checkout_id.clone();
         self.review.forgetting = true;
-        self.review.opencode_error = None;
+        self.review.destination_error = None;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
@@ -1520,7 +1682,7 @@ impl TerminalWindow {
                             if let Some(rounds) = rounds {
                                 app.review.opencode_rounds = rounds;
                             }
-                            app.review.opencode_error = None;
+                            app.review.destination_error = None;
                         } else if let Some((active, _)) = app.open_diff.clone() {
                             // The diff this was asked about is closed or is another one,
                             // so what was forgotten is not what it is showing.
@@ -1541,7 +1703,7 @@ impl TerminalWindow {
                             cx,
                         );
                     }
-                    Err(error) => app.review.opencode_error = Some(error.to_string()),
+                    Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1615,7 +1777,7 @@ impl TerminalWindow {
     }
 
     pub(crate) fn export_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.exporting || self.review.opencode_busy || self.review.opencode_loading {
+        if self.review.exporting || self.review.destination_busy || self.review.opencode_loading {
             return;
         }
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
@@ -1693,7 +1855,7 @@ impl TerminalWindow {
                         if app.open_diff.as_ref().map(|(id, _)| id.as_str())
                             == Some(checkout_id.as_str())
                         {
-                            app.review.opencode_destination =
+                            app.review.destination =
                                 Some(muster_core::opencode::Destination::Markdown);
                         }
                         // The path stays in the toolbar for as long as this

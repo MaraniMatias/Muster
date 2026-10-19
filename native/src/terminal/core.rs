@@ -15,6 +15,7 @@ use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
 
 use super::modes::TerminalModes;
+use super::pi_status::{self, PiProgramStatus, PiTaskState};
 
 /// Longest window title kept, in characters.
 ///
@@ -170,6 +171,23 @@ pub enum TerminalEvent {
         /// `respond` takes `(cols, rows, cell_width, cell_height)`.
         respond: Box<dyn FnOnce(u16, u16, u16, u16) -> String + Send>,
     },
+    /// Pi asked whether the host understands program status.
+    ///
+    /// The handshake, and it is the only way Pi is told that it may report:
+    /// without the answer, Pi keeps its state to itself.
+    PiStatusQuery,
+    /// Pi reported the state of the task in front of it.
+    PiTaskState(PiTaskState),
+    /// Pi's progress indicator: something is running, or is not.
+    PiProgress(bool),
+    /// A command started in the shell.
+    ///
+    /// The boundary a report from before it cannot cross: what Pi said was
+    /// about the command that was running, and a new command is a new process
+    /// in front of the shell.
+    CommandStarted,
+    /// A command finished in the shell.
+    CommandFinished,
     Bell,
 }
 
@@ -184,6 +202,11 @@ impl std::fmt::Debug for TerminalEvent {
             TerminalEvent::ClipboardRequested => write!(f, "ClipboardRequested"),
             TerminalEvent::ColorRequested { index, .. } => write!(f, "ColorRequested({index})"),
             TerminalEvent::TextAreaSizeRequested { .. } => write!(f, "TextAreaSizeRequested"),
+            TerminalEvent::PiStatusQuery => write!(f, "PiStatusQuery"),
+            TerminalEvent::PiTaskState(state) => write!(f, "PiTaskState({state:?})"),
+            TerminalEvent::PiProgress(working) => write!(f, "PiProgress({working})"),
+            TerminalEvent::CommandStarted => write!(f, "CommandStarted"),
+            TerminalEvent::CommandFinished => write!(f, "CommandFinished"),
             TerminalEvent::Bell => write!(f, "Bell"),
         }
     }
@@ -338,7 +361,7 @@ impl TerminalCore {
                 self.advance(&bytes[offset..=index]);
                 let marker = std::mem::take(&mut self.osc);
                 if !self.osc_oversized {
-                    self.apply_shell_marker(&marker);
+                    self.apply_osc(&marker);
                 }
                 self.handle_events_at_position();
                 offset = index + 1;
@@ -380,6 +403,21 @@ impl TerminalCore {
         self.osc.push(byte);
     }
 
+    /// What one OSC payload means, applied at the position it was written.
+    ///
+    /// Three sequences are read here and everything else is left alone: the
+    /// shell's own markers, Pi's program status, and the progress indicator
+    /// every terminal understands.
+    fn apply_osc(&mut self, payload: &[u8]) {
+        if payload.starts_with(b"133;") {
+            self.apply_shell_marker(payload);
+        } else if let Some(data) = payload.strip_prefix(b"7501;") {
+            self.apply_program_status(data);
+        } else if let Some(data) = payload.strip_prefix(b"9;") {
+            self.apply_progress(data);
+        }
+    }
+
     /// What one OSC 133 payload means, applied at the position it was written.
     ///
     /// `B` is the prompt the person can still edit, `C` says a command is
@@ -395,10 +433,14 @@ impl TerminalCore {
         // read as somebody else's sequence.
         let (code, rest) = text.split_once(';').unwrap_or((text.as_ref(), ""));
         match code {
-            "D" => self.command_exit = rest.parse().ok(),
+            "D" => {
+                self.command_exit = rest.parse().ok();
+                self.pending.push(TerminalEvent::CommandFinished);
+            }
             "C" => {
                 self.command_exit = None;
                 self.prompt_anchor = None;
+                self.pending.push(TerminalEvent::CommandStarted);
             }
             "B" if !self.is_alt_screen() => {
                 let grid = self.term.grid();
@@ -409,6 +451,35 @@ impl TerminalCore {
                 });
             }
             _ => {}
+        }
+    }
+
+    /// What one OSC 7501 payload means.
+    ///
+    /// The payload is refused whole when it is malformed, so a broken report
+    /// never becomes half a state.
+    fn apply_program_status(&mut self, data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        match pi_status::parse_program_status(text) {
+            Some(PiProgramStatus::Query) => self.pending.push(TerminalEvent::PiStatusQuery),
+            Some(PiProgramStatus::State(state)) => {
+                self.pending.push(TerminalEvent::PiTaskState(state))
+            }
+            None => {}
+        }
+    }
+
+    /// What one OSC 9 payload means, when it is the progress indicator.
+    fn apply_progress(&mut self, data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        if let Some(progress) = pi_status::parse_progress(text) {
+            self.pending.push(TerminalEvent::PiProgress(
+                progress == pi_status::PiProgress::Working,
+            ));
         }
     }
 
@@ -1084,6 +1155,86 @@ mod tests {
                     .any(|cell| cell.c == 'v'));
             }
         }
+    }
+
+    #[test]
+    fn a_program_status_split_across_reads_is_read_once() {
+        for ending in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let status = [b"\x1b]7501;state=working".as_slice(), ending].concat();
+            for split in 1..status.len() {
+                let mut terminal = TerminalCore::new(80, 24, 20);
+                terminal.feed(&status[..split]);
+                terminal.feed(&status[split..]);
+                let states = terminal
+                    .take_events()
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, TerminalEvent::PiTaskState(PiTaskState::Working))
+                    })
+                    .count();
+                assert_eq!(
+                    states, 1,
+                    "a status split at byte {split} is read once, not twice and not never"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_program_status_query_and_a_progress_indicator_are_read() {
+        let mut terminal = TerminalCore::new(80, 24, 20);
+        terminal.feed(b"\x1b]7501;?\x07");
+        terminal.feed(b"\x1b]9;4;3\x07");
+        terminal.feed(b"\x1b]9;4;0\x07");
+        let events = terminal.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PiStatusQuery)),
+            "the handshake is read"
+        );
+        let progress = events
+            .iter()
+            .filter_map(|event| match event {
+                TerminalEvent::PiProgress(working) => Some(*working),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(progress, vec![true, false], "both progress values are read");
+    }
+
+    #[test]
+    fn a_malformed_program_status_is_not_a_state() {
+        let mut terminal = TerminalCore::new(80, 24, 20);
+        terminal.feed(b"\x1b]7501;state=working:colour=red\x07");
+        terminal.feed(b"\x1b]7501;state=typing\x07");
+        assert!(
+            terminal
+                .take_events()
+                .iter()
+                .all(|event| !matches!(event, TerminalEvent::PiTaskState(_))),
+            "half a status is not a status"
+        );
+    }
+
+    #[test]
+    fn a_command_boundary_is_reported() {
+        let mut terminal = TerminalCore::new(80, 24, 20);
+        terminal.feed(b"\x1b]133;C\x07");
+        terminal.feed(b"\x1b]133;D;0\x07");
+        let events = terminal.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::CommandStarted)),
+            "a command that started is reported"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::CommandFinished)),
+            "a command that finished is reported"
+        );
     }
 
     #[test]

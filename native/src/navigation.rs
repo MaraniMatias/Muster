@@ -388,6 +388,12 @@ pub(crate) fn session_title(name: &str, app: Option<&str>, title: Option<&str>) 
             return title.into();
         }
     }
+    // The name the operating system gives is the program's own, and a row that
+    // said `pi` where the program says `Pi` would be the only place in the
+    // panel that spells a name differently from the thing it names.
+    if foreground_program(app) == Some(ForegroundProgram::Pi) {
+        return "Pi".into();
+    }
     app.map(str::to_owned).unwrap_or_else(|| name.into())
 }
 
@@ -734,6 +740,8 @@ mod tests {
             session_title("sh", Some("opencode"), Some("OC | OpenCode")),
             "opencode"
         );
+        // Pi is the program, and the row says the program's own name for it.
+        assert_eq!(session_title("sh", Some("pi"), None), "Pi");
     }
     #[test]
     fn a_header_path_gives_up_segments_and_not_its_tail() {

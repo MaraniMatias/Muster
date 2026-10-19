@@ -912,7 +912,7 @@ fn worktree_creation_cannot_submit_while_defaults_are_loading(cx: &mut TestAppCo
 /// `pub(super)` because the title bar's own tests draw over the same window
 /// rather than standing up a second fixture for it.
 pub(super) struct Fixture {
-    _directory: TempDir,
+    pub(super) directory: TempDir,
     pub(super) handle: AnyWindowHandle,
     pub(super) view: Entity<TerminalWindow>,
     backend: Arc<TerminalBackend>,
@@ -999,7 +999,7 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
     .unwrap();
     cx.run_until_parked();
     Fixture {
-        _directory: directory,
+        directory,
         handle,
         view,
         backend,
@@ -3765,6 +3765,127 @@ async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut 
             .try_find(format!("select-checkout-{checkout}"))
             .is_none());
         assert!(window.try_find(format!("actions-{repo_id}")).is_none());
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// The words a Pi row says, and whether it moves.
+///
+/// The three answers the panel has, and the one it does not: a turn that
+/// stopped to ask something is parsed and kept, and drawn as nothing, because
+/// the panel has no shape for a question this program asked.
+#[test]
+fn a_pi_row_says_what_pi_is_doing() {
+    use crate::sidebar::pi_row_state;
+    use crate::terminal::PiTaskState;
+
+    let working = pi_row_state(Some(PiTaskState::Working));
+    assert_eq!(working.note, "working");
+    assert!(
+        working.working,
+        "a turn that is running is the one that moves"
+    );
+    assert!(!working.failed);
+
+    let failed = pi_row_state(Some(PiTaskState::Error));
+    assert_eq!(failed.note, "last task failed");
+    assert!(!failed.working);
+    assert!(failed.failed);
+
+    let done = pi_row_state(Some(PiTaskState::Done));
+    assert_eq!(done.note, "task complete");
+    assert!(!done.working);
+    assert!(!done.failed);
+
+    let blocked = pi_row_state(Some(PiTaskState::Blocked));
+    assert_eq!(blocked.note, "");
+    assert!(!blocked.working);
+    assert!(!blocked.failed);
+
+    let idle = pi_row_state(None);
+    assert_eq!(idle.note, "");
+    assert!(!idle.working);
+    assert!(!idle.failed);
+}
+
+/// A terminal row for a Pi that is working says so, and says the program's name.
+///
+/// The whole path, from the operating system's own answer about what is in
+/// front of the shell to the words on the row: a link called `pi` is a process
+/// the OS calls Pi, and the report it writes is the one the row wears.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[gpui_kit::test]
+async fn a_pi_terminal_row_says_what_pi_is_doing(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let pi = fixture.directory.path().join("pi");
+    std::os::unix::fs::symlink("/bin/sh", &pi).unwrap();
+    let id = format!("pi-session-{}", std::process::id());
+    let checkout = fixture.checkout.clone();
+    let command = format!(
+        "{} -c 'while :; do printf \"\\033]7501;state=working\\007\"; sleep 0.1; done'\n",
+        pi.display()
+    );
+    fixture.view.update(cx, |app, cx| {
+        let mut config = TerminalSessionConfig::new(
+            id.clone(),
+            fixture.directory.path().to_owned(),
+            80,
+            24,
+            Some(PathBuf::from("/bin/sh")),
+        );
+        // An interactive shell, because job control is what puts a command in
+        // front of the shell.
+        config.args = Some(Vec::new());
+        config.status_interval = Duration::from_millis(20);
+        let shell = app.owner.spawn(config).unwrap();
+        let terminal =
+            cx.new(|cx| TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx));
+        app.terminals.insert(
+            id.clone(),
+            LiveTerminal {
+                checkout_id: checkout.clone(),
+                view: terminal,
+                shell: shell.clone(),
+            },
+        );
+        app.navigation.add_session(
+            Session {
+                id: id.clone(),
+                checkout_id: checkout,
+                name: "sh".into(),
+                created_at: "test".into(),
+                session_type: SessionType::Shell,
+                status: SavedSessionStatus::Active,
+            },
+            None,
+        );
+        shell.session.send_text(&command).unwrap();
+    });
+
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(format!("select-session-{id}"))
+            .and_then(|row| row.label().map(str::to_owned))
+            .is_some_and(|label| label.contains("working"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let label = window
+            .find(format!("select-session-{id}"))
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            label.contains("Pi"),
+            "the row names the program that is in front: {label}"
+        );
+        assert!(
+            label.contains("working"),
+            "the row says what the program is doing: {label}"
+        );
     })
     .unwrap();
     dispose(&fixture, cx);
