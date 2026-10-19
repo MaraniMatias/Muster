@@ -130,6 +130,15 @@ test('an outer deadline bounds a stalled window query', { skip: process.platform
   assert.equal(result.status, 124, result.stderr);
 }));
 
+test('publication preserves the literal Debian prerelease separator in Bash', () => {
+  const workflow = read('.github/workflows/linux-release.yml');
+  const conversion = workflow.match(/^\s*deb_version=.*$/m)?.[0];
+  assert.ok(conversion, 'publication version conversion is missing');
+  const result = spawnSync('bash', ['-c', `TAG=v1.0.0-rc.3\n${conversion}\nprintf '%s' "$deb_version"`], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '1.0.0~rc.3');
+});
+
 test('publication is downstream of read-only finalization and never rebuilds source', () => {
   const workflow = read('.github/workflows/linux-release.yml');
   assert.match(workflow, /needs: \[source, linux, macos\]/);

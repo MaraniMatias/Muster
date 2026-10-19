@@ -193,7 +193,7 @@ jobs:
           [[ "$(<SOURCE_SHA)" == "$SHA" ]]
           sha256sum -c SHA256SUMS
           shopt -s nullglob
-          deb_version="${TAG#v}"; deb_version="${deb_version/-/~}"
+          deb_version="${TAG#v}"; deb_version="${deb_version/-/\~}"
           files=(*); [[ ${#files[@]} == 4 ]]
           [[ -s "muster_${deb_version}_amd64.deb" && -s "Muster_${TAG#v}_arm64.zip" ]]
           if git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG"; then
