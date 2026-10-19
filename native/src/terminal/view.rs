@@ -2571,7 +2571,7 @@ mod tests {
         // belong to the focused element, and a test that skipped it would be
         // testing a window nobody is typing into.
         cx.simulate_click(gpui_kit::point(px(4.), px(4.)), Default::default());
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes(platform_paste_keystroke());
 
         let pasted = wait_for_char(&session, 'p');
         let _ = session.close().wait();
@@ -2629,6 +2629,14 @@ mod tests {
         let pasted = wait_for_char(&session, 'p');
         let _ = session.close().wait();
         assert!(pasted, "the menu's Paste is the grid's paste");
+    }
+
+    fn platform_paste_keystroke() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-shift-v"
+        }
     }
 
     /// A session whose child prints `selection-text` and then waits for input.
@@ -2704,7 +2712,7 @@ mod tests {
         let text = format!("muster-paste-marker{}", "x".repeat(MAX_PASTE_BYTES));
         assert!(text.len() > MAX_PASTE_BYTES);
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes(platform_paste_keystroke());
         let heard = heard.borrow().clone();
         assert_eq!(heard.len(), 1, "the window was told: {heard:?}");
         assert!(
@@ -2724,7 +2732,7 @@ mod tests {
         let secret = "muster-".repeat(64) + "marker";
         let text = format!("{secret}{}", "x".repeat(MAX_PASTE_BYTES));
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes(platform_paste_keystroke());
         let heard = heard.borrow().clone();
         assert_eq!(heard.len(), 1);
         assert!(
