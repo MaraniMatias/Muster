@@ -406,6 +406,44 @@ pub(crate) struct LiveTerminal {
     pub(crate) view: Entity<TerminalView>,
     pub(crate) shell: Arc<OwnedShell>,
 }
+
+/// A terminal that is about to be opened.
+///
+/// The request is built before the terminal starts, because a program may have
+/// to be handed something to read first: Pi reads a review from a file before
+/// it says anything, and a terminal that opened with nothing to read would be
+/// a terminal that opened wrong.
+pub(crate) struct TerminalRequest {
+    /// The session's id.
+    pub(crate) id: String,
+    /// The checkout it belongs to.
+    pub(crate) checkout_id: String,
+    /// The name its row wears.
+    pub(crate) name: String,
+    /// Where it starts.
+    pub(crate) cwd: PathBuf,
+    /// The program to run.
+    ///
+    /// `None` is the person's own login shell, which the session starts with
+    /// the flag a login shell takes.
+    pub(crate) program: Option<PathBuf>,
+    /// The arguments it runs with.
+    ///
+    /// `None` leaves the session's own default. A program's arguments are
+    /// handed to the process as arguments and are never a string a shell
+    /// reads, so nothing in them can become a command.
+    pub(crate) args: Option<Vec<String>>,
+    /// The prompt the program is about to read, if it is reading one.
+    ///
+    /// It is owned here, because the program may never read it: a terminal
+    /// that does not start leaves the prompt to be removed rather than
+    /// leaving somebody's review in a file nobody will look at.
+    pub(crate) prompt: Option<muster_core::pi::PromptFile>,
+    /// What kind of session this is.
+    pub(crate) session_type: SessionType,
+    /// The navigation revision the request was made under.
+    pub(crate) revision: u64,
+}
 pub(crate) struct Rename {
     pub(crate) id: String,
     pub(crate) input: Entity<InputState>,
@@ -800,8 +838,25 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.closing {
+        let Some(request) = self.prepare_terminal(checkout_id, cx) else {
             return;
+        };
+        self.start_terminal(request, window, cx);
+    }
+
+    /// Decides on a terminal in `checkout_id` and reserves its place.
+    ///
+    /// Nothing is started here. A caller may still have to write something the
+    /// program is going to read -- Pi reads a review from a file before it
+    /// says anything -- and a terminal that opened with nothing to read would
+    /// be a terminal that opened wrong.
+    pub(crate) fn prepare_terminal(
+        &mut self,
+        checkout_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalRequest> {
+        if self.closing {
+            return None;
         }
         if self.removing_checkouts.contains(checkout_id) {
             self.push_error(
@@ -809,15 +864,13 @@ impl TerminalWindow {
                 cx,
             );
             cx.notify();
-            return;
+            return None;
         }
-        let Some(checkout) = self.navigation.checkout(checkout_id) else {
-            return;
-        };
+        let checkout = self.navigation.checkout(checkout_id)?;
         if checkout.is_missing || self.navigation.archived.contains(checkout_id) {
             self.push_error("This directory is unavailable.", cx);
             cx.notify();
-            return;
+            return None;
         }
         let cwd = PathBuf::from(&checkout.path);
         let checkout_id = checkout_id.to_owned();
@@ -837,12 +890,48 @@ impl TerminalWindow {
         self.navigation
             .pending
             .insert(id.clone(), checkout_id.clone());
-        let config =
-            TerminalSessionConfig::new(id.clone(), cwd, INITIAL_COLUMNS, INITIAL_ROWS, None);
         let name = crate::terminal::login_shell()
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shell".into());
+        Some(TerminalRequest {
+            id,
+            checkout_id,
+            name,
+            cwd,
+            program: None,
+            args: None,
+            prompt: None,
+            session_type: SessionType::Shell,
+            revision,
+        })
+    }
+
+    /// Starts the terminal a request describes and puts it on the panel.
+    ///
+    /// The arguments are the program's own: they are handed to the process as
+    /// arguments and are never a string a shell reads, so nothing in them can
+    /// become a command.
+    pub(crate) fn start_terminal(
+        &mut self,
+        request: TerminalRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let TerminalRequest {
+            id,
+            checkout_id,
+            name,
+            cwd,
+            program,
+            args,
+            prompt,
+            session_type,
+            revision,
+        } = request;
+        let mut config =
+            TerminalSessionConfig::new(id.clone(), cwd, INITIAL_COLUMNS, INITIAL_ROWS, program);
+        config.args = args;
         let owner = self.owner.clone();
         let worker = cx
             .background_executor()
@@ -861,13 +950,20 @@ impl TerminalWindow {
                                     checkout_id,
                                     name,
                                     created_at: String::new(),
-                                    session_type: SessionType::Shell,
+                                    session_type,
                                     status: SavedSessionStatus::Active,
                                 },
                                 (app.latest_terminal_request.as_deref() == Some(&id))
                                     .then_some(revision),
                             );
                         if accepted {
+                            // The terminal is live, and the program in it is
+                            // about to read the prompt: the file stays, because
+                            // a prompt removed before that is a review Pi
+                            // never saw.
+                            if let Some(prompt) = prompt {
+                                prompt.hand_over();
+                            }
                             let terminal = cx.new(|cx| {
                                 TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
                             });
@@ -1698,6 +1794,29 @@ impl TerminalWindow {
                 .any(|terminal| terminal.checkout_id == checkout_id)
     }
 
+    /// Whether a live Pi process is working in this checkout.
+    ///
+    /// The operating system's own answer, asked of every PTY this window owns.
+    /// The sidebar's list of terminals cannot answer it: a terminal may be
+    /// closed, or moved to another worktree, while the program it started keeps
+    /// running in the directory it was started in. A worktree removed under a
+    /// running Pi is a worktree somebody loses work in.
+    pub(crate) fn checkout_has_running_pi(&self, checkout_id: &str) -> bool {
+        let Some(checkout) = self.navigation.checkout(checkout_id) else {
+            return false;
+        };
+        let Ok(processes) = self.owner.backend().pi_process_locations() else {
+            // The operating system would not say at all. Fail closed: a
+            // worktree that stays is a nuisance, and a worktree that goes
+            // under a running process is a loss.
+            return true;
+        };
+        let checkout = Path::new(&checkout.canonical_path);
+        processes.iter().any(|(_, directory)| {
+            muster_core::pi::protects_checkout(directory.as_deref(), checkout)
+        })
+    }
+
     /// Follow the task name into the branch, until the person takes the branch
     /// over by typing in it. Editing it is not reversible here: a rename would
     /// silently move a branch the person had already chosen.
@@ -2186,6 +2305,14 @@ impl TerminalWindow {
             );
             return;
         }
+        if self.checkout_has_running_pi(&id) {
+            self.worktree_removal_error(
+                request_id,
+                "Pi is running in this worktree. Close it before archiving this worktree.".into(),
+                cx,
+            );
+            return;
+        }
         match self.navigation.archive(&id) {
             Ok(()) => {
                 self.worktree_removal = None;
@@ -2271,6 +2398,14 @@ impl TerminalWindow {
             self.worktree_removal_error(
                 request_id,
                 "Close every terminal session and wait for pending shell creation before deleting this worktree.".into(),
+                cx,
+            );
+            return;
+        }
+        if self.checkout_has_running_pi(&id) {
+            self.worktree_removal_error(
+                request_id,
+                "Pi is running in this worktree. Close it before deleting this worktree.".into(),
                 cx,
             );
             return;

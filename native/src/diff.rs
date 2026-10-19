@@ -724,17 +724,21 @@ impl TerminalWindow {
         let has_pending_opencode =
             !crate::review::can_start_opencode_round(&self.review.opencode_rounds);
         let include_outdated = self.review.include_outdated;
-        let opencode_busy = self.review.opencode_busy;
+        let destination_busy = self.review.destination_busy;
         let opencode_loading = self.review.opencode_loading;
         let opencode_selected = matches!(
-            self.review.opencode_destination,
+            self.review.destination,
             Some(
                 muster_core::opencode::Destination::Opencode { .. }
                     | muster_core::opencode::Destination::OpencodeNew
             )
         );
-        let opencode_error = opencode_selected
-            .then(|| self.review.opencode_error.clone())
+        // Pi is a destination too, and it is not a round: it opens a terminal
+        // rather than delivering a message, so nothing about it is recorded.
+        let pi_selected = self.review.destination == Some(muster_core::opencode::Destination::Pi);
+        let agent_selected = opencode_selected || pi_selected;
+        let destination_error = agent_selected
+            .then(|| self.review.destination_error.clone())
             .flatten();
         let opencode_rounds = self.review.opencode_rounds.clone();
         let opencode_status = opencode_selected
@@ -746,7 +750,7 @@ impl TerminalWindow {
                     crate::review::opencode_round_state(round.status)
                 )
             });
-        let opencode_session = match (&self.review.opencode_destination, opencode_selected) {
+        let opencode_session = match (&self.review.destination, opencode_selected) {
             (Some(muster_core::opencode::Destination::Opencode { session_id }), true) => {
                 Some(session_id.clone())
             }
@@ -1193,9 +1197,17 @@ impl TerminalWindow {
                                 // corners it keeps.
                                 .child({
                                     let send_action = weak.clone();
+                                    let pi_action = weak.clone();
                                     let export_action = weak.clone();
                                     let choose = weak.clone();
-                                    let busy = exporting_review || opencode_busy || opencode_loading;
+                                    let busy = exporting_review || destination_busy || opencode_loading;
+                                    let label = if pi_selected {
+                                        "Send to Pi"
+                                    } else if opencode_selected {
+                                        "Send to OpenCode"
+                                    } else {
+                                        "Save"
+                                    };
                                     div().id("review-export").test_support().flex().flex_none()
                                         .child(
                                             zed_button("review-primary-action")
@@ -1207,11 +1219,12 @@ impl TerminalWindow {
                                                 // beside it says where it goes. Naming the
                                                 // format here would make the default read as a
                                                 // special case of itself.
-                                                .label(if opencode_selected { "Send to OpenCode" } else { "Save" })
-                                                .accessibility_label(if opencode_selected { "Send to OpenCode" } else { "Save" })
+                                                .label(label)
+                                                .accessibility_label(label)
                                                 .disabled(note_count == 0 || busy || (opencode_selected && has_pending_opencode))
                                                 .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
-                                                .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
+                                                .when(pi_selected, |button| button.on_click(move |_, window, cx| { let _ = pi_action.update(cx, |app, cx| app.send_review_to_pi(window, cx)); }))
+                                                .when(!agent_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
                                         )
                                         .child(
                                             zed_button("review-destination")
@@ -1224,16 +1237,19 @@ impl TerminalWindow {
                                                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                                                     let markdown = choose.clone();
                                                     let opencode = choose.clone();
+                                                    let pi = choose.clone();
                                                     menu.item(PopupMenuItem::new("Markdown").on_click(move |_, _, cx| {
-                                                        let _ = markdown.update(cx, |app, cx| app.set_opencode_destination(muster_core::opencode::Destination::Markdown, cx));
+                                                        let _ = markdown.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Markdown, cx));
                                                     })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
                                                         let _ = opencode.update(cx, |app, cx| {
-                                                            let destination = match app.review.opencode_destination.clone() {
+                                                            let destination = match app.review.destination.clone() {
                                                                 Some(value @ muster_core::opencode::Destination::Opencode { .. }) => value,
                                                                 _ => muster_core::opencode::Destination::OpencodeNew,
                                                             };
-                                                            app.set_opencode_destination(destination, cx);
+                                                            app.set_destination(destination, cx);
                                                         });
+                                                    })).item(PopupMenuItem::new("Pi").on_click(move |_, _, cx| {
+                                                        let _ = pi.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Pi, cx));
                                                     }))
                                                 })
                                         )
@@ -1301,7 +1317,7 @@ impl TerminalWindow {
                                 .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(session.clone())))))
                             .when_some(opencode_status, |row, status| row.child(div().id("opencode-review-status").test_support()
                                 .text_size(px(11.)).text_color(roles.text_muted).child(status)))
-                            .when_some(opencode_error, |row, error| row.child(div().id("opencode-review-error").test_support()
+                            .when_some(destination_error, |row, error| row.child(div().id("opencode-review-error").test_support()
                                 .text_size(px(11.)).text_color(roles.status.danger_text).child(error)))
                             .when_some(opencode_rounds.iter().find(|round| opencode_selected && (round.status.is_pending()
                                 || round.status == muster_core::opencode::RoundStatus::Unknown))
@@ -1327,10 +1343,10 @@ impl TerminalWindow {
                                             })
                                         }
                                     };
-                                    row.child(button.disabled(opencode_busy || opencode_loading))
+                                    row.child(button.disabled(destination_busy || opencode_loading))
                                         .when(status == muster_core::opencode::RoundStatus::Unknown, |row| row.child(
                                             zed_button("recheck-unknown-opencode-round").small().compact().label("Check delivery again")
-                                                .disabled(opencode_busy || opencode_loading)
+                                                .disabled(destination_busy || opencode_loading)
                                                 .on_click(move |_, window, cx| {
                                                     let _ = reconcile.update(cx, |app, cx| app.reconcile_opencode_round(&reconcile_id, window, cx));
                                                 })))

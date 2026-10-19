@@ -53,3 +53,6 @@ pub mod review;
 /// A client for the OpenCode service a person started, and the durable rounds that
 /// make sending a review to it safe to retry.
 pub mod opencode;
+
+/// Where Pi is, and the private file a review is written to before Pi reads it.
+pub mod pi;

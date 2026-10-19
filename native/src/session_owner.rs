@@ -85,6 +85,15 @@ impl SessionOwner {
         Ok(shell)
     }
 
+    /// The PTY backend this window's shells run in.
+    ///
+    /// The window asks it what is running when a worktree is about to go:
+    /// a process that is still working in a directory is a fact the sidebar's
+    /// own list of terminals cannot answer.
+    pub(crate) fn backend(&self) -> &Arc<TerminalBackend> {
+        &self.backend
+    }
+
     pub(crate) fn close_one(&self, id: &str) -> Result<(), String> {
         // A per-window shutdown may be closing this same session. Serializing
         // both paths ensures exactly one caller begins the PTY close sequence;

@@ -8,6 +8,23 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **Pi is a review destination, and its state is on the panel.** Pi reports
+  through OSC 7501, and the terminal now reads it: a bounded payload, a
+  handshake answered with the same question, and a report believed only while
+  the operating system says Pi is what is in front of the shell. The sidebar
+  row for a Pi terminal wears Pi's glyph, a spinner while a turn is running,
+  and the words `working`, `task complete` or `last task failed`. A review can
+  be sent to Pi as well: it is written to a private file under the app's own
+  folder and handed to a new Pi terminal in the checkout as its first prompt.
+  There is no queue, no session to choose and nothing marked as sent -- a send
+  opens a terminal, and the terminal is the whole of what happened. A prompt
+  that no Pi read -- a terminal that failed to start, a window that went away
+  before the terminal opened -- is removed rather than left behind. The
+  per-checkout review destination in `~/.muster/opencode-rounds.json` carries
+  `pi` beside `markdown` and `opencode`, which is a change to that file's
+  shape: it is made in place, and a file this build cannot read is refused by
+  name.
+
 ## 1.0.0-rc.3
 
 - Ship both the native macOS Apple Silicon ZIP and an Ubuntu 24.04 x86_64

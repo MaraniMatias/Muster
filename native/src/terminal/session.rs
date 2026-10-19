@@ -47,6 +47,7 @@ use super::core::{CursorSnapshot, PromptAnchor, RowSnapshot, TerminalCore, Termi
 use super::keys::{encode_key, KeyPress};
 use super::modes::TerminalModes;
 use super::paste::{encode_paste, encode_paste_confirmed, PasteError};
+use super::pi_status::{self, PiTaskState, PiTracker};
 use super::write_queue::{EnqueueError, WriteQueue};
 use crate::pty::{OutputSink, ReaderEnd, ReaderEndSink, SpawnOptions, TerminalBackend};
 use crate::workspace::TerminalProcessState;
@@ -88,6 +89,14 @@ const REPLY_ROOM_RETRY: Duration = Duration::from_millis(2);
 
 /// How often a close looks at what is still in flight.
 const DRAIN_POLL: Duration = Duration::from_millis(2);
+
+/// How many program-status replies one session hands to its child.
+///
+/// The reply is a handshake, and a handshake is not a conversation: a program
+/// that keeps asking is not a program asking once. The bound is what keeps a
+/// terminal from being written to by its own output, and it is far past the
+/// number of times a person starts Pi in one shell.
+const MAX_PI_STATUS_REPLIES: u64 = 64;
 
 // ---------------------------------------------------------------------------------------------
 // What the host has to answer
@@ -396,6 +405,19 @@ pub struct Foreground {
     pub app: Option<String>,
 }
 
+/// Whether what is in front of the shell is Pi.
+///
+/// The operating system's own answer, and the only one that counts: a terminal
+/// may print anything at all, and what says a report came from Pi is that the
+/// OS names Pi as the process in front of the shell.
+fn foreground_is_pi(foreground: &Foreground) -> bool {
+    foreground.running
+        && foreground
+            .app
+            .as_deref()
+            .is_some_and(muster_core::pi::is_pi)
+}
+
 /// How the output stream ended, if it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -436,6 +458,13 @@ pub struct SessionStatus {
     /// The last status read that failed, kept so a failure stays visible instead
     /// of being reported as an idle terminal.
     pub poll_error: Option<String>,
+    /// What Pi says about the task in front of it, if Pi is what is in front.
+    ///
+    /// `None` is most of the time, and it means two different things that are
+    /// deliberately the same: nothing is running, and what is running is not
+    /// Pi. The panel draws a row the same either way, and the difference is
+    /// only in what may be believed.
+    pub pi_task: Option<PiTaskState>,
 }
 
 /// One grid cell as `(row, column)`, in visible screen coordinates.
@@ -701,6 +730,13 @@ struct Shared {
     applied: Mutex<(u16, u16)>,
     /// Output chunks parsed. The unit the wake coalescing is measured in.
     chunks: AtomicU64,
+    /// What Pi has said about the task in front of it.
+    ///
+    /// Written by the reader thread and read by the view, so it is behind a
+    /// lock like the rest of the state two threads share.
+    pi: Mutex<PiTracker>,
+    /// How many program-status replies this session has handed to its child.
+    pi_replies: AtomicU64,
 }
 
 impl Shared {
@@ -717,6 +753,8 @@ impl Shared {
             requested: Mutex::new((cols, rows)),
             applied: Mutex::new((cols, rows)),
             chunks: AtomicU64::new(0),
+            pi: Mutex::new(PiTracker::default()),
+            pi_replies: AtomicU64::new(0),
         }
     }
 
@@ -1021,6 +1059,10 @@ impl Inner {
             poll_error: None,
         };
 
+        // The OS has said what is in front of the shell, so the doubt a
+        // command start raised is answered, and a report that named a process
+        // which is no longer there is forgotten.
+        let pi_is_foreground = foreground_is_pi(&polled.foreground);
         let changed = {
             let mut stored = self
                 .side
@@ -1032,6 +1074,12 @@ impl Inner {
             *stored = polled;
             changed
         };
+        self.side
+            .shared
+            .pi
+            .lock()
+            .expect("terminal pi state poisoned")
+            .confirmed(pi_is_foreground);
         if changed {
             // Only when the answer actually changed. A poll that wakes a view
             // every 250 ms is a view that repaints for nothing four times a
@@ -1069,12 +1117,20 @@ impl Inner {
             .lock()
             .expect("terminal stream poisoned")
             .clone();
+        let pi_task = self
+            .side
+            .shared
+            .pi
+            .lock()
+            .expect("terminal pi state poisoned")
+            .task(foreground_is_pi(&polled.foreground));
         SessionStatus {
             generation: polled.generation,
             shell: polled.shell,
             foreground: polled.foreground,
             stream,
             poll_error: side_protocol_error(&self.side).or(polled.poll_error),
+            pi_task,
         }
     }
 
@@ -1266,6 +1322,44 @@ fn handle_events(side: &ReaderSide, events: Vec<TerminalEvent>) -> Result<(), St
                     side,
                     respond(cols, rows, metrics.width, metrics.height).into_bytes(),
                 )?;
+            }
+            // The handshake, answered the only way it can be: the same
+            // question back. A program that asked is told the host listens,
+            // and from then on it reports.
+            TerminalEvent::PiStatusQuery => {
+                if side.shared.pi_replies.fetch_add(1, Ordering::Relaxed) < MAX_PI_STATUS_REPLIES {
+                    push_reply(side, pi_status::PROGRAM_STATUS_REPLY.as_bytes().to_vec())?;
+                }
+            }
+            TerminalEvent::PiTaskState(state) => {
+                side.shared
+                    .pi
+                    .lock()
+                    .expect("terminal pi state poisoned")
+                    .report(state);
+            }
+            TerminalEvent::PiProgress(working) => {
+                side.shared
+                    .pi
+                    .lock()
+                    .expect("terminal pi state poisoned")
+                    .progress(working);
+            }
+            // The shell's own boundaries: what a program said before them was
+            // said about the command that was running then.
+            TerminalEvent::CommandStarted => {
+                side.shared
+                    .pi
+                    .lock()
+                    .expect("terminal pi state poisoned")
+                    .command_started();
+            }
+            TerminalEvent::CommandFinished => {
+                side.shared
+                    .pi
+                    .lock()
+                    .expect("terminal pi state poisoned")
+                    .command_finished();
             }
             TerminalEvent::Bell => {
                 side.shared.bell.fetch_add(1, Ordering::Relaxed);
@@ -2902,6 +2996,72 @@ mod tests {
             answer[3..answer.len() - 1].iter().all(u8::is_ascii_digit),
             "a mode flag list, not something half-written: {answer:?}"
         );
+    }
+
+    /// The shell under Pi's name.
+    ///
+    /// The operating system names a process by the file it was started from --
+    /// its first argument on macOS, its `comm` on Linux -- so a link called `pi`
+    /// is a process the panel will call Pi. That is the whole of what the
+    /// foreground identity is: the OS's own answer, and not anything the
+    /// terminal was told.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn fake_pi(dir: &Path) -> PathBuf {
+        let pi = dir.join("pi");
+        std::os::unix::fs::symlink("/bin/sh", &pi).expect("the shell is linked");
+        pi
+    }
+
+    #[test]
+    fn a_program_status_query_is_answered_with_the_same_question() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let reply_file = dir.path().join("reply.bin");
+
+        // Raw mode, or the line discipline would hold a reply that has no
+        // newline until something else arrives.
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\'; dd bs=1 of='{}' 2>/dev/null",
+            reply_file.display()
+        );
+        let (_backend, session, _wake) = start(config(dir.path(), &script));
+
+        let read = || std::fs::read(&reply_file).unwrap_or_default();
+        wait_for("the program-status query to be answered", || {
+            read() == b"\x1b]7501;?\x1b\\"
+        });
+
+        session.close().wait().expect("the session closes");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_program_status_is_believed_while_pi_is_in_front_and_forgotten_when_it_is_not() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let pi = fake_pi(dir.path());
+        // An interactive shell, because job control is what puts a command in
+        // front of the shell: a shell that runs a script has no foreground
+        // group of its own to give away.
+        let (_backend, session, _wake) = start(interactive_config(dir.path()));
+        // The report is written again and again: a report that arrives before
+        // the operating system has said what is in front is not believed yet,
+        // and the next one is.
+        session
+            .send_text(&format!(
+                "{} -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do printf \"\\033]7501;state=working\\007\"; sleep 0.1; done'\n",
+                pi.display()
+            ))
+            .expect("the command is sent");
+
+        wait_for("the program status to be believed", || {
+            session.status().pi_task == Some(PiTaskState::Working)
+        });
+        // The process is gone, so what it said is about a process that is not
+        // there any more, and the row must not still be claiming a task.
+        wait_for("the status to be forgotten when Pi is gone", || {
+            session.status().pi_task.is_none()
+        });
+
+        session.close().wait().expect("the session closes");
     }
 
     #[test]
