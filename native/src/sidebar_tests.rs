@@ -3567,6 +3567,19 @@ fn shortcuts_respect_platform_and_keyboard_layout() {
 async fn closing_a_busy_terminal_requires_consent_and_keeps_its_sibling(cx: &mut TestAppContext) {
     let fixture = open(cx);
     let id = fixture.sessions[0].clone();
+    // Busy is the last poll's answer about the foreground process group, so it
+    // is waited for rather than assumed: a close that lands before the poll has
+    // seen `cat` is a close of an idle terminal, which asks nothing and takes
+    // the very prompt this test is about.
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .terminals
+            .get(&id)
+            .is_some_and(|terminal| terminal.shell.session.status().foreground.running)
+    })
+    .await;
     cx.update_window(fixture.handle, |_, window, cx| {
         // The close is behind the row's hover, so the pointer arrives on the row first.
         window.hover(SharedString::from(format!("select-session-{id}")), cx);
