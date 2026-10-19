@@ -2,12 +2,11 @@
 
 Muster is a desktop workspace for people working with coding agents in Git worktrees. It keeps each repository and worktree’s files, diffs, and terminals together. Leave notes on specific diff lines, then send them to OpenCode, start a fresh Pi review session, or export them as Markdown. Muster does not run models; other CLI agents can be started in its terminals.
 
-> **This repository is mid-migration.** The shipped app is parked under
-> [`legacy/`](legacy) and the root is the new native app. Everything below
-> describes the shipped one, except **Layout**, **Build and run** and **State**,
-> which describe the native tree.
+> **Native app:** releases target macOS (Apple Silicon) and Ubuntu 24.04
+> (x86_64). The former Tauri app is retained under [`legacy/`](legacy) as
+> reference material; it is not the released application.
 
-- **Platforms:** macOS (Apple Silicon) · Linux (amd64 / arm64)
+- **Native release targets:** macOS (Apple Silicon) · Ubuntu 24.04 (x86_64)
 - **License:** MIT
 
 ![Muster](./docs/muster.png)
@@ -36,19 +35,10 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 Download the [latest release](https://github.com/MaraniMatias/Muster/releases/latest).
 
-- **macOS:** Open the DMG and move Muster to Applications. If macOS blocks the first launch, run:
+- **macOS (Apple Silicon):** Unzip `Muster-macos-arm64.zip` and move `Muster.app` to Applications. This unsigned, unnotarized build may be blocked by Gatekeeper; assess the source and build before bypassing quarantine.
 
-  ```sh
-  xattr -dr com.apple.quarantine /Applications/Muster.app
-  ```
-
-- **Debian / Ubuntu:** `sudo apt install ./muster_<version>_amd64.deb` (or `_arm64.deb`).
-- **Other Linux:** Make the AppImage executable and run it:
-
-  ```sh
-  chmod +x Muster_<version>_amd64.AppImage
-  ./Muster_<version>_amd64.AppImage
-  ```
+- **Ubuntu 24.04 x86_64 (native app):** install the `.deb` with `sudo apt install ./muster_<version>_amd64.deb`. This is the initial native Linux package target; Linux ARM64 and AppImage are not provided by the native release path.
+- **Other Linux:** No native package is currently provided.
 
 For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.
 
@@ -74,16 +64,7 @@ esac
 tail -n 60 "$LOG"
 ```
 
-If it reports an unsupported database schema, Muster cannot migrate it. Quit Muster first, back up the database, then remove it; the next launch creates an empty workspace. This deletes registrations, review notes, rounds, and saved UI state, but not repository files. Settings and review exports are stored separately.
-
-```sh
-case "$(uname -s)" in
-  Darwin) DB="$HOME/Library/Application Support/dev.muster.workspace/muster.sqlite3" ;;    # macOS
-  *)      DB="${XDG_DATA_HOME:-$HOME/.local/share}/dev.muster.workspace/muster.sqlite3" ;; # Linux
-esac
-cp -v "$DB" "${DB%.sqlite3}.$(date +%s).sqlite3" &&
-  rm -fv "$DB" "$DB"-wal "$DB"-shm "$DB"-journal
-```
+Native workspace and review state are JSON files under `~/.muster`; preferences are in `~/.muster/settings.json`. A malformed or unsupported workspace/review file is refused rather than migrated or overwritten. Back up the named file before removing it; deleting it starts that store empty. Repository files are not affected.
 
 ### Why does macOS say the app is damaged or can’t be opened?
 
@@ -115,7 +96,7 @@ It deletes that checkout’s registration and attached notes, rounds, and UI sta
 
 ## Privacy and local data
 
-Workspace data and review notes stay local; Muster has no telemetry, and it never backs up or migrates your database — that is yours to do before any reset (see [Muster won’t start](#muster-wont-start)). Your agent controls what it sends to its model provider.
+Workspace data, review rounds and preferences are stored locally under `~/.muster`; review exports use the selected export location. Muster has no telemetry. Native workspace and review state are not migrated from Legacy SQLite. Back up files before manually resetting them.
 
 ## Maintainers
 
@@ -137,7 +118,9 @@ writes and group-safe shutdown exist once.
 ## Build and run
 
 Requires the Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) and,
-for the security audit only, Node 22.
+for the security audit only, Node 22. Linux builds also require Vulkan, X11,
+xcb, XKB, freetype and fontconfig development packages; Ubuntu package names
+and the native Linux release process are documented in [release safety](docs/release-safety.md).
 
 ```sh
 rustup run 1.97.1 cargo run --locked -p muster
@@ -164,10 +147,9 @@ line counts counted against Git, a searchable worktree picker in the title bar,
 worktree creation and archive-or-delete dialogs, drag to reorder or move a
 terminal between worktrees, and a window state file.
 
-**Not ported yet:** review notes on diff lines, delivery to an agent, live
-preferences, OSC 8 links, file activation and terminal search. Those are the next milestone, and
-[`docs/native-rust-migration/interface-parity.md`](docs/native-rust-migration/interface-parity.md)
-is the specification for them.
+The native app includes review notes and agent delivery/export, editable
+preferences, file activation and terminal search. See the [native migration
+notes](docs/native-rust-migration/README.md) for implementation details.
 
 [`Terminal implementation status`](docs/native-rust-migration/ghostty-reference.md)
 records the implemented behavior, remaining parity work, and measured costs (§12).

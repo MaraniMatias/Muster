@@ -1,0 +1,150 @@
+name: Native release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA to validate and package
+        required: true
+        type: string
+      mode:
+        description: Validate only, or publish the validated artifacts
+        required: true
+        type: choice
+        options: [validate, publish]
+        default: validate
+      tag:
+        description: New release tag matching the checked-out manifests (publish only)
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate requested source and tag
+        env:
+          SHA: ${{ inputs.sha }}
+          MODE: ${{ inputs.mode }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init source && cd source
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$SHA"
+          [[ "$(git rev-parse FETCH_HEAD)" == "$SHA" ]]
+          version="$(git show FETCH_HEAD:native/Cargo.toml | awk -F'\"' '/^version = \"/{print $2; exit}')"
+          root_version="$(git show FETCH_HEAD:Cargo.toml | awk -F'\"' '/^version = \"/{print $2; exit}')"
+          lock_version="$(git show FETCH_HEAD:Cargo.lock | awk '/^name = "muster"$/{f=1;next} f&&/^version = /{gsub(/\"/,"");print $3;exit}')"
+          [[ -n "$version" && "$version" == "$lock_version" && "$version" == "$root_version" ]]
+          if [[ "$MODE" == publish ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]]
+            [[ "$TAG" =~ ^v(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ ]]
+            [[ "$TAG" == "v$version" ]]
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then echo "tag exists: $TAG"; exit 1; else status=$?; [[ $status == 2 ]]; fi
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { components: rustfmt, clippy }
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - run: sudo apt-get update && sudo apt-get install -y git libvulkan-dev libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfreetype6-dev libfontconfig1-dev dpkg-dev xvfb x11-utils mesa-vulkan-drivers
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: . -> target }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs scripts/linux-release.test.mjs
+      - run: node scripts/audit-rust.mjs
+      - run: cargo build --locked --release -p muster
+      - run: scripts/package-linux-deb.sh
+      - name: Runtime-only container smoke test
+        run: |
+          docker run --rm --network host -v "$PWD/dist:/artifacts:ro" -v "$PWD/scripts/linux-package-smoke.sh:/smoke.sh:ro" ubuntu:24.04 bash /smoke.sh /artifacts/$(basename dist/*.deb)
+      - name: Checksum package and record source
+        env:
+          SHA: ${{ inputs.sha }}
+        run: cd dist && sha256sum *.deb > SHA256SUMS && printf '%s\n' "$SHA" > SOURCE_SHA
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ inputs.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: '${{ inputs.sha }}', fetch-depth: 1 }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { components: rustfmt, clippy }
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs scripts/linux-release.test.mjs && node scripts/audit-rust.mjs
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release -p muster
+      - run: test "$(uname -m)" = arm64 && lipo -archs target/release/Muster | grep -qw arm64
+      - run: scripts/bundle-macos.sh
+      - name: Validate bundle version
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          expected="$(awk -F'\"' '/^version = \"/{print $2; exit}' native/Cargo.toml)"
+          actual="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Muster.app/Contents/Info.plist)"
+          test "$actual" = "$expected"
+          test "$(lipo -archs dist/Muster.app/Contents/MacOS/Muster)" = arm64
+      - name: Checksum bundle and record source
+        env:
+          SHA: ${{ inputs.sha }}
+        run: cd dist && ditto -c -k --sequesterRsrc --keepParent Muster.app Muster-macos-arm64.zip && shasum -a 256 Muster-macos-arm64.zip > SHA256SUMS && printf '%s\n' "$SHA" > SOURCE_SHA
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ inputs.sha }}
+          path: |
+            dist/Muster-macos-arm64.zip
+            dist/SHA256SUMS
+            dist/SOURCE_SHA
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    if: inputs.mode == 'publish'
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v7
+        with: { pattern: '*-${{ inputs.sha }}', path: dist, merge-multiple: false }
+      - name: Validate final artifacts, annotate tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(dist/linux-${SHA}/*.deb); mac=(dist/macos-${SHA}/Muster-macos-arm64.zip)
+          [[ ${#debs[@]} == 1 && ${#mac[@]} == 1 ]]
+          for dir in "dist/linux-${SHA}" "dist/macos-${SHA}"; do [[ "$(<"$dir/SOURCE_SHA")" == "$SHA" ]]; (cd "$dir" && sha256sum -c SHA256SUMS); done
+          expected="${TAG#v}"; expected="${expected/-/~}"
+          [[ "$(dpkg-deb -f "${debs[0]}" Version)" == "$expected" ]]
+          [[ "$(dpkg-deb -f "${debs[0]}" Architecture)" == amd64 ]]
+          contents="$(dpkg-deb --contents "${debs[0]}")"
+          for file in './usr/bin/Muster' './usr/share/applications/muster.desktop' './usr/share/icons/hicolor/512x512/apps/muster.png' './usr/share/doc/muster/copyright'; do grep -Fq "$file" <<<"$contents"; done
+          unzip -Z1 "${mac[0]}" | grep -q 'Muster.app/Contents/MacOS/Muster'
+          unzip -p "${mac[0]}" Muster.app/Contents/Info.plist | grep -q "<string>${TAG#v}</string>"
+          [[ "$TAG" =~ ^v(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ ]]
+          git init source && cd source && git remote add origin "https://github.com/$REPO.git" && git fetch --no-tags --depth=1 origin "$SHA"
+          if git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG"; then echo "tag exists: $TAG"; exit 1; else status=$?; [[ $status == 2 ]]; fi
+          object="$(gh api "repos/$REPO/git/tags" -f tag="$TAG" -f message="Release $TAG" -f object="$SHA" -f type=commit --jq .sha)"
+          gh api "repos/$REPO/git/refs" -X POST -f ref="refs/tags/$TAG" -f sha="$object"
+          release_flags=()
+          if [[ "$TAG" == *-* ]]; then release_flags+=(--prerelease --latest=false); fi
+          gh release create "$TAG" "$GITHUB_WORKSPACE/dist/linux-${SHA}/$(basename "${debs[0]}")" "$GITHUB_WORKSPACE/dist/linux-${SHA}/SHA256SUMS" "$GITHUB_WORKSPACE/dist/linux-${SHA}/SOURCE_SHA" "$GITHUB_WORKSPACE/dist/macos-${SHA}/Muster-macos-arm64.zip" "$GITHUB_WORKSPACE/dist/macos-${SHA}/SHA256SUMS" "$GITHUB_WORKSPACE/dist/macos-${SHA}/SOURCE_SHA" --repo "$REPO" --verify-tag --title "$TAG" --notes "Native macOS arm64 and Ubuntu 24.04 amd64 artifacts built from $SHA." "${release_flags[@]}"
