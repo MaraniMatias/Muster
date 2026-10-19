@@ -1,52 +1,92 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
+import { verifyPayload } from './finalize-native-release.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const read = (file) => readFileSync(path.join(root, file), 'utf8');
+const read = file => readFileSync(path.join(root, file), 'utf8');
+const sha = 'a'.repeat(40);
 
-test('Linux package derives runtime dependencies from the linked binary and validates package contents', () => {
-  const script = read('scripts/package-linux-deb.sh');
-  assert.match(script, /dpkg-shlibdeps -O -e/);
-  assert.match(script, /dpkg-deb -f/);
-  assert.match(script, /\.\/debian\//);
-  assert.match(script, /\[\[ "\$binary" = \/\* \]\]/);
-  assert.match(script, /\[\[ "\$out" = \/\* \]\]/);
-  assert.match(script, /readelf -h/);
-  assert.match(script, /usr\/share\/doc\/muster\/copyright/);
-  assert.match(script, /only amd64 is supported/);
-  assert.match(script, /Architecture: amd64/);
-  assert.match(script, /muster\.desktop/);
-  assert.match(script, /native\/assets\/icon\.png/);
-});
+function temporary(run) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'muster-release-'));
+  try { run(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
 
-test('workflow builds the requested SHA once and publishes its retained artifact only in publish mode', () => {
-  const workflow = read('.github/workflows/linux-release.yml');
-  assert.match(workflow, /\^\[0-9a-f\]\{40\}\$/);
-  assert.match(workflow, /cargo build --locked --release -p muster/);
-  assert.match(workflow, /needs: \[linux, macos\]/);
-  assert.match(workflow, /--repo/);
-  assert.match(workflow, /--latest=false/);
-  assert.match(workflow, /git ls-remote/);
-  assert.match(workflow, /if: inputs\.mode == 'publish'/);
-  assert.match(workflow, /actions\/download-artifact/);
-  assert.match(workflow, /docker run --rm --network host/);
-  assert.match(workflow, /dist\/SHA256SUMS/);
-  assert.match(workflow, /dist\/SOURCE_SHA/);
-  assert.match(workflow, /macos-15-arm64|test "\$\(uname -m\)" = arm64/);
-  assert.doesNotMatch(workflow, /dist\/\{Muster-macos-arm64/);
-  assert.match(workflow, /gh release create/);
-  assert.doesNotMatch(workflow, /git push/);
-  assert.match(workflow, /git\/refs.*POST/);
-});
-
-test('Debian version conversion preserves stable ordering and prerelease semantics', () => {
-  const script = path.join(root, 'scripts/debian-version.sh');
-  const run = (version) => spawnSync('bash', [script, version], { encoding: 'utf8' });
+test('Debian versions preserve RC upgrade ordering and reject invalid input', () => {
+  const run = version => spawnSync('bash', [path.join(root, 'scripts/debian-version.sh'), version], { encoding: 'utf8' });
   assert.equal(run('1.0.0-rc.2').stdout.trim(), '1.0.0~rc.2');
   assert.equal(run('0.4.3+build.7').stdout.trim(), '0.4.3+build.7');
-  assert.notEqual(run('1.0.0-').status, 0);
+  for (const invalid of ['1.0.0-', 'garbage', '1.0.0\nDepends: evil']) assert.notEqual(run(invalid).status, 0);
+});
+
+test('finalization refuses wrong SHA, tampering, missing targets and unexpected files', () => temporary(dir => {
+  const filename = 'muster_1.0.0~rc.2_amd64.deb';
+  const bytes = Buffer.from('test payload');
+  const checksum = createHash('sha256').update(bytes).digest('hex');
+  writeFileSync(path.join(dir, filename), bytes);
+  writeFileSync(path.join(dir, 'SOURCE_SHA'), `${sha}\n`);
+  writeFileSync(path.join(dir, 'SHA256SUMS'), `${checksum}  ${filename}\n`);
+  assert.deepEqual(verifyPayload(dir, sha, filename), bytes);
+  assert.throws(() => verifyPayload(dir, 'b'.repeat(40), filename), /source SHA mismatch/);
+  assert.throws(() => verifyPayload(dir, sha, 'missing.zip'), /unexpected artifact files/);
+  writeFileSync(path.join(dir, filename), 'tampered');
+  assert.throws(() => verifyPayload(dir, sha, filename), /checksum mismatch/);
+  writeFileSync(path.join(dir, 'extra'), 'unapproved');
+  assert.throws(() => verifyPayload(dir, sha, filename), /unexpected artifact files/);
+}));
+
+function smoke(dir, app, window) {
+  const executable = (name, body) => {
+    const file = path.join(dir, name);
+    writeFileSync(file, `#!/bin/bash\n${body}\n`, { mode: 0o755 });
+    return file;
+  };
+  const appPath = executable('app', app);
+  executable('setsid', 'exec "$@"');
+  executable('timeout', 'shift; exec "$@"');
+  executable('sleep', '/bin/sleep 0.03');
+  executable('xwininfo', window);
+  return spawnSync('bash', [path.join(root, 'scripts/linux-window-smoke.sh'), path.join(dir, 'log'), appPath], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}` }, encoding: 'utf8', timeout: 5000,
+  });
+}
+
+test('startup smoke rejects a clean exit before any window', () => temporary(dir => {
+  const result = smoke(dir, 'exit 0', 'exit 1');
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /app exited before window/);
+}));
+
+test('startup smoke rejects a crash even if a stale window has the expected title', () => temporary(dir => {
+  const result = smoke(dir, 'exit 7', '/bin/sleep 0.05; echo Muster');
+  assert.equal(result.status, 1, result.stderr);
+}));
+
+test('startup smoke requires a window, not just a live process', () => temporary(dir => {
+  const result = smoke(dir, 'exec /bin/sleep 10', 'exit 1');
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /window not observed/);
+}));
+
+test('startup smoke accepts a window only while the process remains alive', () => temporary(dir => {
+  const result = smoke(dir, 'exec /bin/sleep 10', 'echo Muster');
+  assert.equal(result.status, 0, result.stderr);
+}));
+
+test('publication is downstream of read-only finalization and never rebuilds source', () => {
+  const workflow = read('.github/workflows/linux-release.yml');
+  assert.match(workflow, /needs: \[source, linux, macos\]/);
+  assert.match(workflow, /if: inputs\.mode == 'publish'/);
+  const publish = workflow.slice(workflow.indexOf('\n  publish:'));
+  assert.match(publish, /needs: finalize/);
+  assert.match(publish, /--prerelease --latest=false/);
+  assert.match(publish, /Tag already exists/);
+  assert.match(publish, /status=\$\?; \[\[ \$status == 2 \]\]/);
+  assert.match(publish, /--draft/);
+  assert.doesNotMatch(publish, /uses: actions\/checkout|cargo |node |git push/);
 });

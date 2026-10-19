@@ -33,11 +33,12 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 ## Install
 
-Download the [latest release](https://github.com/MaraniMatias/Muster/releases/latest).
+Choose a native candidate from [Releases](https://github.com/MaraniMatias/Muster/releases).
+The `/latest` link may still select the frozen Legacy release. Existing candidates
+may contain only a macOS archive; the new workflow adds Linux packages to future releases.
 
-- **macOS (Apple Silicon):** Unzip `Muster-macos-arm64.zip` and move `Muster.app` to Applications. This unsigned, unnotarized build may be blocked by Gatekeeper; assess the source and build before bypassing quarantine.
-
-- **Ubuntu 24.04 x86_64 (native app):** install the `.deb` with `sudo apt install ./muster_<version>_amd64.deb`. This is the initial native Linux package target; Linux ARM64 and AppImage are not provided by the native release path.
+- **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
+- **Ubuntu 24.04 x86_64:** When the release includes a `.deb`, install it with `sudo apt install ./muster_<version>_amd64.deb`. RC versions use Debian's `~` notation, e.g. `1.0.0~rc.3`. Linux ARM64 and AppImage are not provided by the native release path.
 - **Other Linux:** No native package is currently provided.
 
 For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.
@@ -54,14 +55,14 @@ For native OpenCode integration, install and run [OpenCode](https://opencode.ai)
 
 ### Muster won’t start
 
-Check the startup log first:
+The native app logs to stderr, not Legacy's log file. Quit any running instance,
+then start the binary from a terminal to see the error:
 
 ```sh
-case "$(uname -s)" in
-  Darwin) LOG="$HOME/Library/Logs/dev.muster.workspace/Muster.log" ;;                       # macOS
-  *)      LOG="${XDG_DATA_HOME:-$HOME/.local/share}/dev.muster.workspace/logs/Muster.log" ;; # Linux
-esac
-tail -n 60 "$LOG"
+# Linux
+MUSTER_LOG=debug Muster
+# macOS, when installed in Applications
+MUSTER_LOG=debug /Applications/Muster.app/Contents/MacOS/Muster
 ```
 
 Native workspace and review state are JSON files under `~/.muster`; preferences are in `~/.muster/settings.json`. A malformed or unsupported workspace/review file is refused rather than migrated or overwritten. Back up the named file before removing it; deleting it starts that store empty. Repository files are not affected.
@@ -158,8 +159,8 @@ The app uses one dark appearance. Native state lives in
 lock protects it and shutdown flushes the latest accepted navigation snapshot.
 Git discovery/counting stays active at a slower cadence in hidden windows.
 
-`legacy/` keeps the last shipped version (v0.22.0) for reference and for its
-users until the native app covers it.
+`legacy/` keeps the former Tauri release (v0.22.0) for reference. It is not built
+or packaged by the native release workflow.
 
 ## License
 
