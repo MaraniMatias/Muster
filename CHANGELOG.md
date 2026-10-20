@@ -8,6 +8,12 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **A Mac layout's symbols are typed, not prefixed.** ⌥⇧H is ◊ on a US
+  layout, and the terminal now sends that character to the shell as text
+  instead of prefixing it with the meta escape a shell reads as a command.
+  Option on its own is still the meta key, which is what ESC in front of a
+  key means.
+
 - **Pi is a review destination, and its state is on the panel.** Pi reports
   through OSC 7501, and the terminal now reads it: a bounded payload, a
   handshake answered with the same question, and a report believed only while
