@@ -31,9 +31,13 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 ## Install
 
-Choose a native candidate from [Releases](https://github.com/MaraniMatias/Muster/releases).
-The `/latest` link may still select the frozen Legacy release. Existing candidates
-may contain only a macOS archive; the new workflow adds Linux packages to future releases.
+The current candidate is **v1.0.0-rc.6**:
+[`Muster_1.0.0-rc.6_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.6/Muster_1.0.0-rc.6_arm64.zip) for macOS,
+[`muster_1.0.0-rc.6_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.6/muster_1.0.0-rc.6_amd64.deb) for Ubuntu.
+
+It is a pre-release, so GitHub's `Latest` badge still selects the frozen Legacy
+release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Muster/releases)
+page. Existing candidates may contain only a macOS archive; the new workflow adds Linux packages to future releases.
 
 - **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
 - **Ubuntu 24.04 x86_64:** When the release includes a `.deb`, install it with `sudo apt install ./muster_<version>_amd64.deb`. Download filenames use `-rc.3`; the package's internal Debian version uses `~rc.3` for correct upgrade ordering. Linux ARM64 and AppImage are not provided by the native release path.
