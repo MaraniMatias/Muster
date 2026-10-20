@@ -89,9 +89,11 @@ destructive action into a misleading neutral action. Native controls and
 in-app commands use the default arrow cursor; reserve the pointing hand for
 actual external links.
 
-Use one compact geometry system across screens: 4px corners on controls,
-8px corners on overlays, a small set of sizes for compact rows/toolbars and
-regular actions, and consistent input/select heights within a form. Prefer
+Use one compact geometry system across screens: 4px corners on buttons,
+square hairline borders on form fields, 8px corners on overlays, a small set of
+sizes for compact rows/toolbars and regular actions, and consistent input/select
+heights within a form. Draft preferences use checkboxes rather than switches.
+Confirmations use GPUI Kit dialogs; native file and directory pickers remain native. Prefer
 semantic toolkit sizes and shared helpers over one-off dimensions. Keep hover,
 pressed, selected and focus-visible distinct; a selected row must remain
 selected while hovered. Selected navigation uses its own surface and text

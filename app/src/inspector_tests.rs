@@ -3398,8 +3398,8 @@ async fn dirty_document_navigation_waits_for_cancel_or_discard(cx: &mut TestAppC
     })
     .unwrap();
     open_path("second.txt", cx);
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     assert_eq!(
         fixture.view.read_with(cx, |app, cx| app
@@ -3420,7 +3420,7 @@ async fn dirty_document_navigation_waits_for_cancel_or_discard(cx: &mut TestAppC
     );
 
     open_path("second.txt", cx);
-    cx.simulate_prompt_answer("Discard");
+    answer_confirmation(fixture.handle, "Discard", cx);
     cx.run_until_parked();
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
@@ -3467,8 +3467,8 @@ async fn app_quit_waits_for_dirty_document_decisions(cx: &mut TestAppContext) {
     cx.update(crate::menus::install);
     cx.update_window(fixture.handle, |_, window, cx| window.press("cmd-q", cx))
         .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     assert!(fixture
         .view
@@ -3505,8 +3505,8 @@ async fn dirty_document_window_close_can_be_cancelled(cx: &mut TestAppContext) {
             .update(cx, |app, cx| app.request_window_close(window, cx));
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     assert!(fixture
         .view
@@ -3561,7 +3561,7 @@ async fn dirty_document_save_conflict_keeps_draft_and_pending_destination(cx: &m
     })
     .unwrap();
     std::fs::write(fixture.root.join("first.txt"), "external edit").unwrap();
-    cx.simulate_prompt_answer("Save");
+    answer_confirmation(fixture.handle, "Save", cx);
     cx.run_until_parked();
     // The refusal is the window's toast rather than a line in the action bar: the bar
     // is Legacy's, and it says what the draft needs rather than what went wrong.
@@ -3634,7 +3634,7 @@ async fn uncertain_publication_blocks_navigation_until_durability_retry(cx: &mut
         app.document_view.as_mut().unwrap().durability_uncertain = true;
     });
     open("second.txt", cx);
-    assert!(!cx.has_pending_prompt());
+    assert!(!confirmation_open(fixture.handle, cx));
     assert_eq!(
         fixture
             .view
@@ -3693,7 +3693,7 @@ async fn dirty_document_navigation_applies_only_after_successful_save(cx: &mut T
     })
     .unwrap();
     open("second.txt", cx);
-    cx.simulate_prompt_answer("Save");
+    answer_confirmation(fixture.handle, "Save", cx);
     cx.run_until_parked();
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
@@ -3749,7 +3749,7 @@ async fn navigation_requested_while_saving_keeps_newer_edits_until_decided(
         });
     })
     .unwrap();
-    assert!(!cx.has_pending_prompt());
+    assert!(!confirmation_open(fixture.handle, cx));
     fixture.view.update(cx, |app, _| {
         app.document_view.as_mut().unwrap().saving = false
     });
@@ -3759,8 +3759,8 @@ async fn navigation_requested_while_saving_keeps_newer_edits_until_decided(
             .update(cx, |app, cx| app.continue_document_transition(window, cx));
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     cx.update_window(fixture.handle, |_, _, cx| {
         assert_eq!(editor_text(&fixture, cx), "original first edit newer edit");
@@ -3804,7 +3804,7 @@ async fn navigation_requested_during_formatting_is_deferred_until_idle(cx: &mut 
         });
     })
     .unwrap();
-    assert!(!cx.has_pending_prompt());
+    assert!(!confirmation_open(fixture.handle, cx));
     fixture.view.update(cx, |app, _| {
         app.document_view.as_mut().unwrap().formatting = false
     });
@@ -3814,14 +3814,14 @@ async fn navigation_requested_during_formatting_is_deferred_until_idle(cx: &mut 
             .update(cx, |app, cx| app.continue_document_transition(window, cx));
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
+    assert!(confirmation_open(fixture.handle, cx));
     assert_eq!(
         fixture
             .view
             .read_with(cx, |app, _| app.document_target.as_ref().unwrap().1.clone()),
         "first.txt"
     );
-    cx.simulate_prompt_answer("Cancel");
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     cx.update_window(fixture.handle, |_, _, cx| {
         assert_eq!(editor_text(&fixture, cx), "original draft");
@@ -3873,7 +3873,7 @@ async fn a_document_transition_with_no_destination_asks_nothing(cx: &mut TestApp
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(!cx.has_pending_prompt());
+    assert!(!confirmation_open(fixture.handle, cx));
     fixture.view.update(cx, |app, _| {
         assert!(app.document_view.as_ref().unwrap().is_dirty());
         assert!(app.pending_document_transition.is_none());
@@ -3936,7 +3936,7 @@ async fn a_finished_format_with_no_destination_asks_nothing(cx: &mut TestAppCont
             .formatting
     })
     .await;
-    assert!(!cx.has_pending_prompt());
+    assert!(!confirmation_open(fixture.handle, cx));
     fixture.view.update(cx, |app, _| {
         assert!(app.document_view.as_ref().unwrap().is_dirty());
         assert!(app.pending_document_transition.is_none());

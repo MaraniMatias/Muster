@@ -955,7 +955,7 @@ impl TerminalWindow {
                                         Select::new(picker)
                                             .id("review-range-start")
                                             .xsmall()
-                                            .rounded(px(4.))
+                                            .rounded_none()
                                             .bg(roles.surface_base)
                                             .menu_width(px(96.))
                                             .accessibility_label("First line of the range"),
@@ -971,7 +971,7 @@ impl TerminalWindow {
                                 .w_full()
                                 .mt_2()
                                 .bg(roles.surface_base)
-                                .rounded(px(4.))
+                                .rounded_none()
                                 .px_2()
                                 .py_1()
                                 .font_family(UI_FONT_FAMILY)
@@ -1311,7 +1311,7 @@ impl TerminalWindow {
                                 .text_color(roles.text_muted).child(format!("{note_count} {}", if note_count == 1 { "note" } else { "notes" }))))
                             .when(has_outdated, |row| {
                                 let toggle = weak.clone();
-                                row.child(gpui_kit::component::checkbox::Checkbox::new("review-outdated")
+                                row.child(crate::theme::checkbox("review-outdated", roles)
                                     .checked(include_outdated).label("Include outdated notes")
                                     .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
                             })
@@ -1351,7 +1351,7 @@ impl TerminalWindow {
                                                     .id("review-opencode-search")
                                                     .small()
                                                     .bg(roles.surface_base)
-                                                    .rounded(px(4.))
+                                                    .rounded_none()
                                                     .aria_label("Search OpenCode sessions")
                                                     .w(px(150.)),
                                             )

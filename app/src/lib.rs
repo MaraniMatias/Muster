@@ -12,6 +12,9 @@ pub mod about;
 /// writes through `muster_core::files`.
 pub mod document;
 
+/// Cross-platform confirmation dialogs.
+mod confirmation;
+
 /// Central checkout diff previews.
 mod diff;
 

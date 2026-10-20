@@ -11,8 +11,8 @@
 //! overlays live in its own unpublished crate, and the toolkit's widgets are
 //! a different design system on the same `gpui` core. So the shape of a
 //! control is set here too: [`install`] gives the theme Zed's two corner
-//! radii (4px for a control, 8px for an overlay) and [`zed_button`] gives every
-//! button Zed's borderless fill. What the toolkit still decides on its own is
+//! radii (4px for a button, 8px for an overlay) and [`zed_button`] gives every
+//! button Zed's borderless fill. Form fields keep square, hairline borders. What the toolkit still decides on its own is
 //! the *size* ladder — 20/24/32px where Zed's is 22/28/32 — because it hardcodes
 //! those in each widget's render and no theme token reaches them.
 //!
@@ -32,9 +32,12 @@
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle, LanguageConfig};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{px, rgb, rgba, App, ElementId, Hsla, Styled};
+use gpui_kit::{
+    px, rgb, rgba, App, ElementId, Hsla, InteractiveElement, StatefulInteractiveElement, Styled,
+};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
@@ -455,9 +458,9 @@ pub fn install(cx: &mut App) {
         // number: it is the one its dropdown menus and popovers read, and a
         // menu that rounds 4px where every Zed menu rounds 8px is the one
         // shape difference a menu cannot hide. The controls that share that
-        // token — buttons through [`zed_button`], the app's own fields —
-        // name Zed's 4px where they are built, because a control is not an
-        // overlay and a 8px corner on a 24px control is a pill.
+        // token name their shape where they are built: 4px for buttons through
+        // [`zed_button`], square corners for form fields. Neither inherits the
+        // overlay radius, which would turn a compact field into a pill.
         theme.radius = px(8.);
         theme.radius_lg = px(8.);
         theme.highlight_theme = Arc::new(content_highlight_theme(theme));
@@ -495,6 +498,16 @@ pub fn install(cx: &mut App) {
 /// otherwise opts into a pointing hand intended for link-like content.
 pub fn zed_button(id: impl Into<ElementId>) -> Button {
     Button::new(id).secondary().rounded(px(4.)).cursor_default()
+}
+
+/// A checkbox with a quiet hover surface and a distinct pressed state.
+/// The toolkit keeps ownership of its checkmark, keyboard focus and activation.
+pub fn checkbox(id: impl Into<ElementId>, roles: Roles) -> Checkbox {
+    Checkbox::new(id)
+        .p_1()
+        .cursor_default()
+        .hover(move |style| style.bg(roles.hover))
+        .active(move |style| style.bg(roles.pressed))
 }
 
 /// Every capture name a grammar this app compiles in can emit, and the Legacy
@@ -1143,8 +1156,8 @@ mod tests {
     ///
     /// A *control* is not on this test: the toolkit keeps one token for both
     /// roles, so `radius` holds the overlay's 8px and the controls name the
-    /// 4px they wear where they are built — `zed_button` for every button,
-    /// and the field that takes a search query.
+    /// shape they wear where they are built — `zed_button` for 4px buttons,
+    /// and square corners for form fields.
     #[gpui_kit::test]
     fn overlays_are_rounded_lg(cx: &mut TestAppContext) {
         cx.update(|cx| {

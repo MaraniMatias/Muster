@@ -1136,31 +1136,35 @@ impl TerminalWindow {
             return;
         }
         self.document_transition_prompted = true;
-        let prompt = window.prompt(
-            gpui_kit::PromptLevel::Warning,
-            "Save changes to this document?",
-            Some("Your edits will be lost if you discard them."),
-            &["Cancel", "Save", "Discard"],
+        use gpui_kit::component::button::ButtonVariant;
+        let view = cx.entity().downgrade();
+        crate::confirmation::ask(
+            window,
             cx,
-        );
-        cx.spawn_in(window, async move |view, cx| {
-            let choice = prompt.await;
-            let _ = view.update_in(cx, |app, window, cx| {
-                app.document_transition_prompted = false;
-                match choice {
-                    Ok(1) => app.save_document(window, cx),
-                    Ok(2) => {
-                        let transition = app.pending_document_transition.take();
-                        app.clear_document();
-                        if let Some(transition) = transition {
-                            transition(app, window, cx);
+            "Save changes to this document?",
+            "Your edits will be lost if you discard them.",
+            &[
+                ("Cancel", ButtonVariant::Default),
+                ("Save", ButtonVariant::Default),
+                ("Discard", ButtonVariant::Danger),
+            ],
+            move |choice, window, cx| {
+                let _ = view.update(cx, |app, cx| {
+                    app.document_transition_prompted = false;
+                    match choice {
+                        1 => app.save_document(window, cx),
+                        2 => {
+                            let transition = app.pending_document_transition.take();
+                            app.clear_document();
+                            if let Some(transition) = transition {
+                                transition(app, window, cx);
+                            }
                         }
+                        _ => app.pending_document_transition = None,
                     }
-                    _ => app.pending_document_transition = None,
-                }
-            });
-        })
-        .detach();
+                });
+            },
+        );
     }
 
     /// Write the open document back, or say why it cannot be written.

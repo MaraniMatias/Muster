@@ -15,10 +15,9 @@ use std::path::PathBuf;
 
 use gpui_kit::component::{
     button::ButtonVariants,
-    checkbox::Checkbox,
     dialog::{Dialog, DialogContent, DialogFooter},
     input::{Input, InputState},
-    Disableable,
+    Disableable, Sizable,
 };
 use gpui_kit::{
     div, prelude::FluentBuilder, px, AnyElement, Context, Entity, IntoElement, ParentElement,
@@ -174,11 +173,9 @@ impl TerminalWindow {
                     .child(div().text_size(px(12.)).child("Task name"))
                     .child(
                         Input::new(&task)
+                            .small()
                             .bg(roles.surface_base)
-                            // A field is a control, not an overlay: Zed rounds
-                            // one `rounded_sm`, where the theme's own radius is
-                            // the overlay's 8px.
-                            .rounded(px(4.))
+                            .rounded_none()
                             .aria_label("Task name")
                             .w_full(),
                     )
@@ -195,11 +192,9 @@ impl TerminalWindow {
                     .child(div().mt_3().text_size(px(12.)).child("New branch"))
                     .child(
                         Input::new(&branch)
+                            .small()
                             .bg(roles.surface_base)
-                            // A field is a control, not an overlay: Zed rounds
-                            // one `rounded_sm`, where the theme's own radius is
-                            // the overlay's 8px.
-                            .rounded(px(4.))
+                            .rounded_none()
                             .aria_label("New branch")
                             .w_full(),
                     )
@@ -211,11 +206,9 @@ impl TerminalWindow {
                     )
                     .child(
                         Input::new(&base)
+                            .small()
                             .bg(roles.surface_base)
-                            // A field is a control, not an overlay: Zed rounds
-                            // one `rounded_sm`, where the theme's own radius is
-                            // the overlay's 8px.
-                            .rounded(px(4.))
+                            .rounded_none()
                             .aria_label("Starting from branch")
                             .w_full(),
                     );
@@ -448,7 +441,7 @@ impl TerminalWindow {
                                     });
                                 }))
                             .child(
-                                Checkbox::new("worktree-confirm-dirty")
+                                crate::theme::checkbox("worktree-confirm-dirty", roles)
                                     .checked(dirty_confirmed)
                                     .label("I understand uncommitted files may be lost; delete anyway.")
                                     .on_change(move |checked, _, cx| {
@@ -493,7 +486,7 @@ impl TerminalWindow {
                         if info.branch.is_none() {
                             let toggle_unmerged = toggle_unmerged.clone();
                             content = content.child(
-                                Checkbox::new("worktree-confirm-unmerged")
+                                crate::theme::checkbox("worktree-confirm-unmerged", roles)
                                     .checked(unmerged_confirmed)
                                     .label("I understand these detached commits may be lost; delete anyway.")
                                     .on_change(move |checked, _, cx| {
@@ -515,7 +508,7 @@ impl TerminalWindow {
                     if let Some(branch) = info.branch.as_deref() {
                         let toggle_branch = toggle_branch.clone();
                         content = content.child(
-                            Checkbox::new("worktree-delete-branch")
+                            crate::theme::checkbox("worktree-delete-branch", roles)
                                 .checked(delete_branch)
                                 .label(format!(
                                     "Delete local branch {}{}",

@@ -13,6 +13,39 @@ use tempfile::TempDir;
 #[path = "inspector_tests.rs"]
 mod inspector_tests;
 
+fn confirmation_open(handle: AnyWindowHandle, cx: &mut TestAppContext) -> bool {
+    use gpui_kit::component::WindowExt;
+    assert!(
+        !cx.has_pending_prompt(),
+        "confirmations must not use platform prompts"
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let open = window.has_active_dialog(cx);
+        assert_eq!(open, window.try_find("dialog").is_some());
+        open
+    })
+    .unwrap()
+}
+
+fn answer_confirmation(handle: AnyWindowHandle, label: &str, cx: &mut TestAppContext) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let choice = (0..3usize)
+            .find(|choice| {
+                window
+                    .within("dialog")
+                    .try_find(("confirmation-choice", *choice))
+                    .is_some_and(|button| button.label() == Some(label))
+            })
+            .expect("the confirmation offers this action");
+        window
+            .within("dialog")
+            .click(("confirmation-choice", choice), cx);
+    })
+    .unwrap();
+}
+
 fn run_git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
@@ -4040,8 +4073,8 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         window.click(action, cx);
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     cx.run_until_parked();
     assert!(!fixture
         .view
@@ -4059,7 +4092,7 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         });
     })
     .unwrap();
-    cx.simulate_prompt_answer("Hide checkout");
+    answer_confirmation(fixture.handle, "Hide checkout", cx);
     cx.run_until_parked();
     fixture.view.update(cx, |app, _| {
         assert!(!app.navigation.archived.contains(&missing_id));
@@ -4077,7 +4110,7 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         window.click(format!("dismiss-missing-{missing_id}"), cx);
     })
     .unwrap();
-    cx.simulate_prompt_answer("Hide checkout");
+    answer_confirmation(fixture.handle, "Hide checkout", cx);
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
             .view
@@ -4306,14 +4339,25 @@ async fn closing_a_busy_terminal_requires_consent_and_keeps_its_sibling(cx: &mut
             .is_some_and(|terminal| terminal.shell.session.status().foreground.running)
     })
     .await;
+    let previous_focus = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            let focus = window.focused(cx).expect("the terminal has focus");
+            // The close is behind the row's hover, so the pointer arrives on the row first.
+            window.hover(SharedString::from(format!("select-session-{id}")), cx);
+            window.click(SharedString::from(format!("close-session-{id}")), cx);
+            focus
+        })
+        .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
     cx.update_window(fixture.handle, |_, window, cx| {
-        // The close is behind the row's hover, so the pointer arrives on the row first.
-        window.hover(SharedString::from(format!("select-session-{id}")), cx);
-        window.click(SharedString::from(format!("close-session-{id}")), cx);
+        window.press("escape", cx);
+        assert!(
+            previous_focus.is_focused(window),
+            "Escape restores terminal focus"
+        );
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Cancel");
+    assert!(!confirmation_open(fixture.handle, cx));
     cx.run_until_parked();
     assert!(fixture.backend.status(&id).is_ok());
     assert!(!fixture
@@ -4324,8 +4368,21 @@ async fn closing_a_busy_terminal_requires_consent_and_keeps_its_sibling(cx: &mut
         window.click(SharedString::from(format!("close-session-{id}")), cx);
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Close terminal");
+    assert!(confirmation_open(fixture.handle, cx));
+    cx.update_window(fixture.handle, |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!confirmation_open(fixture.handle, cx));
+    assert!(
+        fixture.backend.status(&id).is_ok(),
+        "Enter without a selected action cancels"
+    );
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(SharedString::from(format!("select-session-{id}")), cx);
+        window.click(SharedString::from(format!("close-session-{id}")), cx);
+    })
+    .unwrap();
+    answer_confirmation(fixture.handle, "Close terminal", cx);
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         !fixture.view.read(cx).terminals.contains_key(&id)
     })
@@ -4459,8 +4516,8 @@ async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut 
         window.within("items").click(0usize, cx);
     })
     .unwrap();
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer("Remove from panel");
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Remove from panel", cx);
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
             .view

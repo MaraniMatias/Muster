@@ -31,7 +31,6 @@ use gpui_kit::component::{
     dialog::{Dialog, DialogFooter},
     input::{Input, InputState},
     select::{Select, SelectEvent, SelectState},
-    switch::Switch,
     Disableable, IndexPath, Sizable,
 };
 use gpui_kit::{
@@ -49,7 +48,7 @@ use muster_core::settings::{
 use std::path::PathBuf;
 
 use crate::app::TerminalWindow;
-use crate::theme::{zed_button, Roles};
+use crate::theme::{checkbox, zed_button, Roles};
 use crate::tooltip::RestingTooltip;
 
 /// The options a closed setting offers, and the row the current one sits on.
@@ -355,7 +354,7 @@ fn settings_section(title: &'static str, roles: Roles, rows: Vec<AnyElement>) ->
         .into_any_element()
 }
 
-/// A row whose control is a switch, named by the field it writes.
+/// A row whose control is a checkbox, named by the field it writes.
 ///
 /// The field is a function rather than a path string so a preference added here is a row and a
 /// closure, not a branch in a template that has to be read to find out what a control does.
@@ -374,7 +373,7 @@ fn toggle_row(
         description,
         None,
         roles,
-        Switch::new(id)
+        checkbox(id, roles)
             .checked(checked)
             .small()
             .accessibility_label(label)
@@ -402,7 +401,7 @@ fn select_row(
         Select::new(picker)
             .id(id)
             .small()
-            .rounded(px(4.))
+            .rounded_none()
             .bg(roles.surface_base)
             .accessibility_label(label),
     )
@@ -425,9 +424,7 @@ fn size_row(
                 .id(id)
                 .small()
                 .bg(roles.surface_base)
-                // A field is a control, not an overlay: Zed rounds one `rounded_sm`,
-                // where the theme's own radius is the overlay's 8px.
-                .rounded(px(4.))
+                .rounded_none()
                 .aria_label(label)
                 .w_full(),
         ),

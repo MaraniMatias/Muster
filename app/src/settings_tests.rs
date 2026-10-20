@@ -361,7 +361,7 @@ fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
     dispose(&panel.fixture, cx);
 }
 
-/// The switch is compact, and the picker and number field share the same height.
+/// The checkbox is compact, and the picker and number field share the same height.
 #[gpui_kit::test]
 fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
@@ -387,8 +387,8 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
                 .as_f32(),
         ];
         assert!(
-            (heights[0] - 16.).abs() <= 1.,
-            "compact switch: {heights:?}"
+            heights[0] <= heights[1],
+            "the checkbox fits within the field height: {heights:?}"
         );
         assert!(
             (heights[1] - heights[2]).abs() <= 1.,
@@ -396,6 +396,31 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
+#[gpui_kit::test]
+fn a_checkbox_changes_only_the_draft_until_apply(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    let checked = panel.fixture.view.read_with(cx, |app, _| {
+        app.settings.as_ref().unwrap().draft.ui.tree_sticky_scroll
+    });
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        let checkbox = window.find("settings-ui-sticky");
+        assert_eq!(checkbox.role(), Some(gpui_kit::Role::CheckBox));
+        assert_eq!(checkbox.checked(), Some(checked));
+        window.hover("settings-ui-sticky", cx);
+        assert_eq!(window.find("settings-ui-sticky").checked(), Some(checked));
+        window.click("settings-ui-sticky", cx);
+        assert_eq!(window.find("settings-ui-sticky").checked(), Some(!checked));
+    })
+    .unwrap();
+    assert!(!panel.path().exists());
+    apply(cx, &panel);
+    assert_eq!(
+        settings::load(&panel.path()).unwrap().ui.tree_sticky_scroll,
+        !checked
+    );
     dispose(&panel.fixture, cx);
 }
 

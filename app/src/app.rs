@@ -15,7 +15,7 @@ use std::time::Duration;
 #[cfg(test)]
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    button::{Button, ButtonCustomVariant},
+    button::{Button, ButtonCustomVariant, ButtonVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, ResizableState},
     window_border, Disableable, TitleBar,
@@ -23,7 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
@@ -1512,16 +1512,16 @@ impl TerminalWindow {
             || status.poll_error.is_some()
             || matches!(status.shell, ShellState::Unknown)
         {
-            let prompt = window.prompt(PromptLevel::Warning, "Close this terminal?",
-                Some("A running process may be stopped. If its state is unavailable, closing may still interrupt work."), &["Cancel", "Close terminal"], cx);
             let id = id.to_owned();
-            cx.spawn_in(window, async move |view, cx| {
-                if prompt.await == Ok(1) {
-                    let _ =
-                        view.update_in(cx, |app, window, cx| app.close_terminal(&id, window, cx));
-                }
-            })
-            .detach();
+            let view = cx.entity().downgrade();
+            crate::confirmation::ask(window, cx, "Close this terminal?",
+                "A running process may be stopped. If its state is unavailable, closing may still interrupt work.",
+                &[("Cancel", ButtonVariant::Default), ("Close terminal", ButtonVariant::Danger)],
+                move |choice, window, cx| {
+                    if choice == 1 {
+                        let _ = view.update(cx, |app, cx| app.close_terminal(&id, window, cx));
+                    }
+                });
         } else {
             self.close_terminal(id, window, cx);
         }
@@ -1619,15 +1619,15 @@ impl TerminalWindow {
                 || matches!(status.shell, ShellState::Unknown)
         }) || !self.navigation.pending.is_empty();
         if busy {
-            let prompt = window.prompt(PromptLevel::Warning, "Close Muster and stop its terminals?",
-                Some("All terminals in this window will be stopped, including terminals in other directories."), &["Cancel", "Stop and close"], cx);
-            cx.spawn_in(window, async move |view, cx| {
-                if prompt.await == Ok(1) {
-                    let _ =
-                        view.update_in(cx, |app, window, cx| app.finish_window_close(window, cx));
-                }
-            })
-            .detach();
+            let view = cx.entity().downgrade();
+            crate::confirmation::ask(window, cx, "Close Muster and stop its terminals?",
+                "All terminals in this window will be stopped, including terminals in other directories.",
+                &[("Cancel", ButtonVariant::Default), ("Stop and close", ButtonVariant::Danger)],
+                move |choice, window, cx| {
+                    if choice == 1 {
+                        let _ = view.update(cx, |app, cx| app.finish_window_close(window, cx));
+                    }
+                });
         } else {
             self.finish_window_close(window, cx);
         }
@@ -2435,20 +2435,18 @@ impl TerminalWindow {
             "Hide missing checkout “{}” from the sidebar?",
             checkout.path
         );
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            &question,
-            Some("No files will be deleted. Git metadata and the branch are kept, and the repository menu can restore this row."),
-            &["Cancel", "Hide checkout"],
-            cx,
-        );
         let id = checkout_id.to_owned();
-        cx.spawn_in(window, async move |view, cx| {
-            if prompt.await == Ok(1) {
-                let _ = view.update(cx, |app, cx| app.dismiss_missing_checkout(&id, cx));
-            }
-        })
-        .detach();
+        let view = cx.entity().downgrade();
+        crate::confirmation::ask(
+            window, cx, question,
+            "No files will be deleted. Git metadata and the branch are kept, and the repository menu can restore this row.",
+            &[("Cancel", ButtonVariant::Default), ("Hide checkout", ButtonVariant::Default)],
+            move |choice, _, cx| {
+                if choice == 1 {
+                    let _ = view.update(cx, |app, cx| app.dismiss_missing_checkout(&id, cx));
+                }
+            },
+        );
     }
 
     fn dismiss_missing_checkout(&mut self, checkout_id: &str, cx: &mut Context<Self>) {
@@ -2926,27 +2924,30 @@ impl TerminalWindow {
                 "worktrees"
             }
         );
-        let prompt = window.prompt(
-            PromptLevel::Info,
-            &message,
-            Some("Their rows return to the sidebar. Nothing on disk changes."),
-            &["Cancel", "Restore"],
+        let view = cx.entity().downgrade();
+        crate::confirmation::ask(
+            window,
             cx,
+            message,
+            "Their rows return to the sidebar. Nothing on disk changes.",
+            &[
+                ("Cancel", ButtonVariant::Default),
+                ("Restore", ButtonVariant::Default),
+            ],
+            move |choice, _, cx| {
+                if choice == 1 {
+                    let _ = view.update(cx, |app, cx| {
+                        for id in ids {
+                            app.navigation.archived.remove(&id);
+                        }
+                        app.membership_revision += 1;
+                        app.persist();
+                        app.refresh_diff_totals(cx);
+                        cx.notify();
+                    });
+                }
+            },
         );
-        cx.spawn_in(window, async move |view, cx| {
-            if prompt.await == Ok(1) {
-                let _ = view.update(cx, |app, cx| {
-                    for id in ids {
-                        app.navigation.archived.remove(&id);
-                    }
-                    app.membership_revision += 1;
-                    app.persist();
-                    app.refresh_diff_totals(cx);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
     pub(crate) fn remove_repo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2988,17 +2989,27 @@ impl TerminalWindow {
             1 => "No files will be deleted. Its 1 running terminal will be closed. Opening the directory again brings it back.".into(),
             n => format!("No files will be deleted. Its {n} running terminals will be closed. Opening the directory again brings it back."),
         };
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some(&detail),
-            &["Cancel", "Remove from panel"],
-            cx,
-        );
         let id = id.to_owned();
-        cx.spawn_in(window, async move |view, cx| {
-            if prompt.await == Ok(1) {
-                let _ = view.update_in(cx, |app, window, cx| {
+        let view = cx.entity().downgrade();
+        crate::confirmation::ask(
+            window,
+            cx,
+            message,
+            detail,
+            if terminals == 0 {
+                &[
+                    ("Cancel", ButtonVariant::Default),
+                    ("Remove from panel", ButtonVariant::Default),
+                ]
+            } else {
+                &[
+                    ("Cancel", ButtonVariant::Default),
+                    ("Remove from panel", ButtonVariant::Danger),
+                ]
+            },
+            move |choice, window, cx| {
+                if choice == 1 {
+                    let _ = view.update(cx, |app, cx| {
                     // Revalidate after the prompt: the group can be gone, or a
                     // worktree can be on its way into it, while it was open.
                     let (removed, sessions) = {
@@ -3027,8 +3038,9 @@ impl TerminalWindow {
                     app.membership_revision += 1; app.persist(); app.refresh_diff_totals(cx);
                     cx.notify();
                 });
-            }
-        }).detach();
+                }
+            },
+        );
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {

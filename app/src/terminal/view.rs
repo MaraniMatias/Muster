@@ -1078,21 +1078,29 @@ impl TerminalView {
     fn paste_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         match self.session.paste(&text) {
             Err(super::SessionError::Paste(super::PasteError::Unsafe)) => {
-                let prompt = window.prompt(gpui_kit::PromptLevel::Warning,
-                        "Paste multiple lines?", Some("This program has not enabled bracketed paste. Pasting may execute commands."),
-                        &["Cancel", "Paste"], cx);
-                cx.spawn_in(window, async move |view, cx| {
-                    if prompt.await == Ok(1) {
-                        let _ = view.update(cx, |view, cx| {
-                            if let Err(error) = view.session.paste_confirmed(&text) {
-                                view.refuse("The paste was refused", &error, cx);
-                            }
-                            view.reset_blink();
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
+                use gpui_kit::component::button::ButtonVariant;
+                let view = cx.entity().downgrade();
+                crate::confirmation::ask(
+                    window,
+                    cx,
+                    "Paste multiple lines?",
+                    "This program has not enabled bracketed paste. Pasting may execute commands.",
+                    &[
+                        ("Cancel", ButtonVariant::Default),
+                        ("Paste", ButtonVariant::Danger),
+                    ],
+                    move |choice, _, cx| {
+                        if choice == 1 {
+                            let _ = view.update(cx, |view, cx| {
+                                if let Err(error) = view.session.paste_confirmed(&text) {
+                                    view.refuse("The paste was refused", &error, cx);
+                                }
+                                view.reset_blink();
+                                cx.notify();
+                            });
+                        }
+                    },
+                );
             }
             Err(error) => {
                 self.refuse("The clipboard paste was refused", &error, cx);
@@ -2646,6 +2654,87 @@ mod tests {
         let pasted = wait_for_char(&session, 'p');
         let _ = session.close().wait();
         assert!(pasted, "the clipboard never reached the child's write path");
+    }
+
+    #[gpui_kit::test]
+    fn multiline_paste_waits_for_a_toolkit_confirmation(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{component::WindowExt, AppContext, Focusable};
+        let session = script_session("printf ready; cat");
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| {
+                cx.new(|cx| {
+                    TerminalView::new(
+                        session,
+                        Arc::new(Mutex::new(CellMetrics {
+                            width: 8,
+                            height: 16,
+                        })),
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
+        assert!(wait_for_char(&session, 'r'));
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "Zfirst\nsecond\n".into(),
+        ));
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            view.read(cx).focus_handle(cx).focus(window, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("muster-terminal", cx);
+            window.press(platform_paste_keystroke(), cx);
+            assert!(window.has_active_dialog(cx));
+            assert!(window
+                .within("dialog")
+                .find(("confirmation-choice", 1usize))
+                .visible());
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+            assert!(view.read(cx).focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+        assert!(!cx.has_pending_prompt());
+        assert!(!session
+            .snapshot()
+            .rows
+            .iter()
+            .any(|row| row.cells.iter().any(|cell| cell.c == 'Z')));
+        cx.update_window(handle, |_, window, cx| {
+            window.press(platform_paste_keystroke(), cx);
+            window.press("tab", cx);
+            assert_eq!(
+                window
+                    .within("dialog")
+                    .find(("confirmation-choice", 0usize))
+                    .focused(),
+                Some(true),
+                "first Tab focuses Cancel"
+            );
+            window.press("tab", cx);
+            assert_eq!(
+                window
+                    .within("dialog")
+                    .find(("confirmation-choice", 1usize))
+                    .focused(),
+                Some(true),
+                "second Tab focuses Paste"
+            );
+            window.press("enter", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+        let pasted = wait_for_char(&session, 'Z');
+        let _ = session.close().wait();
+        assert!(pasted, "the confirmed paste reaches the child");
     }
 
     /// The same two answers, the way the menu bar asks for them.
