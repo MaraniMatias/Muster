@@ -1936,6 +1936,58 @@ async fn a_json_file_is_visible_in_the_actual_workspace_editor(cx: &mut TestAppC
     close(&fixture, cx);
 }
 
+/// The open document draws its caret.
+///
+/// The toolkit's editor draws its caret only once it has been told it is
+/// focused, and that answer comes with a frame's report of what holds the
+/// keyboard. An editor built and focused in the same frame never hears about
+/// it, and a document with no caret in it reads as a picture of a file rather
+/// than as something a person can type in.
+#[gpui_kit::test]
+async fn the_open_document_draws_its_caret(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("main.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "main.rs".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    // The caret wears the toolkit's own caret colour, and it is a narrow bar:
+    // nothing else in this window is painted in that colour.
+    let caret = cx.read(|cx| gpui_kit::component::Theme::global(cx).caret);
+    let mut drawn = false;
+    for _ in 0..8 {
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        drawn = cx
+            .update_window(fixture.handle, |_, window, _| {
+                window.painted_quads().iter().any(|quad| {
+                    let Some(color) = quad.background.as_solid() else {
+                        return false;
+                    };
+                    color.h == caret.h
+                        && color.s == caret.s
+                        && color.l == caret.l
+                        && color.a == caret.a
+                        && quad.bounds.size.height > quad.bounds.size.width
+                })
+            })
+            .unwrap();
+        if drawn {
+            break;
+        }
+    }
+    assert!(drawn, "the open document draws its caret");
+    close(&fixture, cx);
+}
+
 /// The menu is one search field over one list, and `Auto` is its first row.
 ///
 /// The search is drawn above the rows because it is the first thing a person
@@ -2564,10 +2616,14 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
     let reading_id = preview.entity_id();
 
     // It opens as a document, so the reading is what holds the keyboard and the
-    // editor behind it holds nothing.
+    // editor behind it holds nothing. The keyboard is asked for at the end of
+    // the frame that opened the document, so it is read in the next one.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
         assert!(
             preview.read(cx).focus_handle().is_focused(window),
             "a Markdown document opened with its reading on screen and the keyboard somewhere else"
@@ -2701,6 +2757,9 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
         assert!(
             plain.read(cx).focus_handle(cx).is_focused(window),
             "a document with only a source did not take the keyboard"

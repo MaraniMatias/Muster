@@ -312,6 +312,15 @@ Three rules it depends on, each pinned by a test:
   editor's rope against the loaded text, so an undo back to what the file holds
   ends the draft instead of leaving a state a draft can be stuck in.
 
+**The caret is drawn, and it takes a frame to say so.** The toolkit's editor
+paints its caret only once it has been told it is focused, and that answer comes
+with a frame's report of what holds the keyboard. A reading built in the frame
+that focuses it never hears about it — that frame's report is made before the
+reading's own listener is live — so the document opens with no cursor in it. The
+keyboard is therefore asked for at the end of the cycle, where the next frame's
+report can carry it: `focus_visible_after_this_frame`.
+`the_open_document_draws_its_caret` in `app/src/inspector_tests.rs` pins it.
+
 ## The review composer
 
 `app/src/diff.rs` draws the note being written as a row of the diff and

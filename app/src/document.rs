@@ -10,9 +10,9 @@ use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView,
 use gpui_kit::component::{Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, point, px, AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, TestSupportExt, Window,
+    div, point, px, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Role, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, TestSupportExt, Window,
 };
 use muster_core::workspace::{Checkout, Repo};
 use std::ffi::{OsStr, OsString};
@@ -130,13 +130,37 @@ impl DocumentView {
     /// handles are the toolkit's own — `EditorState` and `TextViewState` each carry
     /// one, and the toolkit tracks them on the elements it draws.
     fn focus_visible(&self, window: &mut Window, cx: &mut App) {
-        if self.is_rendered() {
-            if let Some(preview) = self.preview.as_ref() {
-                preview.read(cx).focus_handle().clone().focus(window, cx);
-                return;
-            }
+        if let Some(handle) = self.visible_handle(cx) {
+            handle.focus(window, cx);
         }
-        self.state.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// The same keyboard, asked for at the end of this cycle rather than now.
+    ///
+    /// The toolkit's editor draws its caret only once it has been told it is
+    /// focused, and that answer comes with a frame's report of what holds the
+    /// keyboard. A reading built in this very frame never hears about it: the
+    /// report this frame makes is made before the reading's own listener is
+    /// live, so the caret is never drawn and the document reads as a picture of
+    /// a file rather than as something a person can type in. Asked for at the
+    /// end of the cycle, the focus is where the next frame's report can carry
+    /// it.
+    fn focus_visible_after_this_frame(&self, window: &mut Window, cx: &mut App) {
+        let Some(handle) = self.visible_handle(cx) else {
+            return;
+        };
+        window.defer(cx, move |window, cx| handle.focus(window, cx));
+    }
+
+    /// The handle of the reading that is on screen.
+    fn visible_handle(&self, cx: &App) -> Option<FocusHandle> {
+        if self.is_rendered() {
+            self.preview
+                .as_ref()
+                .map(|preview| preview.read(cx).focus_handle().clone())
+        } else {
+            Some(self.state.read(cx).focus_handle(cx))
+        }
     }
 }
 
@@ -1678,10 +1702,16 @@ impl TerminalWindow {
                 // Only the reading that is on screen takes the keyboard: a
                 // Markdown document opens as its reading, so the editor behind
                 // it stays unfocused until the header asks for the source.
+                //
+                // The keyboard is asked for at the end of this cycle, and not
+                // now: the reading was built in this very frame, and the
+                // toolkit only tells an editor it is focused once a frame has
+                // reported it, which is a report this editor's own listener is
+                // not yet around to hear.
                 self.document_view
                     .as_ref()
                     .expect("just installed")
-                    .focus_visible(window, cx);
+                    .focus_visible_after_this_frame(window, cx);
             }
             // A Markdown file is read as a document and can be read as its source;
             // everything else is its source and only its source.
