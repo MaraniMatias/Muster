@@ -1,15 +1,10 @@
 [package]
 name = "muster"
 version = "1.0.0-rc.3"
-# 2021, as `muster-core` is. The toolkit this app draws with is edition 2024,
-# and a crate may depend on one of a different edition, so nothing here forces
-# this one to move.
 edition = "2021"
 publish = false
 description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer."
-# Read by the About panel, the same way the app it replaces read it: `env!` is
-# resolved by rustc, so the URL lands in the binary, where a field read off the
-# bundle config at runtime would not.
+# Embedded in the About panel through `env!("CARGO_PKG_HOMEPAGE")`.
 homepage = "https://github.com/MaraniMatias/Muster"
 
 [lib]
@@ -81,11 +76,8 @@ gpui-kit = { version = "0.7.3", features = [
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cmake = "0.7.5"
 tree-sitter-swift = "0.7.4"
-# The toolkit has no Vue grammar at all and no feature to turn one on, and
-# The app this one replaces highlighted Vue. `theme::install` registers this one in
-# the toolkit's own registry with the queries it ships, the same mechanism the
-# three above use for an empty query. Nothing else depends on it and it adds no
-# new highlighter.
+# The toolkit exposes no Vue grammar feature. Register the grammar and its
+# queries in the toolkit's existing highlighter through `theme::install`.
 tree-sitter-vue-updated = "0.1.0"
 # The toolkit has no Gitignore parser. This pinned upstream grammar is built with
 # the workspace's compatible cc release; its tree hash is checked by the RustSec audit.
@@ -95,11 +87,7 @@ tree-sitter-ini = "1.4.0"
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by
 # deserializing the theme literal rather than by assigning fields.
 serde_json = "1"
-# The PTY layer is not reimplemented here: the same backend the old app used,
-# as a dependency. Process lifetime, bounded writes and group-safe shutdown have
-# exactly one implementation. It lives in `muster-core`, and this crate reads it
-# through `muster_core::pty`, so the backend crate is the only one that names
-# `portable-pty`.
+# Backend operations, including PTY process ownership, stay independent of GPUI.
 muster-core = { path = "../core" }
 libc = "0.2"
 log = "0.4"

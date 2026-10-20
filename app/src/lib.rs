@@ -1,9 +1,6 @@
-//! Muster's native crate.
+//! Muster's desktop interface: windows, widgets, the document editor and the VT terminal.
 //!
-//! The window and the half of the terminal that draws it. What it does not own
-//! is process lifetime: [`muster_core::pty`] is the PTY backend the Tauri app
-//! used, reached as a dependency instead of a path into its tree, so there is
-//! exactly one implementation of bounded writes and group-safe shutdown.
+//! Backend operations live in [`muster_core`], independently of the GUI toolkit.
 
 /// The workspace window, retained terminal registry, and native sidebar.
 pub mod app;
@@ -76,8 +73,7 @@ pub mod logging;
 #[cfg(test)]
 mod perf;
 
-/// `muster_core::workspace`, re-exported so a host-side module can reach the
-/// status shapes through one path.
+/// Repository, checkout and terminal status types shared with the backend.
 pub use muster_core::workspace;
 
 /// `muster_core::pty`: `TerminalBackend`, `SpawnOptions`, `OutputSink` and the
