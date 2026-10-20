@@ -811,7 +811,7 @@ impl TerminalWindow {
 // Reuse the wire-level fixture, not a stubbed Client, in native orchestration tests.
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../../core/src/opencode/mock.rs"]
+#[path = "../core/src/opencode/mock.rs"]
 pub(crate) mod mock;
 
 #[cfg(test)]

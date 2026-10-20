@@ -4,16 +4,16 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const PATCHED_ALACRITTY_DIR = join(ROOT, "native/vendor/alacritty_terminal-0.26.0");
+export const PATCHED_ALACRITTY_DIR = join(ROOT, "vendor/alacritty_terminal-0.26.0");
 const PATCHED_ALACRITTY_VERSION = "0.26.0";
 // Original crates.io archive checksum for alacritty_terminal 0.26.0, the latest published release.
 // `Cargo.lock` cannot supply it: a `[patch.crates-io]` path replacement drops the registry
 // `source` and `checksum` lines from the entry. This is the `cksum` field of the 0.26.0 entry in
 // the crates.io sparse index, confirmed by hashing the archive downloaded from static.crates.io.
 // Upstream has published no advisory for the panic this patch fixes; see
-// `native/vendor/alacritty_terminal-0.26.0/PATCHES.md` for the defect and the one-line fix.
+// `vendor/alacritty_terminal-0.26.0/PATCHES.md` for the defect and the one-line fix.
 export const PATCHED_ALACRITTY_ARCHIVE_SHA256 = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59";
-export const PATCHED_ALACRITTY_TREE_SHA256 = "b502cd0ca3c120dad7886a31005276b1003c3d4be4cd3d2c2cbb0ea4208ee0e1";
+export const PATCHED_ALACRITTY_TREE_SHA256 = "845b19ba05d064dc640dab2261d895fd457da05c141d5a1697bfd8649b9d5bb2";
 const VERIFIED_PATCH = Symbol("verified patched alacritty");
 
 export function patchedAlacrittyTreeSha256(root = PATCHED_ALACRITTY_DIR) {

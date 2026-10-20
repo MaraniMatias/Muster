@@ -68,7 +68,7 @@ else in the file, or anywhere else in the crate, is modified.
 Verify the patch against the published sources with:
 
 ```
-git diff --no-index <extracted-crate>/src/term/mod.rs native/vendor/alacritty_terminal-0.26.0/src/term/mod.rs
+git diff --no-index <extracted-crate>/src/term/mod.rs vendor/alacritty_terminal-0.26.0/src/term/mod.rs
 ```
 
 which must show exactly one changed line.

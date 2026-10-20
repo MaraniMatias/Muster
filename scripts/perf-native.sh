@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Measure the native terminal's hot paths and print the table.
 #
-# The measurement lives in `native/src/perf.rs` as `#[ignore]`d cases that print
+# The measurement lives in `src/perf.rs` as `#[ignore]`d cases that print
 # rather than assert, so it is reproducible and cannot become a budget written
 # on one machine and failed on another. This script is only the command.
 #

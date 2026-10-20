@@ -25,7 +25,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 binary="${1:-$root/target/release/Muster}"
 out="${2:-$root/dist}"
-icon="$root/native/assets/icon.icns"
+icon="$root/assets/icon.icns"
 app="$out/Muster.app"
 
 for required in "$binary" "$icon"; do
@@ -38,16 +38,16 @@ done
 # The version the bundle advertises is the one the crate declares, read from
 # where it is written down. A literal here would be a second answer to a
 # question that has one.
-version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/native/Cargo.toml")"
+version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/Cargo.toml")"
 [ -n "$version" ] || {
-  echo "bundle-macos: native/Cargo.toml declares no version" >&2
+  echo "bundle-macos: Cargo.toml declares no version" >&2
   exit 1
 }
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # `Muster`, the name `CFBundleExecutable` below declares and the name the binary
-# carries in `native/Cargo.toml`: inside the bundle the executable name is the
+# carries in `Cargo.toml`: inside the bundle the executable name is the
 # one the system reports in Activity Monitor and in Get Info, and it is the same
 # word `CFBundleName` gives the app, so the bundle and the bare executable in
 # `target/` are one application under one name.

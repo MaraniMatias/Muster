@@ -1059,21 +1059,33 @@ mod tests {
     }
 
     // Syntax captures remain pinned to the project's previous token contract; UI chrome does not.
+    //
+    // The contract is written down here rather than read from the stylesheet it
+    // came from: that stylesheet is not in this repository any more, and these
+    // are the values its dark theme carried. The constants above are the
+    // production copy of the same numbers and the theme literal is the third;
+    // this table is what says all three must agree.
+    const LEGACY_TOKENS: &[(&str, u32)] = &[
+        ("content-text", 0xdce0e5),
+        ("content-text-faint", 0x767d8d),
+        ("syntax-foreground", 0xacb2be),
+        ("syntax-token-comment", 0x878e98),
+        ("syntax-token-constant", 0xdfc184),
+        ("syntax-token-keyword", 0xbd81d6),
+        ("syntax-token-string", 0xa1c181),
+        ("syntax-token-function", 0x73ade9),
+        ("syntax-token-string-expression", 0xdfc184),
+        ("syntax-token-punctuation", 0xb2b9c6),
+        ("syntax-token-link", 0x74ade8),
+    ];
+
     fn legacy(token: &str) -> Hsla {
-        let css = include_str!("../../legacy/src/muster.css");
-        let dark = css.split(":root[data-theme=\"light\"]").next().unwrap();
-        let prefix = format!("--muster-{token}: #");
-        let value = dark
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(&prefix))
+        let value = LEGACY_TOKENS
+            .iter()
+            .find(|(name, _)| *name == token)
             .unwrap_or_else(|| panic!("missing syntax token: {token}"))
-            .trim_end_matches(';');
-        let value_number = u32::from_str_radix(value, 16).unwrap();
-        if value.len() == 8 {
-            rgba(value_number).into()
-        } else {
-            rgb(value_number).into()
-        }
+            .1;
+        rgb(value).into()
     }
 
     #[gpui_kit::test]

@@ -46,7 +46,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           [[ "$(git rev-parse HEAD)" == "$SHA" ]]
-          version="$(awk -F'"' '/^version = "/{print $2; exit}' native/Cargo.toml)"
+          version="$(awk -F'"' '/^version = "/{print $2; exit}' Cargo.toml)"
           lock_version="$(awk '/^name = "muster"$/{f=1;next} f&&/^version = /{gsub(/"/,"");print $3;exit}' Cargo.lock)"
           [[ "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ && "$version" == "$lock_version" ]]
           echo "version=$version" >> "$GITHUB_OUTPUT"

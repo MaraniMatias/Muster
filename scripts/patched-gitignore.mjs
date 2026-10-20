@@ -4,7 +4,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const PATCHED_GITIGNORE_DIR = join(ROOT, "native/vendor/konomanoasa-tree-sitter-gitignore-0.3.1");
+export const PATCHED_GITIGNORE_DIR = join(ROOT, "vendor/konomanoasa-tree-sitter-gitignore-0.3.1");
 const PATCHED_GITIGNORE_VERSION = "0.3.1";
 export const PATCHED_GITIGNORE_ARCHIVE_SHA256 = "060cb9f087373dda1b2899edb48edbdb004d7c212f1fddb2c42f977a321fd91c";
 export const PATCHED_GITIGNORE_TREE_SHA256 = "168240244e0570b6ba2c4b263a336f7230f4372edae601684951ff447f57b83d";

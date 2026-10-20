@@ -10,7 +10,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // is not audited either.
 export const AUDITED_MANIFESTS = Object.freeze([
   resolve(ROOT, "core/Cargo.toml"),
-  resolve(ROOT, "native/Cargo.toml"),
+  resolve(ROOT, "Cargo.toml"),
 ]);
 export const CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index";
 const OSV_ENDPOINT = "https://api.osv.dev/v1/querybatch";

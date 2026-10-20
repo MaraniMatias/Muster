@@ -13,7 +13,7 @@ arch="$(dpkg --print-architecture)"
 [[ "$arch" == amd64 ]] || { echo "package-linux-deb: only amd64 is supported (got $arch)" >&2; exit 1; }
 command -v readelf >/dev/null || { echo 'package-linux-deb: readelf is required' >&2; exit 1; }
 readelf -h "$binary" | grep -Eq 'Machine: +Advanced Micro Devices X86-64' || { echo 'package-linux-deb: binary is not x86_64 ELF' >&2; exit 1; }
-semver="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/native/Cargo.toml")"
+semver="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/Cargo.toml")"
 version="$(bash "$root/scripts/debian-version.sh" "$semver")"
 mkdir -p "$out"
 tmp="$(mktemp -d)"
@@ -22,7 +22,7 @@ stage="$tmp/payload"
 metadata="$tmp/source"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/512x512/apps" "$stage/usr/share/doc/muster" "$metadata/debian"
 install -m 0755 "$binary" "$stage/usr/bin/Muster"
-install -m 0644 "$root/native/assets/icon.png" "$stage/usr/share/icons/hicolor/512x512/apps/muster.png"
+install -m 0644 "$root/assets/icon.png" "$stage/usr/share/icons/hicolor/512x512/apps/muster.png"
 cat >"$stage/usr/share/applications/dev.muster.workspace.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application

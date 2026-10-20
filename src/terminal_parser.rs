@@ -21,9 +21,9 @@ const COLUMNS: usize = 80;
 const SCREEN_LINES: usize = 24;
 
 /// `KEYBOARD_MODE_STACK_MAX_DEPTH` in the vendored crate
-/// (`native/vendor/alacritty_terminal-0.26.0/src/term/mod.rs:48`). Pushing one entry
+/// (`vendor/alacritty_terminal-0.26.0/src/term/mod.rs:48`). Pushing one entry
 /// past it is what reaches the removal the fix is about
-/// (`native/vendor/alacritty_terminal-0.26.0/src/term/mod.rs:1295`).
+/// (`vendor/alacritty_terminal-0.26.0/src/term/mod.rs:1295`).
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 4096;
 
 /// The push every flood case sends: `CSI > 1 u`, which is
@@ -158,7 +158,7 @@ fn kitty_keyboard_negotiation_still_replies_after_the_fix() {
     let mut parser: Processor = Processor::new();
 
     // `CSI > 1 u` pushes DISAMBIGUATE_ESC_CODES; `CSI ? u` is answered by
-    // `report_keyboard_mode` (`native/vendor/alacritty_terminal-0.26.0/src/term/mod.rs:1275`)
+    // `report_keyboard_mode` (`vendor/alacritty_terminal-0.26.0/src/term/mod.rs:1275`)
     // with `CSI ? Ps u` naming the mode on top of the stack. A stack that never records
     // the push answers with mode 0, which is how the fix could quietly break
     // modified-key negotiation without panicking.

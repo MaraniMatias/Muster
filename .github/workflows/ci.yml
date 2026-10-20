@@ -7,9 +7,9 @@ on:
   pull_request:
 
 jobs:
-  # The workspace is the two crates at the root: `core` and `native`. The Tauri tree under
-  # `legacy/` is parked -- it is not built, not tested and not released from here, so nothing in
-  # this workflow reaches into it.
+  # The workspace is the two crates at the root: `core` and the app itself, whose source is `src/`.
+  # The Tauri tree under `legacy/` is parked -- it is not built, not tested and not released from
+  # here, so nothing in this workflow reaches into it.
   checks:
     runs-on: macos-latest
     steps:

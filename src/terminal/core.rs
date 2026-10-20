@@ -9,7 +9,7 @@ use alacritty_terminal::term::color::{Colors, COUNT as COLOR_COUNT};
 // Not a test-only path, despite living in a module called `test`: the vendored
 // crate leaves `pub mod test` ungated, and it is the crate's own `Dimensions`
 // implementation, so there is no reason for this crate to grow a second one.
-// `native/src/terminal_parser.rs` already reaches for the same type.
+// `src/terminal_parser.rs` already reaches for the same type.
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
