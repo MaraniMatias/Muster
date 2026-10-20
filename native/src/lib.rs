@@ -39,6 +39,12 @@ mod navigation;
 /// The worktree creation and removal dialogs.
 pub mod worktree_dialog;
 
+/// What the OpenCode service says, read in the background and drawn in the panel.
+pub mod agent_watch;
+
+/// Following the work a terminal is doing into another worktree.
+pub mod follow;
+
 /// The crumb line and the searchable menu each crumb opens.
 pub mod titlebar;
 

@@ -41,9 +41,10 @@ use gpui_kit::{
 };
 use muster_core::review::ReviewStorage;
 use muster_core::settings::{
-    self, AppSettings, EditorSettings, IndentationSettings, SizeLimits, TerminalCursorStyle,
-    TerminalScrollbarMode, TerminalSettings, UiSettings, EDITOR_FONT_SIZE_LIMITS,
-    INDENTATION_SIZE_LIMITS, TERMINAL_FONT_SIZE_LIMITS, UI_FONT_SIZE_LIMITS,
+    self, AppSettings, EditorSettings, FollowWorktree, IndentationSettings, SizeLimits,
+    TerminalCursorStyle, TerminalScrollbarMode, TerminalSettings, UiSettings,
+    EDITOR_FONT_SIZE_LIMITS, INDENTATION_SIZE_LIMITS, TERMINAL_FONT_SIZE_LIMITS,
+    UI_FONT_SIZE_LIMITS,
 };
 use std::path::PathBuf;
 
@@ -126,6 +127,26 @@ fn storage_row(storage: ReviewStorage) -> usize {
     }
 }
 
+/// Which row of the follow picker a setting is on.
+fn follow_row(mode: FollowWorktree) -> usize {
+    match mode {
+        FollowWorktree::Off => 0,
+        FollowWorktree::Cd => 1,
+        FollowWorktree::Agent => 2,
+        FollowWorktree::Both => 3,
+    }
+}
+
+/// The follow mode a row of [`FOLLOW_WORDS`] stands for.
+fn follow_for_row(row: usize) -> FollowWorktree {
+    match row {
+        1 => FollowWorktree::Cd,
+        2 => FollowWorktree::Agent,
+        3 => FollowWorktree::Both,
+        _ => FollowWorktree::Off,
+    }
+}
+
 fn review_storage(row: usize) -> ReviewStorage {
     match row {
         0 => ReviewStorage::Default,
@@ -145,6 +166,8 @@ const CURSOR_WORDS: [&str; 3] = ["Block", "Bar", "Underline"];
 const SCROLLBAR_WORDS: [&str; 3] = ["Hidden", "While scrolling", "Always"];
 const INDENT_WORDS: [&str; 2] = ["Spaces", "Tabs"];
 const STORAGE_WORDS: [&str; 2] = ["App cache", "This checkout"];
+/// The words a follow setting is chosen with.
+const FOLLOW_WORDS: [&str; 4] = ["Off", "Shell directory", "Agent work", "Both"];
 
 /// The draft this window's panel is editing, if it has one open.
 pub(crate) struct SettingsDraft {
@@ -169,6 +192,8 @@ pub(crate) struct SettingsDraft {
     pub(crate) scrollbar: Entity<SelectState<Vec<SharedString>>>,
     pub(crate) indent_with: Entity<SelectState<Vec<SharedString>>>,
     pub(crate) review_storage_picker: Entity<SelectState<Vec<SharedString>>>,
+    /// What a terminal follows when its work moves to another worktree.
+    pub(crate) follow_worktree: Entity<SelectState<Vec<SharedString>>>,
     pub(crate) error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -189,6 +214,7 @@ impl SettingsDraft {
                 selection_copy: self.draft.terminal.selection_copy,
                 scrollbar: self.draft.terminal.scrollbar,
                 shell_integration: self.draft.terminal.shell_integration,
+                follow_worktree: self.draft.terminal.follow_worktree,
             },
             editor: EditorSettings {
                 font_size: sized(&self.editor_font_size, EDITOR_FONT_SIZE_LIMITS, 13., cx),
@@ -463,6 +489,12 @@ impl TerminalWindow {
         let review_storage = self.navigation.review_storage;
         let review_storage_picker =
             picker_state(&STORAGE_WORDS, storage_row(review_storage), window, cx);
+        let follow_worktree = picker_state(
+            &FOLLOW_WORDS,
+            follow_row(saved.terminal.follow_worktree),
+            window,
+            cx,
+        );
 
         let mut subscriptions = Vec::new();
         // Each picker reports the word that was chosen and nothing else; turning a word into a
@@ -523,6 +555,20 @@ impl TerminalWindow {
             },
         ));
 
+        subscriptions.push(
+            cx.subscribe_in(&follow_worktree, window, |app, _, event, _, cx| {
+                let SelectEvent::Confirm(Some(word)) = event else {
+                    return;
+                };
+                let Some(row) = FOLLOW_WORDS.iter().position(|name| *name == word.as_ref()) else {
+                    return;
+                };
+                app.edit_settings_draft(cx, move |settings| {
+                    settings.terminal.follow_worktree = follow_for_row(row);
+                });
+            }),
+        );
+
         self.settings = Some(SettingsDraft {
             path,
             draft: saved,
@@ -535,6 +581,7 @@ impl TerminalWindow {
             scrollbar,
             indent_with,
             review_storage_picker,
+            follow_worktree,
             error: failure,
             _subscriptions: subscriptions,
         });
@@ -606,6 +653,10 @@ impl TerminalWindow {
                 &draft.review_storage_picker,
                 storage_row(ReviewStorage::default()),
             ),
+            (
+                &draft.follow_worktree,
+                follow_row(FollowWorktree::default()),
+            ),
         ];
         for (picker, row) in picks {
             picker.update(cx, |picker, cx| {
@@ -654,6 +705,7 @@ impl TerminalWindow {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
         let storage = draft.review_storage;
+        self.set_follow_worktree(next.terminal.follow_worktree);
         self.settings = None;
         if storage != self.navigation.review_storage {
             self.set_review_storage(storage, cx);
@@ -685,6 +737,7 @@ impl TerminalWindow {
         let scrollbar = draft.scrollbar.clone();
         let indent_with = draft.indent_with.clone();
         let storage_picker = draft.review_storage_picker.clone();
+        let follow_worktree = draft.follow_worktree.clone();
         let terminal = draft.draft.terminal;
         let editor = draft.draft.editor;
         let sticky = draft.draft.ui.tree_sticky_scroll;
@@ -822,6 +875,14 @@ impl TerminalWindow {
                             roles,
                             terminal.shell_integration,
                             |settings, checked| settings.terminal.shell_integration = checked,
+                        ),
+                        select_row(
+                            "settings-terminal-follow-worktree",
+                            "Follow worktree",
+                            "Moves a terminal's row when its work moves to another worktree. The process and its scrollback stay as they are.",
+                            None,
+                            roles,
+                            &follow_worktree,
                         ),
                     ],
                 ));

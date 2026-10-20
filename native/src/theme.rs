@@ -932,6 +932,48 @@ pub fn over(base: Hsla, top: Hsla) -> Hsla {
     base.blend(top)
 }
 
+/// A colour the service gave, as ink, when it is a colour this app will paint.
+///
+/// The colour belongs to the service: it is a string on a wire that becomes a tint in a
+/// window, so it is checked for being a colour before it is used and a string that is
+/// not one is not painted at all. What a row wears instead is the theme's decision, not
+/// the service's.
+///
+/// `#RGB`, `#RRGGBB` and `#RRGGBBAA` are the shapes OpenCode writes.
+pub fn service_tint(color: &str) -> Option<Hsla> {
+    let digits = color.strip_prefix('#')?;
+    let value = match digits.len() {
+        3 => {
+            let mut expanded = String::with_capacity(6);
+            for digit in digits.chars() {
+                expanded.push(digit);
+                expanded.push(digit);
+            }
+            u32::from_str_radix(&expanded, 16).ok()?
+        }
+        6 => u32::from_str_radix(digits, 16).ok()?,
+        8 => u32::from_str_radix(digits, 16).ok()?,
+        _ => return None,
+    };
+    let (red, green, blue, alpha) = match digits.len() {
+        8 => (
+            (value >> 24) & 0xff,
+            (value >> 16) & 0xff,
+            (value >> 8) & 0xff,
+            value & 0xff,
+        ),
+        _ => (
+            (value >> 16) & 0xff,
+            (value >> 8) & 0xff,
+            value & 0xff,
+            0xff,
+        ),
+    };
+    Some(Hsla::from(gpui_kit::rgba(
+        (red << 24) | (green << 16) | (blue << 8) | alpha,
+    )))
+}
+
 /// WCAG relative luminance, for asking whether two roles can be read.
 pub fn luminance(color: Hsla) -> f32 {
     let rgba = color.to_rgb();
@@ -1299,6 +1341,21 @@ mod tests {
     /// Every capture name a grammar this app compiles in can emit, and the
     /// Legacy token it wears.
     ///
+    /// A colour the service gave is painted only when it is a colour.
+    ///
+    /// The service owns the colour, and it is a string on a wire that becomes a tint in
+    /// a window: a string that is not a colour is not painted, and the theme's own ink
+    /// is what a row wears instead.
+    #[test]
+    fn a_service_colour_is_painted_only_when_it_is_a_colour() {
+        for color in ["#5c7cfa", "#abc", "#5c7cfa80", "#ABCDEF"] {
+            assert!(service_tint(color).is_some(), "{color} is a colour");
+        }
+        for color in ["rebeccapurple", "#12345", "#1234567", "5c7cfa", ""] {
+            assert!(service_tint(color).is_none(), "{color} is not a colour");
+        }
+    }
+
     /// This is the compatibility contract, stated once and read off Legacy's own
     /// table: a capture naming a meaning Legacy names takes that token, and the
     /// whole of them stays readable on the surface they are drawn on. Every row

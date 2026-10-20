@@ -16,8 +16,28 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// Binds a port, waiting for it while another mock is holding it.
+///
+/// A test that stops a mock and starts another where it was frees a port that the
+/// operating system may hand to a test running beside it. Waiting is the answer:
+/// the test wants that port, and the mock that took it is not going to keep it.
+fn bind_port(port: u16) -> TcpListener {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("the mock should bind the port: {error}"),
+        }
+    }
+}
 
 /// What the service answers with. `body` is sent verbatim, so a test can answer with
 /// something that is not JSON at all.
@@ -142,14 +162,14 @@ impl Mock {
 
     /// Serves on a port the test already knows, which is what stopping one service and
     /// starting another where it was needs.
+    ///
+    /// The port is waited for rather than refused: the mock that was stopped freed it,
+    /// and the operating system may have handed it to another mock in the meantime.
     pub(crate) fn start_on(
         port: u16,
         handler: impl Fn(&Request) -> Reply + Send + Sync + 'static,
     ) -> Self {
-        Self::serve(
-            TcpListener::bind(("127.0.0.1", port)).expect("the mock should bind the port"),
-            handler,
-        )
+        Self::serve(bind_port(port), handler)
     }
 
     fn serve(

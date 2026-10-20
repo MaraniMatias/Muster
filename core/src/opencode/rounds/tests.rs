@@ -149,6 +149,8 @@ struct Service {
     silent: Arc<AtomicUsize>,
     refused: Arc<AtomicUsize>,
     swallowed: Arc<AtomicUsize>,
+    /// 0 idle, 1 running, 2 blocked, 3 unreadable pending.
+    activity: Arc<AtomicUsize>,
 }
 
 impl Service {
@@ -158,6 +160,8 @@ impl Service {
         let silent = Arc::new(AtomicUsize::new(0));
         let refused = Arc::new(AtomicUsize::new(0));
         let swallowed = Arc::new(AtomicUsize::new(0));
+        let activity = Arc::new(AtomicUsize::new(0));
+        let current_activity = Arc::clone(&activity);
         let (taken, silent_prompts, refused_prompts, swallowed_prompts) = (
             Arc::clone(&transcript),
             Arc::clone(&silent),
@@ -177,6 +181,24 @@ impl Service {
             match (request.method.as_str(), request.path.as_str()) {
                 ("GET", "/api/info") => mock::reply(200, json!({ "data": {} })),
                 ("POST", "/api/session") => answer(json!({ "id": SESSION })),
+                ("GET", "/api/session") => answer(json!([{
+                    "id": SESSION, "location": { "directory": location }
+                }])),
+                ("GET", "/api/session/active") => {
+                    let state = current_activity.load(Ordering::SeqCst);
+                    answer(if state == 1 || state == 2 {
+                        json!({ SESSION: { "type": "running" } })
+                    } else {
+                        json!({})
+                    })
+                }
+                ("GET", "/api/form" | "/api/permission/request") => {
+                    match current_activity.load(Ordering::SeqCst) {
+                        2 => answer(json!([{ "sessionID": SESSION }])),
+                        3 => mock::reply(500, json!({})),
+                        _ => answer(json!([])),
+                    }
+                }
                 ("GET", path) if path == format!("/api/session/{SESSION}") => {
                     answer(json!({ "id": SESSION }))
                 }
@@ -222,6 +244,7 @@ impl Service {
             silent,
             refused,
             swallowed,
+            activity,
         }
     }
 
@@ -267,6 +290,379 @@ fn take_one(counter: &AtomicUsize) -> bool {
             left.checked_sub(1)
         })
         .is_ok()
+}
+
+/// A queued review is recorded before it is offered, and goes out when it is flushed.
+///
+/// The queue is only ever reachable by a round that provably was never taken, so a
+/// flush can offer it without asking whether it landed first.
+#[test]
+fn a_queued_round_is_recorded_before_it_is_offered_and_goes_out_when_it_is_flushed() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+
+    let round = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+
+    assert_eq!(round.status, RoundStatus::Queued);
+    assert!(
+        fixture.service.prompts().is_empty(),
+        "a queued round was not offered to the service"
+    );
+    assert!(
+        fixture
+            .store
+            .round(&fixture.checkout.id, &round.id)
+            .unwrap()
+            .is_some(),
+        "the round is on disk before anything is offered"
+    );
+
+    let sent = fixture
+        .store
+        .flush_rounds_for_session(&fixture.client, &fixture.checkout.id, SESSION)
+        .unwrap();
+
+    assert_eq!(sent, 1);
+    assert_eq!(fixture.status(&round.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.service.prompts().len(), 1);
+}
+
+/// A round that is waiting for one session is not sent into another one's turn.
+#[test]
+fn a_queued_round_for_another_session_is_not_flushed() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let round = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+
+    let sent = fixture
+        .store
+        .flush_rounds_for_session(&fixture.client, &fixture.checkout.id, "ses_other")
+        .unwrap();
+
+    assert_eq!(sent, 0);
+    assert_eq!(fixture.status(&round.id), RoundStatus::Queued);
+    assert!(fixture.service.prompts().is_empty());
+}
+
+/// A completed turn settles the rounds that were already delivered to that session,
+/// and only those.
+#[test]
+fn a_completed_turn_settles_only_what_was_already_delivered_to_that_session() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let round = fixture
+        .store
+        .send_round(&fixture.client, fixture.request(&notes, "review"))
+        .unwrap();
+    assert_eq!(round.status, RoundStatus::Dispatched);
+
+    let eligible = fixture.store.eligible_dispatched().unwrap();
+    let acked = fixture
+        .store
+        .ack_dispatched_rounds(SESSION, &eligible)
+        .unwrap();
+
+    assert_eq!(acked, 1);
+    assert_eq!(fixture.status(&round.id), RoundStatus::Acked);
+}
+
+/// A round that was flushed by the same observation that completed the turn belongs to
+/// the turn that follows, so that turn does not settle it.
+#[test]
+fn a_round_that_was_just_flushed_is_not_settled_by_the_turn_that_finished() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let round = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+    let eligible = fixture.store.eligible_dispatched().unwrap();
+    fixture
+        .store
+        .flush_rounds_for_session(&fixture.client, &fixture.checkout.id, SESSION)
+        .unwrap();
+
+    let acked = fixture
+        .store
+        .ack_dispatched_rounds(SESSION, &eligible)
+        .unwrap();
+
+    assert_eq!(acked, 0);
+    assert_eq!(fixture.status(&round.id), RoundStatus::Dispatched);
+}
+
+/// The same review asked for twice is one round, and it is offered once.
+#[test]
+fn the_same_review_queued_twice_is_one_round_and_is_offered_once() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+
+    let first = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+    let second = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+
+    assert_eq!(first.id, second.id);
+    assert_eq!(fixture.store.rounds(&fixture.checkout.id).unwrap().len(), 1);
+    let sent = fixture
+        .store
+        .flush_rounds_for_session(&fixture.client, &fixture.checkout.id, SESSION)
+        .unwrap();
+    assert_eq!(sent, 1);
+    assert_eq!(fixture.service.prompts().len(), 1);
+}
+
+#[test]
+fn a_late_window_cannot_ack_a_review_another_window_just_flushed() {
+    let fixture = Fixture::start();
+    let first = fixture.send(&fixture.notes()).unwrap();
+    let notes = vec![note(&fixture.checkout.id, "next-note")];
+    let queued = fixture
+        .store
+        .queue_round(fixture.request(&notes, "next review"))
+        .unwrap();
+    let second_window = RoundStore::open(fixture.home.path()).unwrap();
+    // Both windows begin observing the same turn before either settles it.
+    let slow_observation = fixture.store.eligible_dispatched().unwrap();
+    let fast_observation = second_window.eligible_dispatched().unwrap();
+    assert_eq!(
+        second_window
+            .ack_dispatched_rounds(SESSION, &fast_observation)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        second_window
+            .flush_rounds_for_session(&fixture.client, &fixture.checkout.id, SESSION)
+            .unwrap(),
+        1
+    );
+    // The slow window resumes after that send. It must not discover new eligibility.
+    assert_eq!(
+        fixture
+            .store
+            .ack_dispatched_rounds(SESSION, &slow_observation)
+            .unwrap(),
+        0
+    );
+    assert_eq!(fixture.status(&first.id), RoundStatus::Acked);
+    assert_eq!(fixture.status(&queued.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.service.prompts().len(), 2);
+}
+
+#[test]
+fn a_restart_can_drain_a_durable_queue_without_a_running_to_idle_edge() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let queued = fixture
+        .store
+        .queue_round(fixture.request(&notes, "persisted review"))
+        .unwrap();
+    let restarted = RoundStore::open(fixture.home.path()).unwrap();
+    let client = Client::connect(fixture.home.path(), Path::new(&fixture.checkout.path)).unwrap();
+    assert_eq!(restarted.queued().unwrap(), vec![queued.clone()]);
+    assert_eq!(
+        restarted
+            .flush_rounds_for_session(&client, &fixture.checkout.id, SESSION)
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.status(&queued.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.service.prompts(), vec![queued.prompt]);
+}
+
+#[test]
+fn an_ordinary_send_uses_fresh_busy_state_and_claims_nothing_until_the_choice() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    // A panel may still show idle. The service now says running.
+    fixture.service.activity.store(1, Ordering::SeqCst);
+    assert!(fixture
+        .store
+        .send_round_if_ready(&fixture.client, fixture.request(&notes, "review"))
+        .unwrap()
+        .is_none());
+    assert!(fixture
+        .store
+        .rounds(&fixture.checkout.id)
+        .unwrap()
+        .is_empty());
+    assert!(fixture.service.prompts().is_empty());
+    // Explicitly confirming Send now is a different operation.
+    let sent = fixture
+        .store
+        .send_round(&fixture.client, fixture.request(&notes, "review"))
+        .unwrap();
+    assert_eq!(fixture.status(&sent.id), RoundStatus::Dispatched);
+}
+
+#[test]
+fn an_ordinary_send_refuses_unknown_pending_state_without_claiming_notes() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    fixture.service.activity.store(3, Ordering::SeqCst);
+    assert!(fixture
+        .store
+        .send_round_if_ready(&fixture.client, fixture.request(&notes, "review"))
+        .is_err());
+    assert!(fixture
+        .store
+        .rounds(&fixture.checkout.id)
+        .unwrap()
+        .is_empty());
+    assert!(fixture.service.prompts().is_empty());
+}
+
+#[test]
+fn a_known_blocked_turn_is_not_busy_for_an_ordinary_review_action() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    fixture.service.activity.store(2, Ordering::SeqCst);
+    let round = fixture
+        .store
+        .send_round_if_ready(&fixture.client, fixture.request(&notes, "review"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.status(&round.id), RoundStatus::Dispatched);
+}
+
+#[test]
+fn a_queue_waits_through_busy_blocked_and_unknown_until_positive_idle() {
+    let fixture = Fixture::start();
+    let notes = fixture.notes();
+    let queued = fixture
+        .store
+        .queue_round(fixture.request(&notes, "review"))
+        .unwrap();
+    for state in [1, 2, 3] {
+        fixture.service.activity.store(state, Ordering::SeqCst);
+        assert_eq!(
+            fixture
+                .store
+                .flush_rounds(&fixture.client, &fixture.checkout.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(fixture.status(&queued.id), RoundStatus::Queued);
+        assert!(fixture.service.prompts().is_empty());
+    }
+    fixture.service.activity.store(0, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .store
+            .flush_rounds(&fixture.client, &fixture.checkout.id)
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.status(&queued.id), RoundStatus::Dispatched);
+}
+
+/// A round whose session the service does not list any more waits for the person, and
+/// it does not hold up the rounds behind it.
+#[test]
+fn a_round_whose_session_is_gone_does_not_hold_up_the_rounds_behind_it() {
+    let fixture = Fixture::start();
+    let gone_notes = vec![note(&fixture.checkout.id, "note-gone")];
+    let gone = fixture
+        .store
+        .queue_round(fixture.request_for("ses_gone", &gone_notes, "gone review"))
+        .unwrap();
+    let here = fixture
+        .store
+        .queue_round(fixture.request(&fixture.notes(), "review"))
+        .unwrap();
+
+    let sent = fixture
+        .store
+        .flush_rounds(&fixture.client, &fixture.checkout.id)
+        .unwrap();
+
+    assert_eq!(sent, 1);
+    assert_eq!(
+        fixture.status(&gone.id),
+        RoundStatus::Queued,
+        "a round for a session that is not there waits for the person"
+    );
+    assert_eq!(fixture.status(&here.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.service.prompts().len(), 1);
+}
+
+/// One read of the service's answer, however many rounds are waiting.
+#[test]
+fn one_read_answers_every_waiting_round() {
+    let fixture = Fixture::start();
+    let first = fixture
+        .store
+        .queue_round(fixture.request(&fixture.notes(), "first review"))
+        .unwrap();
+    let second_notes = vec![note(&fixture.checkout.id, "note-second")];
+    let second = fixture
+        .store
+        .queue_round(fixture.request(&second_notes, "second review"))
+        .unwrap();
+
+    let sent = fixture
+        .store
+        .flush_rounds(&fixture.client, &fixture.checkout.id)
+        .unwrap();
+
+    assert_eq!(sent, 2);
+    assert_eq!(fixture.status(&first.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.status(&second.id), RoundStatus::Dispatched);
+    let lists = fixture
+        .service
+        .mock
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "GET" && request.path == "/api/session")
+        .count();
+    assert_eq!(
+        lists, 1,
+        "the sessions were read once for the whole queue, not once per round"
+    );
+}
+
+/// One review whose answer was lost does not hold up the reviews behind it.
+#[test]
+fn a_send_whose_answer_was_lost_does_not_hold_up_the_queue_behind_it() {
+    let fixture = Fixture::start();
+    let first = fixture
+        .store
+        .queue_round(fixture.request(&fixture.notes(), "first review"))
+        .unwrap();
+    let second_notes = vec![note(&fixture.checkout.id, "note-second")];
+    let second = fixture
+        .store
+        .queue_round(fixture.request(&second_notes, "second review"))
+        .unwrap();
+    // The first prompt is taken and never answered, and never leaves a trace.
+    fixture.service.swallow_next(1);
+
+    let outcome = fixture
+        .store
+        .flush_rounds(&fixture.client, &fixture.checkout.id);
+
+    assert!(
+        outcome.is_err(),
+        "the lost answer is the caller's report, not a reason to stop"
+    );
+    assert_eq!(
+        fixture.status(&first.id),
+        RoundStatus::Dispatching,
+        "a prompt that may have landed is a question, not a retry"
+    );
+    assert_eq!(fixture.status(&second.id), RoundStatus::Dispatched);
+    assert_eq!(fixture.service.prompt_posts().len(), 2);
 }
 
 struct Fixture {
@@ -315,9 +711,19 @@ impl Fixture {
     }
 
     fn request<'a>(&'a self, notes: &'a [ReviewNote], markdown: &'a str) -> RoundRequest<'a> {
+        self.request_for(SESSION, notes, markdown)
+    }
+
+    /// The same request, aimed at another session of the same checkout.
+    fn request_for<'a>(
+        &'a self,
+        session_id: &'a str,
+        notes: &'a [ReviewNote],
+        markdown: &'a str,
+    ) -> RoundRequest<'a> {
         RoundRequest {
             checkout: &self.checkout,
-            session_id: SESSION,
+            session_id,
             notes,
             review_markdown: markdown,
         }

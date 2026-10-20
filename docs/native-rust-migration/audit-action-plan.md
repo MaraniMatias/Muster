@@ -1563,14 +1563,20 @@ verification. Cargo reported the existing future-incompatibility warning for
 ### Latest NOTAS integration verification (native v0.1.0)
 
 This supersedes earlier suite counts, not historical results below. With Rust and
-Cargo 1.97.1, `cargo test --locked --workspace` passed **364 native, 159 core and
+Cargo 1.97.1, `cargo test --locked --workspace` passed **476 native, 225 core and
 4 instance-lock tests**; 3 native performance measurements remain ignored.
 `cargo clippy --locked --workspace --all-targets -- -D warnings`,
 `cargo fmt --all --check` and `git diff --check` passed. The release/audit script
 suite contains 23 tests; the live dependency audit has no blocking advisories after
 updating `rustls` to 0.23.46. OpenCode protocol tests use a mock local service;
 a real OpenCode session and a real external Prettier installation are not manual
-acceptance evidence. Linux runtime and graphical/platform acceptance remain open.
+acceptance evidence. The OpenCode integration's own rules — an unreadable service
+protecting a worktree, a queue offered only on a freshly read idle session, one
+observation answering the whole queue, a follow pass that is single-flight — are
+pinned by the tests in `core/src/opencode/`, `native/src/agent_watch.rs`,
+`native/src/follow.rs` and `native/src/sidebar_tests.rs`; none of them was
+exercised against a real OpenCode service. Linux runtime and graphical/platform
+acceptance remain open.
 `scripts/release.sh release` passed and produced `dist/Muster.app` (0.1.0), including
 local plist and ad-hoc signature verification. A clean optimized build needs
 `strip = "none"`: the pinned compiler's debuginfo-stripping pass otherwise produces

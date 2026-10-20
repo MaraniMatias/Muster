@@ -306,6 +306,9 @@ impl TerminalWindow {
         cx: &mut Context<Self>,
     ) {
         let checkout = checkout.to_owned();
+        // The search over the sessions a review can go to is opened with the change
+        // set: it is part of the panel that is about to be on screen.
+        self.open_opencode_search(window, cx);
         self.request_document_transition(
             Box::new(move |app, _, cx| app.open_changes(&checkout, path, cx)),
             window,
@@ -321,7 +324,10 @@ impl TerminalWindow {
     ) {
         self.clear_document();
         self.open_diff = Some((checkout.to_owned(), path.clone()));
+        // A choice raised about one change set is not a choice about another.
+        self.review.opencode_choice = None;
         self.restore_opencode_review(checkout, cx);
+        self.sync_opencode_sessions(cx);
         self.prune_diff_cache();
         self.focus_pending = false;
         self.open_crumb = None;
@@ -741,6 +747,20 @@ impl TerminalWindow {
             .then(|| self.review.destination_error.clone())
             .flatten();
         let opencode_rounds = self.review.opencode_rounds.clone();
+        let opencode_choices = self.opencode_session_choices();
+        let opencode_total = self.review.opencode_sessions.len();
+        let opencode_target_label = match &self.review.destination {
+            Some(muster_core::opencode::Destination::Opencode { session_id }) => self
+                .review
+                .opencode_sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+                .map(|session| session.display_title().to_string())
+                .unwrap_or_else(|| "Selected session".into()),
+            Some(muster_core::opencode::Destination::OpencodeNew) => "New session".into(),
+            _ => String::new(),
+        };
+        let opencode_search = self.review.opencode_search.clone();
         let opencode_status = opencode_selected
             .then(|| opencode_rounds.last())
             .flatten()
@@ -1242,11 +1262,7 @@ impl TerminalWindow {
                                                         let _ = markdown.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Markdown, cx));
                                                     })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
                                                         let _ = opencode.update(cx, |app, cx| {
-                                                            let destination = match app.review.destination.clone() {
-                                                                Some(value @ muster_core::opencode::Destination::Opencode { .. }) => value,
-                                                                _ => muster_core::opencode::Destination::OpencodeNew,
-                                                            };
-                                                            app.set_destination(destination, cx);
+                                                            app.choose_opencode_destination(cx);
                                                         });
                                                     })).item(PopupMenuItem::new("Pi").on_click(move |_, _, cx| {
                                                         let _ = pi.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Pi, cx));
@@ -1310,6 +1326,77 @@ impl TerminalWindow {
                                         .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
                                         })))
+                            })
+                            .when(opencode_selected, |row| {
+                                let choose = weak.clone();
+                                let choices = opencode_choices.clone();
+                                // The search comes first: it is what narrows the
+                                // list the chooser below offers. It is only here
+                                // when the list is long enough to need one.
+                                let searched = row
+                                    .when(opencode_total > crate::agent_watch::SEARCH_THRESHOLD, |row| {
+                                        row.when_some(opencode_search.clone(), |row, search| {
+                                            row.child(
+                                                gpui_kit::component::input::Input::new(&search)
+                                                    .id("review-opencode-search")
+                                                    .small()
+                                                    .bg(roles.surface_base)
+                                                    .rounded(px(4.))
+                                                    .aria_label("Search OpenCode sessions")
+                                                    .w(px(150.)),
+                                            )
+                                        })
+                                    });
+                                searched.child(
+                                    zed_button("review-opencode-session")
+                                        .small()
+                                        .compact()
+                                        .h(px(20.))
+                                        .rounded(px(0.))
+                                        .label(opencode_target_label.clone())
+                                        .accessibility_label("OpenCode session")
+                                        .resting_tooltip(opencode_target_label.clone())
+                                        .dropdown_caret(true)
+                                        .dropdown_menu_with_anchor(
+                                            Anchor::TopRight,
+                                            move |menu, _, _| {
+                                                let mut menu = menu.min_w(px(260.));
+                                                for session in &choices {
+                                                    let id = session.id.clone();
+                                                    let title =
+                                                        session.display_title().to_string();
+                                                    let weak = choose.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(title).on_click(
+                                                            move |_, _, cx| {
+                                                                let _ = weak.update(
+                                                                    cx,
+                                                                    |app, cx| {
+                                                                        app.choose_opencode_session(
+                                                                            Some(id.clone()),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        ),
+                                                    );
+                                                }
+                                                let weak = choose.clone();
+                                                menu.item(
+                                                    PopupMenuItem::new("New session").on_click(
+                                                        move |_, _, cx| {
+                                                            let _ = weak.update(cx, |app, cx| {
+                                                                app.choose_opencode_session(
+                                                                    None, cx,
+                                                                );
+                                                            });
+                                                        },
+                                                    ),
+                                                )
+                                            },
+                                        ),
+                                )
                             })
                             .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
                                 .text().small().compact().h(px(20.)).label("Copy session ID").resting_tooltip(session.clone())

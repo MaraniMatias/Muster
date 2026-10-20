@@ -43,7 +43,11 @@ use std::{
     io::{self, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use base64::Engine as _;
@@ -51,8 +55,14 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(test)]
 mod mock;
+pub mod observe;
+pub mod relocate;
 pub mod rounds;
 
+pub use observe::{
+    agent_color, agent_label, elapsed_seconds, is_hex_color, match_session_title, now_millis,
+    terminal_session_title, AgentAgent, AgentSession, Attention, MatchedSession,
+};
 pub use rounds::{unsent_notes, Destination, ReviewRound, RoundStatus, RoundStore};
 
 /// Where the service registers itself, and the name it registers under.
@@ -76,6 +86,83 @@ const REGISTRATION_CAP: u64 = 64 * 1024;
 /// The rest of the requests: a service busy answering a turn can delay them, but a
 /// review is one message and waiting for a wedge is not worth it either.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The entire observation, including discovery, pending lists and catalogs.
+pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// An observation never waits this long again for every endpoint in a snapshot.
+const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// One shared deadline and cancellation flag for an off-thread service read.
+///
+/// Clones share cancellation. Requests check it before touching the wire and use the
+/// remaining deadline (at most one second) as their HTTP timeout, including the body.
+#[derive(Clone, Debug)]
+pub struct ReadBudget {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    /// The longest a single request may take.
+    request: Duration,
+}
+
+impl ReadBudget {
+    /// A budget for an observation: one deadline for the whole read, and a short cap
+    /// on each request so one slow endpoint cannot spend it all.
+    pub fn new(timeout: Duration) -> Self {
+        Self::with_request_cap(timeout, READ_REQUEST_TIMEOUT)
+    }
+
+    /// A budget for a caller that is waiting for one answer: the same total deadline,
+    /// but a request may take as long as that deadline allows.
+    ///
+    /// An observation asks about a service that may be busy with a turn, and a short
+    /// request is what keeps the panel painting. An action — a send, a retry — is
+    /// waiting for the service on purpose, and a timeout there is a question about a
+    /// review rather than a row that could not be painted.
+    pub fn patient(timeout: Duration) -> Self {
+        Self::with_request_cap(timeout, timeout)
+    }
+
+    fn with_request_cap(timeout: Duration, request: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            request,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// A short slice of this read, sharing its cancellation and outer deadline.
+    pub fn slice(&self, timeout: Duration) -> Self {
+        Self {
+            deadline: self.deadline.min(Instant::now() + timeout),
+            cancelled: Arc::clone(&self.cancelled),
+            request: self.request.min(timeout),
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, DispatchError> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(DispatchError::Unavailable(
+                "the OpenCode observation was cancelled".into(),
+            ));
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                DispatchError::Unavailable("the OpenCode observation deadline expired".into())
+            })
+    }
+
+    /// The longest one request may take inside this budget.
+    pub fn request_timeout(&self) -> Result<Duration, DispatchError> {
+        Ok(self.remaining()?.min(self.request))
+    }
+}
 
 /// The header the service reads to decide which location answers a request.
 const DIRECTORY_HEADER: &str = "x-opencode-directory";
@@ -168,9 +255,64 @@ struct ApiLocation {
 #[derive(Debug, Deserialize)]
 struct ApiSession {
     id: String,
+    /// The title the session's own TUI writes into the terminal it runs in.
+    #[serde(default)]
+    title: String,
+    /// When the session was created, touched and last went idle.
+    #[serde(default)]
+    time: ApiSessionTime,
     /// Present inside the session object, unlike the envelope-level `location`.
     #[serde(default)]
     location: Option<ApiLocation>,
+    /// The agent running it, named by the catalog.
+    #[serde(default)]
+    agent: Option<String>,
+    /// The session this one is a child of, when it is a subagent.
+    #[serde(default, rename = "parentID")]
+    parent_id: Option<String>,
+    /// How the last turn ended.
+    #[serde(default)]
+    outcome: Option<String>,
+    /// The model the session runs on.
+    #[serde(default)]
+    model: Option<ApiModel>,
+}
+
+/// The model's own shape, which carries a provider of its own.
+#[derive(Debug, Deserialize)]
+struct ApiModel {
+    #[serde(default)]
+    provider_id: String,
+    id: String,
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+impl ApiModel {
+    /// The model as one string, in the `provider/id#variant` form OpenCode writes in
+    /// its configuration.
+    fn label(&self) -> String {
+        let base = if self.provider_id.is_empty() {
+            self.id.clone()
+        } else {
+            format!("{}/{}", self.provider_id, self.id)
+        };
+        match &self.variant {
+            Some(variant) => format!("{base}#{variant}"),
+            None => base,
+        }
+    }
+}
+
+/// The times a session carries, in epoch milliseconds.
+#[derive(Debug, Default, Deserialize)]
+struct ApiSessionTime {
+    #[serde(default)]
+    created: i64,
+    #[serde(default)]
+    updated: i64,
+    #[serde(default)]
+    idle: Option<i64>,
 }
 
 /// Where the service may have registered itself, most specific first.
@@ -346,7 +488,11 @@ fn endpoint(url: &str, password: String) -> Result<ServiceEndpoint, DispatchErro
 
 /// Asks the service whether it is there, with the password that says this client may ask.
 fn probe(endpoint: &ServiceEndpoint) -> Result<(), DispatchError> {
-    let agent = agent(PROBE_TIMEOUT);
+    probe_with_timeout(endpoint, PROBE_TIMEOUT)
+}
+
+fn probe_with_timeout(endpoint: &ServiceEndpoint, timeout: Duration) -> Result<(), DispatchError> {
+    let agent = agent(timeout);
     let response = agent
         .get(&format!("{}/api/info", endpoint.url))
         .header("authorization", authorization(&endpoint.password))
@@ -358,7 +504,10 @@ fn probe(endpoint: &ServiceEndpoint) -> Result<(), DispatchError> {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(refused_status(response.status().as_u16())),
         Err(ureq::Error::StatusCode(status)) => Err(refused_status(status)),
-        Err(_) => Err(DispatchError::Unavailable(NOT_RUNNING.into())),
+        Err(error) if failed_before_send(&error) => {
+            Err(DispatchError::Unavailable(NOT_RUNNING.into()))
+        }
+        Err(error) => Err(map_error(error)),
     }
 }
 
@@ -380,7 +529,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
-            .timeout_connect(Some(PROBE_TIMEOUT))
+            .timeout_connect(Some(timeout.min(PROBE_TIMEOUT)))
             // No redirect is followed. The service is one loopback origin, and following a
             // `Location` is the one thing on this path that would carry the registration's
             // password to an address this client never validated.
@@ -393,10 +542,19 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 /// One conversation with the service, scoped to one checkout's directory.
+///
+/// A client with no directory is a client of the whole service: the reads that answer
+/// for every location the service knows carry no scope at all, because a session that
+/// has moved is not listed by the directory it left.
+#[derive(Clone)]
 pub struct Client {
     endpoint: ServiceEndpoint,
     directory: PathBuf,
+    /// Whether the requests carry the directory. A client without one asks about the
+    /// service rather than about a checkout.
+    scoped: bool,
     agent: ureq::Agent,
+    read_budget: Option<ReadBudget>,
 }
 
 impl Client {
@@ -409,8 +567,64 @@ impl Client {
         Ok(Self {
             endpoint: discover(home)?,
             directory: directory.to_path_buf(),
+            scoped: true,
             agent: agent(REQUEST_TIMEOUT),
+            read_budget: None,
         })
+    }
+
+    /// A client of the whole service, for the reads that answer for every location.
+    ///
+    /// The service registers itself once and its clients find it there, so this is the
+    /// same discovery a scoped client does: there is no port to pick and no process to
+    /// wait for.
+    pub fn connect_service(home: &Path) -> Result<Self, DispatchError> {
+        Self::connect_service_with_budget(home, ReadBudget::new(OBSERVATION_TIMEOUT))
+    }
+
+    /// Uses one caller-owned deadline for discovery and every read that follows it.
+    /// Cancel the budget when the window or observation is superseded.
+    pub fn connect_service_with_budget(
+        home: &Path,
+        budget: ReadBudget,
+    ) -> Result<Self, DispatchError> {
+        budget.remaining()?;
+        let registration = read_registration(home)?;
+        supported_version(&registration.version)?;
+        let endpoint = endpoint(&registration.url, registration.password)?;
+        probe_with_timeout(&endpoint, budget.request_timeout()?)?;
+        Ok(Self {
+            endpoint,
+            directory: PathBuf::new(),
+            scoped: false,
+            agent: agent(REQUEST_TIMEOUT),
+            read_budget: Some(budget),
+        })
+    }
+
+    /// Bounds subsequent reads, including on a client already scoped to a checkout.
+    pub fn with_read_budget(mut self, budget: ReadBudget) -> Self {
+        self.read_budget = Some(budget);
+        self
+    }
+
+    fn request_timeout(&self) -> Result<Duration, DispatchError> {
+        match &self.read_budget {
+            Some(budget) => budget.request_timeout(),
+            None => Ok(REQUEST_TIMEOUT),
+        }
+    }
+
+    /// A checkout-scoped client sharing the observation's discovery and read deadline.
+    pub fn connect_with_budget(
+        home: &Path,
+        directory: &Path,
+        budget: ReadBudget,
+    ) -> Result<Self, DispatchError> {
+        let mut client = Self::connect_service_with_budget(home, budget)?;
+        client.directory = directory.to_path_buf();
+        client.scoped = true;
+        Ok(client)
     }
 
     pub fn endpoint(&self) -> &ServiceEndpoint {
@@ -495,23 +709,74 @@ impl Client {
     /// Refuses a session or an answer that belongs to another directory than the
     /// checkout this client was scoped to.
     fn check_location(&self, location: Option<&ApiLocation>) -> Result<(), DispatchError> {
-        let Some(location) = location else {
-            return Ok(());
-        };
-        if same_directory(Path::new(&location.directory), &self.directory) {
-            Ok(())
+        if self.scoped {
+            check_scope(location, &self.directory)
         } else {
-            Err(DispatchError::Foreign(
-                "the agent server answered for a different directory".into(),
-            ))
+            Ok(())
         }
     }
 
     fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, DispatchError> {
         let scope = self.scope()?;
+        let mut request = self.agent.get(&format!("{}{path}", self.endpoint.url));
+        if let Some(scope) = &scope {
+            request = request
+                .query("directory", scope)
+                .header(DIRECTORY_HEADER, scope);
+        }
+        let response = request
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
+            .header("authorization", authorization(&self.endpoint.password))
+            .header("accept", "application/json")
+            .call()
+            .map_err(map_error)?;
+        let envelope: ApiEnvelope<T> = read_json(response)?;
+        self.check_location(envelope.location.as_ref())?;
+        Ok(envelope.data)
+    }
+
+    /// Fetches a path that carries its own query, with no scope at all.
+    ///
+    /// The path is given whole because the one read that asks about the whole service
+    /// asks for a page of sessions with `limit`, and a second query parameter appended
+    /// to that would be a second `?`.
+    fn get_json_unscoped<T: DeserializeOwned>(
+        &self,
+        path_and_query: &str,
+    ) -> Result<T, DispatchError> {
+        let response = self
+            .agent
+            .get(&format!("{}{path_and_query}", self.endpoint.url))
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
+            .header("authorization", authorization(&self.endpoint.password))
+            .header("accept", "application/json")
+            .call()
+            .map_err(map_error)?;
+        let envelope: ApiEnvelope<T> = read_json(response)?;
+        // There is no scope to check the answer against, so there is nothing to refuse.
+        Ok(envelope.data)
+    }
+
+    /// Fetches a path as one other location answers it.
+    ///
+    /// The catalog and the pending lists answer for one location, so a client that
+    /// talks about the whole service still has to ask each location about its own.
+    fn get_json_for<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        directory: &Path,
+    ) -> Result<T, DispatchError> {
+        let scope = scope_of(directory)?;
         let response = self
             .agent
             .get(&format!("{}{path}", self.endpoint.url))
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
             .query("directory", &scope)
             .header("authorization", authorization(&self.endpoint.password))
             .header(DIRECTORY_HEADER, &scope)
@@ -519,7 +784,7 @@ impl Client {
             .call()
             .map_err(map_error)?;
         let envelope: ApiEnvelope<T> = read_json(response)?;
-        self.check_location(envelope.location.as_ref())?;
+        check_scope(envelope.location.as_ref(), directory)?;
         Ok(envelope.data)
     }
 
@@ -529,12 +794,17 @@ impl Client {
         body: &B,
     ) -> Result<T, DispatchError> {
         let scope = self.scope()?;
-        let response = self
-            .agent
-            .post(&format!("{}{path}", self.endpoint.url))
-            .query("directory", &scope)
+        let mut request = self.agent.post(&format!("{}{path}", self.endpoint.url));
+        if let Some(scope) = &scope {
+            request = request
+                .query("directory", scope)
+                .header(DIRECTORY_HEADER, scope);
+        }
+        let response = request
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
             .header("authorization", authorization(&self.endpoint.password))
-            .header(DIRECTORY_HEADER, &scope)
             .send_json(body)
             .map_err(map_error)?;
         let envelope: ApiEnvelope<T> = read_json(response)?;
@@ -544,14 +814,14 @@ impl Client {
 
     /// The checkout path as both the query and the header carry it. A path that
     /// cannot be spelled in a header is refused rather than sent half-encoded.
-    fn scope(&self) -> Result<String, DispatchError> {
-        let scope = self.directory.to_string_lossy().into_owned();
-        if scope.bytes().any(|byte| byte.is_ascii_control()) {
-            return Err(DispatchError::Failed(
-                "the checkout path cannot be represented in an HTTP header".into(),
-            ));
+    ///
+    /// `None` for a client of the whole service: a read with no directory is the one
+    /// read that answers for every location the service knows.
+    fn scope(&self) -> Result<Option<String>, DispatchError> {
+        if !self.scoped {
+            return Ok(None);
         }
-        Ok(scope)
+        scope_of(&self.directory).map(Some)
     }
 }
 
@@ -561,7 +831,7 @@ fn map_error(error: ureq::Error) -> DispatchError {
     match error {
         ureq::Error::StatusCode(status) => refused_status(status),
         ureq::Error::Timeout(_) => DispatchError::Unavailable(format!(
-            "the OpenCode service did not answer within {}s",
+            "the OpenCode service did not answer within its request deadline (at most {}s)",
             REQUEST_TIMEOUT.as_secs()
         )),
         error if failed_before_send(&error) => {
@@ -613,6 +883,39 @@ fn same_directory(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+/// Refuses an answer that names another directory than the one that was asked about.
+///
+/// An answer with no location at all is not refused: it says nothing about where it
+/// came from, and refusing it would turn a service that omits the field into a service
+/// this app cannot talk to.
+fn check_scope(location: Option<&ApiLocation>, expected: &Path) -> Result<(), DispatchError> {
+    let Some(location) = location else {
+        return Ok(());
+    };
+    if same_directory(Path::new(&location.directory), expected) {
+        Ok(())
+    } else {
+        Err(DispatchError::Foreign(
+            "the agent server answered for a different directory".into(),
+        ))
+    }
+}
+
+/// A path as the query and the header carry it.
+///
+/// A path that cannot be spelled in a header is refused rather than sent half-encoded:
+/// a scope that arrives mangled is a scope that names a directory this app does not
+/// know, and the answer would be read as somebody else's.
+fn scope_of(directory: &Path) -> Result<String, DispatchError> {
+    let scope = directory.to_string_lossy().into_owned();
+    if scope.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(DispatchError::Failed(
+            "the checkout path cannot be represented in an HTTP header".into(),
+        ));
+    }
+    Ok(scope)
 }
 
 #[cfg(test)]
@@ -731,6 +1034,137 @@ mod tests {
                 "{url}: {error}"
             );
         }
+    }
+
+    /// A service that answers the observation routes.
+    fn observing_service(
+        handler: impl Fn(&crate::opencode::mock::Request) -> crate::opencode::mock::Reply
+            + Send
+            + Sync
+            + 'static,
+    ) -> (crate::opencode::mock::Mock, tempfile::TempDir) {
+        let mock = Mock::start(move |request| {
+            if request.path == "/api/info" {
+                return mock::reply(200, serde_json::json!({ "data": {} }));
+            }
+            handler(request)
+        });
+        let home = home_with_registration(&registration_for(mock.port(), "secret", "2.0.22"));
+        (mock, home)
+    }
+
+    /// One session, in one directory, with the fields the panel reads.
+    fn observed_session(id: &str, title: &str, directory: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "title": title,
+            "time": { "created": 1, "updated": 2, "idle": 3 },
+            "location": { "directory": directory },
+            "agent": "build"
+        })
+    }
+
+    #[test]
+    fn the_service_wide_session_list_is_read_without_a_directory() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let (mock, home) = observing_service(move |request| match request.path.as_str() {
+            "/api/session" => mock::reply(
+                200,
+                serde_json::json!({ "data": [observed_session("ses_a", "work", &directory)] }),
+            ),
+            "/api/session/active" => mock::reply(200, serde_json::json!({ "data": {} })),
+            _ => mock::reply(200, serde_json::json!({ "data": [] })),
+        });
+
+        let client = Client::connect_service(home.path()).unwrap();
+        let sessions = client.service_sessions().unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "work");
+        let listed = mock
+            .requests()
+            .into_iter()
+            .find(|request| request.path == "/api/session")
+            .expect("the session list was asked for");
+        assert!(
+            listed.query_param("directory").is_none(),
+            "a session that moved is not listed by the directory it left"
+        );
+        assert!(listed.header("x-opencode-directory").is_none());
+    }
+
+    #[test]
+    fn a_pending_list_that_cannot_be_read_leaves_the_session_unknown_rather_than_idle() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let (mock, home) = observing_service(move |request| match request.path.as_str() {
+            "/api/session" => mock::reply(
+                200,
+                serde_json::json!({ "data": [observed_session("ses_a", "work", &directory)] }),
+            ),
+            "/api/session/active" => mock::reply(200, serde_json::json!({ "data": {} })),
+            "/api/form" => mock::reply(500, serde_json::json!({})),
+            _ => mock::reply(200, serde_json::json!({ "data": [] })),
+        });
+
+        let client = Client::connect_service(home.path()).unwrap();
+        let sessions = client.service_sessions().unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].awaiting_reply, None,
+            "a question this app could not see is not a question that was not asked"
+        );
+        assert!(mock
+            .requests()
+            .iter()
+            .any(|request| request.path == "/api/form"));
+    }
+
+    #[test]
+    fn a_pending_request_names_the_session_that_is_waiting() {
+        let directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let (_mock, home) = observing_service(move |request| match request.path.as_str() {
+            "/api/session" => mock::reply(
+                200,
+                serde_json::json!({ "data": [observed_session("ses_a", "work", &directory)] }),
+            ),
+            "/api/session/active" => mock::reply(
+                200,
+                serde_json::json!({ "data": { "ses_a": { "type": "running" } } }),
+            ),
+            "/api/form" => mock::reply(
+                200,
+                serde_json::json!({ "data": [{ "sessionID": "ses_a" }] }),
+            ),
+            _ => mock::reply(200, serde_json::json!({ "data": [] })),
+        });
+
+        let client = Client::connect_service(home.path()).unwrap();
+        let sessions = client.service_sessions().unwrap();
+
+        assert!(sessions[0].running);
+        assert_eq!(sessions[0].awaiting_reply, Some(true));
+    }
+
+    #[test]
+    fn a_catalog_answered_for_another_directory_is_refused() {
+        let elsewhere = std::env::temp_dir()
+            .join("elsewhere")
+            .to_string_lossy()
+            .into_owned();
+        let (_mock, home) = observing_service(move |_| {
+            mock::reply(
+                200,
+                serde_json::json!({ "data": [], "location": { "directory": elsewhere } }),
+            )
+        });
+
+        let client = Client::connect_service(home.path()).unwrap();
+        let error = client
+            .agents(&std::env::temp_dir().join("here"))
+            .unwrap_err();
+
+        assert!(matches!(error, DispatchError::Foreign(_)), "{error}");
     }
 
     #[test]

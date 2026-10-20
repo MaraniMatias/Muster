@@ -10,7 +10,7 @@ use crate::theme::{zed_button, Roles};
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::dialog::{Dialog, DialogContent, DialogFooter};
 use gpui_kit::component::diff::{DiffLineRange, DiffSide};
-use gpui_kit::component::input::TextareaState;
+use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::select::{SelectEvent, SelectState};
 use gpui_kit::component::IndexPath;
 use gpui_kit::{
@@ -186,6 +186,19 @@ pub(crate) struct ReviewState {
     pub(crate) opencode_loading: bool,
     pub(crate) destination: Option<muster_core::opencode::Destination>,
     pub(crate) opencode_rounds: Vec<muster_core::opencode::ReviewRound>,
+    /// The sessions a review of this checkout can go to, newest first.
+    ///
+    /// A read of what the service lists, not a list kept in step with it: the service
+    /// is the only thing that knows which sessions exist.
+    pub(crate) opencode_sessions: Vec<muster_core::opencode::AgentSession>,
+    /// What the search over those sessions said.
+    pub(crate) opencode_query: String,
+    /// The search field, when there are enough sessions to need one.
+    pub(crate) opencode_search: Option<Entity<InputState>>,
+    /// The subscription that carries what the search said.
+    pub(crate) opencode_search_subscription: Option<gpui_kit::Subscription>,
+    /// The review that is waiting for an answer about a busy session.
+    pub(crate) opencode_choice: Option<OpenCodeReview>,
     pub(crate) destination_error: Option<String>,
     opencode_checkout: Option<String>,
     opencode_generation: u64,
@@ -199,6 +212,34 @@ pub(crate) struct ReviewState {
 pub(crate) struct ExportedReview {
     pub(crate) checkout_id: String,
     pub(crate) path: PathBuf,
+}
+
+/// A review that is ready to go, and the choice a busy target raises.
+///
+/// The review is prepared before the choice is asked, so "Send now" and "Queue" are
+/// the same message either way and neither has to rebuild it.
+pub(crate) struct OpenCodeReview {
+    /// The checkout the review is about.
+    pub(crate) checkout: muster_core::workspace::Checkout,
+    /// The session it would go to, when one was chosen.
+    pub(crate) session_id: Option<String>,
+    /// The notes it carries.
+    pub(crate) notes: Vec<ReviewNote>,
+    /// The review as it would be sent.
+    pub(crate) markdown: String,
+    /// The title a session created for this review carries.
+    pub(crate) title: String,
+}
+
+/// What a person chose about a review whose target is busy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCodeDispatch {
+    /// Read fresh activity and ask before interrupting a running turn.
+    IfReady,
+    /// Send it into the turn that is running.
+    Now,
+    /// Wait for the turn that is running to finish.
+    Queue,
 }
 
 pub(crate) fn can_start_opencode_round(rounds: &[muster_core::opencode::ReviewRound]) -> bool {
@@ -1284,15 +1325,27 @@ impl TerminalWindow {
         {
             return;
         }
-        let Some((checkout_id, _)) = self.open_diff.as_ref() else {
+        let Some(review) = self.prepare_opencode_review(cx) else {
             return;
         };
+        // The poll only paints the panel. The locked send path reads activity again
+        // before offering anything and returns the review for a choice if now busy.
+        self.dispatch_opencode_review(review, OpenCodeDispatch::IfReady, window, cx);
+    }
+
+    /// Gathers what a review to OpenCode would carry, without sending anything.
+    ///
+    /// The notes are what no round has already taken, unchanged: a review that was
+    /// delivered is not delivered again because the window was reopened, and a note
+    /// somebody edited since is a new comment and is kept.
+    fn prepare_opencode_review(&mut self, cx: &mut Context<Self>) -> Option<OpenCodeReview> {
+        let (checkout_id, _) = self.open_diff.as_ref()?;
         let checkout_id = checkout_id.clone();
         let Some(checkout) = self.navigation.checkout(&checkout_id).cloned() else {
             self.review.destination_error =
                 Some("The checkout for this review is no longer available.".into());
             cx.notify();
-            return;
+            return None;
         };
         let Some(repo) = self
             .navigation
@@ -1304,10 +1357,8 @@ impl TerminalWindow {
             self.review.destination_error =
                 Some("The repository for this review is no longer available.".into());
             cx.notify();
-            return;
+            return None;
         };
-        // A restored round's notes are in the window's list so they can be shown again;
-        // what a new send carries is what no round has already taken, unchanged.
         let notes = opencode_send_notes(&self.review, &checkout_id)
             .into_iter()
             .filter(|note| self.review.include_outdated || !note.outdated)
@@ -1316,23 +1367,14 @@ impl TerminalWindow {
             self.review.destination_error =
                 Some("There are no review notes to send: every note here was already sent.".into());
             cx.notify();
-            return;
+            return None;
         }
-        let Some(home) = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-        else {
-            self.review.destination_error =
-                Some("HOME is unavailable for OpenCode review storage.".into());
-            cx.notify();
-            return;
-        };
         let (date, _) = match review::local_review_timestamp() {
             Ok(value) => value,
             Err(error) => {
                 self.review.destination_error = Some(error);
                 cx.notify();
-                return;
+                return None;
             }
         };
         let markdown = review::build_review_markdown(
@@ -1348,50 +1390,122 @@ impl TerminalWindow {
             "Muster review · {}",
             checkout.branch.as_deref().unwrap_or(&checkout.id)
         );
+        // The session the review would go to. A destination that names none is not a
+        // destination: the review would go nowhere.
+        let session_id = match self.review.destination.clone() {
+            Some(muster_core::opencode::Destination::Opencode { session_id }) => Some(session_id),
+            Some(muster_core::opencode::Destination::OpencodeNew) => None,
+            _ => {
+                self.review.destination_error =
+                    Some("OpenCode is not the selected review destination.".into());
+                cx.notify();
+                return None;
+            }
+        };
+        Some(OpenCodeReview {
+            checkout,
+            session_id,
+            notes,
+            markdown,
+            title,
+        })
+    }
+
+    /// Sends or queues a prepared review.
+    ///
+    /// The round is recorded before it is offered either way: a queued review is
+    /// written down with the exact message it will be sent with, so a round that waits
+    /// is a round that provably was never taken, and a round that is sent is claimed
+    /// before the request goes out.
+    fn dispatch_opencode_review(
+        &mut self,
+        review: OpenCodeReview,
+        mode: OpenCodeDispatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+        else {
+            self.review.destination_error =
+                Some("HOME is unavailable for OpenCode review storage.".into());
+            cx.notify();
+            return;
+        };
+        let checkout_id = review.checkout.id.clone();
+        self.review.opencode_choice = None;
         self.review.destination_busy = true;
         self.review.destination_error = None;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
-            use muster_core::opencode::{rounds::RoundRequest, Client, Destination, RoundStore};
+            use muster_core::opencode::{
+                rounds::RoundRequest, Client, Destination, ReadBudget, RoundStore,
+            };
             let store = RoundStore::open(&home)?;
-            let client = Client::connect(&home, std::path::Path::new(&checkout.path))?;
-            let destination = match store.destination(&checkout.id)? {
-                Some(destination @ Destination::Opencode { .. }) => destination,
-                Some(Destination::OpencodeNew) => {
-                    let session_id = client.create_session(&title)?;
-                    let destination = Destination::Opencode { session_id };
-                    store.set_destination(&checkout.id, destination.clone())?;
-                    destination
-                }
-                None | Some(Destination::Markdown) | Some(Destination::Pi) => {
-                    return Err(muster_core::opencode::DispatchError::Failed(
-                        "OpenCode is not the selected review destination.".into(),
-                    ));
+            let mut review = review;
+            // Queueing an existing destination is a durable local action, even when
+            // the service disappeared after the choice was shown.
+            let client = if mode != OpenCodeDispatch::Queue || review.session_id.is_none() {
+                Some(Client::connect_with_budget(
+                    &home,
+                    std::path::Path::new(&review.checkout.canonical_path),
+                    // A send waits for the service on purpose: the deadline is the
+                    // whole action, and it is longer than an observation's.
+                    ReadBudget::patient(std::time::Duration::from_secs(30)),
+                )?)
+            } else {
+                None
+            };
+            let session_id = match review.session_id.clone() {
+                Some(session_id) => session_id,
+                None => {
+                    // A session created for this review is Muster's own, so the
+                    // destination remembers it and the next review goes to the same
+                    // conversation.
+                    let client = client.as_ref().ok_or_else(|| {
+                        muster_core::opencode::DispatchError::Unavailable(
+                            "OpenCode is unavailable to create a destination".into(),
+                        )
+                    })?;
+                    let session_id = client.create_session(&review.title)?;
+                    store.set_destination(
+                        &review.checkout.id,
+                        Destination::Opencode {
+                            session_id: session_id.clone(),
+                        },
+                    )?;
+                    session_id
                 }
             };
-            let session_id = match &destination {
-                Destination::Opencode { session_id } => session_id.clone(),
-                Destination::OpencodeNew | Destination::Markdown | Destination::Pi => {
-                    unreachable!("resolved destination")
-                }
+            review.session_id = Some(session_id.clone());
+            let request = RoundRequest {
+                checkout: &review.checkout,
+                session_id: &session_id,
+                notes: &review.notes,
+                review_markdown: &review.markdown,
             };
-            // The claim, the prompt and the send are one step in the store, so a second
-            // window cannot put these notes on the wire as another round.
-            let sent = store.send_round(
-                &client,
-                RoundRequest {
-                    checkout: &checkout,
-                    session_id: &session_id,
-                    notes: &notes,
-                    review_markdown: &markdown,
-                },
-            );
-            // The round is on disk either way, so the window is told what it is even when
-            // the answer was lost.
+            let outcome = match (mode, client.as_ref()) {
+                (OpenCodeDispatch::IfReady, Some(client)) => {
+                    store.send_round_if_ready(client, request)
+                }
+                (OpenCodeDispatch::Now, Some(client)) => {
+                    store.send_round(client, request).map(Some)
+                }
+                (OpenCodeDispatch::Queue, _) => store.queue_round(request).map(Some),
+                _ => Err(muster_core::opencode::DispatchError::Unavailable(
+                    "OpenCode is unavailable; no review was sent".into(),
+                )),
+            };
+            let needs_choice = matches!(outcome, Ok(None));
+            // The round is on disk on any uncertain send, so refresh even if the answer
+            // was lost. A busy preflight has claimed nothing and keeps the same review.
+            let rounds = store.rounds(&review.checkout.id)?;
             Ok::<_, muster_core::opencode::DispatchError>((
-                destination,
-                store.rounds(&checkout.id)?,
-                sent.map(|_| ()).err().map(|error| error.to_string()),
+                Destination::Opencode { session_id },
+                rounds,
+                outcome.err().map(|error| error.to_string()),
+                needs_choice.then_some(review),
             ))
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -1409,10 +1523,11 @@ impl TerminalWindow {
                 app.review.opencode_generation = app.review.opencode_generation.wrapping_add(1);
                 app.review.opencode_loading = false;
                 match result {
-                    Ok((destination, rounds, dispatch_error)) => {
+                    Ok((destination, rounds, dispatch_error, choice)) => {
                         app.review.destination = Some(destination);
                         app.review.opencode_rounds = rounds;
                         app.review.destination_error = dispatch_error;
+                        app.review.opencode_choice = choice;
                     }
                     Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
@@ -1420,6 +1535,194 @@ impl TerminalWindow {
             });
         })
         .detach();
+    }
+
+    /// The choice a busy session raises, asked before anything is sent.
+    pub(crate) fn opencode_choice_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let review = self.review.opencode_choice.as_ref()?;
+        let roles = Roles::of(cx);
+        let cancel = cx.weak_entity();
+        let cancel_for_escape = cx.weak_entity();
+        let send_now = cx.weak_entity();
+        let queue = cx.weak_entity();
+        let session = review
+            .session_id
+            .as_deref()
+            .and_then(|session_id| self.agent.session(session_id))
+            .map(|session| session.display_title().to_string())
+            .unwrap_or_else(|| "the selected session".into());
+        let message = format!(
+            "{session} is working right now. Send the review into the turn that is running, queue it for the turn that follows, or do not send it."
+        );
+        Some(
+            Dialog::new(cx)
+                .bg(roles.surface_raised)
+                .border_color(roles.border_strong)
+                .width(px(440.))
+                .title("Choose when to send")
+                .content(move |content: DialogContent, _, _| {
+                    content.child(div().text_size(px(12.)).child(message.clone()))
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            zed_button("cancel-opencode-send")
+                                .label("Not now")
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel.update(cx, |app, cx| {
+                                        app.cancel_opencode_choice(cx);
+                                    });
+                                }),
+                        )
+                        .child(zed_button("queue-opencode-send").label("Queue").on_click(
+                            move |_, window, cx| {
+                                let _ = queue.update(cx, |app, cx| {
+                                    app.choose_opencode_dispatch(
+                                        OpenCodeDispatch::Queue,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ))
+                        .child(
+                            zed_button("send-opencode-send")
+                                .primary()
+                                .label("Send now")
+                                .on_click(move |_, window, cx| {
+                                    let _ = send_now.update(cx, |app, cx| {
+                                        app.choose_opencode_dispatch(
+                                            OpenCodeDispatch::Now,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                )
+                .on_cancel(move |_, _, cx| {
+                    let _ = cancel_for_escape.update(cx, |app, cx| {
+                        app.cancel_opencode_choice(cx);
+                    });
+                    false
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The choice a busy session raised is answered.
+    pub(crate) fn choose_opencode_dispatch(
+        &mut self,
+        mode: OpenCodeDispatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.review.opencode_choice.take() else {
+            return;
+        };
+        self.dispatch_opencode_review(review, mode, window, cx);
+    }
+
+    /// Refreshes the sessions a review of the open diff can go to.
+    ///
+    /// A read of what the service lists rather than a list kept in step with it: the
+    /// service is the only thing that knows which sessions exist.
+    pub(crate) fn sync_opencode_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some((checkout_id, _)) = self.open_diff.as_ref() else {
+            self.review.opencode_sessions.clear();
+            return;
+        };
+        let sessions = self.opencode_sessions_for(checkout_id);
+        self.review.opencode_sessions = sessions;
+        cx.notify();
+    }
+
+    /// The sessions the chooser offers, after the search.
+    ///
+    /// The search is case-insensitive and matches the title, because that is the only
+    /// thing a person knows about a session.
+    pub(crate) fn opencode_session_choices(&self) -> Vec<muster_core::opencode::AgentSession> {
+        crate::agent_watch::sessions_matching(
+            &self.review.opencode_sessions,
+            &self.review.opencode_query,
+        )
+    }
+
+    /// Chooses where OpenCode sends this checkout's reviews.
+    ///
+    /// The newest session is the one somebody is most likely to mean, and a session
+    /// created for this review is offered in the chooser for the times the newest is
+    /// not it.
+    pub(crate) fn choose_opencode_destination(&mut self, cx: &mut Context<Self>) {
+        // An explicit choice is kept while it still exists: choosing "OpenCode" again
+        // is not a request for a different session.
+        let destination = match self.review.destination.clone() {
+            Some(destination @ muster_core::opencode::Destination::Opencode { .. }) => destination,
+            _ => match self.review.opencode_sessions.first() {
+                Some(session) => muster_core::opencode::Destination::Opencode {
+                    session_id: session.id.clone(),
+                },
+                None => muster_core::opencode::Destination::OpencodeNew,
+            },
+        };
+        self.set_destination(destination, cx);
+    }
+
+    /// Chooses one session, or a session created for this review.
+    pub(crate) fn choose_opencode_session(
+        &mut self,
+        session_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = match session_id {
+            Some(session_id) => muster_core::opencode::Destination::Opencode { session_id },
+            None => muster_core::opencode::Destination::OpencodeNew,
+        };
+        self.set_destination(destination, cx);
+    }
+
+    /// What the search over the sessions said.
+    pub(crate) fn set_opencode_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.review.opencode_query = query;
+        cx.notify();
+    }
+
+    /// Opens the search over the sessions a review can go to.
+    ///
+    /// The field is opened once and kept: it is part of the panel that says where a
+    /// review goes, and a search that disappears between two openings is a search that
+    /// loses what was typed in it.
+    pub(crate) fn open_opencode_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review.opencode_search.is_some() {
+            return;
+        }
+        let query = self.review.opencode_query.clone();
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(query, window, cx);
+            input
+        });
+        let subscription = cx.subscribe_in(&input, window, |app, _, event, _, cx| {
+            if !matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                return;
+            }
+            let value = app
+                .review
+                .opencode_search
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default();
+            app.set_opencode_query(value, cx);
+        });
+        self.review.opencode_search = Some(input);
+        self.review.opencode_search_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// The choice is not answered, and the review does not go.
+    pub(crate) fn cancel_opencode_choice(&mut self, cx: &mut Context<Self>) {
+        self.review.opencode_choice = None;
+        cx.notify();
     }
 
     pub(crate) fn retry_queued_opencode_rounds(
@@ -1446,9 +1749,10 @@ impl TerminalWindow {
         self.review.destination_busy = true;
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
-            let client = muster_core::opencode::Client::connect(
+            let client = muster_core::opencode::Client::connect_with_budget(
                 &home,
                 std::path::Path::new(&checkout.path),
+                muster_core::opencode::ReadBudget::patient(std::time::Duration::from_secs(30)),
             )?;
             let flush = store.flush_rounds(&client, &checkout.id);
             let rounds = store.rounds(&checkout.id)?;
@@ -1508,9 +1812,10 @@ impl TerminalWindow {
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
             let store = muster_core::opencode::RoundStore::open(&home)?;
-            let client = muster_core::opencode::Client::connect(
+            let client = muster_core::opencode::Client::connect_with_budget(
                 &home,
                 std::path::Path::new(&checkout.path),
+                muster_core::opencode::ReadBudget::patient(std::time::Duration::from_secs(30)),
             )?;
             store.reconcile_round(&client, &checkout.id, &round_id)?;
             store.rounds(&checkout.id)

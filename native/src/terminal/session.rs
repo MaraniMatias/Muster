@@ -465,6 +465,13 @@ pub struct SessionStatus {
     /// Pi. The panel draws a row the same either way, and the difference is
     /// only in what may be believed.
     pub pi_task: Option<PiTaskState>,
+    /// Where the shell is, as the operating system records it.
+    ///
+    /// The shell's own directory and not the foreground program's: a program in
+    /// front changes its own directory for reasons that have nothing to do with
+    /// where the terminal is. This is a reading, never an instruction: nothing
+    /// here feeds a directory to the shell.
+    pub working_directory: Option<String>,
 }
 
 /// One grid cell as `(row, column)`, in visible screen coordinates.
@@ -808,6 +815,8 @@ struct PolledStatus {
     generation: u64,
     shell: ShellState,
     foreground: Foreground,
+    /// Where the shell is, as the operating system recorded it at the last read.
+    working_directory: Option<String>,
     /// `Default` gives `None`, which is not the same as "the read succeeded":
     /// it is the state before the first read, and the state a failed read
     /// leaves behind when it refuses to guess.
@@ -1056,6 +1065,7 @@ impl Inner {
                 running: status.foreground_process,
                 app: status.foreground_app,
             },
+            working_directory: status.working_directory,
             poll_error: None,
         };
 
@@ -1131,6 +1141,7 @@ impl Inner {
             stream,
             poll_error: side_protocol_error(&self.side).or(polled.poll_error),
             pi_task,
+            working_directory: polled.working_directory,
         }
     }
 

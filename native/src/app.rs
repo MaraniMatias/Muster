@@ -34,6 +34,7 @@ use gpui_kit::{
 use gpui_kit::WindowDecorations;
 use muster_core::files::FilePreview;
 use muster_core::navigation::{self, DiffTotals, GitReadBudget};
+use muster_core::settings::FollowWorktree;
 use muster_core::workspace::{
     Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
 };
@@ -576,6 +577,29 @@ pub struct TerminalWindow {
     pub(crate) git_diff_request: HashMap<(String, String), u64>,
     pub(crate) diff_view: Option<crate::diff::DiffView>,
     pub(crate) review: crate::review::ReviewState,
+    /// What the OpenCode service says about its sessions and agents.
+    ///
+    /// Read in the background and drawn in the panel: a row says what its session is
+    /// doing, and a review round is sent to one of the sessions this names.
+    pub(crate) agent: crate::agent_watch::AgentState,
+    /// The watch that reads the OpenCode service, for this window's life.
+    pub(crate) _agent_watch: Option<Task<()>>,
+    /// What a terminal follows when the work it is doing moves to another worktree.
+    pub(crate) follow_worktree: FollowWorktree,
+    /// What the follow logic remembers about each terminal.
+    pub(crate) follow_states: HashMap<String, crate::follow::FollowState>,
+    /// The completion cursor of each session the follow logic has read.
+    pub(crate) follow_cursors: HashMap<String, crate::follow::SessionFollow>,
+    pub(crate) follow_revision: u64,
+    pub(crate) follow_enabled_at: i64,
+    pub(crate) follow_task: Option<crate::follow::FollowTask>,
+    /// Where the OpenCode service registers itself, which is where the removal guard
+    /// looks for it.
+    ///
+    /// The same home the service watch reads, resolved once when the window opens: a
+    /// test may point it at another home so the guard can be driven against a service
+    /// of its own.
+    pub(crate) service_home: Option<PathBuf>,
     /// The diff reads this window still wants, and how many are running.
     pub(crate) diff_queue: crate::inspector::DiffQueue,
     pub(crate) inspector_width: f32,
@@ -636,6 +660,34 @@ pub struct TerminalWindow {
     pub(crate) _maintenance: Option<Task<()>>,
     /// Keeps the visibility observer registered for this window's life.
     pub(crate) _visibility: Subscription,
+}
+
+/// Ephemeral authorization for one removal attempt, never persisted.
+struct RemovalCheck {
+    request_id: u64,
+    root: String,
+    checkout: muster_core::workspace::Checkout,
+    identities: Vec<(u64, u64)>,
+}
+
+impl RemovalCheck {
+    fn identities(root: &str, checkout: &str) -> Result<Vec<(u64, u64)>, String> {
+        use std::os::unix::fs::MetadataExt;
+        [root, checkout]
+            .into_iter()
+            .map(|path| {
+                let metadata = std::fs::symlink_metadata(path)
+                    .map_err(|error| format!("Could not verify worktree identity: {error}"))?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || Path::new(path).canonicalize().ok().as_deref() != Some(Path::new(path))
+                {
+                    return Err("The worktree is no longer a real canonical directory.".into());
+                }
+                Ok((metadata.dev(), metadata.ino()))
+            })
+            .collect()
+    }
 }
 
 impl TerminalWindow {
@@ -701,6 +753,15 @@ impl TerminalWindow {
             git_diff_request: HashMap::new(),
             diff_view: None,
             review: crate::review::ReviewState::default(),
+            agent: crate::agent_watch::AgentState::default(),
+            _agent_watch: None,
+            follow_worktree: FollowWorktree::default(),
+            follow_states: HashMap::new(),
+            follow_cursors: HashMap::new(),
+            follow_revision: 0,
+            follow_enabled_at: muster_core::opencode::now_millis(),
+            follow_task: None,
+            service_home: crate::agent_watch::home_directory(),
             diff_queue: Default::default(),
             inspector_width: 280.,
             next_file_request: 0,
@@ -789,6 +850,8 @@ impl TerminalWindow {
         })
         .detach();
         app.start_maintenance(cx);
+        app.start_agent_watch(cx);
+        app.follow_worktree = follow_setting();
         app
     }
 
@@ -1850,6 +1913,44 @@ impl TerminalWindow {
         })
     }
 
+    /// Whether an OpenCode session is working in this checkout, as the service says.
+    ///
+    /// The service is asked, not the operating system: a session that was started
+    /// outside this app has no process of this app's to look at, and where a
+    /// foreground program was started is not where an agent is working.
+    ///
+    /// The read is off the window's thread: a service that takes its time must not
+    /// hold the panel while somebody waits for an answer about a worktree.
+    fn opencode_activity_read(
+        &self,
+        checkout_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<bool>, String>> {
+        let directory = self
+            .navigation
+            .checkout(checkout_id)
+            .map(|checkout| PathBuf::from(&checkout.canonical_path));
+        let home = self.service_home.clone();
+        cx.background_executor().spawn(async move {
+            let home = home.ok_or("The home directory is unavailable.")?;
+            let directory = directory.ok_or("The worktree is no longer available.")?;
+            crate::agent_watch::read_activity(&home, &directory)
+        })
+    }
+
+    /// Whether this app has already seen an OpenCode session working in this checkout.
+    ///
+    /// The record of what the last read said, and what makes an unreadable service a
+    /// refusal rather than a stale "idle": a session that was working a moment ago may
+    /// still be working now, and nothing has said otherwise.
+    pub(crate) fn knows_active_opencode_session(&self, checkout_id: &str) -> bool {
+        let Some(checkout) = self.navigation.checkout(checkout_id) else {
+            return false;
+        };
+        let directory = std::path::PathBuf::from(&checkout.canonical_path);
+        self.agent.protects_directory(&directory)
+    }
+
     /// Follow the task name into the branch, until the person takes the branch
     /// over by typing in it. Editing it is not reversible here: a rename would
     /// silently move a branch the person had already chosen.
@@ -2229,6 +2330,12 @@ impl TerminalWindow {
         if let Err(error) = self.navigation.move_session(id, target, index) {
             self.push_error(error, cx);
         } else {
+            // A move the person made by hand is not undone by an observation that is
+            // older than it.
+            let now = muster_core::opencode::now_millis();
+            let state = self.follow_states.entry(id.to_string()).or_default();
+            state.manual_at = Some(now);
+            self.follow_revision = self.follow_revision.wrapping_add(1);
             if let Some(terminal) = self.terminals.get_mut(id) {
                 terminal.checkout_id = target.into();
             }
@@ -2307,12 +2414,111 @@ impl TerminalWindow {
         cx.notify();
     }
 
+    /// Reserve before yielding to the network. Every opening/moving path consults
+    /// this set; the final check still distrusts facts captured before the yield.
+    fn reserve_worktree_removal(
+        &mut self,
+        id: &str,
+        request_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<RemovalCheck> {
+        let result = (|| {
+            if self.closing || self.removing_checkouts.contains(id) {
+                return Err("This worktree is already being removed.".into());
+            }
+            let draft = self
+                .worktree_removal
+                .as_ref()
+                .filter(|draft| draft.request_id == request_id && draft.checkout_id == id)
+                .ok_or("The removal request is no longer current.")?;
+            let repo = self
+                .navigation
+                .repos
+                .iter()
+                .find(|repo| repo.id == draft.repo_id)
+                .ok_or("This repository is no longer open.")?;
+            let checkout = repo
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.id == id)
+                .ok_or("This worktree is no longer open.")?
+                .clone();
+            let check = RemovalCheck {
+                request_id,
+                root: repo.root.clone(),
+                checkout,
+                identities: RemovalCheck::identities(
+                    &repo.root,
+                    &self
+                        .navigation
+                        .checkout(id)
+                        .ok_or("The worktree is unavailable.")?
+                        .canonical_path,
+                )?,
+            };
+            Ok(check)
+        })();
+        match result {
+            Ok(check) => {
+                self.removing_checkouts.insert(id.to_string());
+                if let Some(draft) = self.worktree_removal.as_mut() {
+                    draft.busy = true;
+                    draft.error = None;
+                }
+                Some(check)
+            }
+            Err(error) => {
+                self.worktree_removal_error(request_id, error, cx);
+                None
+            }
+        }
+    }
+
+    fn revalidate_worktree_removal(&self, check: &RemovalCheck) -> Result<(), String> {
+        let id = &check.checkout.id;
+        let current = self.worktree_removal.as_ref().is_some_and(|draft| {
+            draft.request_id == check.request_id && draft.checkout_id == *id && draft.busy
+        });
+        let repo = self
+            .navigation
+            .repos
+            .iter()
+            .find(|repo| repo.id == check.checkout.repo_id);
+        if self.closing
+            || !current
+            || !self.removing_checkouts.contains(id)
+            || self.navigation.home.as_ref() == Some(id)
+            || self.navigation.archived.contains(id)
+            || check.checkout.is_primary
+            || check.checkout.is_missing
+            || self.navigation.checkout(id) != Some(&check.checkout)
+            || repo.is_none_or(|repo| repo.kind != RepoKind::Git || repo.root != check.root)
+            || RemovalCheck::identities(&check.root, &check.checkout.canonical_path)?
+                != check.identities
+        {
+            return Err(
+                "The selected worktree changed while activity was checked. Refresh and retry."
+                    .into(),
+            );
+        }
+        if self.checkout_has_terminal_activity(id) {
+            return Err("Close this worktree's terminals and wait for pending shell creation before removing it.".into());
+        }
+        if self.checkout_has_running_pi(id) {
+            return Err(
+                "Pi is running in this worktree. Close it before removing this worktree.".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn worktree_removal_error(&mut self, request_id: u64, error: String, cx: &mut Context<Self>) {
         if let Some(draft) = self
             .worktree_removal
             .as_mut()
             .filter(|draft| draft.request_id == request_id)
         {
+            self.removing_checkouts.remove(&draft.checkout_id);
             draft.error = Some(error);
             draft.busy = false;
         }
@@ -2346,8 +2552,59 @@ impl TerminalWindow {
             );
             return;
         }
-        match self.navigation.archive(&id) {
+        // The service is asked before anything is archived: an OpenCode session that
+        // was started outside this app has no terminal of this app's to look at, and
+        // archiving a worktree somebody is working in loses their work.
+        let Some(check) = self.reserve_worktree_removal(&id, request_id, cx) else {
+            return;
+        };
+        let previously_active = self.knows_active_opencode_session(&id);
+        let read = self.opencode_activity_read(&id, cx);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let outcome = read.await;
+            let _ = view.update(cx, |app, cx| {
+                let previously_active = previously_active || app.knows_active_opencode_session(&id);
+                let message = match &outcome {
+                    Err(error) => Some(error.clone()),
+                    _ => None,
+                };
+                match crate::agent_watch::activity_verdict(outcome, previously_active) {
+                    crate::agent_watch::ActivityVerdict::Busy => app.worktree_removal_error(
+                        request_id,
+                        "An OpenCode session is working in this worktree. Stop it before archiving this worktree."
+                            .into(),
+                        cx,
+                    ),
+                    crate::agent_watch::ActivityVerdict::Unreadable => app.worktree_removal_error(
+                        request_id,
+                        format!(
+                            "{} OpenCode activity could not be verified, so this worktree is not archived.",
+                            message.unwrap_or_default()
+                        ),
+                        cx,
+                    ),
+                    crate::agent_watch::ActivityVerdict::Clear => {
+                        app.archive_worktree(check, cx)
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The worktree is archived, once nothing is working in it.
+    fn archive_worktree(&mut self, check: RemovalCheck, cx: &mut Context<Self>) {
+        let id = &check.checkout.id;
+        let request_id = check.request_id;
+        if let Err(error) = self.revalidate_worktree_removal(&check) {
+            self.removing_checkouts.remove(id);
+            self.worktree_removal_error(request_id, error, cx);
+            return;
+        }
+        match self.navigation.archive(id) {
             Ok(()) => {
+                self.removing_checkouts.remove(id);
                 self.worktree_removal = None;
                 self.membership_revision += 1;
                 self.persist();
@@ -2467,14 +2724,6 @@ impl TerminalWindow {
             );
             return;
         }
-        if !self.removing_checkouts.insert(id.clone()) {
-            self.worktree_removal_error(
-                request_id,
-                "This worktree is already being removed.".into(),
-                cx,
-            );
-            return;
-        }
         let confirmation = muster_core::navigation::WorktreeRemovalConfirmation {
             checkout_id: info.checkout_id.clone(),
             path: info.path.clone(),
@@ -2487,13 +2736,63 @@ impl TerminalWindow {
             confirm_unmerged,
             delete_branch,
         };
-        if let Some(draft) = self
-            .worktree_removal
-            .as_mut()
-            .filter(|draft| draft.request_id == request_id)
-        {
-            draft.busy = true;
-            draft.error = None;
+        // The service is asked before anything is deleted, for the same reason it is
+        // asked before anything is archived.
+        let Some(check) = self.reserve_worktree_removal(&id, request_id, cx) else {
+            return;
+        };
+        let previously_active = self.knows_active_opencode_session(&id);
+        let read = self.opencode_activity_read(&id, cx);
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let outcome = read.await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                let previously_active = previously_active || app.knows_active_opencode_session(&id);
+                let message = match &outcome {
+                    Err(error) => Some(error.clone()),
+                    _ => None,
+                };
+                match crate::agent_watch::activity_verdict(outcome, previously_active) {
+                    crate::agent_watch::ActivityVerdict::Busy => app.worktree_removal_error(
+                        request_id,
+                        "An OpenCode session is working in this worktree. Stop it before deleting this worktree."
+                            .into(),
+                        cx,
+                    ),
+                    crate::agent_watch::ActivityVerdict::Unreadable => app.worktree_removal_error(
+                        request_id,
+                        format!(
+                            "{} OpenCode activity could not be verified, so this worktree is not deleted.",
+                            message.unwrap_or_default()
+                        ),
+                        cx,
+                    ),
+                    crate::agent_watch::ActivityVerdict::Clear => app.remove_worktree_now(
+                        repo, checkout, confirmation, check, window, cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The worktree is deleted, once nothing is working in it.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_worktree_now(
+        &mut self,
+        repo: muster_core::workspace::Repo,
+        checkout: muster_core::workspace::Checkout,
+        confirmation: muster_core::navigation::WorktreeRemovalConfirmation,
+        check: RemovalCheck,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = check.checkout.id.clone();
+        let request_id = check.request_id;
+        if let Err(error) = self.revalidate_worktree_removal(&check) {
+            self.removing_checkouts.remove(&id);
+            self.worktree_removal_error(request_id, error, cx);
+            return;
         }
         let worker = cx
             .background_executor()
@@ -2938,6 +3237,7 @@ impl Render for TerminalWindow {
                     .map(|draft| self.worktree_removal_dialog(draft, cx))
             })
             .or_else(|| self.review_clear_dialog(cx))
+            .or_else(|| self.opencode_choice_dialog(cx))
             .or_else(|| self.opencode_forget_dialog(cx))
             .or_else(|| self.review_delete_dialog(cx))
             // Last, so a confirmation raised from inside the panel is the dialog on screen
@@ -3147,6 +3447,19 @@ pub(crate) fn quit_workspace_window(cx: &mut App) {
 pub fn working_directory() -> PathBuf {
     directory_from(std::env::args_os())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// What a terminal follows when the work it is doing moves to another worktree.
+///
+/// Read from the preferences file, which is where the panel writes it. A file that
+/// cannot be read leaves the follow off: following nothing is the answer that changes
+/// no rows by surprise.
+pub(crate) fn follow_setting() -> FollowWorktree {
+    muster_core::settings::settings_path()
+        .ok()
+        .and_then(|path| muster_core::settings::load(&path).ok())
+        .map(|settings| settings.terminal.follow_worktree)
+        .unwrap_or_default()
 }
 fn directory_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
     args.into_iter()
