@@ -4014,13 +4014,18 @@ async fn a_worktree_with_nothing_to_start_from_is_refused_before_git_is_asked(
 }
 
 #[gpui_kit::test]
-async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_restored(
+async fn dismissed_missing_worktrees_stay_hidden_and_only_available_worktrees_restore(
     cx: &mut TestAppContext,
 ) {
     let fixture = open_git(cx);
     let missing_path = fixture._directory.path().join("missing-worktree");
     let other_path = fixture._directory.path().join("other-missing-worktree");
-    for (branch, path) in [("stale", &missing_path), ("other-stale", &other_path)] {
+    let available_path = fixture._directory.path().join("available-worktree");
+    for (branch, path) in [
+        ("stale", &missing_path),
+        ("other-stale", &other_path),
+        ("available", &available_path),
+    ] {
         run_git(
             &fixture.root,
             &[
@@ -4050,6 +4055,9 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
     };
     let missing_id = checkout_at(&missing_path).id.clone();
     let other_id = checkout_at(&other_path).id.clone();
+    let available_id = checkout_at(&available_path.canonicalize().unwrap())
+        .id
+        .clone();
     fixture
         .view
         .update(cx, |app, _| app.navigation.merge(opened, false));
@@ -4090,7 +4098,7 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         });
     })
     .unwrap();
-    answer_confirmation(fixture.handle, "Hide checkout", cx);
+    answer_confirmation(fixture.handle, "Remove checkout", cx);
     cx.run_until_parked();
     fixture.view.update(cx, |app, _| {
         assert!(!app.navigation.archived.contains(&missing_id));
@@ -4108,7 +4116,7 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         window.click(format!("dismiss-missing-{missing_id}"), cx);
     })
     .unwrap();
-    answer_confirmation(fixture.handle, "Hide checkout", cx);
+    answer_confirmation(fixture.handle, "Remove checkout", cx);
     cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
         fixture
             .view
@@ -4167,42 +4175,81 @@ async fn dismissing_one_missing_worktree_preserves_registrations_and_can_be_rest
         );
     }
 
-    // Restoring the archived id makes the retained checkout visible again.
-    fixture.view.update(cx, |app, _| {
-        assert!(app.navigation.archived.remove(&missing_id));
-        app.membership_revision += 1;
-        app.persist();
-    });
-    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
-        !fixture
-            .view
-            .read(cx)
-            .navigation
-            .archived
-            .contains(&missing_id)
-    })
-    .await;
-    fixture.view.read_with(cx, |app, _| {
-        assert!(app.navigation.checkout(&missing_id).is_some());
-        assert_eq!(
-            app.navigation
-                .checkout(&missing_id)
-                .unwrap()
-                .branch
-                .as_deref(),
-            Some("stale")
-        );
-    });
+    // Missing rows are suppressed, not recoverable through the repository menu.
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
-        window.hover(
-            SharedString::from(format!("fold-checkout-{missing_id}")),
-            cx,
-        );
-        window.render_frame(cx);
-        window.find(format!("dismiss-missing-{missing_id}"));
+        assert!(window
+            .try_find(format!("dismiss-missing-{missing_id}"))
+            .is_none());
+        window.hover(format!("fold-repo-{}", fixture.repo_id), cx);
+        window.click(format!("actions-{}", fixture.repo_id), cx);
+        for index in 0..5usize {
+            assert!(!window
+                .within("popup-menu")
+                .try_find(index)
+                .is_some_and(|item| {
+                    item.label()
+                        .is_some_and(|label| label.starts_with("Restore archived"))
+                }));
+        }
+        window.press("escape", cx);
+        fixture.view.update(cx, |app, cx| {
+            app.restore_archived(&fixture.repo_id, window, cx);
+        });
     })
     .unwrap();
+    assert!(!confirmation_open(fixture.handle, cx));
+
+    // Available archived worktrees still restore, without bringing the missing row back.
+    fixture.view.update(cx, |app, _| {
+        app.navigation.archive(&available_id).unwrap();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.hover(format!("fold-repo-{}", fixture.repo_id), cx);
+        window.click(format!("actions-{}", fixture.repo_id), cx);
+        assert_eq!(
+            window.within("popup-menu").find(1usize).label(),
+            Some("Restore archived worktrees (1)")
+        );
+        window.press("escape", cx);
+        fixture.view.update(cx, |app, cx| {
+            app.restore_archived(&fixture.repo_id, window, cx)
+        });
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    // Revalidate if the directory goes missing while the confirmation is open.
+    fixture.view.update(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter_mut()
+            .flat_map(|repo| &mut repo.checkouts)
+            .find(|checkout| checkout.id == available_id)
+            .unwrap()
+            .is_missing = true;
+    });
+    answer_confirmation(fixture.handle, "Restore", cx);
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.archived.contains(&available_id)));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation
+                .repos
+                .iter_mut()
+                .flat_map(|repo| &mut repo.checkouts)
+                .find(|checkout| checkout.id == available_id)
+                .unwrap()
+                .is_missing = false;
+            app.restore_archived(&fixture.repo_id, window, cx);
+        });
+    })
+    .unwrap();
+    answer_confirmation(fixture.handle, "Restore", cx);
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.navigation.archived.contains(&available_id));
+        assert!(app.navigation.archived.contains(&missing_id));
+    });
     close(&fixture, cx);
 }
 

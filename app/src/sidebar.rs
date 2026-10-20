@@ -539,7 +539,9 @@ impl TerminalWindow {
         let archived = repo
             .checkouts
             .iter()
-            .filter(|checkout| self.navigation.archived.contains(&checkout.id))
+            .filter(|checkout| {
+                !checkout.is_missing && self.navigation.archived.contains(&checkout.id)
+            })
             .count();
         // A missing directory has no repository to ask about, and adding a
         // worktree is the one action that has to be a click away rather than a
@@ -1213,7 +1215,7 @@ impl TerminalWindow {
                                     "Dismiss missing checkout {title}; no files are deleted; Git metadata and branch are retained"
                                 ))
                                 .resting_tooltip(
-                                    "Hide this missing checkout only; no files are deleted, and Git metadata and branch are retained",
+                                    "Remove this missing checkout from the panel; it cannot be restored here. No files are deleted, and Git metadata and branch are retained",
                                 )
                                 .on_click(cx.listener(move |app, _, window, cx| {
                                     cx.stop_propagation();

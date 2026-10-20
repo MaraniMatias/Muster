@@ -2432,15 +2432,15 @@ impl TerminalWindow {
             return;
         };
         let question = format!(
-            "Hide missing checkout “{}” from the sidebar?",
+            "Remove missing checkout “{}” from the sidebar?",
             checkout.path
         );
         let id = checkout_id.to_owned();
         let view = cx.entity().downgrade();
         crate::confirmation::ask(
             window, cx, question,
-            "No files will be deleted. Git metadata and the branch are kept, and the repository menu can restore this row.",
-            &[("Cancel", ButtonVariant::Default), ("Hide checkout", ButtonVariant::Default)],
+            "This missing checkout will no longer be offered for restoration. No files will be deleted; Git metadata and the branch are kept.",
+            &[("Cancel", ButtonVariant::Default), ("Remove checkout", ButtonVariant::Default)],
             move |choice, _, cx| {
                 if choice == 1 {
                     let _ = view.update(cx, |app, cx| app.dismiss_missing_checkout(&id, cx));
@@ -2466,7 +2466,7 @@ impl TerminalWindow {
                     self.persist();
                     self.refresh_diff_totals(cx);
                     self.push_info(
-                        "Missing checkout hidden. No files were deleted; Git metadata and branch were retained.",
+                        "Missing checkout removed from the panel. No files were deleted; Git metadata and branch were retained.",
                         cx,
                     );
                 }
@@ -2909,7 +2909,9 @@ impl TerminalWindow {
         let ids = repo
             .checkouts
             .iter()
-            .filter(|checkout| self.navigation.archived.contains(&checkout.id))
+            .filter(|checkout| {
+                !checkout.is_missing && self.navigation.archived.contains(&checkout.id)
+            })
             .map(|checkout| checkout.id.clone())
             .collect::<Vec<_>>();
         if ids.is_empty() {
@@ -2938,7 +2940,13 @@ impl TerminalWindow {
                 if choice == 1 {
                     let _ = view.update(cx, |app, cx| {
                         for id in ids {
-                            app.navigation.archived.remove(&id);
+                            if app
+                                .navigation
+                                .checkout(&id)
+                                .is_some_and(|checkout| !checkout.is_missing)
+                            {
+                                app.navigation.archived.remove(&id);
+                            }
                         }
                         app.membership_revision += 1;
                         app.persist();

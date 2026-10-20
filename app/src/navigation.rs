@@ -324,6 +324,8 @@ impl Navigation {
             .find(|item| item.is_primary && !item.is_missing && !self.archived.contains(&item.id))
             .map(|item| item.id.clone());
         let was_active = self.active_checkout.as_deref() == Some(id);
+        // Keep the suppression across discovery and restart: Git still lists the stale
+        // registration. Missing entries are never offered by the restore command.
         self.archived.insert(id.into());
         self.selected_by_checkout.remove(id);
         if was_active {
