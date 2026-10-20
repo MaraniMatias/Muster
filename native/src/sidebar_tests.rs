@@ -60,6 +60,109 @@ fn git_repository(base: &Path) -> PathBuf {
     root
 }
 
+/// A session the service reported protects a worktree that has no terminal of its own.
+///
+/// The session may have been started outside this app: the service is the only thing
+/// that knows about it, and where a foreground program was started is not where an
+/// agent is working.
+#[gpui_kit::test]
+fn a_session_the_service_reported_protects_a_worktree_with_no_terminal_of_its_own(
+    cx: &mut TestAppContext,
+) {
+    use muster_core::opencode::observe::AgentSession;
+    let fixture = open_git(cx);
+    let (id, _path) = add_worktree(&fixture, cx);
+    fixture.view.update(cx, |app, _| {
+        let directory = app
+            .navigation
+            .checkout(&id)
+            .expect("the worktree is registered")
+            .canonical_path
+            .clone();
+        app.agent.sessions = vec![AgentSession {
+            id: "ses_a".into(),
+            title: "work".into(),
+            running: true,
+            awaiting_reply: Some(false),
+            directory: Some(PathBuf::from(directory)),
+            ..AgentSession::default()
+        }];
+    });
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.knows_active_opencode_session(&id),
+            "a session started outside this app protects the worktree"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A terminal running OpenCode says what its session is doing, and who is doing it.
+///
+/// The row is a read of what the service says, and the three states it can be in are
+/// the ones the panel has a shape for: working, waiting for an answer, and failed.
+#[gpui_kit::test]
+fn an_opencode_row_says_what_its_session_is_doing(cx: &mut TestAppContext) {
+    use muster_core::opencode::observe::{AgentAgent, AgentSession};
+    let fixture = open_git(cx);
+    add_terminal(&fixture, cx);
+    fixture.view.update(cx, |app, _| {
+        app.agent.sessions = vec![AgentSession {
+            id: "ses_a".into(),
+            title: "work".into(),
+            agent: Some("build".into()),
+            running: true,
+            awaiting_reply: Some(false),
+            updated_at: 1_000,
+            ..AgentSession::default()
+        }];
+        app.agent.catalogs.insert(
+            fixture.checkout.clone(),
+            vec![AgentAgent {
+                id: "build".into(),
+                name: "Build".into(),
+                mode: "primary".into(),
+                color: Some("#5c7cfa".into()),
+                hidden: false,
+            }],
+        );
+    });
+    fixture.view.read_with(cx, |app, _| {
+        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"));
+        assert!(
+            state.working,
+            "a turn that is running is the state that moves"
+        );
+        assert_eq!(state.label.as_deref(), Some("Build"));
+        assert_eq!(state.tint.as_deref(), Some("#5c7cfa"));
+        assert_eq!(state.note, "working");
+        assert_eq!(
+            state.elapsed,
+            Some(((muster_core::opencode::now_millis() - 1_000).max(0) / 1000) as u64)
+        );
+    });
+
+    // A title that names two sessions names neither of them.
+    fixture.view.update(cx, |app, _| {
+        app.agent
+            .sessions
+            .push(muster_core::opencode::observe::AgentSession {
+                id: "ses_b".into(),
+                title: "work".into(),
+                awaiting_reply: Some(false),
+                ..Default::default()
+            });
+    });
+    fixture.view.read_with(cx, |app, _| {
+        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"));
+        assert!(state.unavailable);
+        assert_eq!(state.note, "several sessions with this name");
+        assert!(!state.working);
+    });
+    close(&fixture, cx);
+}
+
+/// A terminal running OpenCode says what its session is doing, and who is doing it.
 #[test]
 fn a_task_name_suggests_a_branch_only_while_the_person_has_not_edited_it() {
     assert_eq!(TerminalWindow::slug_for("Fix login"), "Fix-login");
@@ -2873,6 +2976,238 @@ async fn dirty_worktree_delete_needs_ack_and_preserves_branch_by_default(cx: &mu
         &fixture.root,
         &["show-ref", "--verify", "--quiet", "refs/heads/feature/task"],
     );
+    close(&fixture, cx);
+}
+
+fn removal_attempt(
+    app: &mut TerminalWindow,
+    repo_id: &str,
+    id: &str,
+    cx: &mut Context<TerminalWindow>,
+) -> RemovalCheck {
+    app.worktree_removal = Some(WorktreeRemovalDraft {
+        request_id: 100,
+        repo_id: repo_id.into(),
+        checkout_id: id.into(),
+        info: None,
+        loading: false,
+        busy: false,
+        dirty_confirmed: false,
+        unmerged_confirmed: false,
+        delete_branch: false,
+        error: None,
+    });
+    app.reserve_worktree_removal(id, 100, cx).unwrap()
+}
+
+#[gpui_kit::test]
+fn removal_reserves_before_waiting_and_rechecks_pending_navigation_pi_and_identity(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let check = removal_attempt(app, &fixture.repo_id, &id, cx);
+            assert!(app.removing_checkouts.contains(&id));
+            app.request_terminal(&id, window, cx);
+            assert!(!app
+                .navigation
+                .pending
+                .values()
+                .any(|checkout| checkout == &id));
+            // A pending request accepted before the reservation can complete during HTTP.
+            app.navigation
+                .pending
+                .insert("earlier-shell".into(), id.clone());
+            app.archive_worktree(check, cx);
+            assert!(!app.navigation.archived.contains(&id));
+            assert!(!app.removing_checkouts.contains(&id));
+            assert!(app
+                .worktree_removal
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("pending"));
+            app.navigation.pending.clear();
+
+            let check = removal_attempt(app, &fixture.repo_id, &id, cx);
+            app.navigation.home = Some(id.clone());
+            app.archive_worktree(check, cx);
+            assert!(!app.navigation.archived.contains(&id));
+            app.navigation.home = None;
+
+            let check = removal_attempt(app, &fixture.repo_id, &id, cx);
+            let program = fixture._directory.path().join("pi");
+            std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
+            let backend = std::sync::Arc::clone(app.owner.backend());
+            backend
+                .spawn(
+                    "pi-started-during-check".into(),
+                    crate::pty::SpawnOptions {
+                        program,
+                        args: vec!["-c".into(), "exec sleep 30".into()],
+                        cwd: path.clone(),
+                        cols: 80,
+                        rows: 24,
+                        env: vec![],
+                        reader_end: None,
+                    },
+                    Box::new(|_| Ok(())),
+                )
+                .unwrap();
+            assert!(app.checkout_has_running_pi(&id));
+            app.archive_worktree(check, cx);
+            assert!(!app.navigation.archived.contains(&id));
+            assert!(app
+                .worktree_removal
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Pi"));
+            backend.close("pi-started-during-check").unwrap();
+
+            let check = removal_attempt(app, &fixture.repo_id, &id, cx);
+            let displaced = path.with_extension("original");
+            std::fs::rename(&path, &displaced).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            app.archive_worktree(check, cx);
+            assert!(!app.navigation.archived.contains(&id));
+            assert!(!app.removing_checkouts.contains(&id));
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&displaced, &path).unwrap();
+        });
+    })
+    .unwrap();
+    assert!(path.join(".git").exists());
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+fn delete_completion_rechecks_activity_that_arrived_during_network_wait(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, path) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app
+                .navigation
+                .repos
+                .iter()
+                .find(|repo| repo.id == fixture.repo_id)
+                .unwrap()
+                .clone();
+            let checkout = app.navigation.checkout(&id).unwrap().clone();
+            let info = navigation::worktree_removal_info(&repo, &checkout).unwrap();
+            let confirmation = muster_core::navigation::WorktreeRemovalConfirmation {
+                checkout_id: info.checkout_id,
+                path: info.path,
+                branch: info.branch,
+                head: info.head,
+                dirty_files: info.dirty_files,
+                default_ref: info.default_ref,
+                unmerged_commits: info.unmerged_commits,
+                confirm_dirty: false,
+                confirm_unmerged: false,
+                delete_branch: false,
+            };
+            let check = removal_attempt(app, &fixture.repo_id, &id, cx);
+            app.navigation
+                .pending
+                .insert("started-before-reservation".into(), id.clone());
+            app.remove_worktree_now(repo, checkout, confirmation, check, window, cx);
+            assert!(app.navigation.checkout(&id).is_some());
+            assert!(!app.removing_checkouts.contains(&id));
+            assert!(app.worktree_removal.as_ref().unwrap().error.is_some());
+            app.navigation.pending.clear();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        path.join(".git").exists(),
+        "Git deletion must never start after failed revalidation"
+    );
+    close(&fixture, cx);
+}
+
+/// A worktree whose OpenCode activity cannot be read is not archived.
+///
+/// The service is asked before anything is archived, and an answer that could not be
+/// read is not an idle session: the worktree waits for the person instead.
+#[gpui_kit::test]
+fn a_worktree_whose_opencode_activity_cannot_be_read_is_not_archived(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, _path) = add_worktree(&fixture, cx);
+    // A service that lists a session for the worktree but cannot read the pending
+    // lists: nothing says whether that session is working.
+    let mock = crate::agent_watch::mock::Mock::start(|request| {
+        let directory = request.query_param("directory").unwrap_or_default();
+        let (status, data) = match request.path.as_str() {
+            "/api/session" => (
+                200,
+                serde_json::json!([{ "id": "ses_external", "location": { "directory": directory } }]),
+            ),
+            "/api/form" | "/api/permission/request" => (500, serde_json::json!({})),
+            _ => (200, serde_json::json!({})),
+        };
+        crate::agent_watch::mock::reply(
+            status,
+            serde_json::json!({ "data": data, "location": { "directory": directory } }),
+        )
+    });
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join(".local/state/opencode");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("service.json"),
+        serde_json::json!({
+            "url": format!("http://127.0.0.1:{}", mock.port()),
+            "password": "secret",
+            "version": "2.0.22",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, _window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.service_home = Some(home.path().to_path_buf());
+            app.worktree_removal = Some(WorktreeRemovalDraft {
+                request_id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+                repo_id: fixture.repo_id.clone(),
+                checkout_id: id.clone(),
+                info: None,
+                loading: false,
+                busy: false,
+                dirty_confirmed: false,
+                unmerged_confirmed: false,
+                delete_branch: false,
+                error: None,
+            });
+            app.submit_worktree_archive(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            !app.navigation.archived.contains(&id),
+            "a worktree whose activity could not be read was archived"
+        );
+        let error = app
+            .worktree_removal
+            .as_ref()
+            .and_then(|draft| draft.error.as_deref())
+            .unwrap_or_default();
+        assert!(
+            error.contains("could not be verified"),
+            "the refusal says why: {error}"
+        );
+    });
     close(&fixture, cx);
 }
 

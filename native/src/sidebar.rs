@@ -71,10 +71,13 @@ pub(crate) fn foreground_program_icon(
 /// The glyph a terminal row wears in front of its name.
 ///
 /// The program's own, unless a turn is running: that is the one state that
-/// moves, and a static list cannot say that about itself.
+/// moves, and a static list cannot say that about itself. A session that is
+/// waiting for an answer wears a question instead, because the answer is the
+/// only thing the person can give it.
 fn session_glyph(
     program: Option<ForegroundProgram>,
     working: bool,
+    asking: bool,
     size: Pixels,
     color: Hsla,
 ) -> AnyElement {
@@ -82,6 +85,12 @@ fn session_glyph(
         return Spinner::new()
             .with_size(size)
             .color(color)
+            .into_any_element();
+    }
+    if asking {
+        return Icon::new(IconName::BadgeQuestionMark)
+            .size(size)
+            .text_color(color)
             .into_any_element();
     }
     program.map_or_else(
@@ -1213,6 +1222,37 @@ impl TerminalWindow {
                     let program =
                         crate::navigation::foreground_program(status.foreground.app.as_deref());
                     let agent = program == Some(ForegroundProgram::OpenCode);
+                    // What the service says about the session this terminal is showing.
+                    // The title is the only thing that says which session that is, and
+                    // it is matched conservatively: a title that names several
+                    // sessions names none of them.
+                    let agent_state = agent.then(|| {
+                        self.opencode_row_state(
+                            &session.checkout_id,
+                            terminal.shell.session.title().as_deref(),
+                        )
+                    });
+                    // The agent's name and how long ago the service last touched the
+                    // session, in the row's trailing slot.
+                    let agent_suffix = agent_state.as_ref().and_then(|state| {
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(label) = state.label.as_ref() {
+                            parts.push(label.clone());
+                        }
+                        let elapsed = crate::agent_watch::elapsed_label(state.elapsed);
+                        if !elapsed.is_empty() {
+                            parts.push(elapsed);
+                        }
+                        (!parts.is_empty()).then(|| parts.join(" · "))
+                    });
+                    // The trailing slot takes its room from the name, so a long name
+                    // is cut rather than pushed under the slot.
+                    let name_room = (self.navigation.sidebar_width
+                        - 73.
+                        - agent_suffix.as_ref().map_or(0., |suffix| {
+                            sidebar_text_width(window, suffix, 10.).as_f32() + 10.
+                        }))
+                    .max(24.);
                     // Pi's own state, read only while Pi is what is in front of
                     // the shell: a report left over from a process that is gone
                     // is not a report about this row.
@@ -1247,8 +1287,8 @@ impl TerminalWindow {
                         // the panel has no shape for a question this program
                         // asked, so the row stays neutral.
                         pi_note
-                    } else if agent {
-                        "agent session state not identified"
+                    } else if let Some(state) = agent_state.as_ref() {
+                        state.note.as_str()
                     } else if busy {
                         "process running"
                     } else {
@@ -1258,83 +1298,111 @@ impl TerminalWindow {
                     let closing = self.closing_sessions.contains(&id);
                     let renaming = self.editing.as_ref().is_some_and(|edit| edit.id == id);
                     let row_clickable = !closing && !renaming;
-                    let content =
-                        if let Some(editing) = self.editing.as_ref().filter(|edit| edit.id == id) {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(7.))
-                                .h(px(26.))
-                                .w_full()
-                                .child(program.map_or_else(
-                                    || {
-                                        Icon::new(IconName::SquareTerminal)
-                                            .size(px(14.))
-                                            .text_color(roles.text_muted)
-                                            .into_any_element()
-                                    },
-                                    |program| {
-                                        foreground_program_icon(program, px(14.), roles.text_muted)
-                                    },
-                                ))
-                                .child(
-                                    Input::new(&editing.input)
-                                        .id(SharedString::from(format!("rename-session-{id}")))
-                                        .appearance(false)
-                                        .p_0()
-                                        .aria_label("Terminal session name")
-                                        .h(px(26.))
-                                        .w_full()
-                                        .min_w_0(),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex()
-                                .items_center()
-                                .h(px(26.))
-                                .w_full()
-                                .min_w_0()
-                                .gap(px(7.))
-                                .child({
-                                    let color = if unknown {
-                                        roles.status.warning
-                                    } else if pi {
-                                        // What Pi is doing, in the panel's own
-                                        // colours: the accent for a turn that is
-                                        // running, the danger ink for one that
-                                        // failed, and the muted ink for
-                                        // everything else.
-                                        if pi_state.working {
-                                            roles.accent
-                                        } else if pi_state.failed {
-                                            roles.status.danger_text
-                                        } else {
-                                            roles.text_muted
-                                        }
-                                    } else if failed {
+                    let content = if let Some(editing) =
+                        self.editing.as_ref().filter(|edit| edit.id == id)
+                    {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .h(px(26.))
+                            .w_full()
+                            .child(program.map_or_else(
+                                || {
+                                    Icon::new(IconName::SquareTerminal)
+                                        .size(px(14.))
+                                        .text_color(roles.text_muted)
+                                        .into_any_element()
+                                },
+                                |program| {
+                                    foreground_program_icon(program, px(14.), roles.text_muted)
+                                },
+                            ))
+                            .child(
+                                Input::new(&editing.input)
+                                    .id(SharedString::from(format!("rename-session-{id}")))
+                                    .appearance(false)
+                                    .p_0()
+                                    .aria_label("Terminal session name")
+                                    .h(px(26.))
+                                    .w_full()
+                                    .min_w_0(),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .items_center()
+                            .h(px(26.))
+                            .w_full()
+                            .min_w_0()
+                            .gap(px(7.))
+                            .child({
+                                let color = if unknown {
+                                    roles.status.warning
+                                } else if pi {
+                                    // What Pi is doing, in the panel's own
+                                    // colours: the accent for a turn that is
+                                    // running, the danger ink for one that
+                                    // failed, and the muted ink for
+                                    // everything else.
+                                    if pi_state.working {
+                                        roles.accent
+                                    } else if pi_state.failed {
                                         roles.status.danger_text
-                                    } else if busy && !agent {
-                                        roles.status.success
                                     } else {
                                         roles.text_muted
-                                    };
-                                    session_glyph(program, pi && pi_state.working, px(14.), color)
-                                })
-                                .child(
+                                    }
+                                } else if agent {
+                                    // The colour the service gives its agent is
+                                    // the agent's own, and it wears while the
+                                    // session is idle, working or waiting. A
+                                    // turn that failed keeps the error ink, and a
+                                    // state that could not be read keeps the
+                                    // warning one.
+                                    match agent_state.as_ref() {
+                                        Some(state) if state.failed => roles.status.danger_text,
+                                        Some(state) if state.unavailable => roles.status.warning,
+                                        Some(state) => state
+                                            .tint
+                                            .as_deref()
+                                            .and_then(crate::theme::service_tint)
+                                            .unwrap_or(roles.text_muted),
+                                        None => roles.text_muted,
+                                    }
+                                } else if failed {
+                                    roles.status.danger_text
+                                } else if busy {
+                                    roles.status.success
+                                } else {
+                                    roles.text_muted
+                                };
+                                let working = (pi && pi_state.working)
+                                    || agent_state.as_ref().is_some_and(|state| state.working);
+                                let asking = agent_state.as_ref().is_some_and(|state| state.asking);
+                                session_glyph(program, working, asking, px(14.), color)
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(sidebar_name(window, &title, name_room)),
+                            )
+                            .when_some(agent_suffix, |row, suffix| {
+                                row.child(
                                     div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(sidebar_name(
-                                            window,
-                                            &title,
-                                            self.navigation.sidebar_width - 73.,
-                                        )),
+                                        .id(SharedString::from(format!("session-agent-{id}")))
+                                        .test_support()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(roles.text_muted)
+                                        .child(suffix),
                                 )
-                                .into_any_element()
-                        };
+                            })
+                            .into_any_element()
+                    };
                     let row_group = SharedString::from(format!("session-row-{id}"));
                     let (row_focus, row_focused) = sidebar_row_focus(window, cx, &id);
                     let row = div()

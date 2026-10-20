@@ -371,6 +371,93 @@ worktree it might be in. The *identity* does not: a process the OS will not
 name is not counted as Pi at all, which is what the parked app does too and is
 not changed here.
 
+## The OpenCode integration
+
+OpenCode is a service a person starts, and this app is a client of it. It never
+starts one and never ends one: `core::opencode::discover` reads the registration
+and checks that the service answers there, and a service that is not running leaves
+the rows with no state, which is a state to wait in rather than a failure to report.
+
+**What is read.** `core::opencode::observe` is the reading layer: the sessions the
+service lists, the agent catalog, which sessions are running, and which are waiting
+for a question or a permission. Three things make it safe to draw.
+
+- The session list is read **without a directory**, because a session that moved to
+  another worktree is not listed by the directory it left, and the row that would say
+  so would draw nothing at all. The catalog and the pending lists answer for one
+  location, so each location is asked about on its own.
+- A pending list that **cannot be read** leaves its sessions *unknown* rather than
+  idle: a question this app could not see is not a question that was not asked.
+- A colour the service gave is checked for being a colour before it is painted
+  (`theme::service_tint`), and the theme's own ink is what a row wears instead.
+
+**What a row says.** `native/src/agent_watch.rs` turns that reading into what a
+terminal row wears: a spinner while a turn runs, a question while it waits, the
+error ink after a failed turn, the agent's own name and colour, and how long ago the
+service last touched the session. The title the TUI wrote is the only thing that says
+which session a terminal has open, and it is matched conservatively: a title that
+names several sessions names none of them, and a service that could not be read names
+none either.
+
+**Where the reading happens.** The poll is on the background executor and comes back
+as a value, so a service that takes its time costs a tick of the panel and nothing
+else. Every answer carries the generation of the request it answered, and an answer
+from an earlier generation is dropped rather than drawn: a stale answer describes a
+world that is no longer on screen. The task belongs to the window, so it stops when
+the window goes.
+
+**The review round.** A review to OpenCode is a round in
+`~/.muster/opencode-rounds.json`, and the store is what makes a send safe to retry.
+A busy session is asked about rather than interrupted: *Send now*, *Queue* or *Not
+now*. A queued round is written down **before** anything is offered, with the exact
+message it will be sent with, so a round that waits is a round that provably was
+never taken. A turn that finishes settles only the rounds that were already delivered
+to that session: the round that was just flushed belongs to the turn that follows, and
+an acknowledgement is not a note being resolved. A send that may have landed is never
+re-offered on this app's own.
+
+A queue is offered only on a **fresh** reading of the service, and only to a session
+that is positively free: running, waiting for an answer, and a pending list that could
+not be read are all reasons to wait, and a round whose session is not in the checkout
+any more waits rather than holding up the rounds behind it. One reading answers the
+whole queue, so several waiting reviews do not spend a deadline each. An ordinary send
+reads the activity again before it offers anything, and claims nothing until it knows:
+a busy session is a question for the person, and an unknown pending state is a
+refusal.
+
+**Following the work.** `native/src/follow.rs` moves a terminal's **row** when the
+work it is doing moves to another worktree. The process, its scrollback and its
+window stay exactly where they are: nothing here writes to a terminal, feeds a
+directory to a shell, or tells a program in front of the shell where to go. Two
+questions are followed separately — the shell's own directory, and the agent's work —
+and the setting says which of them (`off`, `cd`, `agent`, `both`). A move needs a
+destination that is a registered checkout: the deepest registered root wins, a nested
+Git checkout this app does not know about is never folded into its parent, and two
+roots that are one directory are ambiguous. Exactly one terminal may be showing the
+session, and a move the person made by hand is not undone by an observation that is
+older than it.
+
+The **effective target** is kept, not just the cursor: no new tool work is not a
+return to the session's starting directory. A session's own directory is its origin,
+the baseline is the moment following was enabled, and work finished before that is
+not a relocation. One pass runs at a time, and a result that arrives after the facts
+it was computed from have changed is dropped rather than applied.
+
+**Removing a worktree.** The service is asked before anything is archived or
+deleted, because a session that was started outside this app has no terminal of this
+app's to look at. The read is fresh: a row that said "idle" a minute ago is not what
+the service says now, and the panel's own state is only a fallback. Three answers
+come out of it — nothing is working there, something is, or **nobody could say** — and
+the third one is a refusal, because an answer that could not be read is not an idle
+session. A service that is not running at all is not evidence of anything, so it only
+refuses when this app had already seen it working; that evidence survives a poll that
+could not be read, and only a positively idle session erases it. The removal is
+**reserved before** the network is waited on and **revalidated before** anything is
+archived or deleted, so a worktree that changed while the service was being asked is
+not removed on the strength of a stale answer.
+The Pi guard stays: the operating system's answer about Pi's processes is a separate
+claim, and neither one replaces the other.
+
 ## The preferences panel
 
 `native/src/settings.rs` is the panel, and the shape it draws is

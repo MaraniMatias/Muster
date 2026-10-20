@@ -88,6 +88,39 @@ pub enum TerminalScrollbarMode {
     Always,
 }
 
+/// What a terminal follows when the work it is doing moves to another worktree.
+///
+/// A row in the panel moves; the shell inside it does not. Nothing here changes a
+/// process's working directory or feeds a directory to a program in front of the
+/// shell: a row is a row, and where it is filed says which worktree the person is
+/// looking at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowWorktree {
+    /// Follow neither a shell's working directory nor an agent's work.
+    #[default]
+    Off,
+    /// Follow the directory the shell is in, when that is another registered worktree.
+    Cd,
+    /// Follow the work an agent session is doing, when that is another registered
+    /// worktree.
+    Agent,
+    /// Follow both.
+    Both,
+}
+
+impl FollowWorktree {
+    /// Whether a shell's working directory is followed.
+    pub fn follows_cd(self) -> bool {
+        matches!(self, Self::Cd | Self::Both)
+    }
+
+    /// Whether an agent session's work is followed.
+    pub fn follows_agent(self) -> bool {
+        matches!(self, Self::Agent | Self::Both)
+    }
+}
+
 /// The interface's own sizes and one tree behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -120,6 +153,8 @@ pub struct TerminalSettings {
     /// so it applies to the terminals already open.
     pub selection_copy: bool,
     pub scrollbar: TerminalScrollbarMode,
+    /// Whether a terminal follows the work it is doing into another worktree.
+    pub follow_worktree: FollowWorktree,
     /// Whether a new terminal is told to report how its commands ended, which is what turns a
     /// failed command's row red. Read when a terminal is created, so it decides only the
     /// terminals opened after the change; off costs the red row, because nothing else in the app
@@ -137,6 +172,7 @@ impl Default for TerminalSettings {
             selection_copy: true,
             scrollbar: TerminalScrollbarMode::Hidden,
             shell_integration: true,
+            follow_worktree: FollowWorktree::Off,
         }
     }
 }
@@ -220,6 +256,7 @@ impl AppSettings {
                 selection_copy: self.terminal.selection_copy,
                 scrollbar: self.terminal.scrollbar,
                 shell_integration: self.terminal.shell_integration,
+                follow_worktree: self.terminal.follow_worktree,
             },
             editor: EditorSettings {
                 font_size: bounded(self.editor.font_size, EDITOR_FONT_SIZE_LIMITS, 13.0),
@@ -400,6 +437,7 @@ mod tests {
                 selection_copy: false,
                 scrollbar: TerminalScrollbarMode::Always,
                 shell_integration: false,
+                follow_worktree: FollowWorktree::Both,
             },
             editor: EditorSettings {
                 font_size: 15.0,

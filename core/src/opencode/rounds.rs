@@ -306,7 +306,10 @@ impl RoundStore {
         self.write(&mut state)
     }
 
-    /// Claims `request`'s notes and sends the review, as one locked step.
+    /// Claims `request`'s notes and explicitly sends the review now, as one locked step.
+    ///
+    /// This is the user's confirmed "Send now" path. Ordinary sends must use
+    /// [`Self::send_round_if_ready`], and automatic delivery uses the idle-only flush.
     ///
     /// The claim and the message are written **before** the request goes out, so a second
     /// window asking for the same notes gets this round back instead of starting another
@@ -327,6 +330,28 @@ impl RoundStore {
         client: &Client,
         request: RoundRequest<'_>,
     ) -> Result<ReviewRound, DispatchError> {
+        self.send(client, request, false)?.ok_or_else(|| {
+            DispatchError::Failed("the selected OpenCode session is not ready".into())
+        })
+    }
+
+    /// Sends after a fresh, known activity read, or returns `None` to ask the person
+    /// about a running turn. A blocked turn is not a busy turn for this explicit review
+    /// action, but an unreadable pending list is never permission to send.
+    pub fn send_round_if_ready(
+        &self,
+        client: &Client,
+        request: RoundRequest<'_>,
+    ) -> Result<Option<ReviewRound>, DispatchError> {
+        self.send(client, request, true)
+    }
+
+    fn send(
+        &self,
+        client: &Client,
+        request: RoundRequest<'_>,
+        check_activity: bool,
+    ) -> Result<Option<ReviewRound>, DispatchError> {
         if !same_directory(
             client.directory(),
             Path::new(&request.checkout.canonical_path),
@@ -337,10 +362,22 @@ impl RoundStore {
         }
         let _lock = self.lock()?;
         let mut state = self.read()?;
-        let (index, offer) = claim_round(&mut state, request)?;
+        let (index, offer) = claim_round(&mut state, request, RoundStatus::Dispatching)?;
         if !offer {
             // Another window already offered these notes and is answering for this round.
-            return Ok(state.rounds[index].clone());
+            return Ok(Some(state.rounds[index].clone()));
+        }
+        if check_activity {
+            let session = fresh_session(client, &state.rounds[index].session_id)?;
+            if session.awaiting_reply.is_none() {
+                return Err(DispatchError::Unavailable(
+                    "OpenCode's pending state could not be read; no review was sent".into(),
+                ));
+            }
+            if session.running && session.awaiting_reply != Some(true) {
+                // Nothing has been persisted yet: asking does not claim the notes.
+                return Ok(None);
+            }
         }
         // Durable before the request, whatever this round was waiting as: a round this
         // caller is about to offer is no longer provably untaken, and a crash between the
@@ -363,7 +400,26 @@ impl RoundStore {
         // The error is the caller's report and the round is already durable, so a caller
         // that wants to draw the outcome reads the rounds back rather than being handed a
         // copy that could disagree with the file.
-        sent.map(|()| stored)
+        sent.map(|()| Some(stored))
+    }
+
+    /// Records the review as a round that waits, without offering it to the service.
+    ///
+    /// This is what "Queue" means: the notes are claimed and the exact message that
+    /// will be sent is written down **before** anything is offered, so a round that
+    /// waits is a round that provably was never taken. That is the only state a round
+    /// may be offered from, so a queued round is a safe send later rather than a
+    /// question.
+    ///
+    /// A round that already holds these notes is handed back rather than a second one
+    /// being started: one review is one round, whatever window asked for it.
+    pub fn queue_round(&self, request: RoundRequest<'_>) -> Result<ReviewRound, DispatchError> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let (index, _) = claim_round(&mut state, request, RoundStatus::Queued)?;
+        let stored = state.rounds[index].clone();
+        self.write(&mut state)?;
+        Ok(stored)
     }
 
     /// Gives up the notes of every round the service has already answered for, in every
@@ -502,22 +558,137 @@ impl RoundStore {
     /// flush holds the store's lock: that is what stops a second window from asking about
     /// a round that is in flight right now.
     pub fn flush_rounds(&self, client: &Client, checkout_id: &str) -> Result<usize, DispatchError> {
+        self.flush(client, Some(checkout_id), None)
+    }
+
+    /// Offers the queued rounds of one session, and only that session's.
+    ///
+    /// A session that has just gone idle is the one whose turn is over, so its own
+    /// queued review is the one that may go out now. A round aimed at a session that is
+    /// still working is left waiting: sending it into a turn that is already running is
+    /// not the same thing as sending it into the turn that follows.
+    ///
+    /// The checkout is named as well as the session, because the client is scoped to
+    /// one checkout: a round of another checkout is not this client's to offer.
+    pub fn flush_rounds_for_session(
+        &self,
+        client: &Client,
+        checkout_id: &str,
+        session_id: &str,
+    ) -> Result<usize, DispatchError> {
+        self.flush(client, Some(checkout_id), Some(session_id))
+    }
+
+    /// Captures the exact deliveries eligible for the observation that starts next.
+    /// Reads one atomically published store snapshot before HTTP, never after observing
+    /// completion. No lock is needed for this immutable read: a concurrent dispatch
+    /// published later is ineligible. Acknowledgement rechecks under the mutation lock.
+    pub fn eligible_dispatched(&self) -> Result<Vec<ReviewRound>, DispatchError> {
+        Ok(self
+            .read()?
+            .rounds
+            .into_iter()
+            .filter(|round| round.status == RoundStatus::Dispatched)
+            .collect())
+    }
+
+    /// Acknowledges only unchanged delivery identities captured before observation.
+    /// A queued or newly dispatched round from another window is not an eligible
+    /// delivery, even if that window flushed it before this acknowledgement acquired
+    /// the lock. No timestamp or schema field is invented to order separate windows.
+    pub fn ack_dispatched_rounds(
+        &self,
+        session_id: &str,
+        eligible: &[ReviewRound],
+    ) -> Result<usize, DispatchError> {
         let _lock = self.lock()?;
         let mut state = self.read()?;
-        let mut sent = 0;
-        // The file is in the order rounds were recorded, so index order is age order.
-        for index in 0..state.rounds.len() {
-            if state.rounds[index].checkout_id != checkout_id
-                || state.rounds[index].status != RoundStatus::Queued
+        let mut acked = 0;
+        for round in &mut state.rounds {
+            if round.session_id != session_id
+                || round.status != RoundStatus::Dispatched
+                || !eligible.iter().any(|seen| same_delivery(seen, round))
             {
                 continue;
             }
+            round.status = RoundStatus::Acked;
+            round.updated_at = now_millis();
+            acked += 1;
+        }
+        if acked > 0 {
+            self.write(&mut state)?;
+        }
+        Ok(acked)
+    }
+
+    /// Every durable queue, including queues restored after a restart. A caller can
+    /// schedule these against the current registered checkout, without needing to
+    /// have seen a busy-to-idle edge. The flush itself rechecks positive idle.
+    pub fn queued(&self) -> Result<Vec<ReviewRound>, DispatchError> {
+        Ok(self
+            .read()?
+            .rounds
+            .into_iter()
+            .filter(|round| round.status == RoundStatus::Queued)
+            .collect())
+    }
+
+    fn flush(
+        &self,
+        client: &Client,
+        checkout_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<usize, DispatchError> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        // The rounds that are waiting, in age order: the file is in the order rounds
+        // were recorded, so index order is age order.
+        let waiting: Vec<usize> = (0..state.rounds.len())
+            .filter(|index| {
+                state.rounds[*index].status == RoundStatus::Queued
+                    && checkout_id.is_none_or(|wanted| state.rounds[*index].checkout_id == wanted)
+                    && session_id.is_none_or(|wanted| state.rounds[*index].session_id == wanted)
+            })
+            .collect();
+        if waiting.is_empty() {
+            return Ok(0);
+        }
+        // One answer about this checkout's sessions, shared by every waiting round:
+        // whether a session is free for the next turn is the same question for all of
+        // them, and asking it once is what keeps a queue of several rounds inside one
+        // deadline.
+        let sessions = fresh_sessions(client)?;
+        let mut sent = 0;
+        // The first failure is the caller's report. The rounds behind it are still
+        // offered: one review that could not be sent is not a reason to hold the
+        // rest of the queue.
+        let mut failure: Option<DispatchError> = None;
+        for index in waiting {
             let round = state.rounds[index].clone();
-            // Already there: this round went out and its answer was lost.
-            if client.session_mentions(&round.session_id, &round.marker)? {
-                set_status(&mut state, index, RoundStatus::Dispatched);
-                self.write(&mut state)?;
+            // A queue is for the next free turn. Never flush into a blocked turn,
+            // unknown pending state, or a session whose state changed since polling.
+            let Some(session) = sessions
+                .iter()
+                .find(|session| session.id == round.session_id)
+            else {
+                // The session is not in this checkout any more. The round waits for
+                // the person rather than being offered to a session that is not there,
+                // and it does not hold up the rounds behind it.
                 continue;
+            };
+            if session.running || session.awaiting_reply != Some(false) {
+                continue;
+            }
+            // Already there: this round went out and its answer was lost.
+            match client.session_mentions(&round.session_id, &round.marker) {
+                Ok(true) => {
+                    set_status(&mut state, index, RoundStatus::Dispatched);
+                    self.write(&mut state)?;
+                    continue;
+                }
+                Ok(false) => {}
+                // The question could not be answered, so nothing is offered on a guess.
+                Err(_) => continue,
             }
             // Claim before the call, and write the claim before making it: a crash
             // between here and the answer leaves `dispatching`, which is a question.
@@ -538,9 +709,14 @@ impl RoundStore {
                 Err(_) => {}
             }
             self.write(&mut state)?;
-            offered?;
+            if let Err(error) = offered {
+                failure.get_or_insert(error);
+            }
         }
-        Ok(sent)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(sent),
+        }
     }
 
     fn transition(
@@ -735,6 +911,49 @@ pub fn unsent_notes(notes: &[ReviewNote], rounds: &[ReviewRound]) -> Vec<ReviewN
         .collect()
 }
 
+// Ignore fields maintenance may compact, but require the exact delivery identity
+// and delivery revision. An explicit reset followed by a new round is not this one.
+fn same_delivery(seen: &ReviewRound, current: &ReviewRound) -> bool {
+    seen.status == RoundStatus::Dispatched
+        && seen.id == current.id
+        && seen.checkout_id == current.checkout_id
+        && seen.session_id == current.session_id
+        && seen.marker == current.marker
+        && seen.claim == current.claim
+        && seen.created_at == current.created_at
+        && seen.updated_at == current.updated_at
+}
+
+/// The sessions this checkout's service says about, read fresh.
+///
+/// One read for every waiting round: whether a session is free for the next turn is
+/// the same question for all of them, and asking it once is what keeps a queue of
+/// several rounds inside one deadline.
+fn fresh_sessions(client: &Client) -> Result<Vec<super::observe::AgentSession>, DispatchError> {
+    let budget = client
+        .read_budget
+        .clone()
+        .map(|budget| budget.slice(super::OBSERVATION_TIMEOUT))
+        .unwrap_or_else(|| super::ReadBudget::new(super::OBSERVATION_TIMEOUT));
+    let bounded = client.clone().with_read_budget(budget);
+    bounded.directory_sessions(client.directory())
+}
+
+fn fresh_session(
+    client: &Client,
+    session_id: &str,
+) -> Result<super::observe::AgentSession, DispatchError> {
+    let mut matching = fresh_sessions(client)?
+        .into_iter()
+        .filter(|session| session.id == session_id);
+    match (matching.next(), matching.next()) {
+        (Some(session), None) => Ok(session),
+        _ => Err(DispatchError::Foreign(
+            "the selected OpenCode session could not be identified in this checkout".into(),
+        )),
+    }
+}
+
 /// What one batch of notes claims, as a single string.
 ///
 /// Sorted, so the order the caller happened to hand them over is not part of the claim:
@@ -756,6 +975,7 @@ fn round_claim(notes: &[ReviewNote]) -> String {
 fn claim_round(
     state: &mut RoundFile,
     request: RoundRequest<'_>,
+    initial: RoundStatus,
 ) -> Result<(usize, bool), DispatchError> {
     let checkout_id = checkout_identity(request.checkout)?;
     if request.notes.is_empty() || request.notes.len() > MAX_ROUND_NOTES {
@@ -826,7 +1046,7 @@ fn claim_round(
         id,
         checkout_id,
         session_id: request.session_id.trim().to_string(),
-        status: RoundStatus::Dispatching,
+        status: initial,
         marker: marker.clone(),
         // Trimmed once, here, so the stored prompt and the one the client puts on
         // the wire are the same string.
