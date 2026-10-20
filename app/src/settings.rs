@@ -368,21 +368,22 @@ fn toggle_row(
     checked: bool,
     set: fn(&mut AppSettings, bool),
 ) -> AnyElement {
-    settings_row(
-        label,
-        description,
-        None,
-        roles,
-        checkbox(id, roles)
-            .checked(checked)
-            .small()
-            .accessibility_label(label)
-            .on_change(move |checked, _, cx| {
-                let _ = view.update(cx, |app, cx| {
-                    app.edit_settings_draft(cx, move |settings| set(settings, *checked));
-                });
-            }),
-    )
+    checkbox(id, roles)
+        .checked(checked)
+        .small()
+        .w_full()
+        .flex_row_reverse()
+        .gap(px(16.))
+        .px_0()
+        .py(px(5.))
+        .accessibility_label(label)
+        .child(settings_row_text(label, description, None, roles))
+        .on_change(move |checked, _, cx| {
+            let _ = view.update(cx, |app, cx| {
+                app.edit_settings_draft(cx, move |settings| set(settings, *checked));
+            });
+        })
+        .into_any_element()
 }
 
 fn select_row(

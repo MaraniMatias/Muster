@@ -361,7 +361,7 @@ fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
     dispose(&panel.fixture, cx);
 }
 
-/// The checkbox is compact, and the picker and number field share the same height.
+/// The checkbox owns its full preference row; picker and number field share a height.
 #[gpui_kit::test]
 fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
@@ -387,8 +387,8 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
                 .as_f32(),
         ];
         assert!(
-            heights[0] <= heights[1],
-            "the checkbox fits within the field height: {heights:?}"
+            (heights[0] - 43.).abs() <= 1.,
+            "the checkbox covers the text and the row's padding: {heights:?}"
         );
         assert!(
             (heights[1] - heights[2]).abs() <= 1.,
@@ -409,6 +409,13 @@ fn a_checkbox_changes_only_the_draft_until_apply(cx: &mut TestAppContext) {
         let checkbox = window.find("settings-ui-sticky");
         assert_eq!(checkbox.role(), Some(gpui_kit::Role::CheckBox));
         assert_eq!(checkbox.checked(), Some(checked));
+        let row = checkbox.bounds();
+        let field = window.find("settings-ui-font-size").bounds();
+        assert!(
+            row.size.width > field.size.width * 2.,
+            "hover and activation must cover the label, not just the indicator"
+        );
+        assert!((row.right() - field.right()).as_f32().abs() <= 1.);
         window.hover("settings-ui-sticky", cx);
         assert_eq!(window.find("settings-ui-sticky").checked(), Some(checked));
         window.click("settings-ui-sticky", cx);

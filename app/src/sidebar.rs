@@ -833,11 +833,7 @@ impl TerminalWindow {
                         .flex_1()
                         .min_w_0()
                         .flex()
-                        // The name and the path are the heading's whole text and
-                        // the heading is as wide as the panel, so the pair sits
-                        // in the middle of the room it has rather than against
-                        // the left edge of it.
-                        .justify_center()
+                        .justify_start()
                         // Bottom, not baseline: the flex engine is handed no
                         // baseline to align, so `items_baseline` degrades to the
                         // top, and a 14px name and an 11px path each sit half

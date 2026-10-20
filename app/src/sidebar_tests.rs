@@ -399,13 +399,9 @@ fn repo_fold_target_covers_the_heading_height(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
-/// The repository heading's name and path sit in the middle of the row.
-///
-/// The heading is as wide as the panel and the pair is what it says, so the
-/// pair is centred in the room the heading has rather than held against its
-/// left edge.
+/// The repository heading starts at the left edge, with the path beside its name.
 #[gpui_kit::test]
-fn the_repository_heading_centres_its_name_and_path(cx: &mut TestAppContext) {
+fn the_repository_heading_left_aligns_its_name_and_path(cx: &mut TestAppContext) {
     let fixture = open(cx);
     let repo = fixture
         .view
@@ -417,13 +413,15 @@ fn the_repository_heading_centres_its_name_and_path(cx: &mut TestAppContext) {
         let path = window.find(format!("repo-path-{repo}")).bounds();
         assert!(
             path.size.width > px(0.),
-            "the fixture's repository has no path to centre"
+            "the fixture's repository has no path"
         );
-        let left = name.left().as_f32() - content.left().as_f32();
-        let right = content.right().as_f32() - path.right().as_f32();
         assert!(
-            (left - right).abs() <= 1.,
-            "the heading's texts sit {left}px from the left and {right}px from the right"
+            (name.left() - content.left()).as_f32().abs() <= 1.,
+            "the name must start at the heading's left edge: {name:?} {content:?}"
+        );
+        assert!(
+            (path.left() - name.right() - px(8.)).as_f32().abs() <= 1.,
+            "the path must follow the name on the same row: {name:?} {path:?}"
         );
     })
     .unwrap();
