@@ -46,6 +46,13 @@ use muster_core::settings::{
     UI_FONT_SIZE_LIMITS,
 };
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
+
+static NEXT_SETTINGS_DRAFT: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::app::TerminalWindow;
 use crate::theme::{checkbox, zed_button, Roles};
@@ -194,6 +201,10 @@ pub(crate) struct SettingsDraft {
     /// What a terminal follows when its work moves to another worktree.
     pub(crate) follow_worktree: Entity<SelectState<Vec<SharedString>>>,
     pub(crate) error: Option<String>,
+    draft_id: u64,
+    pub(crate) saving: bool,
+    #[cfg(test)]
+    pub(crate) save_override: Option<gpui_kit::Task<Result<(), String>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -367,8 +378,10 @@ fn toggle_row(
     roles: Roles,
     checked: bool,
     set: fn(&mut AppSettings, bool),
+    disabled: bool,
 ) -> AnyElement {
     checkbox(id, roles)
+        .disabled(disabled)
         .checked(checked)
         .small()
         .w_full()
@@ -393,6 +406,7 @@ fn select_row(
     detail: Option<(&'static str, String)>,
     roles: Roles,
     picker: &Entity<SelectState<Vec<SharedString>>>,
+    disabled: bool,
 ) -> AnyElement {
     settings_row(
         label,
@@ -400,6 +414,7 @@ fn select_row(
         detail,
         roles,
         Select::new(picker)
+            .disabled(disabled)
             .id(id)
             .small()
             .rounded_none()
@@ -414,6 +429,7 @@ fn size_row(
     description: &'static str,
     roles: Roles,
     input: &Entity<InputState>,
+    disabled: bool,
 ) -> AnyElement {
     settings_row(
         label,
@@ -422,6 +438,7 @@ fn size_row(
         roles,
         div().w(px(96.)).flex().items_center().gap(px(6.)).child(
             Input::new(input)
+                .disabled(disabled)
                 .id(id)
                 .small()
                 .bg(roles.surface_base)
@@ -458,6 +475,9 @@ impl TerminalWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.as_ref().is_some_and(|draft| draft.saving) {
+            return;
+        }
         let (saved, failure) = match settings::load(&path) {
             Ok(saved) => (saved, self.settings_error.take()),
             Err(error) => (AppSettings::default(), Some(error)),
@@ -581,6 +601,10 @@ impl TerminalWindow {
             review_storage_picker,
             follow_worktree,
             error: failure,
+            draft_id: NEXT_SETTINGS_DRAFT.fetch_add(1, Ordering::Relaxed),
+            saving: false,
+            #[cfg(test)]
+            save_override: None,
             _subscriptions: subscriptions,
         });
         cx.notify();
@@ -597,7 +621,7 @@ impl TerminalWindow {
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut AppSettings),
     ) {
-        if let Some(draft) = self.settings.as_mut() {
+        if let Some(draft) = self.settings.as_mut().filter(|draft| !draft.saving) {
             edit(&mut draft.draft);
             draft.error = None;
             cx.notify();
@@ -610,7 +634,7 @@ impl TerminalWindow {
         storage: ReviewStorage,
         cx: &mut Context<Self>,
     ) {
-        if let Some(draft) = self.settings.as_mut() {
+        if let Some(draft) = self.settings.as_mut().filter(|draft| !draft.saving) {
             draft.review_storage = storage;
             draft.error = None;
             cx.notify();
@@ -622,6 +646,9 @@ impl TerminalWindow {
     /// It replaces rather than edits, which is why the controls are told as well: a Reset that
     /// changed only the model would leave four numbers on screen that Apply does not mean.
     pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.as_ref().is_some_and(|draft| draft.saving) {
+            return;
+        }
         let defaults = AppSettings::default();
         let Some(draft) = self.settings.as_ref() else {
             return;
@@ -678,37 +705,75 @@ impl TerminalWindow {
     /// it: a failure to write it has to leave the panel open with the person's choices still
     /// in them, which is the only state from which they can be applied again.
     pub(crate) fn apply_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.settings.as_ref() else {
+        let Some(draft) = self.settings.as_mut() else {
             return;
         };
-        let next = draft.resolve(cx);
-        let path = draft.path.clone();
-        if let Err(error) = settings::save(&path, &next) {
-            let draft = self.settings.as_mut().expect("the draft was just read");
-            draft.error = Some(format!("Settings were not saved. {error}"));
-            cx.notify();
+        if draft.saving {
             return;
         }
-        // The fields are told what was written, so the panel closes on numbers that are the
-        // ones on file rather than the ones somebody typed before the range was applied.
-        for (input, value) in [
-            (&draft.ui_font_size, next.ui.font_size.to_string()),
-            (
-                &draft.terminal_font_size,
-                next.terminal.font_size.to_string(),
-            ),
-            (&draft.editor_font_size, next.editor.font_size.to_string()),
-            (&draft.indent_size, next.editor.indentation.size.to_string()),
-        ] {
-            input.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
+        let next = draft.resolve(cx);
+        let path = draft.path.clone();
         let storage = draft.review_storage;
-        self.set_follow_worktree(next.terminal.follow_worktree);
-        self.settings = None;
-        if storage != self.navigation.review_storage {
-            self.set_review_storage(storage, cx);
-        }
+        let draft_id = draft.draft_id;
+        #[cfg(test)]
+        let save_override = draft.save_override.take();
+        draft.saving = true;
+        draft.error = None;
         cx.notify();
+
+        let next_to_save = next;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    #[cfg(test)]
+                    if let Some(save) = save_override {
+                        return save.await;
+                    }
+                    let _guard = SETTINGS_SAVE_LOCK
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    settings::save(&path, &next_to_save)
+                })
+                .await;
+
+            let _ = this.update_in(cx, |app, window, cx| {
+                let Some(draft) = app.settings.as_mut() else {
+                    return;
+                };
+                if draft.draft_id != draft_id || !draft.saving {
+                    return;
+                }
+                match result {
+                    Err(error) => {
+                        draft.saving = false;
+                        draft.error = Some(format!("Settings were not saved. {error}"));
+                        cx.notify();
+                    }
+                    Ok(()) => {
+                        // A successful snapshot is authoritative; the displayed number fields
+                        // are normalized to exactly what was written before the panel closes.
+                        for (input, value) in [
+                            (&draft.ui_font_size, next.ui.font_size.to_string()),
+                            (
+                                &draft.terminal_font_size,
+                                next.terminal.font_size.to_string(),
+                            ),
+                            (&draft.editor_font_size, next.editor.font_size.to_string()),
+                            (&draft.indent_size, next.editor.indentation.size.to_string()),
+                        ] {
+                            input.update(cx, |input, cx| input.set_value(value, window, cx));
+                        }
+                        app.set_follow_worktree(next.terminal.follow_worktree);
+                        app.settings = None;
+                        if storage != app.navigation.review_storage {
+                            app.set_review_storage(storage, cx);
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// The panel, drawn as the conversation it is.
@@ -741,6 +806,7 @@ impl TerminalWindow {
         let sticky = draft.draft.ui.tree_sticky_scroll;
         let storage = draft.review_storage;
         let error = draft.error.clone();
+        let saving = draft.saving;
         let is_default =
             draft.resolve(cx) == AppSettings::default() && storage == ReviewStorage::default();
         // Where a round would be written for the mode this row is showing, which is not
@@ -799,6 +865,7 @@ impl TerminalWindow {
                             "Scales every size the interface draws itself in.",
                             roles,
                             &ui_font_size,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -808,6 +875,7 @@ impl TerminalWindow {
                             roles,
                             sticky,
                             |settings, checked| settings.ui.tree_sticky_scroll = checked,
+                            saving,
                         ),
                     ],
                 ));
@@ -821,6 +889,7 @@ impl TerminalWindow {
                             "",
                             roles,
                             &terminal_font_size,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -830,6 +899,7 @@ impl TerminalWindow {
                             roles,
                             terminal.ligatures,
                             |settings, checked| settings.terminal.ligatures = checked,
+                            saving,
                         ),
                         select_row(
                             "settings-terminal-cursor",
@@ -838,6 +908,7 @@ impl TerminalWindow {
                             None,
                             roles,
                             &cursor,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -847,6 +918,7 @@ impl TerminalWindow {
                             roles,
                             terminal.cursor_blink,
                             |settings, checked| settings.terminal.cursor_blink = checked,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -856,6 +928,7 @@ impl TerminalWindow {
                             roles,
                             terminal.selection_copy,
                             |settings, checked| settings.terminal.selection_copy = checked,
+                            saving,
                         ),
                         select_row(
                             "settings-terminal-scrollbar",
@@ -864,6 +937,7 @@ impl TerminalWindow {
                             None,
                             roles,
                             &scrollbar,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -873,6 +947,7 @@ impl TerminalWindow {
                             roles,
                             terminal.shell_integration,
                             |settings, checked| settings.terminal.shell_integration = checked,
+                            saving,
                         ),
                         select_row(
                             "settings-terminal-follow-worktree",
@@ -881,6 +956,7 @@ impl TerminalWindow {
                             None,
                             roles,
                             &follow_worktree,
+                            saving,
                         ),
                     ],
                 ));
@@ -894,6 +970,7 @@ impl TerminalWindow {
                             "",
                             roles,
                             &editor_font_size,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -903,6 +980,7 @@ impl TerminalWindow {
                             roles,
                             editor.ligatures,
                             |settings, checked| settings.editor.ligatures = checked,
+                            saving,
                         ),
                         toggle_row(
                             view.clone(),
@@ -912,6 +990,7 @@ impl TerminalWindow {
                             roles,
                             editor.cursor_blink,
                             |settings, checked| settings.editor.cursor_blink = checked,
+                            saving,
                         ),
                         select_row(
                             "settings-editor-indent-with",
@@ -920,6 +999,7 @@ impl TerminalWindow {
                             None,
                             roles,
                             &indent_with,
+                            saving,
                         ),
                         size_row(
                             "settings-editor-indent-size",
@@ -927,6 +1007,7 @@ impl TerminalWindow {
                             "Columns one level of indent is.",
                             roles,
                             &indent_size,
+                            saving,
                         ),
                     ],
                 ));
@@ -944,6 +1025,7 @@ impl TerminalWindow {
                             folder.map(|folder| ("settings-review-folder", folder)),
                             roles,
                             &storage_picker,
+                            saving,
                         ),
                         settings_actions(
                             "Stored rounds",
@@ -1003,8 +1085,8 @@ impl TerminalWindow {
                         zed_button("settings-reset")
                             .text()
                             .label("Reset to defaults")
-                            .disabled(is_default)
-                            .when(is_default, |button| button.text_color(roles.text_disabled))
+                            .disabled(is_default || saving)
+                            .when(is_default || saving, |button| button.text_color(roles.text_disabled))
                             .on_click(move |_, window, cx| {
                                 let _ = reset.update(cx, |app, cx| {
                                     app.reset_settings_draft(window, cx)
@@ -1017,17 +1099,21 @@ impl TerminalWindow {
                         zed_button("settings-cancel")
                             .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
                             .label("Cancel")
+                            .disabled(saving)
                             .on_click(move |_, _, cx| {
                                 let _ = cancel.update(cx, |app, cx| {
-                                    app.settings = None;
-                                    cx.notify();
+                                    if !app.settings.as_ref().is_some_and(|draft| draft.saving) {
+                                        app.settings = None;
+                                        cx.notify();
+                                    }
                                 });
                             })
                     })
                     .child(
                         zed_button("settings-apply")
                             .primary()
-                            .label("Apply")
+                            .label(if saving { "Saving…" } else { "Apply" })
+                            .disabled(saving)
                             .on_click(move |_, window, cx| {
                                 let _ = apply.update(cx, |app, cx| {
                                     app.apply_settings_draft(window, cx)
@@ -1037,8 +1123,10 @@ impl TerminalWindow {
             )
             .on_cancel(move |_, _, cx| {
                 let _ = cancel.update(cx, |app, cx| {
-                    app.settings = None;
-                    cx.notify();
+                    if !app.settings.as_ref().is_some_and(|draft| draft.saving) {
+                        app.settings = None;
+                        cx.notify();
+                    }
                 });
                 true
             })

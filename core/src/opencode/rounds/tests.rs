@@ -11,6 +11,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
@@ -735,6 +736,32 @@ impl Fixture {
             &self.client,
             self.request(notes, "# Code Review 2026-06-02\n"),
         )
+    }
+
+    /// Sends the notes through a client of the caller's choosing.
+    fn send_with(
+        &self,
+        client: &Client,
+        notes: &[ReviewNote],
+    ) -> Result<ReviewRound, DispatchError> {
+        self.store
+            .send_round(client, self.request(notes, "# Code Review 2026-06-02\n"))
+    }
+
+    /// The same service, reached under a deadline of the caller's choosing.
+    fn client_with_budget(&self, budget: crate::opencode::ReadBudget) -> Client {
+        (*self.client).clone().with_read_budget(budget)
+    }
+
+    /// The store's lock, held the way another window holds it.
+    fn hold_the_lock(&self) -> File {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        let file = options
+            .open(self.store.directory.join(LOCK_FILE))
+            .expect("the lock file is openable");
+        file.lock().expect("the lock is takeable");
+        file
     }
 
     fn settle(&self, round_id: &str) -> ReviewRound {
@@ -1914,4 +1941,158 @@ fn what_a_forgotten_review_keeps_does_not_grow_with_the_review_it_sent() {
         vec![edited],
         "an edited note is still a new comment"
     );
+}
+
+/// Another window holding the lock is a state to wait in, not a reason to park this
+/// thread for as long as that window's service call takes.
+///
+/// The wait is bounded, and nothing is changed while it runs: a review that was not
+/// claimed is a review that is still there to claim.
+#[test]
+fn a_store_another_window_is_holding_gives_up_instead_of_waiting_forever() {
+    let fixture = Fixture::start();
+    let held = fixture.hold_the_lock();
+
+    let started = Instant::now();
+    let error = fixture
+        .store
+        .queue_round(fixture.request(&fixture.notes(), "review"))
+        .unwrap_err();
+    let waited = started.elapsed();
+
+    assert!(matches!(error, DispatchError::Unavailable(_)), "{error}");
+    assert!(
+        waited <= LOCK_WAIT + Duration::from_secs(1),
+        "the wait for the lock is bounded: {waited:?}"
+    );
+    assert!(
+        fixture
+            .store
+            .rounds(&fixture.checkout.id)
+            .unwrap()
+            .is_empty(),
+        "nothing was claimed while the lock was held"
+    );
+    assert!(
+        fixture.service.prompt_posts().is_empty(),
+        "nothing was offered to the service either"
+    );
+
+    drop(held);
+}
+
+/// The wait is not a refusal: the moment the other window lets the lock go, the send
+/// that was waiting for it goes out.
+#[test]
+fn a_send_waiting_for_the_lock_goes_out_when_the_lock_is_released() {
+    let fixture = Fixture::start();
+    let held = fixture.hold_the_lock();
+    let (store, client) = (fixture.store.clone(), Arc::clone(&fixture.client));
+    let checkout = fixture.checkout.clone();
+    let notes = fixture.notes();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        store.send_round(
+            &client,
+            RoundRequest {
+                checkout: &checkout,
+                session_id: SESSION,
+                notes: &notes,
+                review_markdown: "# Code Review",
+            },
+        )
+    });
+
+    // The send is waiting for the lock now. Letting it go is what unblocks it.
+    started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    drop(held);
+
+    let round = worker.join().unwrap().unwrap();
+    assert_eq!(round.status, RoundStatus::Dispatched);
+    assert_eq!(
+        fixture.service.prompt_posts().len(),
+        1,
+        "the review that waited for the lock went out once"
+    );
+}
+
+/// A send that cannot take the lock gives up with the client's own deadline, rather
+/// than waiting for a lock nobody knows how long it is held for.
+#[test]
+fn a_send_that_cannot_take_the_lock_gives_up_with_the_clients_deadline() {
+    let fixture = Fixture::start();
+    let held = fixture.hold_the_lock();
+    let client = fixture.client_with_budget(crate::opencode::ReadBudget::patient(
+        Duration::from_millis(400),
+    ));
+
+    let started = Instant::now();
+    let error = fixture.send_with(&client, &fixture.notes()).unwrap_err();
+    let waited = started.elapsed();
+
+    assert!(matches!(error, DispatchError::Unavailable(_)), "{error}");
+    assert!(
+        waited <= Duration::from_secs(2),
+        "the wait follows the client's deadline: {waited:?}"
+    );
+    assert!(
+        fixture
+            .store
+            .rounds(&fixture.checkout.id)
+            .unwrap()
+            .is_empty(),
+        "a send that never claimed anything wrote nothing"
+    );
+    assert!(
+        fixture.service.prompt_posts().is_empty(),
+        "and offered nothing to the service"
+    );
+
+    drop(held);
+}
+
+/// A read that was cancelled is refused before the lock is taken: a review is never
+/// claimed for a request that will not be made.
+#[test]
+fn a_cancelled_client_refuses_the_send_before_it_claims_anything() {
+    let fixture = Fixture::start();
+    let budget = crate::opencode::ReadBudget::patient(Duration::from_secs(30));
+    let client = fixture.client_with_budget(budget.clone());
+    budget.cancel();
+
+    let error = fixture.send_with(&client, &fixture.notes()).unwrap_err();
+
+    assert!(matches!(error, DispatchError::Unavailable(_)), "{error}");
+    assert!(
+        fixture
+            .store
+            .rounds(&fixture.checkout.id)
+            .unwrap()
+            .is_empty(),
+        "a cancelled send claimed nothing"
+    );
+    assert!(fixture.service.prompt_posts().is_empty());
+}
+
+/// The same for a deadline that has run out: the notes are still unclaimed, so the
+/// review is still the person's to send.
+#[test]
+fn an_expired_client_refuses_the_send_before_it_claims_anything() {
+    let fixture = Fixture::start();
+    let client = fixture.client_with_budget(crate::opencode::ReadBudget::patient(Duration::ZERO));
+
+    let error = fixture.send_with(&client, &fixture.notes()).unwrap_err();
+
+    assert!(matches!(error, DispatchError::Unavailable(_)), "{error}");
+    assert!(
+        fixture
+            .store
+            .rounds(&fixture.checkout.id)
+            .unwrap()
+            .is_empty(),
+        "a send that ran out of time claimed nothing"
+    );
+    assert!(fixture.service.prompt_posts().is_empty());
 }

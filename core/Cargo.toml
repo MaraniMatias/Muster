@@ -2,6 +2,7 @@
 name = "muster-core"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.97.1"
 publish = false
 description = "Muster's backend: PTY processes, Git, checkout files, persistence and agent integrations. No GUI dependencies."
 

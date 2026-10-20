@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
+import { MACOS_MINIMUM_VERSION, parseVersionText, plistMinimumSystemVersion, sameVersion } from './finalize-native-release.mjs';
 
 const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'release.sh');
 
@@ -35,4 +36,22 @@ test('the release profile leaves rustc from stripping, which breaks every proc m
   // to strip, so the root manifest turns the step off.
   const manifest = readFileSync(path.resolve(path.dirname(script), '..', 'Cargo.toml'), 'utf8');
   assert.match(manifest, /\[profile\.release\]\s*\nstrip = "none"/);
+});
+
+test('the macOS floor is one decision in the config, the bundle and the release check', () => {
+  // Cargo's `[env]` table leaves a variable the environment already carries
+  // alone, so an inherited `MACOSX_DEPLOYMENT_TARGET` would quietly lower the
+  // floor the bundle then claims. `force = true` is what makes the floor the
+  // one written down whatever the shell says.
+  const root = path.resolve(path.dirname(script), '..');
+  const config = readFileSync(path.join(root, '.cargo/config.toml'), 'utf8');
+  assert.match(config, /MACOSX_DEPLOYMENT_TARGET = \{ value = "15\.0", force = true \}/);
+  // The floor is one decision written down three times: the build enforces
+  // it, the bundle declares it, and the release check refuses a binary that
+  // states another one. All three have to be the same version.
+  const enforced = /MACOSX_DEPLOYMENT_TARGET = \{ value = "([^"]+)", force = true \}/.exec(config);
+  assert.ok(enforced, 'the build config does not force a macOS deployment target');
+  assert.ok(sameVersion(parseVersionText(enforced[1]), MACOS_MINIMUM_VERSION));
+  const bundle = readFileSync(path.join(root, 'scripts/bundle-macos.sh'), 'utf8');
+  assert.ok(sameVersion(plistMinimumSystemVersion(bundle), MACOS_MINIMUM_VERSION));
 });

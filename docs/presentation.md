@@ -1,7 +1,8 @@
 # Muster — presentation script
 
-Every claim here has a `file:line` behind it; nothing in this file asserts something the code
-does not.
+> Historical presentation for the Legacy build. Its versions, platform matrix, test counts,
+> storage model and source references do not describe the current native app. Use
+> [README.md](../README.md) and [release safety](release-safety.md) for current claims.
 
 Use the 30-second version for an introduction and the slides for the pitch. The demo script is the
 part that actually convinces.

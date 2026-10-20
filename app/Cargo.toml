@@ -2,6 +2,7 @@
 name = "muster"
 version = "1.0.0-rc.5"
 edition = "2021"
+rust-version = "1.97.1"
 publish = false
 description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer."
 # Embedded in the About panel through `env!("CARGO_PKG_HOMEPAGE")`.

@@ -20,7 +20,6 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -507,11 +506,8 @@ struct FormatterOutput {
     stderr: Vec<u8>,
 }
 
-/// Run the formatter, handing it `stdin_source` when it reads the document that way.
-///
-/// The write happens before the streams are read and the daemon reads its input before
-/// it answers, so the two cannot block each other; a formatter that died first takes the
-/// write as its own failure rather than as a document it refused.
+/// Run the formatter with one deadline for all three pipes. Nonblocking I/O keeps
+/// descendants that retain a pipe from pinning a reader thread past that deadline.
 fn run_formatter_process(
     command: Command,
     stdin_source: Option<&str>,
@@ -524,138 +520,173 @@ fn run_formatter_process_with_timeout(
     stdin_source: Option<&str>,
     timeout: Duration,
 ) -> Result<FormatterOutput, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("could not start Prettier: {error}"))?;
-    if let Some(source) = stdin_source {
-        let mut stdin = child.stdin.take().ok_or("Prettier stdin was not piped.")?;
-        if let Err(error) = stdin.write_all(source.as_bytes()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("could not hand the document to Prettier: {error}"));
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    use std::process::Child;
+
+    struct FormatterChild(Child, bool);
+    impl Drop for FormatterChild {
+        fn drop(&mut self) {
+            if !self.1 {
+                // SAFETY: process_group(0) gives this unreaped child a dedicated group.
+                unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = self.0.wait();
+            }
         }
     }
-    let stdout = child
+    fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+        let fd = pipe.as_raw_fd();
+        // SAFETY: fcntl accesses the live pipe descriptor owned by this scope.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: same valid descriptor; only adds O_NONBLOCK to its status flags.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>, limit: usize) -> std::io::Result<bool> {
+        let mut buffer = [0; 8192];
+        for _ in 0..32 {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(count) if bytes.len() + count > limit => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge));
+                }
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    let deadline = Instant::now() + timeout;
+    command.process_group(0);
+    let mut child = FormatterChild(
+        command
+            .spawn()
+            .map_err(|e| format!("could not start Prettier: {e}"))?,
+        false,
+    );
+    let mut stdin = child.0.stdin.take();
+    if stdin_source.is_some() && stdin.is_none() {
+        return Err("Prettier stdin was not piped.".into());
+    }
+    let mut stdout = child
+        .0
         .stdout
         .take()
         .ok_or("Prettier stdout was not piped.")?;
-    let stderr = child
+    let mut stderr = child
+        .0
         .stderr
         .take()
         .ok_or("Prettier stderr was not piped.")?;
-    let (sender, receiver) = mpsc::channel();
-    let stdout_thread = read_formatter_stream(
-        stdout,
-        true,
-        muster_core::files::MAX_PREVIEW_BYTES,
-        sender.clone(),
-    );
-    let stderr_thread = read_formatter_stream(stderr, false, FORMATTER_STDERR_LIMIT, sender);
-    let deadline = Instant::now() + timeout;
-    let mut streams = [None, None];
-    let mut status = None;
-    let mut exited_pipe_deadline = None;
-    let mut failure = None;
-
-    while status.is_none() || streams.iter().any(Option::is_none) {
-        while let Ok((is_stdout, result)) = receiver.try_recv() {
-            let slot = if is_stdout { 0 } else { 1 };
-            if result
-                .as_ref()
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
-            {
-                failure = Some(if is_stdout {
-                    "Prettier produced output larger than the editor's size limit.".to_owned()
-                } else {
-                    "Prettier diagnostics exceeded the output limit.".to_owned()
-                });
-                break;
+    if let Some(pipe) = stdin.as_ref() {
+        nonblocking(pipe).map_err(|e| format!("could not configure Prettier stdin: {e}"))?;
+    }
+    nonblocking(&stdout).map_err(|e| format!("could not configure Prettier stdout: {e}"))?;
+    nonblocking(&stderr).map_err(|e| format!("could not configure Prettier stderr: {e}"))?;
+    let input = stdin_source.unwrap_or("").as_bytes();
+    let mut written = 0;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let (mut out_closed, mut err_closed) = (false, false);
+    let mut exited = false;
+    let mut exited_at = None;
+    let mut group_signalled = false;
+    loop {
+        if let Some(pipe) = stdin.as_mut() {
+            match pipe.write(&input[written..]) {
+                Ok(0) if written < input.len() => {
+                    return Err("Prettier stopped reading the document.".into());
+                }
+                Ok(0) => stdin = None,
+                Ok(count) => {
+                    written += count;
+                    if written == input.len() {
+                        stdin = None;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(format!("could not hand the document to Prettier: {e}")),
             }
-            streams[slot] = Some(result);
         }
-        if failure.is_some() {
+        if !out_closed {
+            out_closed = drain(&mut stdout, &mut out, muster_core::files::MAX_PREVIEW_BYTES)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::FileTooLarge {
+                        "Prettier produced output larger than the editor's size limit.".to_owned()
+                    } else {
+                        format!("could not read Prettier stdout: {e}")
+                    }
+                })?;
+        }
+        if !err_closed {
+            err_closed = drain(&mut stderr, &mut err, FORMATTER_STDERR_LIMIT).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::FileTooLarge {
+                    "Prettier diagnostics exceeded the output limit.".to_owned()
+                } else {
+                    format!("could not read Prettier stderr: {e}")
+                }
+            })?;
+        }
+        // SAFETY: siginfo_t is a C output buffer; all-zero bytes are valid before waitid fills it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid observes (without reaping) this child, keeping its PID reserved until cleanup.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.0.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } < 0
+        {
+            return Err(format!(
+                "could not inspect Prettier's exit: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: si_pid is valid after successful waitid.
+        if unsafe { info.si_pid() } != 0 {
+            exited = true;
+            exited_at.get_or_insert_with(Instant::now);
+        }
+        if exited
+            && (!out_closed || !err_closed)
+            && !group_signalled
+            && exited_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(100))
+        {
+            // SAFETY: the child is still unreaped and reserves its dedicated group ID.
+            unsafe { libc::kill(-(child.0.id() as libc::pid_t), libc::SIGKILL) };
+            group_signalled = true;
+        }
+        if exited && out_closed && err_closed {
+            if written < input.len() {
+                return Err("Prettier exited before reading the document.".into());
+            }
             break;
         }
-        match child.try_wait() {
-            Ok(exit) => status = exit.or(status),
-            Err(error) => {
-                failure = Some(format!("could not wait for Prettier: {error}"));
-                break;
-            }
-        }
         if Instant::now() >= deadline {
-            failure = Some(format!(
+            return Err(format!(
                 "Prettier timed out after {} seconds.",
                 timeout.as_secs()
             ));
-            break;
         }
-        if status.is_some() && streams.iter().any(Option::is_none) {
-            // Give the readers a short drain window before killing a descendant
-            // that inherited either pipe from the formatter parent.
-            let deadline = *exited_pipe_deadline
-                .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
-            if Instant::now() >= deadline {
-                terminate_formatter_group(child.id());
-            }
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-
-    if failure.is_some() {
-        terminate_formatter_group(child.id());
-        let _ = child.kill();
+        thread::sleep(Duration::from_millis(2));
     }
     let final_status = child
+        .0
         .wait()
-        .map_err(|error| format!("could not reap Prettier: {error}"))?;
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    let stdout = streams[0]
-        .take()
-        .ok_or("Prettier stdout was not collected.")?
-        .map_err(|error| format!("could not read Prettier stdout: {error}"))?;
-    let stderr = streams[1]
-        .take()
-        .ok_or("Prettier stderr was not collected.")?
-        .map_err(|error| format!("could not read Prettier stderr: {error}"))?;
+        .map_err(|e| format!("could not reap Prettier: {e}"))?;
+    child.1 = true;
     Ok(FormatterOutput {
-        status: status.unwrap_or(final_status),
-        stdout,
-        stderr,
+        status: final_status,
+        stdout: out,
+        stderr: err,
     })
-}
-
-fn read_formatter_stream<R: Read + Send + 'static>(
-    stream: R,
-    is_stdout: bool,
-    limit: usize,
-    sender: mpsc::Sender<(bool, std::io::Result<Vec<u8>>)>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(limit.min(8192));
-        let result = stream
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .and_then(|_| {
-                if bytes.len() > limit {
-                    Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge))
-                } else {
-                    Ok(bytes)
-                }
-            });
-        let _ = sender.send((is_stdout, result));
-    })
-}
-
-fn terminate_formatter_group(process_id: u32) {
-    if let Ok(process_id) = libc::pid_t::try_from(process_id) {
-        // SAFETY: a negative PID targets only the dedicated formatter process group.
-        unsafe { libc::kill(-process_id, libc::SIGKILL) };
-    }
 }
 
 fn filename_language(name: &str) -> Option<&'static str> {
@@ -2898,6 +2929,71 @@ mod tests {
             .expect("the formatter parent succeeded");
         assert!(result.status.success());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn formatter_process_writes_large_input_while_draining_output() {
+        let source = "x".repeat(256 * 1024);
+        let mut command = formatter_test_command(
+            "head -c 262144 /dev/zero; /bin/cat >/dev/null; printf after-input",
+        );
+        command.stdin(Stdio::piped());
+        let result =
+            run_formatter_process_with_timeout(command, Some(&source), Duration::from_secs(2))
+                .expect("concurrent pipe traffic completes");
+        assert!(result.status.success());
+        assert_eq!(result.stdout.len(), 262144 + b"after-input".len());
+        assert!(result.stdout.ends_with(b"after-input"));
+    }
+
+    #[test]
+    fn formatter_process_deadline_includes_a_child_that_never_reads_stdin() {
+        let source = "x".repeat(256 * 1024);
+        let mut command = formatter_test_command("sleep 30");
+        command.stdin(Stdio::piped());
+        let started = Instant::now();
+        let result =
+            run_formatter_process_with_timeout(command, Some(&source), Duration::from_millis(80));
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn formatter_escaped_pipe_holder() {
+        let Some(pidfile) = std::env::var_os("MUSTER_FORMATTER_HOLDER_PID") else {
+            return;
+        };
+        // SAFETY: this helper runs in a dedicated subprocess, not as its group leader.
+        assert!(unsafe { libc::setsid() } >= 0);
+        std::fs::write(pidfile, std::process::id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn formatter_process_does_not_wait_on_escaped_pipe_holder() {
+        let pidfile = tempfile::NamedTempFile::new().unwrap();
+        let mut command = formatter_test_command(
+            "\"$MUSTER_FORMATTER_HELPER\" --exact document::tests::formatter_escaped_pipe_holder --nocapture & wait",
+        );
+        command
+            .env("MUSTER_FORMATTER_HELPER", std::env::current_exe().unwrap())
+            .env("MUSTER_FORMATTER_HOLDER_PID", pidfile.path());
+        let started = Instant::now();
+        let result = run_formatter_process_with_timeout(command, None, Duration::from_secs(1));
+        let pid = std::fs::read_to_string(pidfile.path()).unwrap();
+        let pid: i32 = pid.trim().parse().unwrap();
+        // SAFETY: this test owns the live helper recorded in its private temporary file.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn formatter_process_refuses_output_after_incomplete_input() {
+        let source = "x".repeat(256 * 1024);
+        let mut command = formatter_test_command("printf partial; exit 0");
+        command.stdin(Stdio::piped());
+        assert!(run_formatter_process(command, Some(&source)).is_err());
     }
 
     #[test]

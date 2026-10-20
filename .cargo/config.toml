@@ -1,5 +1,5 @@
-# The floor the app's bundle declares, enforced by the build instead of promised
-# by `Info.plist`.
+# The floor the app's bundle declares, enforced by the build instead of merely
+# promised by `Info.plist`.
 #
 # `scripts/bundle-macos.sh` writes `LSMinimumSystemVersion 15.0` into the bundle,
 # which is what makes macOS offer this app only on a system that can run it. This
@@ -8,11 +8,15 @@
 # it does not meet. 15.0 is the toolkit's documented macOS floor, recorded in
 # `docs/release-safety.md`.
 #
-# `MACOSX_DEPLOYMENT_TARGET` and not a target rustflag because it is the one knob
-# both halves read: rustc turns it into the `-platform_version` the linker is
-# given, and clang turns it into `__MAC_OS_X_VERSION_MIN_REQUIRED`, which is what
-# marks an API unavailable to a `-sys` crate's bindings.
+# A `MACOSX_DEPLOYMENT_TARGET` and not a target rustflag because it is the one knob
+# rustc and clang both read: rustc turns it into the `-platform_version` the
+# linker is given, and clang turns it into `__MAC_OS_X_VERSION_MIN_REQUIRED`,
+# which is what marks an API unavailable to a `-sys` crate's bindings.
 #
-# Read only on Apple targets, so the Linux job in CI ignores it.
+# `force = true` because Cargo's `[env]` table leaves a variable that the
+# environment already carries alone, and an inherited `MACOSX_DEPLOYMENT_TARGET`
+# would quietly lower the floor the bundle then claims. Forced, the floor is the
+# one written here whatever the shell says. The variable is exported into every
+# build, but only Apple targets read it, so the Linux job in CI is unaffected.
 [env]
-MACOSX_DEPLOYMENT_TARGET = "15.0"
+MACOSX_DEPLOYMENT_TARGET = { value = "15.0", force = true }

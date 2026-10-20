@@ -587,18 +587,50 @@ fn maintain_rounds(
     checkouts: &[(String, PathBuf)],
     cursor: usize,
     budget: ReadBudget,
-) -> bool {
+    retries: Vec<ReviewRound>,
+) -> (bool, Vec<ReviewRound>) {
+    let mut sessions = sessions.to_vec();
+    let mut eligible: Vec<_> = eligible
+        .iter()
+        .filter(|round| sessions.contains(&round.session_id))
+        .cloned()
+        .collect();
+    // A retry names only its old deliveries, not all deliveries in a later snapshot.
+    for round in retries {
+        if !sessions.contains(&round.session_id) {
+            sessions.push(round.session_id.clone());
+        }
+        if !eligible.contains(&round) {
+            eligible.push(round);
+        }
+    }
+    let mut pending = Vec::new();
     let Ok(store) = RoundStore::open(home) else {
-        return false;
+        return (false, eligible);
     };
     let mut changed = false;
-    for session in sessions {
-        changed |= store
-            .ack_dispatched_rounds(session, eligible)
-            .is_ok_and(|n| n > 0);
+    for session in &sessions {
+        if budget.request_timeout().is_err() {
+            pending.extend(
+                eligible
+                    .iter()
+                    .filter(|round| &round.session_id == session)
+                    .cloned(),
+            );
+            continue;
+        }
+        match store.ack_dispatched_rounds(session, &eligible) {
+            Ok(count) => changed |= count > 0,
+            Err(_) => pending.extend(
+                eligible
+                    .iter()
+                    .filter(|round| &round.session_id == session)
+                    .cloned(),
+            ),
+        }
     }
     let Ok(mut queued) = store.queued() else {
-        return changed;
+        return (changed, pending);
     };
     if !queued.is_empty() {
         let start = cursor % queued.len();
@@ -627,7 +659,7 @@ fn maintain_rounds(
             Err(_) => true,
         };
     }
-    changed
+    (changed, pending)
 }
 
 impl TerminalWindow {
@@ -641,49 +673,62 @@ impl TerminalWindow {
         if self._agent_watch.is_some() {
             return;
         }
-        self._agent_watch = Some(cx.spawn(async move |view, cx| loop {
-            let interval = view
-                .read_with(cx, |app, _| app.agent_poll_interval())
-                .unwrap_or(IDLE_POLL);
-            cx.background_executor().timer(interval).await;
-            let Ok((request, revision)) =
-                view.update(cx, |app, _| (app.agent_request(), app.membership_revision))
-            else {
-                return;
-            };
-            let guard = ObservationGuard(ReadBudget::new(OBSERVATION_TIMEOUT));
-            let budget = guard.0.clone();
-            let worker = cx
-                .background_executor()
-                .spawn(async move { read_snapshot(&request, budget) });
-            let mut snapshot = worker.await;
-            let eligible = std::mem::take(&mut snapshot.eligible);
-            drop(guard);
-            let guard = ObservationGuard(ReadBudget::new(OBSERVATION_TIMEOUT));
-            let Ok(maintenance) = view.update(cx, |app, cx| {
-                if app.closing || app.membership_revision != revision {
-                    return None;
-                }
-                let settled = app.agent.apply(snapshot);
-                app.sync_opencode_sessions(cx);
-                app.run_follow_pass(cx);
-                cx.notify();
-                app.maintain_opencode_rounds(settled, eligible, guard.0.clone(), cx)
-            }) else {
-                return;
-            };
-            // One cycle owns both observation and queue maintenance; no overlapping
-            // detached flushes. Dropping the watch cancels the next blocking read.
-            if let Some(worker) = maintenance {
-                let changed = worker.await;
-                let _ = view.update(cx, |app, cx| {
-                    if changed {
-                        if let Some(checkout) = app.open_diff.as_ref().map(|(id, _)| id.clone()) {
-                            app.restore_opencode_review(&checkout, cx);
-                        }
-                        cx.notify();
+        self._agent_watch = Some(cx.spawn(async move |view, cx| {
+            // Keep exact delivery snapshots when the store is busy, never a later
+            // delivery that was not eligible for the turn we saw finish.
+            let mut pending_ack = Vec::new();
+            loop {
+                let interval = view
+                    .read_with(cx, |app, _| app.agent_poll_interval())
+                    .unwrap_or(IDLE_POLL);
+                cx.background_executor().timer(interval).await;
+                let Ok((request, revision)) =
+                    view.update(cx, |app, _| (app.agent_request(), app.membership_revision))
+                else {
+                    return;
+                };
+                let guard = ObservationGuard(ReadBudget::new(OBSERVATION_TIMEOUT));
+                let budget = guard.0.clone();
+                let worker = cx
+                    .background_executor()
+                    .spawn(async move { read_snapshot(&request, budget) });
+                let mut snapshot = worker.await;
+                let eligible = std::mem::take(&mut snapshot.eligible);
+                drop(guard);
+                let guard = ObservationGuard(ReadBudget::new(OBSERVATION_TIMEOUT));
+                let Ok(maintenance) = view.update(cx, |app, cx| {
+                    if app.closing || app.membership_revision != revision {
+                        return None;
                     }
-                });
+                    let settled = app.agent.apply(snapshot);
+                    app.sync_opencode_sessions(cx);
+                    app.run_follow_pass(cx);
+                    cx.notify();
+                    app.maintain_opencode_rounds(
+                        settled,
+                        eligible,
+                        std::mem::take(&mut pending_ack),
+                        guard.0.clone(),
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                // One cycle owns both observation and queue maintenance; no overlapping
+                // detached flushes. Dropping the watch cancels the next blocking read.
+                if let Some(worker) = maintenance {
+                    let (changed, pending) = worker.await;
+                    pending_ack = pending;
+                    let _ = view.update(cx, |app, cx| {
+                        if changed {
+                            if let Some(checkout) = app.open_diff.as_ref().map(|(id, _)| id.clone())
+                            {
+                                app.restore_opencode_review(&checkout, cx);
+                            }
+                            cx.notify();
+                        }
+                    });
+                }
             }
         }));
     }
@@ -738,9 +783,10 @@ impl TerminalWindow {
         &self,
         sessions: Vec<String>,
         eligible: Vec<ReviewRound>,
+        pending: Vec<ReviewRound>,
         budget: ReadBudget,
         cx: &mut Context<Self>,
-    ) -> Option<gpui_kit::Task<bool>> {
+    ) -> Option<gpui_kit::Task<(bool, Vec<ReviewRound>)>> {
         let home = home_directory()?;
         let checkouts: Vec<_> = self
             .navigation
@@ -756,7 +802,9 @@ impl TerminalWindow {
             .collect();
         let cursor = self.agent.cursor;
         Some(cx.background_executor().spawn(async move {
-            maintain_rounds(&home, &sessions, &eligible, &checkouts, cursor, budget)
+            maintain_rounds(
+                &home, &sessions, &eligible, &checkouts, cursor, budget, pending,
+            )
         }))
     }
 
@@ -1281,23 +1329,51 @@ mod tests {
         assert!(snapshot.error.is_none());
         assert_eq!(snapshot.eligible.len(), 1);
         let checkouts = [(checkout.id.clone(), root)];
-        assert!(maintain_rounds(
-            home.path(),
-            &[],
-            &[],
-            &checkouts,
-            0,
-            ReadBudget::new(OBSERVATION_TIMEOUT)
-        ));
-        // Another window flushes before this window applies its earlier idle observation.
-        assert!(maintain_rounds(
+        assert!(
+            maintain_rounds(
+                home.path(),
+                &[],
+                &[],
+                &checkouts,
+                0,
+                ReadBudget::new(OBSERVATION_TIMEOUT),
+                Vec::new(),
+            )
+            .0
+        );
+        // A busy store must not lose the completion edge or widen its eligible deliveries.
+        let store = RoundStore::open(home.path()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.path().with_file_name("opencode-rounds.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let (changed, pending) = maintain_rounds(
             home.path(),
             &["ses_review".into()],
             &snapshot.eligible,
-            &checkouts,
+            &[],
             0,
-            ReadBudget::new(OBSERVATION_TIMEOUT)
-        ));
+            ReadBudget::new(OBSERVATION_TIMEOUT),
+            Vec::new(),
+        );
+        assert!(!changed);
+        assert_eq!(pending, snapshot.eligible);
+        drop(lock);
+        // Another window flushed before this window applied its earlier idle observation.
+        assert!(
+            maintain_rounds(
+                home.path(),
+                &[],
+                &store.eligible_dispatched().unwrap(),
+                &checkouts,
+                0,
+                ReadBudget::new(OBSERVATION_TIMEOUT),
+                pending,
+            )
+            .0
+        );
         let store = RoundStore::open(home.path()).unwrap();
         assert_eq!(
             store.round(&checkout.id, &old.id).unwrap().unwrap().status,

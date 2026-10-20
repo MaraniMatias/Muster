@@ -6,17 +6,32 @@ on:
       - main
   pull_request:
 
+# Nothing here writes to the repository. The token is read-only by default, and
+# every job repeats it explicitly so a job added later cannot inherit more.
+permissions:
+  contents: read
+
 jobs:
   # The workspace is the two crates at the root: `core` and the app itself, whose source is `app/src/`.
   checks:
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
         with:
           components: rustfmt, clippy
+      # That commit is the tip of the action's `1.97.1` branch, and its own
+      # `action.yml` carries `toolchain: 1.97.1`, so the pin installs the
+      # version this repository names rather than whatever the branch says
+      # today. The build says so out loud rather than assuming it.
+      - name: The toolchain in use is the one this repository pins
+        run: test "$(rustc --version | cut -d' ' -f2)" = "1.97.1"
       # The Rust dependencies are the build's cost, and they only change when Cargo.lock does.
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: . -> target
 
@@ -28,7 +43,7 @@ jobs:
       # path package it cannot hash-pin, and queries OSV. Node is needed for that alone, and for
       # the release command tests `scripts/release.sh check` runs beside the audit -- same two files,
       # so a release profile or command that breaks is caught here rather than at packaging.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
       - run: node --test scripts/audit-rust.test.mjs scripts/release.test.mjs scripts/linux-release.test.mjs
@@ -47,12 +62,16 @@ jobs:
   # the runner image and these tests create their own repositories.
   linux-build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
         with:
           components: rustfmt, clippy
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: . -> target
       # Every system library the native crate links against: Vulkan for wgpu, X11 and
@@ -60,12 +79,15 @@ jobs:
       # fontconfig for text. Each missing one fails a different way -- fontconfig.pc
       # makes a build script panic, the rest surface as `unable to find library` at
       # link time -- so the list is read off what the link line actually asks for.
+      # `build-essential` is the C compiler: the tree-sitter grammars are C
+      # sources, and the crate that builds them says so with `cc`.
       - run: >-
           sudo apt-get update && sudo apt-get install -y
           libvulkan-dev libx11-dev libxcb1-dev
           libxkbcommon-dev libxkbcommon-x11-dev
           libfreetype6-dev libfontconfig1-dev dpkg-dev zip unzip
-      - uses: actions/setup-node@v7
+          build-essential
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
       - run: scripts/release.sh build

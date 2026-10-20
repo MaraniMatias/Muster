@@ -555,3 +555,124 @@ fn clearing_cached_exports_is_offered_with_no_diff_open(cx: &mut TestAppContext)
     .unwrap();
     dispose(&panel.fixture, cx);
 }
+
+#[gpui_kit::test]
+fn blocked_apply_keeps_the_ui_responsive_and_failure_keeps_the_draft(cx: &mut TestAppContext) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let panel = open_panel(cx);
+    edit(cx, &panel, |settings| settings.terminal.ligatures = false);
+    let number = terminal_size_field(&panel, cx);
+    cx.update_window(panel.fixture.handle, move |_, window, cx| {
+        number.update(cx, |input, cx| input.set_value("23", window, cx));
+    })
+    .unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let write_count = writes.clone();
+    let delay = cx
+        .background_executor
+        .timer(std::time::Duration::from_secs(1));
+    let save = cx.background_spawn(async move {
+        write_count.fetch_add(1, Ordering::SeqCst);
+        delay.await;
+        Err("blocked test failure".to_owned())
+    });
+    let view = panel.fixture.view.clone();
+    cx.update_window(panel.fixture.handle, move |_, _, cx| {
+        view.update(cx, |app, _| {
+            app.settings.as_mut().unwrap().save_override = Some(save);
+        });
+    })
+    .unwrap();
+
+    let view = panel.fixture.view.clone();
+    cx.update_window(panel.fixture.handle, move |_, window, cx| {
+        view.update(cx, |app, cx| app.apply_settings_draft(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(panel.fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-cancel", cx);
+        window.press("escape", cx);
+        assert!(window.try_find("settings-apply").is_some());
+    })
+    .unwrap();
+
+    // A second Apply is a no-op while the first is blocked; an ordinary UI update still runs.
+    let view = panel.fixture.view.clone();
+    cx.update_window(panel.fixture.handle, move |_, window, cx| {
+        view.update(cx, |app, cx| {
+            app.edit_settings_draft(cx, |settings| settings.terminal.ligatures = true);
+            app.apply_settings_draft(window, cx);
+        });
+    })
+    .unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    assert!(panel.fixture.view.read_with(cx, |app, _| {
+        app.settings.as_ref().is_some_and(|draft| draft.saving)
+    }));
+
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let view = &panel.fixture.view;
+    assert!(view.read_with(cx, |app, _| app.settings.is_some()));
+    assert!(!view.read_with(cx, |app, _| {
+        app.settings.as_ref().unwrap().draft.terminal.ligatures
+    }));
+    assert_eq!(
+        terminal_size_field(&panel, cx).read_with(cx, |input, _| input.value().to_string()),
+        "23"
+    );
+    assert!(view.read_with(cx, |app, _| {
+        app.settings
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked test failure"))
+    }));
+    dispose(&panel.fixture, cx);
+}
+
+#[gpui_kit::test]
+fn a_finished_save_cannot_close_a_replacement_draft(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
+    let delay = cx
+        .background_executor
+        .timer(std::time::Duration::from_secs(1));
+    let save = cx.background_spawn(async move {
+        delay.await;
+        Ok(())
+    });
+    let view = panel.fixture.view.clone();
+    cx.update_window(panel.fixture.handle, move |_, window, cx| {
+        view.update(cx, |app, cx| {
+            app.settings.as_mut().unwrap().save_override = Some(save);
+            app.apply_settings_draft(window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Simulate replacement by an owner, not a Cancel of an already-started write.
+    let view = panel.fixture.view.clone();
+    cx.update_window(panel.fixture.handle, move |_, _, cx| {
+        view.update(cx, |app, _| app.settings = None);
+    })
+    .unwrap();
+    panel.reopen(cx);
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(panel
+        .fixture
+        .view
+        .read_with(cx, |app, _| app.settings.is_some()));
+    dispose(&panel.fixture, cx);
+}

@@ -6,11 +6,56 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
-import { finalize, verifyPayload } from './finalize-native-release.mjs';
+import { finalize, plistMinimumSystemVersion, readMachOMinimumOs, verifyMacBundleMinimumOs, verifyPayload, MACOS_MINIMUM_VERSION } from './finalize-native-release.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => readFileSync(path.join(root, file), 'utf8');
 const sha = 'a'.repeat(40);
+
+// The two load commands that state a Mach-O's minimum macOS version, and a
+// thin arm64 header carrying them.
+const LC_VERSION_MIN_MACOSX = 0x24;
+const LC_BUILD_VERSION = 0x32;
+
+function packVersion(version) {
+  // Arithmetic rather than a bit shift: a major of 32768 does not fit in the
+  // sixteen bits a packed version gives it, and shifting it left would turn it
+  // into a negative number.
+  const [major, minor = 0, patch = 0] = version.split('.').map(Number);
+  return major * 0x10000 + minor * 0x100 + patch;
+}
+
+function buildVersionCommand(minos, sdk = '15.0') {
+  const command = Buffer.alloc(24);
+  command.writeUInt32LE(LC_BUILD_VERSION, 0);
+  command.writeUInt32LE(24, 4);
+  command.writeUInt32LE(1, 8);
+  command.writeUInt32LE(packVersion(minos), 12);
+  command.writeUInt32LE(packVersion(sdk), 16);
+  command.writeUInt32LE(0, 20);
+  return command;
+}
+
+function versionMinCommand(version, sdk = '15.0') {
+  const command = Buffer.alloc(16);
+  command.writeUInt32LE(LC_VERSION_MIN_MACOSX, 0);
+  command.writeUInt32LE(16, 4);
+  command.writeUInt32LE(packVersion(version), 8);
+  command.writeUInt32LE(packVersion(sdk), 12);
+  return command;
+}
+
+function machO(...commands) {
+  const header = Buffer.alloc(32);
+  header.writeUInt32LE(0xfeedfacf, 0);
+  header.writeUInt32LE(0x100000c, 4);
+  header.writeUInt32LE(2, 12);
+  header.writeUInt32LE(commands.length, 16);
+  header.writeUInt32LE(commands.reduce((total, command) => total + command.length, 0), 20);
+  return Buffer.concat([header, ...commands]);
+}
+
+const minimumPlist = '<plist><dict><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>';
 
 function temporary(run) {
   const dir = mkdtempSync(path.join(tmpdir(), 'muster-release-'));
@@ -40,6 +85,59 @@ test('finalization refuses wrong SHA, tampering, missing targets and unexpected 
   assert.throws(() => verifyPayload(dir, sha, filename), /unexpected artifact files/);
 }));
 
+test('the packaged binary states its minimum macOS version in its load commands', () => {
+  assert.deepEqual(readMachOMinimumOs(machO(buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  assert.deepEqual(readMachOMinimumOs(machO(versionMinCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  // A binary that says nothing about the floor states no floor.
+  assert.throws(() => readMachOMinimumOs(machO()), /declares no minimum macOS version/);
+  // Two commands that disagree leave nothing to check against.
+  assert.throws(() => readMachOMinimumOs(machO(buildVersionCommand('15.0'), versionMinCommand('14.0'))), /conflicting minimum macOS versions/);
+  // A command that runs past the end of the load commands is not a floor.
+  const overrun = machO(buildVersionCommand('15.0'));
+  overrun.writeUInt32LE(64, 36);
+  assert.throws(() => readMachOMinimumOs(overrun), /malformed Mach-O load command bounds/);
+  // A header that claims more commands than it carries.
+  const liar = machO(buildVersionCommand('15.0'));
+  liar.writeUInt32LE(4, 16);
+  assert.throws(() => readMachOMinimumOs(liar), /malformed Mach-O load commands/);
+  // A platform that is not macOS is not this app's floor.
+  const other = buildVersionCommand('15.0');
+  other.writeUInt32LE(6, 8);
+  assert.throws(() => readMachOMinimumOs(machO(other)), /non-macOS platform/);
+});
+
+test('the bundle declares the floor the build enforces', () => {
+  assert.deepEqual(plistMinimumSystemVersion(minimumPlist), MACOS_MINIMUM_VERSION);
+  assert.throws(() => plistMinimumSystemVersion('<plist><dict></dict></plist>'), /declares no LSMinimumSystemVersion/);
+  assert.throws(() => plistMinimumSystemVersion('<plist><dict><key>LSMinimumSystemVersion</key><string>fifteen</string></dict></plist>'), /malformed version/);
+  // A version text is three bounded numbers, so a long one is malformed
+  // rather than a number too large to hold.
+  assert.throws(() => plistMinimumSystemVersion('<plist><dict><key>LSMinimumSystemVersion</key><string>1234567890123</string></dict></plist>'), /malformed version/);
+  assert.throws(() => plistMinimumSystemVersion(`<plist><dict><key>LSMinimumSystemVersion</key><string>${'1'.repeat(64)}</string></dict></plist>`), /malformed version/);
+  assert.throws(() => plistMinimumSystemVersion('<plist><dict><key>LSMinimumSystemVersion</key><string>15.0.0.0</string></dict></plist>'), /malformed version/);
+});
+
+test('the binary and the bundle must agree on the floor', () => {
+  assert.deepEqual(verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  // The floor is what this build claims to need, so a binary that states a
+  // different one is refused whichever way it differs: older as much as
+  // newer, because a binary that says otherwise was not built by the decision
+  // it is shipped under.
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('14.0'))), /the binary states macOS 14\.0\.0/);
+  // macOS 15 is followed by 26, so that is the next system a build could ask for.
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('26.0'))), /the binary states macOS 26\.0\.0/);
+  // A major that does not fit in the sixteen bits a packed version gives it
+  // used to read as a negative number, and a negative number compared as
+  // older than the floor. It is refused now, like any other mismatch.
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('32768.0'))), /the binary states macOS 32768\.0\.0/);
+  // A bundle that lowered its own claim is not the floor this build enforces,
+  // and neither is one that raised it.
+  const lowered = '<plist><dict><key>LSMinimumSystemVersion</key><string>14.0</string></dict></plist>';
+  assert.throws(() => verifyMacBundleMinimumOs(lowered, machO(buildVersionCommand('15.0'))), /the bundle declares macOS 14\.0\.0/);
+  const raised = '<plist><dict><key>LSMinimumSystemVersion</key><string>26.0</string></dict></plist>';
+  assert.throws(() => verifyMacBundleMinimumOs(raised, machO(buildVersionCommand('15.0'))), /the bundle declares macOS 26\.0\.0/);
+});
+
 test('finalization validates both package formats and refuses wrong bundle versions', { skip: process.platform !== 'linux' }, () => temporary(dir => {
   const version = '1.0.0-rc.2';
   const linuxDir = path.join(dir, `linux-${sha}`);
@@ -62,11 +160,8 @@ test('finalization validates both package formats and refuses wrong bundle versi
   run('dpkg-deb', ['--build', stage, path.join(linuxDir, deb)]);
   const contents = path.join(dir, 'Muster.app/Contents');
   mkdirSync(path.join(contents, 'MacOS'), { recursive: true });
-  const header = Buffer.alloc(32);
-  header.writeUInt32LE(0xfeedfacf, 0);
-  header.writeUInt32LE(0x100000c, 4);
-  writeFileSync(path.join(contents, 'MacOS/Muster'), header);
-  const plist = '<plist><dict><key>CFBundleShortVersionString</key><string>1.0.0-rc.2</string></dict></plist>';
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('15.0')));
+  const plist = '<plist><dict><key>CFBundleShortVersionString</key><string>1.0.0-rc.2</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>';
   writeFileSync(path.join(contents, 'Info.plist'), plist);
   const record = (directory, filename) => {
     writeFileSync(path.join(directory, 'SOURCE_SHA'), `${sha}\n`);
@@ -83,6 +178,17 @@ test('finalization validates both package formats and refuses wrong bundle versi
   run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
   record(macDir, mac);
   assert.throws(() => finalize(dir, sha, version, output));
+  // A binary that states a floor other than the one the bundle declares is
+  // refused too, whichever way it differs.
+  writeFileSync(path.join(contents, 'Info.plist'), plist);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('26.0')));
+  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
+  record(macDir, mac);
+  assert.throws(() => finalize(dir, sha, version, output), /the binary states macOS 26\.0\.0/);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('14.0')));
+  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
+  record(macDir, mac);
+  assert.throws(() => finalize(dir, sha, version, output), /the binary states macOS 14\.0\.0/);
 }));
 
 function smoke(dir, app, window, deadline = false) {
@@ -142,4 +248,24 @@ test('publication is downstream of read-only finalization and never rebuilds sou
   assert.match(publish, /status=\$\?; \[\[ \$status == 2 \]\]/);
   assert.match(publish, /--draft/);
   assert.doesNotMatch(publish, /uses: actions\/checkout|cargo |node |git push/);
+});
+
+test('every workflow action is pinned to a commit and every job states its permissions', () => {
+  for (const file of ['.github/workflows/ci.yml', '.github/workflows/linux-release.yml']) {
+    const workflow = read(file);
+    for (const [, action] of workflow.matchAll(/uses:\s*(\S+)/g)) {
+      assert.match(action, /^[^@\s]+@[0-9a-f]{40}$/, `${file} does not pin ${action} to a commit`);
+    }
+    for (const [, tail] of workflow.matchAll(/uses:\s*actions\/checkout@[0-9a-f]{40}[^\n]*\n((?: {8,}[^\n]*\n)+)/g)) {
+      assert.match(tail, /persist-credentials: false/, `${file} leaves checkout credentials persisted`);
+    }
+    const jobs = [...workflow.slice(workflow.indexOf('\njobs:\n')).matchAll(/^ {2}([A-Za-z0-9_-]+):$/gm)];
+    assert.ok(jobs.length > 0, `${file} declares no job`);
+    for (const [index, job] of jobs.entries()) {
+      const body = workflow.slice(job.index, jobs[index + 1]?.index ?? workflow.length);
+      const declared = /^ {4}permissions:\n {6}contents: (read|write)$/m.exec(body);
+      assert.ok(declared, `${file}: job ${job[1]} does not declare its permissions`);
+      assert.equal(declared[1], job[1] === 'publish' ? 'write' : 'read', `${file}: job ${job[1]} has the wrong permissions`);
+    }
+  }
 });

@@ -726,8 +726,8 @@ struct Shared {
     /// system clipboard is a claim about the user's data that this crate cannot
     /// check, so the request becomes a state the host can see and refuse.
     clipboard_requested: AtomicBool,
-    /// A reply could not be delivered. Sticky across otherwise successful polls:
-    /// the child may still be waiting and must not appear healthy again.
+    /// A reply failed or the parser panicked. Sticky across otherwise successful
+    /// polls: a broken terminal must not appear healthy again.
     protocol_error: Mutex<Option<String>>,
     /// Bells, counted rather than flagged so a host can rate-limit them.
     bell: AtomicU64,
@@ -772,7 +772,21 @@ impl Shared {
     /// One place that knows how the lock is poisoned, and one short hold: a
     /// feed on the reader, a resize on the worker, a snapshot on the view.
     fn core(&self) -> MutexGuard<'_, TerminalCore> {
-        self.parser.lock().expect("terminal parser poisoned")
+        match self.parser.lock() {
+            Ok(core) => core,
+            Err(poisoned) => {
+                // Never render or continue parsing a partially mutated grid. The reader's
+                // panic is a failure of this terminal, not of the window drawing it.
+                let mut core = poisoned.into_inner();
+                let (cols, rows) = self.requested();
+                *core = TerminalCore::new(cols, rows, 0);
+                self.closing.store(true, Ordering::Release);
+                *self.protocol_error.lock().expect("terminal protocol error poisoned") =
+                    Some("Terminal parser failed; its state was discarded. Close this terminal and start a new one.".into());
+                self.parser.clear_poison();
+                core
+            }
+        }
     }
 
     /// The size a `TextAreaSizeRequest` is answered from.
@@ -1013,6 +1027,9 @@ impl Inner {
 
     /// Hand bytes to the session's one writer.
     fn push_input(&self, bytes: Vec<u8>) -> Result<(), SessionError> {
+        if self.shared().closing.load(Ordering::Acquire) {
+            return Err(SessionError::Closing);
+        }
         self.side.queue.push(bytes).map_err(SessionError::Queue)
     }
 
@@ -2064,6 +2081,39 @@ mod tests {
     const TEST_SCROLLBACK: usize = 500;
 
     static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn a_parser_panic_discards_its_grid_without_panicking_the_next_reader() {
+        let shared = Shared::new(80, 24, TEST_SCROLLBACK);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut core = shared.core();
+            core.feed(b"\x1b]2;partially parsed\x07untrusted output");
+            panic!("injected parser failure");
+        }));
+        assert!(panicked.is_err());
+        assert!(shared.parser.is_poisoned());
+        let core = shared.core();
+        assert_eq!((core.cols(), core.rows()), (80, 24));
+        assert!(core.title().is_none());
+        assert_eq!(core.history_size(), 0);
+        assert!(!shared.parser.is_poisoned());
+        assert!(
+            shared.closing.load(Ordering::Acquire),
+            "input and resize are refused after the parser failed"
+        );
+        assert!(shared
+            .protocol_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|error| error.contains("Terminal parser failed")));
+        drop(core);
+        assert_eq!(
+            shared.core().rows(),
+            24,
+            "later frames can read the clean grid too"
+        );
+    }
 
     fn next_id() -> String {
         format!("session-test-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))

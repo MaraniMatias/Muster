@@ -32,6 +32,11 @@
 //! written to a private temporary file and renamed into place, so a reader never sees
 //! half a file and a crash never leaves one behind.
 //!
+//! The wait for that lock is bounded, because the lock is held across a service call
+//! and another process can retain it beyond this caller's deadline. A mutation that cannot take the lock in
+//! time says so and changes nothing: the review it would have written is still there
+//! to write, and the window that holds the lock is the one making progress.
+//!
 //! It is also bounded, and the bound is a policy rather than a wall. A write that gets
 //! close to the cap gives up what nothing can ask for again — the prompt of a round the
 //! service has already answered for — and a person can forget delivered notes from
@@ -46,7 +51,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +76,24 @@ const COMPACT_ABOVE: u64 = STATE_CAP / 4 * 3;
 const STORE_FILE: &str = "opencode-rounds.json";
 const LOCK_FILE: &str = "opencode-rounds.lock";
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// How long an ordinary mutation waits for the store's lock before it gives up.
+///
+/// The lock is held across the service calls a send makes, so a window that is sending
+/// holds it for as long as the service takes. A mutation that is not a send does not
+/// wait for that: it gives up in a quarter of a second and changes nothing. Background
+/// maintenance also checks its shared budget between sessions.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// The longest a client-aware acquisition waits for the lock, before the client's own
+/// deadline is applied on top of it.
+///
+/// The lock is the last thing a send waits for and the first thing it gives up: a
+/// review that cannot be claimed is a review that is still there to claim.
+const LOCK_WAIT_CLIENT: Duration = Duration::from_secs(5);
+
+/// How often a waiting acquisition asks the operating system again.
+const LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// Where one checkout's reviews go. Remembered per checkout, because a review is
 /// written about one checkout and is not interchangeable with another.
@@ -360,7 +383,7 @@ impl RoundStore {
                 "this agent connection is scoped to another checkout".into(),
             ));
         }
-        let _lock = self.lock()?;
+        let _lock = self.lock_for(client)?;
         let mut state = self.read()?;
         let (index, offer) = claim_round(&mut state, request, RoundStatus::Dispatching)?;
         if !offer {
@@ -514,14 +537,16 @@ impl RoundStore {
     ///
     /// A question the service did not answer leaves the round exactly where it was: this
     /// never sends anything. The lock is held across the question, so a window cannot
-    /// reconcile a round that another window is sending right now.
+    /// reconcile a round that another window is sending right now, and the wait for that
+    /// lock is the client's own deadline rather than as long as the other window's
+    /// service call takes.
     pub fn reconcile_round(
         &self,
         client: &Client,
         checkout_id: &str,
         round_id: &str,
     ) -> Result<ReviewRound, DispatchError> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_for(client)?;
         let mut state = self.read()?;
         let index = round_index(&state, checkout_id, round_id)?;
         let round = state.rounds[index].clone();
@@ -639,7 +664,7 @@ impl RoundStore {
         checkout_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<usize, DispatchError> {
-        let _lock = self.lock()?;
+        let _lock = self.lock_for(client)?;
         let mut state = self.read()?;
         // The rounds that are waiting, in age order: the file is in the order rounds
         // were recorded, so index order is age order.
@@ -805,7 +830,75 @@ impl RoundStore {
     /// OS-held and released by drop or by process death, which is what makes this work
     /// for a window that is killed mid-send. The lock file is never unlinked: replacing
     /// its inode would let a second window lock a different file.
+    ///
+    /// The wait for it is bounded. Another window holds the lock across the service
+    /// calls it makes, so waiting for it without a limit is waiting for that service
+    /// call: an ordinary mutation gives up after [`LOCK_WAIT`] and changes nothing,
+    /// and the caller tries again.
     fn lock(&self) -> Result<File, DispatchError> {
+        self.lock_within(LOCK_WAIT, None)
+    }
+
+    /// The lock for a path that goes on to talk to the service.
+    ///
+    /// The wait is the client's own: what is left of its deadline, and no more than
+    /// [`LOCK_WAIT_CLIENT`]. A budget that was cancelled or has run out is refused
+    /// before the lock is taken, so a send that cannot be made never claims the notes
+    /// it would have carried.
+    fn lock_for(&self, client: &Client) -> Result<File, DispatchError> {
+        let budget = client.read_budget.as_ref();
+        let wait = match budget {
+            Some(budget) => budget.remaining()?.min(LOCK_WAIT_CLIENT),
+            None => LOCK_WAIT_CLIENT,
+        };
+        self.lock_within(wait, budget)
+    }
+
+    /// Takes the lock, asking again for as long as the wait allows.
+    ///
+    /// `budget` is the caller's deadline when there is one. It is asked before the lock
+    /// is taken and again while it is waited for, so a cancelled read stops the wait
+    /// rather than finishing it, and a deadline that ran out while waiting is refused
+    /// before anything is claimed.
+    fn lock_within(
+        &self,
+        wait: Duration,
+        budget: Option<&super::ReadBudget>,
+    ) -> Result<File, DispatchError> {
+        let file = self.open_lock()?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    // Waiting may have spent what was left of the deadline, and a
+                    // request that cannot be made must not claim anything first.
+                    if let Some(budget) = budget {
+                        budget.remaining()?;
+                    }
+                    return Ok(file);
+                }
+                // Another window holds it: this is a state to wait in, not a failure.
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(error) => {
+                    return Err(DispatchError::Failed(format!(
+                        "could not lock the review round store: {error}"
+                    )))
+                }
+            }
+            if let Some(budget) = budget {
+                budget.remaining()?;
+            }
+            if Instant::now() >= deadline {
+                return Err(DispatchError::Unavailable(
+                    "the review round store is locked by another window".into(),
+                ));
+            }
+            std::thread::sleep(LOCK_POLL);
+        }
+    }
+
+    /// The lock file itself, opened the way the store's own files are.
+    fn open_lock(&self) -> Result<File, DispatchError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -827,9 +920,6 @@ impl RoundStore {
                 "the review round lock must be a regular file".into(),
             ));
         }
-        file.lock().map_err(|error| {
-            DispatchError::Failed(format!("could not lock the review round store: {error}"))
-        })?;
         Ok(file)
     }
 
