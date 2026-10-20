@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.5
 
 - Render inline images from Pi and OpenCode through the Kitty graphics protocol,
   including chunked PNG/RGB/RGBA uploads, compressed pixels, cropped placements

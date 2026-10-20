@@ -1,6 +1,6 @@
 [package]
 name = "muster"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 edition = "2021"
 publish = false
 description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer."
