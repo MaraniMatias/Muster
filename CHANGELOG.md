@@ -6,13 +6,41 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## 1.0.0-rc.5
+## 1.0.0-rc.6
 
 - Render inline images from Pi and OpenCode through the Kitty graphics protocol,
   including chunked PNG/RGB/RGBA uploads, compressed pixels, cropped placements
   and Unicode placeholders. Images follow terminal output and are released from
   the GPU atlas when no longer visible. Pi receives an explicit image capability
   unless the user already configured one; the terminal still identifies as Muster.
+
+- **Apply does not freeze the panel.** The preferences file is written on a
+  background task, so the panel keeps answering while it is written: the button
+  says `Saving…`, the fields are disabled, and a second Apply is refused. A
+  write that fails keeps the draft and says what went wrong, and a write that
+  finishes after its draft was replaced cannot close the draft that took its
+  place.
+
+- **A review that cannot be claimed is still there to claim.** The review round
+  store bounds the wait for its lock: an ordinary change gives up after a
+  quarter of a second and changes nothing, and a send waits for the client's own
+  deadline -- at most five seconds -- rather than for as long as another
+  window's service call takes. A cancelled or expired client refuses the send
+  before it claims the notes it would have carried.
+
+- **A formatter that keeps a pipe open cannot pin the editor.** Prettier runs
+  with one deadline for its three pipes and reads them without blocking, so a
+  descendant that holds one cannot keep the reader past that deadline. The
+  child is given its own process group, and the whole group is killed when the
+  format is abandoned.
+
+- **The release pipeline reads the bundle's own floor.** The finalization job
+  reads the minimum macOS version out of the packaged arm64 binary's own Mach-O
+  load commands and refuses a bundle that declares a different one, so the
+  floor in `Info.plist`, the floor the build enforces and the floor the binary
+  states are one decision that is checked rather than assumed. Every action in
+  the release workflow is pinned to a commit, and each job asks for the least
+  permission it needs.
 
 ## 1.0.0-rc.4
 
