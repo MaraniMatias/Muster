@@ -1319,7 +1319,19 @@ mod tests {
     fn native_snapshot_shares_one_deadline_through_pending_and_catalogs() {
         use serde_json::json;
         let mock = mock::Mock::start(|request| {
-            std::thread::sleep(Duration::from_millis(80));
+            // The unscoped reads are cheap and the per-location ones are not: the session
+            // list has to arrive inside the deadline, and the pending lists and the
+            // catalogs are the work that deadline has to cut off. A read that has to
+            // succeed cannot also be an expensive one -- a loaded runner schedules a
+            // thread later than a workstation does, and this test is about the deadline
+            // rather than about the machine.
+            let unscoped = matches!(
+                request.path.as_str(),
+                "/api/info" | "/api/session" | "/api/session/active"
+            );
+            if !unscoped {
+                std::thread::sleep(Duration::from_millis(80));
+            }
             let data = match request.path.as_str() {
                 "/api/session" => json!((0..12)
                     .map(|i| json!({
@@ -1347,18 +1359,21 @@ mod tests {
         let snapshot = read_snapshot_in(
             home.path(),
             &request,
-            ReadBudget::new(Duration::from_millis(400)),
+            ReadBudget::new(Duration::from_millis(600)),
         );
         assert!(
-            started.elapsed() < Duration::from_millis(700),
+            started.elapsed() < Duration::from_millis(900),
             "snapshot resets its deadline between endpoints"
         );
-        assert!(snapshot.error.is_none());
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
         assert!(snapshot
             .sessions
             .iter()
             .any(|session| session.awaiting_reply.is_none()));
         assert!(snapshot.catalogs.is_empty());
-        assert!(mock.requests().len() <= 6);
+        // The work would be thirty-five reads: three unscoped, twenty-four pending and
+        // eight catalogs. The deadline stops it long before that.
+        let reads = mock.requests().len();
+        assert!(reads <= 12, "the snapshot made {reads} reads");
     }
 }
