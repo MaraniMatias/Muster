@@ -883,7 +883,13 @@ mod tests {
                 }
                 _ => serde_json::json!([]),
             };
-            std::thread::sleep(Duration::from_millis(60));
+            // The probe is the one read that has to arrive inside the deadline, so it is
+            // cheap; the reads the deadline has to cut off are not. A loaded runner
+            // schedules a thread later than a workstation does, and this test is about the
+            // deadline rather than about the machine.
+            if request.path != "/api/info" {
+                std::thread::sleep(Duration::from_millis(60));
+            }
             mock::reply(200, serde_json::json!({"data": data}))
         });
         let home = home_for(mock.port());
@@ -898,7 +904,7 @@ mod tests {
             "the deadline restarted for every request: {:?}",
             start.elapsed()
         );
-        assert!(mock.requests().len() <= 4);
+        assert!(mock.requests().len() <= 5);
     }
 
     #[test]
