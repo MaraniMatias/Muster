@@ -16,7 +16,9 @@ use gpui_kit::{
 use muster_core::workspace::{Checkout, Repo, RepoKind};
 
 use crate::{
-    app::{measured_width, ButtonA11y, InspectorTab, TerminalWindow, WidthCache},
+    app::{
+        measured_width, ButtonA11y, InspectorTab, TerminalWindow, ViewKind, ViewPin, WidthCache,
+    },
     file_icons,
     theme::{zed_button, Roles},
     tooltip::RestingTooltip,
@@ -978,6 +980,13 @@ impl TerminalWindow {
         let token = self.document_request;
         let checkout_id = checkout.id.clone();
         self.document_target = Some((checkout_id.clone(), path.clone()));
+        // The pane is on a file from here on, and the row that says so is
+        // named after it.
+        self.view_pin = Some(ViewPin {
+            checkout_id: checkout_id.clone(),
+            kind: ViewKind::Preview,
+            path: Some(path.clone()),
+        });
         window.blur(cx);
         self.open_diff = None;
         self.focus_pending = false;

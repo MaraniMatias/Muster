@@ -501,6 +501,31 @@ pub(crate) enum InspectorTab {
 pub(crate) type PendingDocumentTransition =
     Box<dyn FnOnce(&mut TerminalWindow, &mut Window, &mut Context<TerminalWindow>) + 'static>;
 
+/// What the centre pane is showing when it is not showing a terminal.
+///
+/// Two things, and they are not the same thing: a file being read is a
+/// preview, and a change being read is a diff. A row that says which one it
+/// is the way a person knows the pane is not on a terminal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewKind {
+    Preview,
+    Diff,
+}
+
+/// The view the centre pane was last on.
+///
+/// Kept when the pane leaves it: a click on a terminal is a navigation and
+/// not a close, so the row that names the file that was open is the way back
+/// to it. It is window state, like the document itself, and is never written
+/// to disk.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ViewPin {
+    pub(crate) checkout_id: String,
+    pub(crate) kind: ViewKind,
+    /// The file the view is about, when it is about one file.
+    pub(crate) path: Option<String>,
+}
+
 pub struct TerminalWindow {
     pub(crate) navigation: Navigation,
     pub(crate) terminals: HashMap<String, LiveTerminal>,
@@ -557,6 +582,11 @@ pub struct TerminalWindow {
     /// changed nothing does not send the keyboard back to the top of the list.
     pub(crate) document_grammar_query_seen: String,
     pub(crate) open_diff: Option<(String, Option<String>)>,
+    /// The view the centre pane was last on, kept when the pane leaves it.
+    ///
+    /// The sidebar draws it as a row, so the panel says which file the pane
+    /// is on rather than leaving a terminal marked while a file is read.
+    pub(crate) view_pin: Option<ViewPin>,
     pub(crate) expanded_diffs: HashSet<(String, String)>,
     pub(crate) file_request: HashMap<(String, String), u64>,
     pub(crate) document_request: u64,
@@ -739,6 +769,7 @@ impl TerminalWindow {
             document_grammar_query: None,
             document_grammar_query_seen: String::new(),
             open_diff: None,
+            view_pin: None,
             expanded_diffs: HashSet::new(),
             file_request: HashMap::new(),
             document_request: 0,
@@ -1109,6 +1140,39 @@ impl TerminalWindow {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
         }
         self.focus_pending = false;
+    }
+
+    /// Whether the centre pane is showing the pinned view.
+    ///
+    /// The pin names what the pane was on, and this asks whether the pane is
+    /// still on it: the pane only shows a view of the workdir it is on, so a
+    /// pin that belongs to another workdir is never the one on screen.
+    pub(crate) fn shows_pinned_view(&self) -> bool {
+        let Some(pin) = self.view_pin.as_ref() else {
+            return false;
+        };
+        if self.navigation.active_checkout.as_deref() != Some(pin.checkout_id.as_str()) {
+            return false;
+        }
+        match pin.kind {
+            ViewKind::Preview => {
+                let document = self
+                    .document_target
+                    .as_ref()
+                    .map(|(id, path)| (id, path.as_str()))
+                    .or_else(|| {
+                        self.open_document
+                            .as_ref()
+                            .map(|(id, preview)| (id, preview.path.as_str()))
+                    });
+                document.is_some_and(|(id, path)| {
+                    id == &pin.checkout_id && Some(path) == pin.path.as_deref()
+                })
+            }
+            ViewKind::Diff => self.open_diff.as_ref().is_some_and(|(id, path)| {
+                id == &pin.checkout_id && path.as_deref() == pin.path.as_deref()
+            }),
+        }
     }
 
     pub(crate) fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -180,7 +180,8 @@ forget or reconcile.
   something the file does not, which is exactly the state the Save button is
   drawn for. Typing makes the row; saving, discarding, or undoing back to what
   the file holds takes it away. A file that is merely open, or merely read, is
-  not unfinished work, so clicking through ten files adds nothing.
+  not unfinished work, so clicking through ten files adds no row of unfinished
+  work: what the pane is on is a row of its own, and it is the next section.
 - A **diff** is a row while it holds a note, one row per file the notes are on,
   from `ReviewState::noted_paths`. A whole change set is not a row of its own:
   its notes belong to the files they were written on, and each of those is a row
@@ -226,6 +227,46 @@ difference — computed from the font's own metrics, because the UI font differs
 per platform — so the two share the name's baseline and the path's caps start
 where the name's lowercase starts. `the_repository_heading_shares_one_baseline`
 in `app/src/sidebar_tests.rs` pins it.
+
+## The view the pane is on
+
+The centre pane shows a terminal, a file, or a change. A file is a **preview**
+and a change is a **diff**, and the sidebar says which one is on screen: one
+row under the workdir, below its terminals, that names it.
+
+It is **one row, not one per file**. The pane shows one thing at a time, so
+clicking through ten files leaves one row that follows the file on screen. The
+row says the kind (`Preview`, `Diff`), wears the file's own icon, and names the
+file's path beside it.
+
+It is a **pin**, and that is the one thing about it that is stored: a click on
+a terminal is a navigation and not a close, so the file that was open is still
+one click away and the row is the way back to it. The row's own close (`×`)
+forgets it, and closes the view too when the pane is showing it. The pin is
+window state, like the document itself, and is never written to disk.
+
+**One open thing, one selected row** now has three claimants — the terminal
+rows, the workdir row and this one — and the row that names what the pane is
+showing wears the selection while the others give it up. A terminal left marked
+while a file is being read says the pane is somewhere else, and that was the
+one thing in the panel that was plainly wrong.
+
+A row of unfinished work that names the same file is the pane's row already: a
+draft of the file being previewed, or notes on the file being diffed. Two rows
+for one file would say the same thing twice, so the view row is not drawn
+there, and the row that is drawn keeps the selection it always had.
+
+Four rules the row depends on, each pinned by a test in
+`app/src/sidebar_tests.rs`:
+
+- **A file on screen is a row and the terminal is not marked.**
+  `a_file_on_screen_is_a_row_and_the_terminal_is_not`.
+- **Reading through files leaves one row.**
+  `reading_through_files_leaves_one_row`.
+- **The row outlives the terminal that replaced it, and it is the way back.**
+  `the_view_row_outlives_the_terminal_that_replaced_it`.
+- **The row closes what it names.** `the_view_row_closes_what_it_names`, and
+  `a_change_set_is_a_diff_row` for the other kind.
 
 ## The file tree
 

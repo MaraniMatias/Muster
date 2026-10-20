@@ -1,6 +1,6 @@
 //! Retained, virtualized unified code review surface.
 use crate::{
-    app::{InspectorTab, TerminalWindow, UI_FONT_FAMILY},
+    app::{InspectorTab, TerminalWindow, ViewKind, ViewPin, UI_FONT_FAMILY},
     theme::{zed_button, Roles},
     tooltip::RestingTooltip,
 };
@@ -324,6 +324,13 @@ impl TerminalWindow {
     ) {
         self.clear_document();
         self.open_diff = Some((checkout.to_owned(), path.clone()));
+        // The pane is on a change from here on, and the row that says so is
+        // named after it.
+        self.view_pin = Some(ViewPin {
+            checkout_id: checkout.to_owned(),
+            kind: ViewKind::Diff,
+            path: path.clone(),
+        });
         // A choice raised about one change set is not a choice about another.
         self.review.opencode_choice = None;
         self.restore_opencode_review(checkout, cx);
@@ -1290,6 +1297,9 @@ impl TerminalWindow {
                                             app.open_diff = None;
                                             app.diff_view = None;
                                             app.prune_diff_cache();
+                                            // A close is a close: the row that
+                                            // named this view goes with it.
+                                            app.view_pin = None;
                                             app.focus_terminal(window, cx);
                                             cx.notify();
                                         });

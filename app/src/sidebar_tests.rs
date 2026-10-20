@@ -633,10 +633,11 @@ fn the_open_row_stays_selected_while_the_pointer_is_on_it(cx: &mut TestAppContex
     .unwrap();
     dispose(&fixture, cx);
 }
-/// Reading a file is not unfinished work, so clicking through files leaves the
-/// panel as it was — and a file somebody types in is, without being asked for.
+/// Reading a file is not unfinished work, so clicking through files adds no
+/// row of unfinished work — and a file somebody types in is, without being
+/// asked for.
 #[gpui_kit::test]
-async fn only_the_files_being_edited_are_rows(cx: &mut TestAppContext) {
+async fn only_the_files_being_edited_are_unfinished_work_rows(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     let checkout = fixture.checkout.clone();
     for path in ["one.txt", "two.txt", "three.txt"] {
@@ -664,8 +665,8 @@ async fn only_the_files_being_edited_are_rows(cx: &mut TestAppContext) {
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.try_find("item-row-0").is_none(),
-            "three files read and none of them typed in is not three rows"
+            window.try_find("item-row-three.txt (edited)").is_none(),
+            "three files read and none of them typed in is not unfinished work"
         );
     })
     .unwrap();
@@ -807,6 +808,237 @@ fn a_note_is_a_row_that_says_how_many(cx: &mut TestAppContext) {
         assert!(
             window.try_find("item-row-0").is_none(),
             "a review with nothing left in it is not a row either"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A file on screen is a row of its own, and the terminal it replaced is not
+/// marked.
+///
+/// A terminal left marked while a file is being read says the pane is
+/// somewhere else, and it is the one thing in the panel that is plainly wrong.
+#[gpui_kit::test]
+async fn a_file_on_screen_is_a_row_and_the_terminal_is_not(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let session = fixture.sessions[1].clone();
+    std::fs::write(fixture.directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "code.rs".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let view = window.find("select-view-code.rs");
+        let label = view.label().unwrap();
+        assert!(
+            label.starts_with("Preview of code.rs in "),
+            "the row says what the pane is on, and what it is: {label}"
+        );
+        assert_eq!(
+            window.find("select-view-code.rs").selected(),
+            Some(true),
+            "the row that names the file on screen is the row that is open"
+        );
+        assert_eq!(
+            window.find(format!("select-session-{session}")).selected(),
+            Some(false),
+            "a terminal left marked while a file is read says the pane is somewhere else"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// Reading through files leaves one row, and it is the one on screen.
+///
+/// The row is the pane's, not the file's: ten files read in a row are one
+/// thing being looked at, and ten rows would be ten claims about work that
+/// nobody is doing.
+#[gpui_kit::test]
+async fn reading_through_files_leaves_one_row(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    for path in ["one.txt", "two.txt", "three.txt"] {
+        std::fs::write(fixture.root.join(path), "one line\n").unwrap();
+        cx.update_window(fixture.handle, |_, window, cx| {
+            fixture.view.update(cx, |app, cx| {
+                let repo = app.navigation.repos[0].clone();
+                let checkout = app.navigation.checkout(&checkout).unwrap().clone();
+                app.request_document(repo, checkout, path.into(), window, cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+            fixture
+                .view
+                .read(cx)
+                .open_document
+                .as_ref()
+                .is_some_and(|(id, preview)| id == &checkout && preview.path == path)
+        })
+        .await;
+    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("select-view-one.txt").is_none(),
+            "the row follows the file on screen rather than growing one row per file"
+        );
+        assert_eq!(
+            window.find("select-view-three.txt").label(),
+            Some("Preview of three.txt in main"),
+            "the row says what the pane is on"
+        );
+        assert!(
+            window.try_find("item-row-three.txt (edited)").is_none(),
+            "a file somebody only read is not unfinished work"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The row outlives the terminal that replaced it.
+///
+/// A click on a terminal is a navigation and not a close, so the file that was
+/// open is still one click away: the row is the way back to it.
+#[gpui_kit::test]
+async fn the_view_row_outlives_the_terminal_that_replaced_it(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let session = fixture.sessions[1].clone();
+    std::fs::write(fixture.directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "code.rs".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("select-session-{session}"), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("select-view-code.rs").is_some(),
+            "the row is the way back to the file that was open"
+        );
+        assert_eq!(
+            window.find("select-view-code.rs").selected(),
+            Some(false),
+            "the pane is on the terminal now, so the row is not the open one"
+        );
+        assert_eq!(
+            window.find(format!("select-session-{session}")).selected(),
+            Some(true),
+            "the terminal is what the pane is showing"
+        );
+        window.click("select-view-code.rs", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("select-view-code.rs").selected(),
+            Some(true),
+            "the row is the way back, and it brought the file with it"
+        );
+    })
+    .unwrap();
+    dispose(&fixture, cx);
+}
+
+/// The row closes what it names.
+///
+/// A close is a close: the view goes and the row goes with it, and the pane
+/// is back on the terminal it came from.
+#[gpui_kit::test]
+async fn the_view_row_closes_what_it_names(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let session = fixture.sessions[1].clone();
+    std::fs::write(fixture.directory.path().join("code.rs"), "fn main() {}\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "code.rs".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.hover("select-view-code.rs", cx);
+        window.click("close-view-code.rs", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("select-view-code.rs").is_none(),
+            "a close is a close: the row goes with the view it named"
+        );
+        assert_eq!(
+            window.find(format!("select-session-{session}")).selected(),
+            Some(true),
+            "the pane is back on the terminal"
+        );
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.open_document.is_none()));
+    dispose(&fixture, cx);
+}
+
+/// A change set is a diff, and it says so.
+///
+/// The change set is not a terminal either, and the row that says which it is
+/// is the one that wears the selection.
+#[gpui_kit::test]
+fn a_change_set_is_a_diff_row(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    std::fs::write(fixture.root.join("change.txt"), "first\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&checkout, None, cx);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("select-view-changes").label(),
+            Some("Diff of the changes in main"),
+            "a change set is a diff, and the row says so"
+        );
+        assert_eq!(
+            window.find("select-view-changes").selected(),
+            Some(true),
+            "the row that names what is on screen is the row that is open"
+        );
+        assert_eq!(
+            window
+                .find(format!("select-checkout-{checkout}"))
+                .selected(),
+            Some(false),
+            "the workdir row gives the selection up to what is inside it"
         );
     })
     .unwrap();

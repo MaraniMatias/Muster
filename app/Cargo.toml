@@ -97,9 +97,10 @@ tree-sitter-ini = "1.4.0"
 serde_json = "1"
 # The PTY layer is not reimplemented here: the same backend the old app used,
 # as a dependency. Process lifetime, bounded writes and group-safe shutdown have
-# exactly one implementation.
+# exactly one implementation. It lives in `muster-core`, and this crate reads it
+# through `muster_core::pty`, so the backend crate is the only one that names
+# `portable-pty`.
 muster-core = { path = "../core" }
-portable-pty = "0.9"
 libc = "0.2"
 log = "0.4"
 alacritty_terminal = "0.26.0"
@@ -111,7 +112,6 @@ tempfile = "3"
 [dev-dependencies]
 # Same crate, test-support on: unit tests build the same type universe as the app.
 gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
-tempfile = "3"
 # Already compiled into the test binary through the toolkit, so this costs no
 # build: it reads the bundled icon face's own tables, which is how a test can
 # tell that a private use character has a glyph to be drawn with.

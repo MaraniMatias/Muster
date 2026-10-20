@@ -32,7 +32,8 @@ use muster_core::workspace::RepoKind;
 
 use crate::app::{
     baseline_from_bottom, sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path,
-    sidebar_row_focus, sidebar_text_width, toggle, ButtonA11y, TerminalWindow, UI_FONT_FAMILY,
+    sidebar_row_focus, sidebar_text_width, toggle, ButtonA11y, TerminalWindow, ViewKind,
+    UI_FONT_FAMILY,
 };
 use crate::file_icons;
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
@@ -315,6 +316,86 @@ impl TerminalWindow {
             window,
             cx,
         );
+    }
+
+    /// Open the view the row names.
+    ///
+    /// The row is the way back to a file that was open, so a click on it is
+    /// the same gesture that opened it the first time. A view the pane is
+    /// already showing is left alone: there is nowhere to go.
+    pub(crate) fn open_pinned_view(
+        &mut self,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shows_pinned_view() {
+            return;
+        }
+        let Some(pin) = self.view_pin.clone() else {
+            return;
+        };
+        match pin.kind {
+            ViewKind::Preview => {
+                let Some(path) = pin.path.clone() else {
+                    return;
+                };
+                let Some((repo, checkout)) = self.document_source(&pin.checkout_id) else {
+                    return;
+                };
+                // The pane only shows a view of the workdir it is on, so the
+                // row takes the pane there first.
+                self.navigation.select_checkout(&pin.checkout_id);
+                self.persist();
+                self.request_document(repo, checkout, path, window, cx);
+            }
+            ViewKind::Diff => {
+                self.request_open_changes(&pin.checkout_id, pin.path.clone(), window, cx);
+            }
+        }
+    }
+
+    /// Close the view the row names.
+    ///
+    /// The pane goes back to the terminal when it was showing it, and the row
+    /// goes with it: a close is a close. A view the pane has already left is
+    /// only the row, so closing it closes nothing else.
+    pub(crate) fn close_pinned_view(
+        &mut self,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pin) = self.view_pin.clone() else {
+            return;
+        };
+        if !self.shows_pinned_view() {
+            self.view_pin = None;
+            cx.notify();
+            return;
+        }
+        match pin.kind {
+            ViewKind::Preview => {
+                // Leaving a draft asks about the draft, exactly as the pane's
+                // own close does.
+                self.request_document_transition(
+                    Box::new(|app, window, cx| {
+                        app.view_pin = None;
+                        app.clear_document();
+                        app.focus_terminal(window, cx);
+                        cx.notify();
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            ViewKind::Diff => {
+                self.view_pin = None;
+                self.open_diff = None;
+                self.diff_view = None;
+                self.prune_diff_cache();
+                self.focus_terminal(window, cx);
+                cx.notify();
+            }
+        }
     }
 
     fn open_item_now(
@@ -885,8 +966,10 @@ impl TerminalWindow {
                     && self.navigation.active_session.is_none()
                     // The workdir row stands in for "this is what the pane is
                     // showing", which it can only be when nothing inside it is:
-                    // with an open item the item's own row wears the selection.
-                    && self.shown_item().is_none();
+                    // with an open item the item's own row wears the selection,
+                    // and so does the row that names the view on screen.
+                    && self.shown_item().is_none()
+                    && !self.shows_pinned_view();
                 let has_close = repo.kind == RepoKind::Git
                     && !checkout.is_primary
                     && self.navigation.home.as_deref() != Some(&id);
@@ -1242,6 +1325,10 @@ impl TerminalWindow {
                 // row is drawn under the workdir that owns it, and the pane only
                 // shows what its own active workdir is looking at.
                 let open_is_shown = self.shown_item().is_some();
+                // The view on screen is a row of its own, so the terminal rows
+                // give the selection up to it: a terminal left marked while a
+                // file is being read says the pane is somewhere else.
+                let view_is_shown = self.shows_pinned_view();
                 for (session_index, session) in checkout.sessions.iter().enumerate() {
                     let Some(terminal) = self.terminals.get(&session.id) else {
                         continue;
@@ -1259,7 +1346,8 @@ impl TerminalWindow {
                     // item leaves one row reading as open, and the session that
                     // still holds its shell is not what this window is looking at.
                     let selected = self.navigation.active_session.as_deref() == Some(&session.id)
-                        && !open_is_shown;
+                        && !open_is_shown
+                        && !view_is_shown;
                     let busy = status.foreground.running;
                     let unknown =
                         status.poll_error.is_some() || status.shell == ShellState::Unknown;
@@ -1621,9 +1709,159 @@ impl TerminalWindow {
                 // The work this workdir is in the middle of, named in the workdir
                 // it belongs to: what is being typed here, and what is being
                 // reviewed here. Nothing else is a row — a file somebody only
-                // read is not unfinished work, so clicking through files leaves
-                // the panel as it was.
-                for item in self.items_in(&id) {
+                // read is not unfinished work, and the row above says which
+                // file the pane is on.
+                let items = self.items_in(&id);
+                // The view the centre pane is on, when it is not showing a
+                // terminal: a file being read, or a change being read. It is
+                // one row however many files were clicked through, because the
+                // pane shows one thing at a time, and it is the row that says
+                // the pane is not on a terminal.
+                if let Some(pin) = self.view_pin.as_ref().filter(|pin| pin.checkout_id == id) {
+                    // A row of unfinished work that names the same file is the
+                    // pane's row already: a draft of the file being previewed,
+                    // or notes on the file being diffed. Two rows for one file
+                    // would say the same thing twice.
+                    let named = match (pin.kind, pin.path.as_deref()) {
+                        (ViewKind::Preview, Some(path)) => items
+                            .iter()
+                            .any(|item| item.kind == OpenKind::Document && item.path == path),
+                        (ViewKind::Diff, Some(path)) => items
+                            .iter()
+                            .any(|item| item.kind == OpenKind::Diff && item.path == path),
+                        _ => false,
+                    };
+                    if !named {
+                        let word = match pin.kind {
+                            ViewKind::Preview => "Preview",
+                            ViewKind::Diff => "Diff",
+                        };
+                        let path = pin.path.clone().unwrap_or_default();
+                        // The row is named after what it names, so a panel
+                        // that has one view row and a panel that has three
+                        // are not the same panel.
+                        let view_key = if path.is_empty() {
+                            "changes".to_owned()
+                        } else {
+                            path.clone()
+                        };
+                        // The room the name has is what is left of the panel
+                        // once the icon, the word, the close button and the
+                        // row's own padding have taken theirs.
+                        let name = if path.is_empty() {
+                            String::new()
+                        } else {
+                            let room = (self.navigation.sidebar_width
+                                - 68.
+                                - sidebar_text_width(window, word, 13.).as_f32())
+                            .max(24.);
+                            sidebar_name(window, &path, room)
+                        };
+                        let description = match (pin.kind, pin.path.as_deref()) {
+                            (ViewKind::Preview, Some(path)) => {
+                                format!("Preview of {path} in {title}")
+                            }
+                            (ViewKind::Preview, None) => format!("Preview in {title}"),
+                            (ViewKind::Diff, Some(path)) => format!("Diff of {path} in {title}"),
+                            (ViewKind::Diff, None) => format!("Diff of the changes in {title}"),
+                        };
+                        let selected = view_is_shown;
+                        let row_group = SharedString::from("view-row");
+                        let (row_focus, row_focused) = sidebar_row_focus(window, cx, "view");
+                        let icon: AnyElement = match pin.path.as_deref() {
+                            Some(path) => file_icons::element(
+                                "view-icon",
+                                path.rsplit('/').next().unwrap_or(path),
+                                false,
+                                px(14.),
+                                &roles,
+                            )
+                            .into_any_element(),
+                            None => Icon::new(IconName::GitCompare)
+                                .size(px(14.))
+                                .text_color(roles.text_muted)
+                                .into_any_element(),
+                        };
+                        checkout_children.push(
+                            div()
+                                .id(row_group.clone())
+                                .test_support()
+                                .track_focus(&row_focus)
+                                .group(row_group.clone())
+                                .flex()
+                                .items_center()
+                                .h(px(26.))
+                                .pl(px(12.))
+                                .pr(px(8.))
+                                .gap(px(7.))
+                                // The same retained-while-hovered selection the
+                                // terminal rows wear, and for the same reason:
+                                // this row is what the pane is showing.
+                                .hover(|style| style.bg(roles.row_hover(selected)))
+                                .when(selected, |row| row.bg(roles.row_rest(true)))
+                                .child(
+                                    zed_button(SharedString::from(format!(
+                                        "select-view-{view_key}"
+                                    )))
+                                    .text()
+                                    .rounded(px(0.))
+                                    .absolute()
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .p_0()
+                                    .aria_selected(selected)
+                                    .resting_tooltip(description.clone())
+                                    .accessibility_label(description)
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        cx.stop_propagation();
+                                        app.open_pinned_view(window, cx);
+                                    })),
+                                )
+                                .child(icon)
+                                .child(div().flex_none().child(word))
+                                .when(!name.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .pr(px(20.))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_color(roles.text_muted)
+                                            .child(name),
+                                    )
+                                })
+                                .child(
+                                    zed_button(SharedString::from(format!(
+                                        "close-view-{view_key}"
+                                    )))
+                                    .custom(sidebar_action_style(cx))
+                                    .rounded(px(0.))
+                                    .absolute()
+                                    .right(px(8.))
+                                    .top(px(3.))
+                                    .h(px(20.))
+                                    .w(px(20.))
+                                    .p_0()
+                                    .opacity(if row_focused { 1. } else { 0. })
+                                    .group_hover(row_group.clone(), |style| style.opacity(1.))
+                                    .focus(|style| style.opacity(1.))
+                                    .icon(Icon::new(IconName::X).size(px(14.)))
+                                    .resting_tooltip("Close this view")
+                                    .accessibility_label("Close this view")
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        cx.stop_propagation();
+                                        app.close_pinned_view(window, cx);
+                                    })),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+                for item in items {
                     let label = item.label();
                     let name = sidebar_name(window, &label, self.navigation.sidebar_width - 41.);
                     // The whole name is what the row answers to on hover and to a

@@ -2046,6 +2046,9 @@ impl TerminalWindow {
                                     app.request_document_transition(
                                         Box::new(|app, window, cx| {
                                             app.clear_document();
+                                            // A close is a close: the row that
+                                            // named this view goes with it.
+                                            app.view_pin = None;
                                             app.focus_terminal(window, cx);
                                             cx.notify();
                                         }),
