@@ -390,6 +390,24 @@ Five rules it depends on, each pinned by a test:
   asks first, and the answer lives in the window (`review.delete_confirmation`)
   rather than in the card, so the dialog is the thing on screen while it stands.
 
+## Terminal images
+
+`app/src/terminal/graphics.rs` owns bounded Kitty graphics transfers and placements.
+Decode PNG/RGB/RGBA (and bounded zlib) on the PTY reader, never in a render pass.
+`graphics_handler.rs` forwards VT operations unchanged and observes real scrolling,
+including full history and scroll regions; history growth is not a scroll counter.
+Unicode placeholders use the parser's actual cells, raw foreground/underline IDs and
+protocol diacritics, not font glyphs or theme colours. The painter clips shared raster
+buffers and releases atlas entries on deletion, invisibility and view release.
+Classic placements are invalidated on resize so a TUI redraws rather than retaining
+an incorrect reflow anchor. Never modify the hash-pinned parser for graphics.
+
+`sync_updates.rs` holds bounded raw synchronized updates so VT and graphics commands
+are applied in the same order. The status worker flushes expired updates and reader
+exit flushes the tail. Graphics never reads paths or shared memory named by output.
+Pi's explicit `PI_IMAGE_PROTOCOL=kitty` default is child environment only, respects
+configured values and does not change `TERM_PROGRAM=Muster` or spoof a Kitty identity.
+
 ## The Pi integration
 
 Pi is an agent this app can watch and can send a review to. It is not OpenCode

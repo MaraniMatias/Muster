@@ -14,8 +14,11 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
 
+use super::graphics::{GraphicSnapshot, Graphics, MAX_PACKET};
+use super::graphics_handler::GraphicsHandler;
 use super::modes::TerminalModes;
 use super::pi_status::{self, PiProgramStatus, PiTaskState};
+use super::sync_updates::{SyncUpdates, MAX_SYNC_BYTES};
 
 /// Longest window title kept, in characters.
 ///
@@ -235,6 +238,10 @@ enum StringScan {
     Escape,
     Osc,
     OscEscape,
+    Apc,
+    ApcEscape,
+    Ignored,
+    IgnoredEscape,
 }
 
 /// The parser, the grid, and the parser's own view of what it has been told.
@@ -268,6 +275,10 @@ pub struct TerminalCore {
     title: Option<String>,
     prompt_anchor: Option<PromptAnchor>,
     command_exit: Option<i32>,
+    graphics: Graphics,
+    apc: Vec<u8>,
+    apc_oversized: bool,
+    sync: SyncUpdates,
 }
 
 impl TerminalCore {
@@ -311,6 +322,10 @@ impl TerminalCore {
             title: None,
             prompt_anchor: None,
             command_exit: None,
+            graphics: Graphics::new(rows),
+            apc: Vec::new(),
+            apc_oversized: false,
+            sync: SyncUpdates::default(),
         }
     }
 
@@ -322,6 +337,44 @@ impl TerminalCore {
     /// all, and a call that cannot fail is a call the reader thread can make
     /// without a branch.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.flush_sync_timeout(std::time::Instant::now());
+        let mut offset = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let marker = self.sync.scan(byte);
+            if self.sync.started.is_some() {
+                self.sync.bytes.push(byte);
+                if marker == Some(false) || self.sync.bytes.len() == MAX_SYNC_BYTES {
+                    self.flush_sync();
+                    offset = index + 1;
+                } else if marker == Some(true) {
+                    self.sync.started = Some(std::time::Instant::now());
+                }
+            } else if marker == Some(true) {
+                self.feed_inner(&bytes[offset..=index]);
+                self.sync.started = Some(std::time::Instant::now());
+                offset = index + 1;
+            }
+        }
+        if self.sync.started.is_none() && offset < bytes.len() {
+            self.feed_inner(&bytes[offset..]);
+        }
+    }
+
+    pub(crate) fn flush_sync_timeout(&mut self, now: std::time::Instant) -> bool {
+        if !self.sync.expired(now) {
+            return false;
+        }
+        self.flush_sync();
+        true
+    }
+
+    pub(crate) fn flush_sync(&mut self) {
+        self.sync.started = None;
+        let bytes = std::mem::take(&mut self.sync.bytes);
+        self.feed_inner(&bytes);
+    }
+
+    fn feed_inner(&mut self, bytes: &[u8]) {
         let mut offset = 0;
         let mut state = self.string_scan;
         for (index, &byte) in bytes.iter().enumerate() {
@@ -337,6 +390,12 @@ impl TerminalCore {
                     self.osc_oversized = false;
                     StringScan::Osc
                 }
+                (StringScan::Escape, b'_') => {
+                    self.apc.clear();
+                    self.apc_oversized = false;
+                    StringScan::Apc
+                }
+                (StringScan::Escape, b'P' | b'^' | b'X') => StringScan::Ignored,
                 (StringScan::Escape, 0x1b) => StringScan::Escape,
                 (StringScan::Escape, _) => StringScan::Ground,
 
@@ -349,19 +408,63 @@ impl TerminalCore {
                     self.scan_osc(byte);
                     StringScan::Osc
                 }
+                (StringScan::Apc, 0x1b) => StringScan::ApcEscape,
+                (StringScan::ApcEscape, b'\\') => StringScan::Ground,
+                (StringScan::Apc, 0x18 | 0x1a) => {
+                    self.apc.clear();
+                    self.graphics.abort(self.is_alt_screen());
+                    StringScan::Ground
+                }
+                (StringScan::Apc, _) => {
+                    if !self.apc_oversized {
+                        if self.apc.len() == MAX_PACKET {
+                            self.apc.clear();
+                            self.apc_oversized = true;
+                            self.graphics.abort(self.is_alt_screen());
+                        } else {
+                            self.apc.push(byte);
+                        }
+                    }
+                    StringScan::Apc
+                }
+                (StringScan::ApcEscape, _) => {
+                    self.apc_oversized = true;
+                    self.graphics.abort(self.is_alt_screen());
+                    if byte == 0x1b {
+                        StringScan::ApcEscape
+                    } else {
+                        StringScan::Apc
+                    }
+                }
+                (StringScan::Ignored, 0x1b) => StringScan::IgnoredEscape,
+                (StringScan::IgnoredEscape, b'\\') | (StringScan::Ignored, 0x18 | 0x1a) => {
+                    StringScan::Ground
+                }
+                (StringScan::IgnoredEscape, 0x1b) => StringScan::IgnoredEscape,
+                (StringScan::Ignored | StringScan::IgnoredEscape, _) => StringScan::Ignored,
                 (StringScan::Ground, _) => StringScan::Ground,
             };
             let terminated = (matches!(previous, StringScan::Osc) && byte == 0x07)
                 || (matches!(previous, StringScan::OscEscape) && byte == b'\\');
-            if terminated {
+            let graphic_terminated = matches!(previous, StringScan::ApcEscape) && byte == b'\\';
+            if terminated || graphic_terminated {
                 state = StringScan::Ground;
                 // The grid is read after the parser has consumed exactly up to
                 // the terminator and before anything after it, which is the
                 // position the marker was written at.
                 self.advance(&bytes[offset..=index]);
-                let marker = std::mem::take(&mut self.osc);
-                if !self.osc_oversized {
-                    self.apply_osc(&marker);
+                if graphic_terminated {
+                    if !self.apc_oversized {
+                        if let Some(reply) = self.graphics.apply(&self.apc, &mut self.term) {
+                            self.pending.push(TerminalEvent::PtyWrite(reply));
+                        }
+                    }
+                    self.apc.clear();
+                } else {
+                    let marker = std::mem::take(&mut self.osc);
+                    if !self.osc_oversized {
+                        self.apply_osc(&marker);
+                    }
                 }
                 self.handle_events_at_position();
                 offset = index + 1;
@@ -380,7 +483,23 @@ impl TerminalCore {
     /// scrolling the viewport is safe and is not part of this input operation.
     fn advance(&mut self, bytes: &[u8]) {
         self.term.reset_damage();
-        self.parser.advance(&mut self.term, bytes);
+        self.parser.advance(
+            &mut GraphicsHandler {
+                term: &mut self.term,
+                graphics: &mut self.graphics,
+            },
+            bytes,
+        );
+        // Raw synchronized updates are held by `feed`, so the processor must
+        // not defer the text before a graphics command to a second timeline.
+        if self.parser.sync_timeout().sync_timeout().is_some() {
+            self.parser.stop_sync(&mut GraphicsHandler {
+                term: &mut self.term,
+                graphics: &mut self.graphics,
+            });
+        }
+        self.graphics
+            .prune(self.is_alt_screen(), self.history_size());
         if matches!(self.term.damage(), TermDamage::Full) || self.is_alt_screen() {
             self.prompt_anchor = None;
         }
@@ -502,6 +621,7 @@ impl TerminalCore {
     /// clamped by the grid to whatever the shorter history can still show.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.prompt_anchor = None;
+        self.graphics.resize(rows as usize);
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
     }
@@ -724,6 +844,14 @@ impl TerminalCore {
     /// Every row is `cols` cells wide. A view indexes by column, and trimming the
     /// tail of a row would mean every one of them had to handle a row shorter
     /// than the screen to save an allocation nobody is short of.
+    pub(crate) fn graphic_snapshots(&self) -> Vec<GraphicSnapshot> {
+        self.graphics.snapshot(&self.term)
+    }
+
+    pub(crate) fn set_graphics_cell_metrics(&mut self, width: u16, height: u16) {
+        self.graphics.cell = [width.max(1), height.max(1)];
+    }
+
     pub fn visible_rows(&self) -> Vec<RowSnapshot> {
         let grid = self.term.grid();
         // Viewport row 0 sits `display_offset` lines above the top of the screen.
@@ -735,10 +863,16 @@ impl TerminalCore {
             .map(|row| RowSnapshot {
                 cells: (0..grid.columns())
                     .map(|col| {
-                        cell_snapshot(
+                        let mut cell = cell_snapshot(
                             &grid[Line(row as i32 - offset)][Column(col)],
                             self.term.colors(),
-                        )
+                        );
+                        // Graphics placeholders are metadata, not font glyphs.
+                        if cell.c == super::graphics::PLACEHOLDER {
+                            cell.c = ' ';
+                            cell.zerowidth.clear();
+                        }
+                        cell
                     })
                     .collect(),
             })

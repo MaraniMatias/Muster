@@ -93,6 +93,10 @@ libc = "0.2"
 log = "0.4"
 alacritty_terminal = "0.26.0"
 unicode-width = "0.2"
+# Already in the locked graph. Decode bounded inline graphics off the UI thread.
+base64 = "0.22"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 # The shell-integration scripts are written to a private directory that has to
 # outlive the spawn and disappear with the session; nothing else owns that.
 tempfile = "3"

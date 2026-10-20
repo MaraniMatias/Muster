@@ -3,9 +3,9 @@
 //! `TerminalCore` lives on the PTY reader thread. It owns the VT parser and the
 //! grid, takes raw bytes from the reused backend's `OutputSink`, and answers the
 //! window with a snapshot of what a view of this size can actually show. Nothing
-//! in this module draws and nothing here names a UI framework, because the view
-//! is the part that gets to be redrawn and this is the part that gets the bytes
-//! exactly once.
+//! in this module draws or uses a window/application context. Inline images are
+//! decoded into immutable raster data on the reader and shared with the painter;
+//! the view gets to be redrawn and this part gets the bytes exactly once.
 //!
 //! The other direction -- keys and pastes in, terminal modes out -- is here
 //! too: `keys` and `paste` turn an input event into the exact bytes a child
@@ -19,12 +19,15 @@
 //! sees a snapshot, a wake, and state it can act on.
 
 mod core;
+mod graphics;
+mod graphics_handler;
 mod input;
 mod keys;
 mod modes;
 mod paste;
 mod pi_status;
 mod session;
+mod sync_updates;
 mod view;
 mod write_queue;
 
@@ -32,6 +35,7 @@ pub use self::core::{
     CellSnapshot, ColorSnapshot, CursorShapeSnapshot, CursorSnapshot, PromptAnchor, RowSnapshot,
     SelectionKind, TerminalCore, TerminalEvent, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_TITLE_CHARS,
 };
+pub use self::graphics::GraphicSnapshot;
 pub use self::input::{FocusState, Input, MouseReport};
 pub use self::keys::{encode_key, Key, KeyPress};
 pub use self::modes::TerminalModes;

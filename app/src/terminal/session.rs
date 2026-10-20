@@ -483,6 +483,8 @@ pub type GridRange = (GridPoint, GridPoint);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     pub rows: Vec<RowSnapshot>,
+    /// Images visible in this viewport, decoded on the reader thread.
+    pub graphics: Vec<super::GraphicSnapshot>,
     /// Text selected in the terminal grid, if any.
     pub selection: Option<String>,
     /// Inclusive visible selection range (row, column) endpoints.
@@ -955,6 +957,34 @@ struct ReaderSide {
     wake: Arc<Wake>,
 }
 
+impl ReaderSide {
+    fn deliver_events(&self, events: Vec<TerminalEvent>) -> Result<(), String> {
+        let result = handle_events(self, events);
+        if let Err(error) = &result {
+            *self
+                .shared
+                .protocol_error
+                .lock()
+                .expect("terminal protocol error poisoned") = Some(error.clone());
+        }
+        self.wake.signal();
+        result
+    }
+
+    fn flush_sync(&self, finished: bool) {
+        let events = {
+            let mut core = self.shared.core();
+            if finished {
+                core.flush_sync();
+            } else if !core.flush_sync_timeout(Instant::now()) {
+                return;
+            }
+            core.take_events()
+        };
+        let _ = self.deliver_events(events);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------------------------
@@ -1000,18 +1030,7 @@ impl Inner {
                 core.feed(bytes);
                 core.take_events()
             };
-            let result = handle_events(&side, events);
-            if let Err(error) = &result {
-                *side
-                    .shared
-                    .protocol_error
-                    .lock()
-                    .expect("terminal protocol error poisoned") = Some(error.clone());
-            }
-
-            // After parsing and recording failures, never before either.
-            side.wake.signal();
-            result
+            side.deliver_events(events)
         })
     }
 
@@ -1023,6 +1042,7 @@ impl Inner {
     /// stop while the child is perfectly alive.
     fn reader_end(side: ReaderSide) -> ReaderEndSink {
         Box::new(move |end: ReaderEnd| {
+            side.flush_sync(true);
             let first = {
                 let mut stream = side.shared.stream.lock().expect("terminal stream poisoned");
                 let first = *stream == StreamState::Open;
@@ -1267,7 +1287,9 @@ fn apply_resize(inner: &Inner, request: ResizeRequest) {
     // resized is then drawing for a grid that is already the right shape, and
     // the two agree from the first byte of that redraw.
     {
+        let metrics = (inner.side.host.cell_metrics)();
         let mut core = inner.shared().core();
+        core.set_graphics_cell_metrics(metrics.width, metrics.height);
         core.resize(request.cols, request.rows);
     }
     match inner.backend.resize(&inner.id, request.cols, request.rows) {
@@ -1493,7 +1515,15 @@ impl TerminalSession {
         let (spawn, integration_dir) = shell_integration(&program, &config)
             .map(|(spawn, dir)| (spawn, Some(dir)))
             .unwrap_or(((program, args, config.env.clone()), None));
-        let (program, args, env) = spawn;
+        let (program, args, mut env) = spawn;
+        // Pi currently detects graphics from terminal names, not a probe.
+        // Name our actual capability without impersonating Kitty/Ghostty, and
+        // preserve explicit user choices (including disabling images).
+        if std::env::var_os("PI_IMAGE_PROTOCOL").is_none()
+            && !env.iter().any(|(key, _)| key == "PI_IMAGE_PROTOCOL")
+        {
+            env.push(("PI_IMAGE_PROTOCOL".into(), "kitty".into()));
+        }
 
         let shared = Arc::new(Shared::new(
             config.cols,
@@ -1583,6 +1613,7 @@ impl TerminalSession {
 
             let poller = Arc::clone(&inner);
             control.spawn_worker("terminal-status", move || loop {
+                poller.side.flush_sync(false);
                 let _ = poller.poll_and_record();
                 if !poller.control.keep_going(poller.status_interval) {
                     return;
@@ -1684,6 +1715,7 @@ impl TerminalSession {
         let core = self.inner.shared().core();
         TerminalSnapshot {
             rows: core.visible_rows(),
+            graphics: core.graphic_snapshots(),
             selection: selection.then(|| core.selection_text()).flatten(),
             selection_range: viewport_selection(&core),
             cursor: core.cursor(),

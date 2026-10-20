@@ -645,6 +645,8 @@ pub struct TerminalView {
     left_mouse: Option<(f32, f32)>,
     dragged: bool,
     canvas_origin: Rc<Cell<gpui_kit::Point<Pixels>>>,
+    /// Only images used by the last frame are retained in the GPU atlas.
+    graphic_images: Vec<Arc<gpui_kit::RenderImage>>,
 
     /// The size the PTY has last been told about, shared with the paint pass.
     ///
@@ -728,6 +730,12 @@ impl TerminalView {
             cx.background_executor().allow_parking();
         }
         let session = Arc::new(session);
+        cx.on_release(|view, cx| {
+            for image in view.graphic_images.drain(..) {
+                cx.drop_image(image, None);
+            }
+        })
+        .detach();
 
         // Focus first, because every other input path in the window is
         // downstream of somebody having focused this element.
@@ -774,6 +782,7 @@ impl TerminalView {
             left_mouse: None,
             dragged: false,
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
+            graphic_images: Vec::new(),
         }
     }
 
@@ -1409,6 +1418,35 @@ impl Frame {
             Default::default(),
         ));
         let cursor = cursor_cell(snapshot, (columns, rows));
+        if !snapshot.graphics.is_empty() {
+            paint_graphics(bounds, snapshot, cell, i32::MIN..-1_073_741_824, window);
+            for (row_index, row) in snapshot.rows.iter().take(rows as usize).enumerate() {
+                for (column, source) in row.cells.iter().take(columns as usize).enumerate() {
+                    let background = if source.inverse {
+                        self.palette.foreground(source.fg)
+                    } else {
+                        self.palette.background(source.bg)
+                    };
+                    if background != self.palette.background(ColorSnapshot::Default) {
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(
+                                    bounds.origin.x + column as f32 * cell.width,
+                                    bounds.origin.y + row_index as f32 * cell.height,
+                                ),
+                                size: gpui_kit::size(cell.width, cell.height),
+                            },
+                            px(0.),
+                            background,
+                            px(0.),
+                            gpui_kit::transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
+            }
+            paint_graphics(bounds, snapshot, cell, -1_073_741_824..0, window);
+        }
 
         for (row_index, row) in snapshot.rows.iter().take(rows as usize).enumerate() {
             let y = bounds.origin.y + row_index as f32 * cell.height;
@@ -1472,6 +1510,44 @@ impl Frame {
                 );
 
                 if at_cursor {
+                    paint_cursor(
+                        span,
+                        snapshot.cursor.shape,
+                        focus,
+                        snapshot.cursor.color.unwrap_or(self.palette.cursor),
+                        window,
+                    );
+                }
+            }
+        }
+        paint_graphics(bounds, snapshot, cell, 0..i32::MAX, window);
+        // Images above text still belong below the caret.
+        if !snapshot.graphics.is_empty() {
+            if let Some((row, col)) = cursor {
+                if let Some(source) = snapshot.rows.get(row).and_then(|r| r.cells.get(col)) {
+                    let span = Bounds {
+                        origin: point(
+                            bounds.origin.x + col as f32 * cell.width,
+                            bounds.origin.y + row as f32 * cell.height,
+                        ),
+                        size: gpui_kit::size(source.width.max(1) as f32 * cell.width, cell.height),
+                    };
+                    let text: String = std::iter::once(source.c)
+                        .chain(source.zerowidth.iter().copied())
+                        .collect();
+                    self.paint_text_run(
+                        TextRun {
+                            bounds: span,
+                            cell: source,
+                            text: &text,
+                            at_cursor: true,
+                            selected: false,
+                        },
+                        snapshot,
+                        focus,
+                        window,
+                        cx,
+                    );
                     paint_cursor(
                         span,
                         snapshot.cursor.shape,
@@ -1588,7 +1664,9 @@ impl Frame {
         if cell.dim {
             foreground = fade_toward(foreground, background);
         }
-        if background != self.palette.background(ColorSnapshot::Default) {
+        if snapshot.graphics.is_empty()
+            && background != self.palette.background(ColorSnapshot::Default)
+        {
             window.paint_quad(quad(
                 bounds,
                 px(0.0),
@@ -1683,6 +1761,97 @@ impl Frame {
             cx,
         ) {
             log::warn!("muster: a text run was not painted: {error}");
+        }
+    }
+}
+
+/// The viewport/source mapping is shared by ordinary and Unicode placements.
+/// GPUI crops by clipping the bounds of a scaled full image; it does not need
+/// to copy or decode a separate bitmap for each visible placeholder cell.
+fn graphic_bounds(
+    viewport: Bounds<Pixels>,
+    graphic: &super::GraphicSnapshot,
+    cell: CellSize,
+) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+    let [sx, sy, sw, sh] = graphic.source;
+    let width = graphic.columns as f32 * cell.width.as_f32() - graphic.offset[0] as f32;
+    let height = graphic.rows as f32 * cell.height.as_f32() - graphic.offset[1] as f32;
+    let scale = if graphic.natural_size {
+        1.
+    } else {
+        (width / sw as f32).min(height / sh as f32)
+    };
+    if !scale.is_finite() || scale <= 0. {
+        return None;
+    }
+    let placeholder = graphic.placeholder;
+    let origin = point(
+        viewport.origin.x
+            + (graphic.column as f32 - placeholder.map_or(0., |p| p[0] as f32)) * cell.width
+            + px(graphic.offset[0] as f32),
+        viewport.origin.y + graphic.row as f32 * cell.height + px(graphic.offset[1] as f32),
+    );
+    let source_bounds = Bounds {
+        origin,
+        size: gpui_kit::size(px(sw as f32 * scale), px(sh as f32 * scale)),
+    };
+    let clip = Bounds {
+        origin: point(
+            placeholder.map_or(viewport.origin.x, |_| {
+                viewport.origin.x + graphic.column as f32 * cell.width
+            }),
+            viewport.origin.y + graphic.clip[0] as f32 * cell.height,
+        ),
+        size: gpui_kit::size(
+            if placeholder.is_some() {
+                cell.width
+            } else {
+                viewport.size.width
+            },
+            (graphic.clip[1] - graphic.clip[0]) as f32 * cell.height,
+        ),
+    };
+    let visible = source_bounds.intersect(&viewport).intersect(&clip);
+    if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
+        return None;
+    }
+    let size = graphic.image.size(0);
+    let image_bounds = Bounds {
+        origin: point(
+            origin.x - px(sx as f32 * scale),
+            origin.y - px(sy as f32 * scale),
+        ),
+        size: gpui_kit::size(
+            px(size.width.0 as f32 * scale),
+            px(size.height.0 as f32 * scale),
+        ),
+    };
+    Some((visible, image_bounds))
+}
+
+fn paint_graphics(
+    viewport: Bounds<Pixels>,
+    snapshot: &TerminalSnapshot,
+    cell: CellSize,
+    z: std::ops::Range<i32>,
+    window: &mut Window,
+) {
+    for graphic in &snapshot.graphics {
+        // Include the largest valid z-index in the foreground pass.
+        if !z.contains(&graphic.z) && !(z.end == i32::MAX && graphic.z == i32::MAX) {
+            continue;
+        }
+        if let Some((visible, image_bounds)) = graphic_bounds(viewport, graphic, cell) {
+            if let Err(error) = window.paint_image(
+                visible,
+                image_bounds,
+                Default::default(),
+                Arc::clone(&graphic.image),
+                0,
+                false,
+            ) {
+                log::warn!("muster: terminal image could not be painted: {error}");
+            }
         }
     }
 }
@@ -1893,6 +2062,21 @@ impl Render for TerminalView {
         // it is one lock, and reading it inside the closure would be one lock
         // per element the closure happened to be painted into.
         let mut snapshot = self.session.painting_snapshot();
+        let mut images = Vec::new();
+        for graphic in &snapshot.graphics {
+            if !images
+                .iter()
+                .any(|image: &Arc<gpui_kit::RenderImage>| image.id == graphic.image.id)
+            {
+                images.push(Arc::clone(&graphic.image));
+            }
+        }
+        for old in self.graphic_images.drain(..) {
+            if !images.iter().any(|image| image.id == old.id) {
+                cx.drop_image(old, Some(window));
+            }
+        }
+        self.graphic_images = images;
         if self.gesture_screen != snapshot.alt_screen
             || self.gesture_tracking != snapshot.mouse_tracking
             || self.gesture_size != self.applied.get()
@@ -3001,6 +3185,115 @@ mod tests {
         handle.close().wait().unwrap();
     }
 
+    #[gpui_kit::test]
+    fn terminal_images_reach_the_atlas_and_are_released_when_deleted(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        // The child waits for each step, so initial layout/resize cannot race
+        // the image's first placement. This exercises the real PTY pipeline.
+        let session = script_session(concat!(
+            "stty -echo; printf R; read first; ",
+            "printf '\x1b[?2026h\x1b[?25l\x1b[2;3H\x1b_Ga=T,f=32,s=1,v=1,i=42,c=4,r=2,C=1,q=2;/wAA/w==\x1b\\\\V\x1b[?2026l'; ",
+            "read second; printf '\x1b_Ga=d,d=I,i=42,q=2\x1b\\\\D'; ",
+            "read third; printf '\x1b[?2026h\x1b_Ga=T,f=32,s=1,v=1,i=42,U=1,c=2,r=1,q=2;/wAA/w==\x1b\\\\\x1b[3;3H\x1b[38;5;42m\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}\x1b[0mW\x1b[?2026l'; ",
+            "read fourth; printf '\x1b_Ga=d,d=I,i=42,q=2\x1b\\\\E'; cat"
+        ));
+        let handle = session.clone();
+        let (root, cx) = cx.add_window_view(|_, cx| Chrome {
+            view: gpui_kit::AppContext::new(cx, |cx| {
+                TerminalView::new(
+                    session,
+                    Arc::new(Mutex::new(CellMetrics {
+                        width: 8,
+                        height: 16,
+                    })),
+                    cx,
+                )
+            }),
+            header: px(40.),
+        });
+        let view = root.read_with(cx, |root, _| root.view.clone());
+        cx.update(|window, _| window.activate_window());
+        for _ in 0..3 {
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        assert!(wait_for_char(&handle, 'R'));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.applied_size() != view.read_with(cx, |view, _| view.applied_size()) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for (show, delete, count) in [('V', 'D', 1), ('W', 'E', 2)] {
+            handle.send_text("show\n").unwrap();
+            assert!(wait_for_char(&handle, show));
+            for _ in 0..3 {
+                cx.update(|window, cx| window.render_frame(cx));
+            }
+            let graphics = handle.snapshot().graphics;
+            assert_eq!(graphics.len(), count);
+            let image = Arc::clone(&graphics[0].image);
+            cx.update(|window, _| {
+                assert!(
+                    window.has_image_atlas_entry(&image),
+                    "the actual paint pass must upload the pixels"
+                )
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.graphic_images.len(),
+                    1,
+                    "placeholder cells share one GPU image"
+                );
+                let viewport = Bounds {
+                    origin: view.canvas_origin.get(),
+                    size: gpui_kit::size(px(640.), px(320.)),
+                };
+                let (visible, _) =
+                    graphic_bounds(viewport, &graphics[0], view.cell.unwrap()).unwrap();
+                assert!(
+                    visible.origin.y >= px(40.),
+                    "image must be inside the terminal, below chrome"
+                );
+            });
+            handle.send_text("delete\n").unwrap();
+            assert!(wait_for_char(&handle, delete));
+            for _ in 0..3 {
+                cx.update(|window, cx| window.render_frame(cx));
+            }
+            assert!(handle.snapshot().graphics.is_empty());
+            cx.update(|window, _| {
+                assert!(
+                    !window.has_image_atlas_entry(&image),
+                    "deleted images must leave the GPU atlas"
+                )
+            });
+            view.read_with(cx, |view, _| assert!(view.graphic_images.is_empty()));
+        }
+        handle.close().wait().unwrap();
+    }
+
+    #[test]
+    fn cropped_image_geometry_clips_without_decoding_another_bitmap() {
+        let mut core = crate::terminal::TerminalCore::new(8, 4, 1);
+        core.feed(b"\x1b_Ga=T,f=32,s=2,v=1,i=1,c=4,r=2,x=1,w=1,h=1,C=1,q=2;/wAA/wD/AP8=\x1b\\");
+        let mut graphic = core.graphic_snapshots().remove(0);
+        graphic.row = -1;
+        graphic.clip = [0, 4];
+        let viewport = Bounds {
+            origin: point(px(10.), px(40.)),
+            size: gpui_kit::size(px(80.), px(64.)),
+        };
+        let cell = CellSize {
+            width: px(8.),
+            height: px(16.),
+        };
+        let (visible, full) = graphic_bounds(viewport, &graphic, cell).unwrap();
+        assert_eq!(visible.origin, point(px(10.), px(40.)));
+        assert_eq!(visible.size, gpui_kit::size(px(32.), px(16.)));
+        assert_eq!(full.origin, point(px(-22.), px(24.)));
+        assert_eq!(full.size, gpui_kit::size(px(64.), px(32.)));
+    }
+
     fn script_session(script: &str) -> TerminalSession {
         let backend = Arc::new(crate::pty::TerminalBackend::default());
         let mut config = crate::terminal::TerminalSessionConfig::new(
@@ -3269,6 +3562,7 @@ mod tests {
             rows: vec![super::super::RowSnapshot {
                 cells: vec![wide, spacer, base, cell(' ')],
             }],
+            graphics: Vec::new(),
             selection: Some("e\u{301}".into()),
             selection_range: Some(((0, 2), (0, 2))),
             cursor: super::super::CursorSnapshot {

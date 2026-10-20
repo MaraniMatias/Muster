@@ -4281,8 +4281,11 @@ name = "muster"
 version = "1.0.0-rc.4"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
+ "flate2",
  "gpui-component",
  "gpui-kit",
+ "image",
  "konomanoasa-tree-sitter-gitignore",
  "libc",
  "log",

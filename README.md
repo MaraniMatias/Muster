@@ -75,6 +75,21 @@ xattr -dr com.apple.quarantine /Applications/Muster.app
 
 If Muster still does not start, read the [startup log](#muster-wont-start).
 
+### Can the terminal display images?
+
+Yes. Muster supports direct Kitty graphics transfers (PNG, RGB and RGBA, including
+zlib compression), placements and Unicode image placeholders used by terminal
+applications. OpenCode can detect it with its graphics probe. New terminals set
+`PI_IMAGE_PROTOCOL=kitty` for Pi when that variable is not already configured;
+explicit user overrides are preserved. Restart an existing Pi session after upgrading.
+
+Images stay in memory, not workspace state. Transfers are limited to 16 MiB of
+base64, decoded images to 32 MiB / 8192 pixels per edge, and each screen buffer to
+64 MiB, 64 images and 256 placements. Unsupported or oversized requests are refused.
+Unicode placeholders follow text reflow; classic placements are cleared on resize
+and the terminal application must redraw them. Sixel, iTerm2 images, file/shared-memory
+transfers, animation and tmux passthrough are not implemented.
+
 ### Do terminals survive a restart?
 
 No. Muster restores your workspace and UI state, but stops terminal processes when it closes and clears their sessions on startup.

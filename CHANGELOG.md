@@ -8,6 +8,12 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- Render inline images from Pi and OpenCode through the Kitty graphics protocol,
+  including chunked PNG/RGB/RGBA uploads, compressed pixels, cropped placements
+  and Unicode placeholders. Images follow terminal output and are released from
+  the GPU atlas when no longer visible. Pi receives an explicit image capability
+  unless the user already configured one; the terminal still identifies as Muster.
+
 ## 1.0.0-rc.4
 
 - **A Mac layout's symbols are typed, not prefixed.** ⌥⇧H is ◊ on a US
