@@ -19,6 +19,13 @@ use super::{Key, KeyPress};
 pub enum Input {
     /// Send this press to the child.
     Press(KeyPress),
+    /// Send this text to the child, byte for byte.
+    ///
+    /// A Mac layout spells a symbol with Option and Shift together -- ⌥⇧H is
+    /// ◊ on a US layout -- and that is text rather than a key: the terminal's
+    /// meta prefix would turn it into a command the shell never asked for,
+    /// and the platform's text input only ever sees the key.
+    Text(String),
     /// The application owns this key. Nothing is sent, and nothing is logged:
     /// every window has keys that are not the terminal's, and one of them
     /// being ignored is not an event.
@@ -78,6 +85,17 @@ pub fn press(keystroke: &Keystroke) -> Input {
     // modifier entirely, so Ctrl+C still reaches the PTY and still interrupts.
     if modifiers.platform {
         return Input::Application;
+    }
+
+    // A Mac layout spells a symbol with Option and Shift together: ⌥⇧H is ◊
+    // on a US layout, and something else on every other one, so the character
+    // is asked of the platform rather than named here. It is text, not a key,
+    // and the app is the one that sends it. Option on its own stays the meta
+    // key, which is what a shell reads as ESC.
+    if cfg!(target_os = "macos") && modifiers.alt && modifiers.shift {
+        if let Some(text) = printable(keystroke) {
+            return Input::Text(text);
+        }
     }
 
     let (key, text) = match named_key(&keystroke.key) {
@@ -444,6 +462,40 @@ mod tests {
             panic!("option-s typed nothing");
         };
         assert_eq!(press.key, Key::Char('ß'));
+    }
+
+    /// A Mac layout's symbol is text, and Option on its own is still meta.
+    ///
+    /// ⌥⇧H is ◊ on a US layout, and the terminal's meta prefix would turn it
+    /// into something the shell reads as a command rather than a character.
+    /// Option alone is the shell's meta key, and stays one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn option_and_shift_spell_a_symbol_where_option_alone_is_meta() {
+        assert_eq!(
+            press(&keystroke(
+                "h",
+                Some("◊"),
+                Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..Modifiers::none()
+                },
+            )),
+            Input::Text("◊".to_owned())
+        );
+
+        let Input::Press(press) = press(&keystroke(
+            "h",
+            Some("˙"),
+            Modifiers {
+                alt: true,
+                ..Modifiers::none()
+            },
+        )) else {
+            panic!("Option alone stopped being a key");
+        };
+        assert!(press.meta, "Option alone is the shell's meta key");
     }
 
     #[test]

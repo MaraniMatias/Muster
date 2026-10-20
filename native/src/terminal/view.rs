@@ -958,8 +958,20 @@ impl TerminalView {
         }
         self.reset_blink();
         cx.notify();
-        let input::Input::Press(press) = input::press(&event.keystroke) else {
-            return;
+        let press = match input::press(&event.keystroke) {
+            input::Input::Press(press) => press,
+            input::Input::Text(text) => {
+                // A Mac layout's symbol, ⌥⇧H being ◊: text, and the app
+                // sends it as text. The platform's text input would only see
+                // the key, and the meta prefix would turn the symbol into a
+                // command the shell never asked for.
+                cx.stop_propagation();
+                if let Err(error) = self.session.send_text(&text) {
+                    self.refuse("The text was not sent", &error, cx);
+                }
+                return;
+            }
+            input::Input::Application => return,
         };
         // Text commits belong exclusively to the native input handler. Let
         // plain printable keys and IME composition reach the platform first.
@@ -2433,6 +2445,54 @@ mod tests {
         let _ = session.close().wait();
     }
 
+    /// A Mac layout's symbol reaches the child as the character it is.
+    ///
+    /// ⌥⇧H is ◊ on a US layout. The terminal's meta prefix would turn it
+    /// into something the shell reads as a command, so the character goes out
+    /// as text instead.
+    #[cfg(target_os = "macos")]
+    #[gpui_kit::test]
+    fn a_mac_symbol_reaches_the_child_as_its_character(cx: &mut gpui_kit::TestAppContext) {
+        // Plain `cat`: the character comes back as itself, and the grid can
+        // be asked about it.
+        let session = script_session("stty raw -echo; printf READY; cat");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session,
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        let session = view.read_with(cx, |v, _| Arc::clone(v.session()));
+        let (root, cx) = cx.add_window_view(|_, _| WindowRoot { view });
+        let view = root.read_with(cx, |root, _| root.view.clone());
+        focus_grid(cx, &view);
+        assert!(
+            wait_for_char(&session, 'R'),
+            "the child never drew its marker"
+        );
+
+        press_key_with_char(
+            cx,
+            "h",
+            Some("◊"),
+            gpui_kit::Modifiers {
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            wait_for_char(&session, '◊'),
+            "the symbol never reached the child: {}",
+            grid_text(&session)
+        );
+        let _ = session.close().wait();
+    }
+
     /// Every character the grid holds, one line per row.
     fn grid_text(session: &TerminalSession) -> String {
         session
@@ -2446,12 +2506,23 @@ mod tests {
 
     /// One key press, the way the platform delivers one.
     fn press_key(cx: &mut gpui_kit::VisualTestContext, key: &str, modifiers: gpui_kit::Modifiers) {
+        press_key_with_char(cx, key, None, modifiers)
+    }
+
+    /// One key press that carries a character, the way a Mac layout delivers
+    /// a symbol: the platform says what the key spelled, not only what it was.
+    fn press_key_with_char(
+        cx: &mut gpui_kit::VisualTestContext,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: gpui_kit::Modifiers,
+    ) {
         cx.update(|window, cx| {
             window.dispatch_event(
                 gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
                     keystroke: gpui_kit::Keystroke {
                         key: key.to_owned(),
-                        key_char: None,
+                        key_char: key_char.map(str::to_owned),
                         modifiers,
                     },
                     is_held: false,
