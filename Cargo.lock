@@ -4278,7 +4278,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muster"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 dependencies = [
  "alacritty_terminal",
  "gpui-component",

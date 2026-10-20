@@ -8,6 +8,8 @@ here still gets its generated notes.
 
 ## Unreleased
 
+## 1.0.0-rc.4
+
 - **A Mac layout's symbols are typed, not prefixed.** ⌥⇧H is ◊ on a US
   layout, and the terminal now sends that character to the shell as text
   instead of prefixing it with the meta escape a shell reads as a command.
@@ -30,6 +32,25 @@ here still gets its generated notes.
   `pi` beside `markdown` and `opencode`, which is a change to that file's
   shape: it is made in place, and a file this build cannot read is refused by
   name.
+
+- **The legacy tree is gone, and the native app is the whole app.** The old
+  Tauri source, its schemas and the crate that held them were deleted; the
+  workspace is now the app crate and the core crate, with a virtual manifest
+  at the root. Nothing reads the old SQLite workspace any more: the native one
+  is `~/.muster/native-workspace.json`, and a stored shape is the whole
+  contract -- it is changed in place, and a file this build cannot read is
+  refused by name.
+
+- **The sidebar says what the pane is on.** A file preview and a diff become
+  rows under their worktree, below its terminals and above **New terminal**,
+  and the row that names what the pane is showing is the one that wears the
+  selection. A file being edited and a diff holding notes are rows too, so
+  unfinished work is visible without leaving the pane.
+
+- **OpenCode is a review destination, and a send is safe to retry.** A review
+  can be handed to a running OpenCode session; a busy session is asked about
+  rather than interrupted, and a queued round is written down before anything
+  is offered, so a round that waits is a round that provably was never taken.
 
 ## 1.0.0-rc.3
 
