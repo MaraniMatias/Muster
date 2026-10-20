@@ -25,7 +25,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 binary="${1:-$root/target/release/Muster}"
 out="${2:-$root/dist}"
-icon="$root/assets/icon.icns"
+icon="$root/app/assets/icon.icns"
 app="$out/Muster.app"
 
 for required in "$binary" "$icon"; do
@@ -38,9 +38,9 @@ done
 # The version the bundle advertises is the one the crate declares, read from
 # where it is written down. A literal here would be a second answer to a
 # question that has one.
-version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/Cargo.toml")"
+version="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/app/Cargo.toml")"
 [ -n "$version" ] || {
-  echo "bundle-macos: Cargo.toml declares no version" >&2
+  echo "bundle-macos: app/Cargo.toml declares no version" >&2
   exit 1
 }
 

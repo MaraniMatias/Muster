@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  # The workspace is the two crates at the root: `core` and the app itself, whose source is `src/`.
+  # The workspace is the two crates at the root: `core` and the app itself, whose source is `app/src/`.
   # The Tauri tree under `legacy/` is parked -- it is not built, not tested and not released from
   # here, so nothing in this workflow reaches into it.
   checks:

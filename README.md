@@ -108,7 +108,7 @@ Workspace data, review rounds and preferences are stored locally under `~/.muste
 | Path | What it is |
 | --- | --- |
 | [`core/`](core) | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI. |
-| [`src/`](src) | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. |
+| [`app/`](app) | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. Its source is `app/src/`, and its icon and fonts are `app/assets/`. |
 | [`legacy/`](legacy) | The Tauri 2 + Vue 3 app, frozen at `v0.22.0`. Not built, not tested, not released from here. |
 | [`docs/native-rust-migration/`](docs/native-rust-migration) | Why the port, and what the terminal milestone has to satisfy. |
 
@@ -156,7 +156,7 @@ Everything in `scripts/` belongs to the native tree; the Tauri scripts under
 | `finalize-native-release.mjs` | Checks the built macOS and Linux payloads together before publication | Internal to the release workflow |
 | `audit-rust.mjs` | RustSec audit of the locked graph over OSV, refusing unpinned path packages | `release.sh check` and CI |
 | `perf-native.sh` | Runs the ignored terminal hot-path benchmarks | Development only |
-| `generate-native-file-icons.mjs` | Regenerates `src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |
+| `generate-native-file-icons.mjs` | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |
 | `patched-alacritty.mjs`, `patched-gitignore.mjs` | Hash-pin the vendored crates so the audit can trust them | Internal to `audit-rust.mjs` |
 | `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs` | Tests for the audit, the release commands and the packaging/publish gate | Run by `release.sh check` and CI |
 

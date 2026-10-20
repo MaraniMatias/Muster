@@ -6,11 +6,10 @@ import { auditedPatchedGitignore } from "./patched-gitignore.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // Every manifest whose locked dependency graph is audited: the shared core and
-// the native GPUI app. The parked Tauri tree under `legacy/` is not built, so it
-// is not audited either.
+// the native GPUI app, each in the directory it owns.
 export const AUDITED_MANIFESTS = Object.freeze([
   resolve(ROOT, "core/Cargo.toml"),
-  resolve(ROOT, "Cargo.toml"),
+  resolve(ROOT, "app/Cargo.toml"),
 ]);
 export const CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index";
 const OSV_ENDPOINT = "https://api.osv.dev/v1/querybatch";

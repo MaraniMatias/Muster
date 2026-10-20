@@ -65,7 +65,7 @@ Wayland and broader distribution acceptance are not implied by the Xvfb check.
 
 ## Publish
 
-Prepare a new version in `Cargo.toml` and `Cargo.lock`, update the changelog,
+Prepare a new version in `app/Cargo.toml` and `Cargo.lock`, update the changelog,
 and merge it to `main`. Do not reuse `v1.0.0-rc.2` or move an existing tag.
 
 ```sh
