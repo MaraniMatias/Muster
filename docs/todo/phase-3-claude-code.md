@@ -1,11 +1,11 @@
 # Phase 3 — Claude Code as a review destination
 
-Status: specified, not implemented. Depends on phase 1 (`docs/review-export.md`) for
-`ReviewTarget`, and borrows phase 2's one-shot shape (`docs/phase-2-codex.md`).
+Status: specified, not implemented. Depends on phase 1 for `ReviewTarget`, and borrows phase 2's
+one-shot shape (`docs/todo/phase-2-codex.md`).
 
 **Not parity with OpenCode.** Same reasoning as every non-OpenCode phase: Muster can name the
-program in front of one of its terminals (`src-tauri/src/terminal/process.rs:21-34` macOS,
-`:55` Linux; surfaced as `foregroundApp`, `src-tauri/src/domain/workspace.rs:83-89`) but the name
+program in front of one of its terminals (`core/src/pty/process.rs`; surfaced as `foreground_app`,
+`core/src/workspace.rs`) but the name
 `claude` does not carry that process's conversation id, and there is no authorization to write
 into a session the user started. So Claude Code is driven headless, into a **Muster-managed
 conversation**, one process per round.
@@ -80,7 +80,7 @@ surfacing rather than smoothing over.
 The consequence for Muster is concrete: a round killed with SIGTERM is a round whose
 `result` never arrives, so "did the turn finish?" has no answer from the protocol. A round in
 that state has to be left `dispatching`, exactly as a crashed send is
-(`src-tauri/src/services/review_round.rs:236-239`) — recognizable, not repeated. That is the
+(`core/src/opencode/rounds.rs`) — recognizable, not repeated. That is the
 existing mechanism doing its job, but it means **Muster must send SIGINT, not SIGTERM**, and that
 is a code-level requirement with a comment on it, because SIGTERM is the reflex and a refactor to
 "standardize the shutdown signal" would break the round bookkeeping silently.
@@ -158,7 +158,7 @@ with non-alphanumerics replaced by `-` [source: Claude Code docs].
 parsing it directly can break on any release** [source: code.claude.com/docs/en]. So:
 
 - User message text is stored verbatim, which means a literal substring search for
-  `muster-review:<round id>` works. The marker (`src-tauri/src/domain/review.rs:67-69`) is pure
+  `muster-review:<round id>` works. The marker (`core/src/review.rs`) is pure
   ASCII with no JSON-escapable characters, so the same constraint as Codex holds and the same
   reasoning applies.
 - The cwd encoding and the file layout are **unsupported**. Reconstructing a path from a cwd by
@@ -188,7 +188,7 @@ background turn. The remaining options are not equivalent:
 How an unattended agent should handle approvals is a **security decision, not an argv detail**,
 and it must be settled explicitly before this phase is implemented — by a person, in the changelog
 and in the settings UI, with the default named. Codex's equivalent (`approval_policy=never`) is
-recorded in `docs/phase-2-codex.md`; Claude Code's has a `bypassPermissions` option Codex does
+recorded in `docs/todo/phase-2-codex.md`; Claude Code's has a `bypassPermissions` option Codex does
 not, so "the same decision as Codex" is not a sufficient answer here. The floor is: whatever is
 chosen, it is documented, it is visible, and the user can tell what it is from the app without
 reading a source file.
@@ -202,15 +202,15 @@ can cause is bounded by Muster rather than by the model. The exact set is a prod
 Identical to phase 2 and to what exists today, and for the same reasons:
 
 1. `begin_round` records the round as `dispatching` with its marker and marks the notes `sent`,
-   before the agent is called (`src-tauri/src/services/review_round.rs:54-68`, `:50-53`).
-2. `build_round_prompt` prepends `AGENT_PROMPT_PREFIX` and `[marker]` (`:36-40`).
-3. `check_prompt_size` refuses empty or >512 KiB (`MAX_ROUND_PROMPT_BYTES`,
-   `src-tauri/src/domain/review.rs:7`; check at `:288-299`).
+   before the agent is called (`core/src/opencode/rounds.rs`).
+2. `build_round_prompt` prepends `AGENT_PROMPT_PREFIX` and `[marker]` (`core/src/review.rs`).
+3. `check_round_prompt` refuses empty or >512 KiB (`MAX_ROUND_PROMPT_BYTES`,
+   `core/src/review.rs`).
 4. Spawn with `--session-id`, write the user record, read the stream.
 5. Success → `confirm_round` → `dispatched`. Failure → leave `dispatching`
-   (`services/review_round.rs:236-239`).
+   (`core/src/opencode/rounds.rs`).
 6. On reconnect, `reconcile_round` greps the transcript for the marker and either confirms or
-   requeues (`:161-191`).
+   requeues (`core/src/opencode/rounds.rs`).
 
 The Muster-generated `--session-id` must be written to the round **before** the first turn, and it
 is known before the process starts, which is the one thing phase 3 has that phase 2 does not: the

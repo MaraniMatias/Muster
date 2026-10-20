@@ -313,8 +313,8 @@ impl TerminalBackend {
 
     /// Live Pi processes and their OS-reported current directories, across every registered PTY.
     ///
-    /// `pub` rather than crate-private because the parked Tauri host asks the same
-    /// question of the one PTY implementation it re-exports (`legacy/src-tauri/src/services/worktree.rs`).
+    /// `pub` rather than crate-private because a host asks the same question of
+    /// the one PTY implementation it re-exports.
     pub fn pi_process_locations(&self) -> Result<Vec<(String, Option<PathBuf>)>, String> {
         let sessions = self
             .sessions

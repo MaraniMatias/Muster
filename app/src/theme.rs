@@ -42,8 +42,8 @@ const CONTENT_ADDED: u32 = 0xa1c181;
 const CONTENT_REMOVED: u32 = 0xd97f84;
 
 // The content ink and the syntax tokens, `--muster-content-*` and
-// `--muster-syntax-*` in `legacy/src/muster.css`. The tokens are named per
-// meaning there, not per colour, and a grammar's capture is one of those
+// `--muster-syntax-*`, named as the old theme named them. The tokens are named
+// per meaning, not per colour, and a grammar's capture is one of those
 // meanings spelled its own way.
 //
 // The content *surface* is deliberately not one of them. Legacy's

@@ -1,9 +1,9 @@
 //! The icon a file or a directory wears, and the element that draws it.
 //!
-//! These are Catppuccin's own drawings, the ones Legacy draws in its file tree and on the last
-//! step of a file crumb, so a row here wears the icon the app it replaces gave it. The drawings and
-//! the rules that choose between them are in [`data`], written by
-//! `scripts/generate-native-file-icons.mjs` out of Legacy's generated module.
+//! These are Catppuccin's own drawings, the ones the app this one replaces drew in its file tree
+//! and on the last step of a file crumb, so a row here wears the icon that app gave it. The
+//! drawings and the rules that choose between them are in [`data`], written by
+//! `scripts/generate-native-file-icons.mjs` out of the vendored Catppuccin module.
 //!
 //! # Why one icon is several layers
 //!

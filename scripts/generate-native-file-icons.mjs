@@ -1,15 +1,14 @@
 /**
- * Writes the file-type icon table `app` draws with, from Legacy's own generated module.
+ * Writes the file-type icon table `app` draws with, from the vendored Catppuccin module.
  *
- * Legacy already holds the drawings: `legacy/src/lib/catppuccin-icons.ts` is the output of
- * `legacy/scripts/generate-catppuccin-icons.mjs`, which reads Catppuccin's theme and one flavour of
- * its icons. That generator is frozen with the rest of `legacy/`, and the Catppuccin checkout it
- * wants is not vendored here, so this reads the frozen module instead of the checkout. One source
+ * The drawings live in `app/src/file_icons/catppuccin-icons.ts`: Catppuccin's own theme rules and
+ * the markup of the 510 icons they reach, read from flavour "Catppuccin Mocha". It is kept here
+ * rather than as a Catppuccin checkout, so the table can be regenerated without one. One source
  * of truth, no second copy of Catppuccin's rules to keep in step.
  *
  * ## The colour cannot be copied, only the shape
  *
- * Legacy writes `--muster-icon-*` into every stroke and a browser resolves those against the
+ * A browser build writes `--muster-icon-*` into every stroke and resolves those against the
  * palette in effect. The toolkit rasterizes an SVG to a single-colour alpha mask —
  * `SvgRenderer::render_alpha_mask` keeps `pixel.alpha()` and `Svg` paints it with one
  * `text_color` — so a stroke's own paint is discarded either way. That is what makes this a cut
@@ -38,7 +37,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dirname, "..");
-const SOURCE = join(ROOT, "legacy", "src", "lib", "catppuccin-icons.ts");
+const SOURCE = join(ROOT, "app", "src", "file_icons", "catppuccin-icons.ts");
 const OUTPUT = join(ROOT, "app", "src", "file_icons", "data.rs");
 
 /**

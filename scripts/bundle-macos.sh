@@ -84,7 +84,7 @@ cat >"$app/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <!-- Legacy said 10.13, which described the webview build. The floor here is the
-       toolkit's own, macOS 15: see docs/native-rust-migration/README.md 4.5. -->
+       toolkit's own, macOS 15: see docs/release-safety.md. -->
   <key>LSMinimumSystemVersion</key>
   <string>15.0</string>
   <key>NSHighResolutionCapable</key>

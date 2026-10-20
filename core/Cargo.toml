@@ -1,19 +1,19 @@
 [package]
 name = "muster-core"
 version = "0.2.0"
-# 2021, matching the sources this crate took over from `src-tauri`. Those files
-# are edition 2021 and `muster` -- the only consumer -- does not have to
+# 2021, matching the sources this crate took over from the old Tauri tree. Those
+# files are edition 2021 and `muster` -- the only consumer -- does not have to
 # cross editions to depend on them.
 edition = "2021"
 publish = false
-description = "Muster's host-independent core: the PTY backend and the workspace shapes its callers exchange. No window, no Tauri, no GPUI."
+description = "Muster's host-independent core: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit."
 
 [lib]
 name = "muster_core"
 path = "src/lib.rs"
 
 [dependencies]
-# The PTY layer is not reimplemented here: these are the same crates the Tauri
+# The PTY layer is not reimplemented here: these are the same crates the old
 # backend already used, and the code below is the code it used.
 portable-pty = "0.9"
 libc = "0.2"

@@ -1,17 +1,18 @@
 # Phase 2 — Codex as a review destination
 
-Status: specified, not implemented. Phase 1 (`docs/review-export.md`) is the prerequisite: it adds
+Status: specified, not implemented. Phase 1 is the prerequisite: it adds
 `ReviewTarget` and the `preferences` key, and `"codex"` is added to that union here.
 
 **This is not parity with OpenCode.** The OpenCode integration is a bridge: Muster runs
 `opencode serve` per checkout, creates sessions through an HTTP API, streams events, and can stop a
-turn (`src-tauri/src/services/agent.rs:1-6`). Codex has no such surface. Phase 2 sends a headless,
+turn (the old agent service; the client that replaced it is `core/src/opencode.rs`). Codex has no
+such surface. Phase 2 sends a headless,
 one-shot process per review round, which opens a **Muster-managed review conversation**. It does
 not write into the session the user has open in a terminal.
 
 That is not a shortcut. Muster _can_ read the foreground process name of its own terminals —
-`src-tauri/src/terminal/process.rs:21-34` on macOS via `proc_pidpath`, `:55` on Linux via
-`/proc/<pid>/comm`, surfaced as `foregroundApp` (`src-tauri/src/domain/workspace.rs:83-89`). What
+`core/src/pty/process.rs` on macOS via `proc_pidpath` and on Linux via `/proc/<pid>/comm`,
+surfaced as `foreground_app` (`core/src/workspace.rs`). What
 that name cannot give is the conversation id of a `codex` the user started themselves. There is no
 way to address their session, and no authorization to take it over. So the conversation is ours,
 and the user gets told which one it is.
@@ -39,12 +40,12 @@ codex exec --json --cd <checkout> --skip-git-repo-check -o - <prompt>
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `exec`                           | the non-interactive subcommand. `--json` (alias `--experimental-json`) makes it emit JSONL on stdout [source: `codex-rs/exec/src/cli.rs`]                                                                                                     |
 | `--json`                         | the event stream is the only way to tell turn-started from turn-finished from turn-failed                                                                                                                                                     |
-| `--cd <checkout>`                | working directory. The checkout's canonical path, the same one the OpenCode bridge passes to its child (`services/agent.rs`, `directory()`).                                                                                                  |
-| `--skip-git-repo-check`          | the checkout is registered and already verified to be a git worktree (`src-tauri/src/persistence/mod.rs`, `repo.kind = 'git'`); a second check is redundant and would fail on a plain-folder checkout, where notes are already not collected. |
+| `--cd <checkout>`                | working directory. The checkout's canonical path, the same one the OpenCode bridge passes to its child (`core/src/opencode.rs`, `Client::directory()`).                                                                                                  |
+| `--skip-git-repo-check`          | the checkout is registered and already verified to be a git worktree (`core/src/navigation/discovery.rs`, `RepoKind::Git`); a second check is redundant and would fail on a plain-folder checkout, where notes are already not collected. |
 | `-o -` / `--output-last-message` | the final assistant message on stdout, so the diff can show what came back                                                                                                                                                                    |
 
 The prompt goes on **stdin**, not as an argv element. A review is up to 512 KiB
-(`MAX_ROUND_PROMPT_BYTES`, `src-tauri/src/domain/review.rs:7`); argv is length-limited by the OS
+(`MAX_ROUND_PROMPT_BYTES`, `core/src/review.rs`); argv is length-limited by the OS
 and shows up in `ps`. `codex exec` accepts the prompt positionally or via `-`/stdin
 [source: `codex-rs/exec/src/cli.rs`; learn.chatgpt.com/docs/non-interactive-mode].
 
@@ -95,7 +96,7 @@ phase 2 should treat "a `turn.completed` that is not a clean success" as failed 
 ## 4. Cancel
 
 `codex exec` has no protocol-level cancel; the honest answer is a signal to the child, which is
-what Muster already does for terminals (`src-tauri/src/terminal/mod.rs`, `stop_with_timeout`).
+what Muster already does for terminals (`core/src/pty/mod.rs`, `shutdown`).
 A SIGTERM to `exec` is **unconfirmed** as producing a `turn.completed` at all — it may simply exit.
 If the turn's fate matters (it does: it decides whether a round is `acked` or left `dispatching`),
 the app-server route in §6 has a real `turn/interrupt {threadId, turnId}`
@@ -108,9 +109,8 @@ Codex path is a batch send. If a cancel is added, it comes with the app-server, 
 
 A review round must be recognizable after a crash, or an interrupted send is repeated. Phase 1
 already established the mechanism: the marker is embedded in the message _before_ the send
-(`src-tauri/src/services/review_round.rs:36-40`, `review_round_marker` at
-`src-tauri/src/domain/review.rs:67-69`), and reconciliation asks the transcript whether it is
-there (`reconcile_round`, `services/review_round.rs:161-191`).
+(`core/src/opencode/rounds.rs`, `review_round_marker` at `core/src/review.rs`), and reconciliation
+asks the transcript whether it is there (`core/src/opencode/rounds.rs`).
 
 Codex persists every thread as
 `~/.codex/sessions/rollout-<timestamp>-<conversation_id>.jsonl`
@@ -176,16 +176,16 @@ startup, so a process can boot without credentials and fail on the first turn. `
 The ordering Muster already uses, unchanged:
 
 1. `begin_round` records the round as `dispatching` with its marker and links the notes
-   (`services/review_round.rs:54-68`). Notes go to `sent` **here**, before the agent is called, so a
-   crash cannot leave notes looking delivered when they were not (`:50-53`).
+   (`core/src/opencode/rounds.rs`). Notes go to `sent` **here**, before the agent is called, so a
+   crash cannot leave notes looking delivered when they were not.
 2. `build_round_prompt` prepends `AGENT_PROMPT_PREFIX` and `[marker]`
-   (`services/review_round.rs:36-40`, `src-tauri/src/domain/review.rs:64`).
-3. `check_prompt_size` refuses an empty or >512 KiB prompt (`:288-299`).
+   (`core/src/review.rs`).
+3. `check_round_prompt` refuses an empty or >512 KiB prompt (`core/src/review.rs`).
 4. Spawn `codex exec`, feed the prompt on stdin, read the event stream.
 5. On success, `confirm_round` → `dispatched`. On failure, leave it `dispatching` — the marker is
-   what lets reconciliation learn whether it landed (`:236-239`).
+   what lets reconciliation learn whether it landed (`core/src/opencode/rounds.rs`).
 6. On reconnect, `reconcile_round` asks whether the marker is in the transcript and either confirms
-   or requeues (`:161-191`).
+   or requeues (`core/src/opencode/rounds.rs`).
 
 The thread id from `thread.started` must be stored on the round. `ReviewRound.session_id` is
 already `Option<String>` and already the field reconciliation reads

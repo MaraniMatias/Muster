@@ -3,13 +3,11 @@
 Muster is a desktop workspace for people working with coding agents in Git worktrees. It keeps each repository and worktree’s files, diffs, and terminals together. Leave notes on specific diff lines, then send them to OpenCode, start a fresh Pi review session, or export them as Markdown. Muster does not run models; other CLI agents can be started in its terminals.
 
 > **Native app:** releases target macOS (Apple Silicon) and Ubuntu 24.04
-> (x86_64). The former Tauri app is retained under [`legacy/`](legacy) as
-> reference material; it is not the released application.
+> (x86_64).
 
 - **Native release targets:** macOS (Apple Silicon) · Ubuntu 24.04 (x86_64)
 - **License:** MIT
 
-![Muster](./docs/muster.png)
 
 ## Why
 
@@ -109,8 +107,7 @@ Workspace data, review rounds and preferences are stored locally under `~/.muste
 | --- | --- |
 | [`core/`](core) | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI. |
 | [`app/`](app) | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. Its source is `app/src/`, and its icon and fonts are `app/assets/`. |
-| [`legacy/`](legacy) | The Tauri 2 + Vue 3 app, frozen at `v0.22.0`. Not built, not tested, not released from here. |
-| [`docs/native-rust-migration/`](docs/native-rust-migration) | Why the port, and what the terminal milestone has to satisfy. |
+| [`docs/release-safety.md`](docs/release-safety.md) | The release checklist, and what the native release path promises. |
 
 `core/` is a real dependency, not a shared folder: the app and the parked Tauri
 tree both compile the same PTY implementation, so process lifetime, bounded
@@ -142,8 +139,7 @@ would be discarded, so the app installs one before anything that can log.
 
 ### Scripts
 
-Everything in `scripts/` belongs to the native tree; the Tauri scripts under
-`legacy/scripts/` are frozen reference and are not run from here.
+Every script in `scripts/` belongs to this app's release path.
 
 | Script | What it does | When you run it |
 | --- | --- | --- |
@@ -171,18 +167,12 @@ worktree creation and archive-or-delete dialogs, drag to reorder or move a
 terminal between worktrees, and a window state file.
 
 The native app includes review notes and agent delivery/export, editable
-preferences, file activation and terminal search. See the [native migration
-notes](docs/native-rust-migration/README.md) for implementation details.
+preferences, file activation and terminal search.
 
-[`Terminal implementation status`](docs/native-rust-migration/ghostty-reference.md)
-records the implemented behavior, remaining parity work, and measured costs (§12).
 The app uses one dark appearance. Native state lives in
-`~/.muster/native-workspace.json`, independently of Legacy SQLite; a single-instance
+`~/.muster/native-workspace.json`, independently of the old SQLite database; a single-instance
 lock protects it and shutdown flushes the latest accepted navigation snapshot.
 Git discovery/counting stays active at a slower cadence in hidden windows.
-
-`legacy/` keeps the former Tauri release (v0.22.0) for reference. It is not built
-or packaged by the native release workflow.
 
 ## License
 

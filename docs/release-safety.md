@@ -5,7 +5,6 @@
 - macOS 15+, Apple Silicon: ad-hoc signed `.app` in a versioned ZIP, not notarized.
 - Ubuntu 24.04, x86_64: `.deb`. No native ARM64 Linux or AppImage promise yet.
 
-The Tauri scripts under `legacy/` are reference material, not this release path.
 Existing native candidates may contain only macOS; this workflow adds the Linux
 package to future releases. It never changes an existing release or version.
 

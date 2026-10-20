@@ -1,7 +1,7 @@
 # Muster — presentation script
 
-Derived from [`features.md`](./features.md). Every claim here has a `file:line` behind it in that
-document; nothing in this file asserts something the catalog does not.
+Every claim here has a `file:line` behind it; nothing in this file asserts something the code
+does not.
 
 Use the 30-second version for an introduction and the slides for the pitch. The demo script is the
 part that actually convinces.
@@ -42,7 +42,7 @@ worktree from the dialog and the name slugs into a branch; archive it later and 
 delete it and the branch goes too, with a warning listing the dirty files and the unmerged commits
 before you confirm. Worktrees you create outside Muster show up on their own.
 
-**Evidence:** `docs/features.md` §1.
+**Evidence:** `app/src/worktree_dialog.rs`, `core/src/navigation/worktrees.rs`.
 
 ### 3. The review loop
 
@@ -59,7 +59,7 @@ something else. Outdated notes are held back from a send unless you tick the box
 **Land it with:** resolving a note is only offered when the diff can prove what it refers to. When
 it cannot, it says so rather than guessing.
 
-**Evidence:** `docs/features.md` §3.
+**Evidence:** `app/src/review.rs`, `core/src/review.rs`.
 
 ### 4. Sending it back — and not losing it
 
@@ -78,7 +78,7 @@ with CodeReview.nvim.
 finds the one you already run, refuses any address that isn't loopback before it sends the password,
 and refuses to answer with anything that belongs to a different worktree.
 
-**Evidence:** `docs/features.md` §3, §4.
+**Evidence:** `core/src/opencode/rounds.rs`, `core/src/opencode.rs`.
 
 ### 5. It's a product, not a prototype
 
@@ -93,7 +93,7 @@ that exact commit and all three targets build, and it refuses to re-tag a differ
 dependency tree is pinned and audited, including a vendored security backport whose entire tree is
 hash-checked. Nothing ships without that gate.
 
-**Evidence:** `docs/features.md` scale line and §4; `.github/workflows/release.yml`.
+**Evidence:** `scripts/release.sh`, `scripts/audit-rust.mjs`, `.github/workflows/linux-release.yml`.
 
 ### 6. Where it stops
 

@@ -11,8 +11,8 @@ The SIL Open Font License is included in `LICENSE-FiraCode.txt`.
 [FiraCode Nerd Font Mono](https://github.com/ryanoasis/nerd-fonts) 3.2.1 — the
 same base Fira Code with the Nerd Fonts glyphs patched in — subset to the
 10,093 glyphs those glyphs live in (`U+23FB-23FE`, `U+26A1`, `U+276C-276F`,
-`U+2B58`, `U+E000-F8FF`, `U+F0000-FFFFD`), and converted from the WOFF2 Legacy
-ships to TrueType because the same reason the two text faces are TrueType: the
+`U+2B58`, `U+E000-F8FF`, `U+F0000-FFFFD`), and converted from the WOFF2 the old app
+shipped to TrueType, because the same reason the two text faces are TrueType: the
 macOS text system registers embedded fonts through Core Graphics, which does
 not read WOFF2. Its outlines and advances are the patched font's, so a glyph
 keeps the 1200-of-1950-unit advance — one cell — the parser lays its cell out
@@ -20,7 +20,7 @@ on, and the two text faces are left byte-identical rather than carrying a face
 nobody can read.
 
 The terminal draws a private use character with this family and everything else
-with the text faces (`terminal::view::icon_family_for`), which is what Legacy's
+with the text faces (`terminal::view::icon_family_for`), which is what the
 `"Muster Nerd Mono", "Muster Nerd Icons"` stack did in the browser.
 
 ## The one glyph that is not from the subset

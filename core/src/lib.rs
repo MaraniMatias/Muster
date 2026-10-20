@@ -20,13 +20,13 @@
 //! the name the parser and grid want. Nothing in that subtree refers to itself
 //! by path, so the rename costs nothing outside this file.
 
-/// `src-tauri/src/terminal/`, moved here whole: `TerminalBackend`,
+/// The old Tauri tree's `terminal/`, moved here whole: `TerminalBackend`,
 /// `SpawnOptions`, `OutputSink` and the process-introspection module.
 pub mod pty;
 
-/// `src-tauri/src/domain/workspace.rs`, moved here whole: it is where the status
-/// shapes the terminal backend returns are declared, and it depends on nothing
-/// else in the old tree.
+/// The old Tauri tree's `domain/workspace.rs`, moved here whole: it is where the
+/// status shapes the terminal backend returns are declared, and it depends on
+/// nothing else in that tree.
 pub mod workspace;
 
 /// Checkout and worktree discovery, the Git diffs they answer with, the worktree

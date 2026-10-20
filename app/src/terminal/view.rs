@@ -77,7 +77,7 @@ struct ScrollbarGeometry {
     scrollable: bool,
 }
 
-/// Legacy's arithmetic (`legacy/src/lib/overlay-scrollbar.ts`), over lines
+/// The old app's arithmetic, over lines
 /// rather than pixels: the scrollback is the content, the visible rows are the
 /// viewport, and the offset is how far back the viewport has been scrolled.
 ///
@@ -301,7 +301,7 @@ const DIM_BLEND: f32 = 0.45;
 // Colour
 // ---------------------------------------------------------------------------------------------
 
-/// ANSI entries 0 to 15, transcribed from `--muster-ansi-*` in `legacy/src/muster.css`.
+/// ANSI entries 0 to 15, transcribed from the `--muster-ansi-*` tokens.
 const ANSI_COLORS: [(u8, u8, u8); 16] = [
     (0x28, 0x2c, 0x34), // black
     (0xe0, 0x6c, 0x75), // red
@@ -345,11 +345,10 @@ pub fn xterm_256(index: u8) -> (u8, u8, u8) {
 /// Every colour this terminal draws with.
 ///
 /// The defaults and ANSI colors for the terminal palette. Every one of them is
-/// a `--muster-*` token out of the legacy dark theme in `legacy/src/muster.css`
-///: legacy read that file to build xterm.js' theme, and this is the same table
-/// rather than a second one that happens to agree — except the background,
-/// which is the surface the window is already painted, not a token legacy chose
-/// for the grid.
+/// a `--muster-*` token out of the old dark theme: that theme was read to build
+/// xterm.js' theme, and this is the same table rather than a second one that
+/// happens to agree — except the background, which is the surface the window is
+/// already painted, not a token that theme chose for the grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// `--muster-content-text`: what a cell with no colour of its own is drawn in.
@@ -3583,10 +3582,10 @@ mod tests {
 
     #[test]
     fn every_default_is_the_legacy_dark_token_named_beside_it() {
-        // Transcribed from `legacy/src/muster.css`, `:root` without
-        // `data-theme="light"`, because legacy built xterm.js' theme by reading
-        // exactly these names out of that block. If a value here is edited it is
-        // the CSS that has to move with it, in both apps.
+        // Transcribed from the old theme's `:root` block without
+        // `data-theme="light"`, because that theme built xterm.js' theme by
+        // reading exactly these names out of it. If a value here is edited it is
+        // the token that has to move with it.
         const LEGACY_DARK: [(&str, (u8, u8, u8)); 19] = [
             ("--muster-content-text", (0xdc, 0xe0, 0xe5)),
             ("--muster-bg-0", (0x16, 0x18, 0x1d)),

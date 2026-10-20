@@ -6,10 +6,10 @@ version = "1.0.0-rc.3"
 # this one to move.
 edition = "2021"
 publish = false
-description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer. The Tauri app under legacy/ is parked and is not built from here."
-# Read by the About panel, the same way Legacy's read it: `env!` is resolved by
-# rustc, so the URL lands in the binary, where a field read off the bundle config
-# at runtime would not.
+description = "Muster's native GPUI application: the workspace window, the VT terminal, the document editor and the review composer."
+# Read by the About panel, the same way the app it replaces read it: `env!` is
+# resolved by rustc, so the URL lands in the binary, where a field read off the
+# bundle config at runtime would not.
 homepage = "https://github.com/MaraniMatias/Muster"
 
 [lib]
@@ -82,10 +82,10 @@ tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cmake = "0.7.5"
 tree-sitter-swift = "0.7.4"
 # The toolkit has no Vue grammar at all and no feature to turn one on, and
-# Legacy highlighted Vue. `theme::install` registers this one in the toolkit's
-# own registry with the queries it ships, the same mechanism the three above
-# use for an empty query. Nothing else depends on it and it adds no new
-# highlighter.
+# The app this one replaces highlighted Vue. `theme::install` registers this one in
+# the toolkit's own registry with the queries it ships, the same mechanism the
+# three above use for an empty query. Nothing else depends on it and it adds no
+# new highlighter.
 tree-sitter-vue-updated = "0.1.0"
 # The toolkit has no Gitignore parser. This pinned upstream grammar is built with
 # the workspace's compatible cc release; its tree hash is checked by the RustSec audit.
@@ -95,7 +95,7 @@ tree-sitter-ini = "1.4.0"
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by
 # deserializing the theme literal rather than by assigning fields.
 serde_json = "1"
-# The PTY layer is not reimplemented here: the same backend the Tauri app used,
+# The PTY layer is not reimplemented here: the same backend the old app used,
 # as a dependency. Process lifetime, bounded writes and group-safe shutdown have
 # exactly one implementation.
 muster-core = { path = "../core" }

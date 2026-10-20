@@ -8,7 +8,6 @@ coverage/
 .eslintcache
 .prettier-cache
 *.tsbuildinfo
-legacy/src-tauri/gen/
 .DS_Store
 .ruff_cache/
 .pytest_cache/

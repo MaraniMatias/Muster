@@ -1,7 +1,7 @@
 //! The macOS menu bar: the app menu, and the Edit submenu.
 //!
-//! Legacy built the same two submenus in `legacy/src-tauri/src/menus.rs`, and
-//! wrote down there why the second one is not decoration: on macOS the key
+//! The app this one replaces built the same two submenus, and wrote down there
+//! why the second one is not decoration: on macOS the key
 //! equivalents on the Edit submenu are what carry `⌘C`, `⌘V`, `⌘X`, `⌘A` and
 //! `⌘Z` to whatever is focused. This app already answers those from its key
 //! bindings — the toolkit binds them, and the terminal answers `⌘C` and `⌘V` in

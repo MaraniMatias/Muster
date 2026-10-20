@@ -172,8 +172,8 @@ fn document_state(
 
 /// Whether a path names a Markdown file.
 ///
-/// Legacy's own set (`legacy/src/lib/markdown-preview.ts:20`), which is the same
-/// four names `syntax_language` answers `markdown` for: a file whose whole point
+/// The old app's own set, which is the same four names `syntax_language`
+/// answers `markdown` for: a file whose whole point
 /// is to be read, rather than one whose point is that something runs it.
 pub(crate) fn is_markdown(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
