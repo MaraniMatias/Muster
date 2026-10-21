@@ -6,6 +6,30 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## 1.0.0-rc.8
+
+- **The chrome wears the toolkit's own controls.** Buttons, checkboxes and
+  fields are drawn by the toolkit rather than by a hand-rolled helper, so the
+  shape, the states and the focus are one implementation instead of two that
+  drift apart. A control is rounded 4px, and the small overlays the toolkit
+  draws itself -- a menu, a popover, a picker's panel -- wear the same corner;
+  the large surfaces over the window -- a dialog, a notification, a command
+  palette -- are 8px.
+
+- **Keyboard focus is a line, not a ring.** The 3px outer ring is off: the rows
+  in this window clip their content, so the ring was cut off exactly where a
+  keyboard user needs to see it. A focused control shows the toolkit's thin
+  focus on its own edge now, and no control suppresses it.
+
+- **A button says what it is.** The destructive action is `danger`, the commit
+  action is `primary`, and the quiet ones are `ghost`. A disabled control is
+  the toolkit's disabled control, so it stays visibly disabled without turning
+  a destructive action into a misleading neutral one.
+
+- **The worktree removal dialog reads its buttons in the order the decision
+  works.** `Delete worktree` comes first and stands apart from `Cancel` and
+  `Archive`: it is the one action there that cannot be taken back.
+
 ## 1.0.0-rc.7
 
 - Prepare the next native testing candidate for Ubuntu 24.04 amd64 and macOS
