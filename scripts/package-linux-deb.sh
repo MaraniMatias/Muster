@@ -53,6 +53,9 @@ cd "$metadata"
 deps="$(dpkg-shlibdeps -O -e"$binary" -l"$(dirname "$binary")" | sed -n 's/^shlibs:Depends=//p')"
 [[ -n "$deps" ]] || { echo 'package-linux-deb: could not derive runtime dependencies' >&2; exit 1; }
 deps="$deps, git, xdg-utils, libvulkan1"
+# The native directory picker is the desktop portal on Linux, and a machine
+# without it cannot open a directory at all: the package asks for it.
+deps="$deps, xdg-desktop-portal, xdg-desktop-portal-gtk"
 cat >"$stage/DEBIAN/control" <<CONTROL
 Package: muster
 Version: $version

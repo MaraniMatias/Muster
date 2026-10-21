@@ -97,7 +97,8 @@ and consistent input/select heights within a form. The two radii live in the
 theme — `Theme::radius` and `Theme::radius_lg` — so a button, a field and a
 picker wear the same corner without a call site naming it. Draft preferences
 use checkboxes rather than switches. Confirmations use GPUI Kit dialogs; native
-file and directory pickers remain native. Prefer semantic toolkit sizes and
+file and directory pickers remain native, and a path typed by hand is the
+second answer when the native one cannot open. Prefer semantic toolkit sizes and
 shared helpers over one-off dimensions: a control's height is its size tier,
 and a number in a call site is a row's own geometry rather than a control's.
 Keep hover, pressed, selected and focus-visible distinct; a selected row must
@@ -156,6 +157,25 @@ tinted per layer. The generator enforces that every layer carries a paint usvg c
 parse, that every shape lands in exactly one layer, and that no rule key carries a
 dot — a key with a dot is one no file name can be asked about, which is how Legacy
 reaches a third fewer rules than the theme defines.
+
+## On Linux, the app fills the window
+
+Linux has no window frame of its own unless the window manager draws one, so
+the app draws its own: `window_border()` owns the border and the resize band.
+**The frame reserves no band for itself.** The toolkit's Linux default keeps
+one for a shadow the window manager draws, and that band is a margin around
+the app: the window's own controls sit twenty pixels away from the corner the
+pointer goes to, the app is framed rather than filling the window, and the
+band is gone when the window is tiled — so the app looks different maximized
+than it does not. `FRAME_SHADOW` in `app/src/app.rs` is that decision, and it
+is zero on every platform.
+
+The native directory picker is the desktop portal on Linux, and a portal is a
+service the desktop session may not run. **The picker is the first answer and
+the typed path is the second**: when the native picker cannot open, the app
+asks for the path in a dialog of its own, so that adding a directory is never
+a button that does nothing. The `.deb` depends on `xdg-desktop-portal` and
+`xdg-desktop-portal-gtk` so that a fresh install has one.
 
 ## On macOS, the app is the bundle
 
