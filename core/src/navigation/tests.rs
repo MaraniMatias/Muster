@@ -504,11 +504,7 @@ fn overflowing_git_output_is_refused_instead_of_truncated() {
     // deadline rather than about the cap.
     let error = git_output(
         temp.path(),
-        &[
-            "-c",
-            "alias.flood=!head -c 33554432 /dev/zero",
-            "flood",
-        ],
+        &["-c", "alias.flood=!head -c 33554432 /dev/zero", "flood"],
         Duration::from_secs(5),
     )
     .unwrap_err();
