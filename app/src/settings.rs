@@ -27,7 +27,8 @@
 //! that pretended otherwise would lie about what a preference does.
 
 use gpui_kit::component::{
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     dialog::{Dialog, DialogFooter},
     input::{Input, InputState},
     select::{Select, SelectEvent, SelectState},
@@ -55,7 +56,7 @@ static NEXT_SETTINGS_DRAFT: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::app::TerminalWindow;
-use crate::theme::{checkbox, zed_button, Roles};
+use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
 
 /// The options a closed setting offers, and the row the current one sits on.
@@ -380,7 +381,7 @@ fn toggle_row(
     set: fn(&mut AppSettings, bool),
     disabled: bool,
 ) -> AnyElement {
-    checkbox(id, roles)
+    Checkbox::new(id)
         .disabled(disabled)
         .checked(checked)
         .small()
@@ -417,7 +418,6 @@ fn select_row(
             .disabled(disabled)
             .id(id)
             .small()
-            .rounded_none()
             .bg(roles.surface_base)
             .accessibility_label(label),
     )
@@ -442,7 +442,6 @@ fn size_row(
                 .id(id)
                 .small()
                 .bg(roles.surface_base)
-                .rounded_none()
                 .aria_label(label)
                 .w_full(),
         ),
@@ -1032,14 +1031,12 @@ impl TerminalWindow {
                             "Cached exports and delivered rounds stay where they are until one of these removes them.",
                             roles,
                             vec![
-                                zed_button("settings-review-clear")
+                                Button::new("settings-review-clear")
                                     .small()
                                     .label("Clear cached exports")
                                     .disabled(!can_clear)
                                     .when(!can_clear, |button| {
-                                        button
-                                            .text_color(roles.text_disabled)
-                                            .resting_tooltip(clear_reason)
+                                        button.resting_tooltip(clear_reason)
                                     })
                                     .on_click(move |_, _, cx| {
                                         let _ = clear_button.update(cx, |app, cx| {
@@ -1047,14 +1044,12 @@ impl TerminalWindow {
                                         });
                                     })
                                     .into_any_element(),
-                                zed_button("settings-review-forget")
+                                Button::new("settings-review-forget")
                                     .small()
                                     .label("Forget delivered reviews")
                                     .disabled(!can_forget)
                                     .when(!can_forget, |button| {
-                                        button.text_color(roles.text_disabled).resting_tooltip(
-                                            "Forgetting delivered reviews…",
-                                        )
+                                        button.resting_tooltip("Forgetting delivered reviews…")
                                     })
                                     .on_click(move |_, _, cx| {
                                         let _ = forget_button.update(cx, |app, cx| {
@@ -1082,11 +1077,10 @@ impl TerminalWindow {
             .footer(
                 DialogFooter::new()
                     .child(
-                        zed_button("settings-reset")
-                            .text()
+                        Button::new("settings-reset")
+                            .ghost()
                             .label("Reset to defaults")
                             .disabled(is_default || saving)
-                            .when(is_default || saving, |button| button.text_color(roles.text_disabled))
                             .on_click(move |_, window, cx| {
                                 let _ = reset.update(cx, |app, cx| {
                                     app.reset_settings_draft(window, cx)
@@ -1096,8 +1090,7 @@ impl TerminalWindow {
                     .child(div().flex_1())
                     .child({
                         let cancel = cancel.clone();
-                        zed_button("settings-cancel")
-                            .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
+                        Button::new("settings-cancel")
                             .label("Cancel")
                             .disabled(saving)
                             .on_click(move |_, _, cx| {
@@ -1110,7 +1103,7 @@ impl TerminalWindow {
                             })
                     })
                     .child(
-                        zed_button("settings-apply")
+                        Button::new("settings-apply")
                             .primary()
                             .label(if saving { "Saving…" } else { "Apply" })
                             .disabled(saving)

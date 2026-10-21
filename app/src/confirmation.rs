@@ -3,7 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::component::{
-    button::{ButtonVariant, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     dialog::{Confirm, DialogEntrance, DialogFooter},
     WindowExt,
 };
@@ -40,12 +40,9 @@ pub(crate) fn ask(
                             }
                         });
                         let click = choose.clone();
-                        crate::theme::zed_button(("confirmation-choice", choice))
+                        Button::new(("confirmation-choice", choice))
                             .label(*label)
-                            .with_variant(match variant {
-                                ButtonVariant::Default => ButtonVariant::Secondary,
-                                variant => *variant,
-                            })
+                            .with_variant(*variant)
                             .on_click(move |_, window, cx| click(window, cx))
                             // The dialog binds Enter to Confirm before GPUI's native
                             // keyboard click. Let the focused choice answer it.

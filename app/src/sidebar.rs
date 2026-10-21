@@ -15,7 +15,7 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::{
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
     input::Input,
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
@@ -31,14 +31,13 @@ use gpui_kit::{
 use muster_core::workspace::RepoKind;
 
 use crate::app::{
-    baseline_from_bottom, sidebar_action_style, sidebar_faint_ink, sidebar_name, sidebar_repo_path,
-    sidebar_row_focus, sidebar_text_width, toggle, ButtonA11y, TerminalWindow, ViewKind,
-    UI_FONT_FAMILY,
+    baseline_from_bottom, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
+    sidebar_text_width, toggle, ButtonA11y, TerminalWindow, ViewKind, UI_FONT_FAMILY,
 };
 use crate::file_icons;
 use crate::navigation::{checkout_title, session_title, ForegroundProgram};
 use crate::terminal::{PiTaskState, ShellState};
-use crate::theme::{zed_button, Roles};
+use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
 
 pub(crate) const SIDEBAR_DRAG_THRESHOLD: f32 = 5.0;
@@ -803,9 +802,11 @@ impl TerminalWindow {
                 .pt(px(8.))
                 .pb(px(4.))
                 .child(
-                    zed_button(SharedString::from(format!("fold-repo-{id}")))
+                    Button::new(SharedString::from(format!("fold-repo-{id}")))
                         .text()
-                        .rounded(px(0.))
+                        // The toolkit's text variant asks for a pointing hand,
+                        // which is for links. This is a command.
+                        .cursor_default()
                         .absolute()
                         .left(px(10.))
                         .right(px(if has_menu { 36. } else { 8. }))
@@ -902,8 +903,9 @@ impl TerminalWindow {
                                 trigger.bg(roles.hover)
                             })
                             .child(
-                                zed_button(SharedString::from(format!("actions-{id}")))
+                                Button::new(SharedString::from(format!("actions-{id}")))
                                     .text()
+                                    .cursor_default()
                                     .text_color(sidebar_faint_ink(cx))
                                     .opacity(if self.open_repo_menu.as_deref() == Some(&id) {
                                         1.
@@ -915,7 +917,6 @@ impl TerminalWindow {
                                         |style| style.opacity(1.),
                                     )
                                     .focus(|style| style.opacity(1.))
-                                    .rounded(px(0.))
                                     .h(px(20.))
                                     .w(px(20.))
                                     .p_0()
@@ -1025,12 +1026,12 @@ impl TerminalWindow {
                         move |app, _, window, cx| app.select_checkout_row(&row_select_id, window, cx)
                     }))
                     .child(
-                        zed_button(SharedString::from(format!("fold-checkout-{id}")))
+                        Button::new(SharedString::from(format!("fold-checkout-{id}")))
                             .text()
+                            .cursor_default()
                             .text_color(sidebar_faint_ink(cx))
                             .small()
                             .compact()
-                            .rounded(px(0.))
                             .h(px(26.))
                             .w(px(16.))
                             .ml(px(-4.))
@@ -1057,9 +1058,9 @@ impl TerminalWindow {
                             })),
                     )
                     .child(
-                        zed_button(SharedString::from(format!("select-checkout-{id}")))
+                        Button::new(SharedString::from(format!("select-checkout-{id}")))
                             .text()
-                            .rounded(px(0.))
+                            .cursor_default()
                             .absolute()
                             .left(px(27.))
                             .top(px(0.))
@@ -1197,10 +1198,9 @@ impl TerminalWindow {
                     .when(has_close && checkout.is_missing, |row| {
                         let dismiss_id = id.clone();
                         row.child(
-                            zed_button(SharedString::from(format!("dismiss-missing-{id}")))
-                                .custom(sidebar_action_style(cx))
+                            Button::new(SharedString::from(format!("dismiss-missing-{id}")))
+                                .ghost()
                                 .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                .rounded(px(0.))
                                 .absolute()
                                 .right(px(8.))
                                 .top(px(3.))
@@ -1231,10 +1231,9 @@ impl TerminalWindow {
                             // The contextual lifecycle dialog names both reversible archive
                             // and destructive deletion; no row action deletes immediately.
                             row.child(
-                                zed_button(SharedString::from(format!("worktree-actions-{id}")))
-                                    .custom(sidebar_action_style(cx))
+                                Button::new(SharedString::from(format!("worktree-actions-{id}")))
+                                    .ghost()
                                     .when(dragging, |button| button.cursor(gpui_kit::CursorStyle::ClosedHand))
-                                    .rounded(px(0.))
                                     .absolute()
                                     .right(px(8.))
                                     .top(px(3.))
@@ -1587,9 +1586,9 @@ impl TerminalWindow {
                         })
                         .when(!renaming, |row| {
                             row.child(
-                                zed_button(SharedString::from(format!("select-session-{id}")))
+                                Button::new(SharedString::from(format!("select-session-{id}")))
                                     .text()
-                                    .rounded(px(0.))
+                                    .cursor_default()
                                     .absolute()
                                     .left(px(0.))
                                     .right(px(0.))
@@ -1636,9 +1635,8 @@ impl TerminalWindow {
                         })
                         .child(div().flex_1().min_w_0().pr(px(20.)).child(content))
                         .child(
-                            zed_button(SharedString::from(format!("close-session-{id}")))
-                                .custom(sidebar_action_style(cx))
-                                .rounded(px(0.))
+                            Button::new(SharedString::from(format!("close-session-{id}")))
+                                .ghost()
                                 .absolute()
                                 .right(px(8.))
                                 .top(px(3.))
@@ -1652,12 +1650,6 @@ impl TerminalWindow {
                                 .resting_tooltip("Close terminal")
                                 .accessibility_label(format!("Close terminal session: {title}"))
                                 .disabled(closing)
-                                .when(closing, |button| {
-                                    button
-                                        .bg(roles.disabled_surface)
-                                        .text_color(roles.text_disabled)
-                                        .border_color(gpui_kit::transparent_black())
-                                })
                                 .when(dragging && !closing, |button| {
                                     button.cursor(gpui_kit::CursorStyle::ClosedHand)
                                 })
@@ -1798,11 +1790,11 @@ impl TerminalWindow {
                                 .hover(|style| style.bg(roles.row_hover(selected)))
                                 .when(selected, |row| row.bg(roles.row_rest(true)))
                                 .child(
-                                    zed_button(SharedString::from(format!(
+                                    Button::new(SharedString::from(format!(
                                         "select-view-{view_key}"
                                     )))
                                     .text()
-                                    .rounded(px(0.))
+                                    .cursor_default()
                                     .absolute()
                                     .left(px(0.))
                                     .right(px(0.))
@@ -1833,11 +1825,10 @@ impl TerminalWindow {
                                     )
                                 })
                                 .child(
-                                    zed_button(SharedString::from(format!(
+                                    Button::new(SharedString::from(format!(
                                         "close-view-{view_key}"
                                     )))
-                                    .custom(sidebar_action_style(cx))
-                                    .rounded(px(0.))
+                                    .ghost()
                                     .absolute()
                                     .right(px(8.))
                                     .top(px(3.))
@@ -1894,9 +1885,9 @@ impl TerminalWindow {
                             // accessible name, not a label and a neighbour that
                             // happen to agree.
                             .child(
-                                zed_button(SharedString::from(format!("select-item-{label}")))
+                                Button::new(SharedString::from(format!("select-item-{label}")))
                                     .text()
-                                    .rounded(px(0.))
+                                    .cursor_default()
                                     .absolute()
                                     .left(px(0.))
                                     .right(px(0.))
@@ -2132,12 +2123,12 @@ impl TerminalWindow {
             )
             .child(
                 div().border_t_1().border_color(roles.border).child(
-                    zed_button("open-directory")
+                    Button::new("open-directory")
                         .text()
+                        .cursor_default()
                         .text_color(sidebar_faint_ink(cx))
                         .small()
                         .compact()
-                        .rounded(px(0.))
                         .w_full()
                         .h(px(26.))
                         .icon(IconName::FolderPlus)
@@ -2145,12 +2136,6 @@ impl TerminalWindow {
                         .accessibility_label("Open directory")
                         .resting_tooltip("Open directory")
                         .disabled(self.opening || self.closing)
-                        .when(self.opening || self.closing, |button| {
-                            button
-                                .bg(roles.disabled_surface)
-                                .text_color(roles.text_disabled)
-                                .border_color(gpui_kit::transparent_black())
-                        })
                         .when(dragging && !self.opening && !self.closing, |button| {
                             button.cursor(gpui_kit::CursorStyle::ClosedHand)
                         })

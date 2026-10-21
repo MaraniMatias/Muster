@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::TerminalWindow;
-use crate::theme::{zed_button, Roles};
-use gpui_kit::component::button::ButtonVariants;
+use crate::theme::Roles;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::{Dialog, DialogContent, DialogFooter};
 use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 use gpui_kit::component::input::{InputState, TextareaState};
@@ -938,7 +938,7 @@ impl TerminalWindow {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            zed_button("cancel-clear-review-exports")
+                            Button::new("cancel-clear-review-exports")
                                 .label("Cancel")
                                 .on_click(move |_, _, cx| {
                                     let _ = cancel.update(cx, |app, cx| {
@@ -947,7 +947,7 @@ impl TerminalWindow {
                                 }),
                         )
                         .child(
-                            zed_button("confirm-clear-review-exports")
+                            Button::new("confirm-clear-review-exports")
                                 .danger()
                                 .label("Delete exports")
                                 .on_click(move |_, window, cx| {
@@ -991,7 +991,7 @@ impl TerminalWindow {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            zed_button("cancel-delete-review-note")
+                            Button::new("cancel-delete-review-note")
                                 .label("Cancel")
                                 .on_click(move |_, _, cx| {
                                     let _ = cancel.update(cx, |app, cx| {
@@ -1000,7 +1000,7 @@ impl TerminalWindow {
                                 }),
                         )
                         .child(
-                            zed_button("confirm-delete-review-note")
+                            Button::new("confirm-delete-review-note")
                                 .danger()
                                 .label("Delete note")
                                 .on_click(move |_, _, cx| {
@@ -1566,7 +1566,7 @@ impl TerminalWindow {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            zed_button("cancel-opencode-send")
+                            Button::new("cancel-opencode-send")
                                 .label("Not now")
                                 .on_click(move |_, _, cx| {
                                     let _ = cancel.update(cx, |app, cx| {
@@ -1574,7 +1574,7 @@ impl TerminalWindow {
                                     });
                                 }),
                         )
-                        .child(zed_button("queue-opencode-send").label("Queue").on_click(
+                        .child(Button::new("queue-opencode-send").label("Queue").on_click(
                             move |_, window, cx| {
                                 let _ = queue.update(cx, |app, cx| {
                                     app.choose_opencode_dispatch(
@@ -1586,7 +1586,7 @@ impl TerminalWindow {
                             },
                         ))
                         .child(
-                            zed_button("send-opencode-send")
+                            Button::new("send-opencode-send")
                                 .primary()
                                 .label("Send now")
                                 .on_click(move |_, window, cx| {
@@ -2043,7 +2043,7 @@ impl TerminalWindow {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            zed_button("cancel-forget-opencode-reviews")
+                            Button::new("cancel-forget-opencode-reviews")
                                 .label("Cancel")
                                 .on_click(move |_, _, cx| {
                                     let _ = cancel.update(cx, |app, cx| {
@@ -2052,7 +2052,7 @@ impl TerminalWindow {
                                 }),
                         )
                         .child(
-                            zed_button("confirm-forget-opencode-reviews")
+                            Button::new("confirm-forget-opencode-reviews")
                                 .label("Forget notes")
                                 .on_click(move |_, window, cx| {
                                     let _ = forget.update(cx, |app, cx| {
@@ -2061,7 +2061,7 @@ impl TerminalWindow {
                                 }),
                         )
                         .child(
-                            zed_button("confirm-reset-opencode-reviews")
+                            Button::new("confirm-reset-opencode-reviews")
                                 .danger()
                                 .label("Forget and reset")
                                 .on_click(move |_, window, cx| {

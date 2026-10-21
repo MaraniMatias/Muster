@@ -14,7 +14,8 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     dialog::{Dialog, DialogContent, DialogFooter},
     input::{Input, InputState},
     Disableable, Sizable,
@@ -27,7 +28,7 @@ use muster_core::navigation::WorktreeRemovalInfo;
 use muster_core::workspace::RepoKind;
 
 use crate::app::TerminalWindow;
-use crate::theme::{zed_button, Roles};
+use crate::theme::Roles;
 
 /// The one worktree this window is removing, if it is removing one.
 pub(crate) struct WorktreeRemovalDraft {
@@ -175,7 +176,6 @@ impl TerminalWindow {
                         Input::new(&task)
                             .small()
                             .bg(roles.surface_base)
-                            .rounded_none()
                             .aria_label("Task name")
                             .w_full(),
                     )
@@ -194,7 +194,6 @@ impl TerminalWindow {
                         Input::new(&branch)
                             .small()
                             .bg(roles.surface_base)
-                            .rounded_none()
                             .aria_label("New branch")
                             .w_full(),
                     )
@@ -208,7 +207,6 @@ impl TerminalWindow {
                         Input::new(&base)
                             .small()
                             .bg(roles.surface_base)
-                            .rounded_none()
                             .aria_label("Starting from branch")
                             .w_full(),
                     );
@@ -234,19 +232,16 @@ impl TerminalWindow {
             })
             .footer(
                 DialogFooter::new()
+                    .child(Button::new("worktree-cancel").label("Cancel").on_click(
+                        move |_, _window, cx| {
+                            let _ = cancel_button.update(cx, |app, cx| {
+                                close_worktree_dialog(app, cx);
+                                cx.notify();
+                            });
+                        },
+                    ))
                     .child(
-                        zed_button("worktree-cancel")
-                            .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
-                            .label("Cancel")
-                            .on_click(move |_, _window, cx| {
-                                let _ = cancel_button.update(cx, |app, cx| {
-                                    close_worktree_dialog(app, cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        zed_button("worktree-create")
+                        Button::new("worktree-create")
                             .primary()
                             .label(if draft.busy {
                                 "Creating…"
@@ -425,15 +420,11 @@ impl TerminalWindow {
                         let shell_checkout_id = shell_checkout_id.clone();
                         content = content
                             .child(preview)
-                            .child(zed_button("worktree-commit-shell")
+                            .child(Button::new("worktree-commit-shell")
                                 .text()
+                                .cursor_default()
                                 .label("Open a shell to commit or stash first")
                                 .disabled(busy)
-                                .when(busy, |button| {
-                                    button.bg(roles.disabled_surface)
-                                        .text_color(roles.text_disabled)
-                                        .border_color(gpui_kit::transparent_black())
-                                })
                                 .on_click(move |_, window, cx| {
                                     let _ = open_shell.update(cx, |app, cx| {
                                         close_worktree_dialog(app, cx);
@@ -441,7 +432,7 @@ impl TerminalWindow {
                                     });
                                 }))
                             .child(
-                                crate::theme::checkbox("worktree-confirm-dirty", roles)
+                                Checkbox::new("worktree-confirm-dirty")
                                     .checked(dirty_confirmed)
                                     .label("I understand uncommitted files may be lost; delete anyway.")
                                     .on_change(move |checked, _, cx| {
@@ -486,7 +477,7 @@ impl TerminalWindow {
                         if info.branch.is_none() {
                             let toggle_unmerged = toggle_unmerged.clone();
                             content = content.child(
-                                crate::theme::checkbox("worktree-confirm-unmerged", roles)
+                                Checkbox::new("worktree-confirm-unmerged")
                                     .checked(unmerged_confirmed)
                                     .label("I understand these detached commits may be lost; delete anyway.")
                                     .on_change(move |checked, _, cx| {
@@ -508,7 +499,7 @@ impl TerminalWindow {
                     if let Some(branch) = info.branch.as_deref() {
                         let toggle_branch = toggle_branch.clone();
                         content = content.child(
-                            crate::theme::checkbox("worktree-delete-branch", roles)
+                            Checkbox::new("worktree-delete-branch")
                                 .checked(delete_branch)
                                 .label(format!(
                                     "Delete local branch {}{}",
@@ -576,16 +567,24 @@ impl TerminalWindow {
             })
             .footer(
                 DialogFooter::new()
+                    // The destructive action comes first and stands on its own:
+                    // it is the one button here that cannot be taken back.
                     .child(
-                        zed_button("worktree-removal-cancel")
-                            .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
+                        Button::new("worktree-delete")
+                            .danger()
+                            .label(if busy { "Deleting…" } else { "Delete worktree" })
+                            .disabled(!can_delete)
+                            .on_click(move |_, window, cx| {
+                                let _ = delete.update(cx, |app, cx| {
+                                    app.submit_worktree_delete(window, cx)
+                                });
+                            }),
+                    )
+                    .child(div().w_4())
+                    .child(
+                        Button::new("worktree-removal-cancel")
                             .label("Cancel")
                             .disabled(busy)
-                            .when(busy, |button| {
-                                button.bg(roles.disabled_surface)
-                                    .text_color(roles.text_disabled)
-                                    .border_color(gpui_kit::transparent_black())
-                            })
                             .on_click(move |_, _, cx| {
                                 let _ = close_for_cancel.update(cx, |app, cx| {
                                     close_worktree_dialog(app, cx);
@@ -593,30 +592,11 @@ impl TerminalWindow {
                             }),
                     )
                     .child(
-                        zed_button("worktree-archive")
-                            .custom(crate::app::sidebar_action_style(cx).foreground(roles.text))
+                        Button::new("worktree-archive")
                             .label(if busy { "Archiving…" } else { "Archive" })
                             .disabled(!can_archive)
-                            .when(!can_archive, |button| {
-                                button.bg(roles.disabled_surface)
-                                    .text_color(roles.text_disabled)
-                                    .border_color(gpui_kit::transparent_black())
-                            })
                             .on_click(move |_, _, cx| {
                                 let _ = archive.update(cx, |app, cx| app.submit_worktree_archive(cx));
-                            }),
-                    )
-                    .child(
-                        zed_button("worktree-delete")
-                            .danger()
-                            .border_1()
-                            .border_color(roles.status.danger)
-                            .label(if busy { "Deleting…" } else { "Delete worktree" })
-                            .disabled(!can_delete)
-                            .on_click(move |_, window, cx| {
-                                let _ = delete.update(cx, |app, cx| {
-                                    app.submit_worktree_delete(window, cx)
-                                });
                             }),
                     ),
             )
