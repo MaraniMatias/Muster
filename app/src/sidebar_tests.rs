@@ -3084,6 +3084,54 @@ async fn archiving_keeps_worktree_files_and_git_registration(cx: &mut TestAppCon
     close(&fixture, cx);
 }
 
+/// The removal dialog reads its buttons as Delete, Cancel, Archive.
+///
+/// The destructive action comes first and stands apart from the two that
+/// leave the checkout alone: it is the one button there that cannot be taken
+/// back, so it is read before them rather than after them.
+#[gpui_kit::test]
+async fn the_destructive_action_comes_first_in_the_removal_dialog(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (id, _) = add_worktree(&fixture, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_removal_dialog(&fixture.repo_id, &id, window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| draft.info.is_some())
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let delete = window.find("worktree-delete").bounds();
+        let cancel = window.find("worktree-removal-cancel").bounds();
+        let archive = window.find("worktree-archive").bounds();
+        assert!(
+            delete.left() < cancel.left() && cancel.left() < archive.left(),
+            "the removal dialog reads Delete, Cancel, Archive, and it reads them \
+             at {}px, {}px and {}px",
+            delete.left().as_f32(),
+            cancel.left().as_f32(),
+            archive.left().as_f32()
+        );
+        let gap = cancel.left().as_f32() - delete.right().as_f32();
+        assert!(
+            gap >= 16.,
+            "the destructive action stands apart from the others, but the gap \
+             between them is {gap}px"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 #[gpui_kit::test]
 fn stale_diff_totals_require_the_same_revision_and_checkout_membership(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
