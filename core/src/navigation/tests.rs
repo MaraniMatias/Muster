@@ -498,9 +498,17 @@ fn oversized_save_preserves_last_good_file() {
 fn overflowing_git_output_is_refused_instead_of_truncated() {
     let temp = tempdir().unwrap();
     let began = std::time::Instant::now();
+    // Thirty-two megabytes of zeros, written as fast as the pipe takes them:
+    // twice the cap, and quick. A flood that produces its bytes slowly lets
+    // the deadline arrive before the cap, and the test would then be about the
+    // deadline rather than about the cap.
     let error = git_output(
         temp.path(),
-        &["-c", "alias.flood=!yes x", "flood"],
+        &[
+            "-c",
+            "alias.flood=!head -c 33554432 /dev/zero",
+            "flood",
+        ],
         Duration::from_secs(5),
     )
     .unwrap_err();
