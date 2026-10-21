@@ -5,16 +5,32 @@
 //! components paint with. A row drawn by hand and a menu drawn by the toolkit
 //! therefore share one palette and state language.
 //!
-//! ## Shape: Zed's radii, the toolkit's sizes
+//! ## Shape: one radius for controls, one for overlays
 //!
-//! GPUI Kit is not the widget library Zed draws with — Zed's buttons and
-//! overlays live in its own unpublished crate, and the toolkit's widgets are
-//! a different design system on the same `gpui` core. So the shape of a
-//! control is set here too: [`install`] gives the theme Zed's two corner
-//! radii (4px for a button, 8px for an overlay) and [`zed_button`] gives every
-//! button Zed's borderless fill. Form fields keep square, hairline borders. What the toolkit still decides on its own is
-//! the *size* ladder — 20/24/32px where Zed's is 22/28/32 — because it hardcodes
-//! those in each widget's render and no theme token reaches them.
+//! The shape of a control is set here, in one place: [`install`] gives the
+//! theme a 4px radius for controls and the small overlays the toolkit draws
+//! itself, and an 8px one for the large surfaces that sit over the window.
+//! The toolkit's own widgets read those tokens, so a button, a field and a
+//! picker wear the same corner without a call site naming it.
+//! What the toolkit still decides on its own is the *size* ladder —
+//! 20/24/32px — because it hardcodes those in each widget's render and no
+//! theme token reaches them.
+//!
+//! ## Focus: a line on the control's own edge
+//!
+//! The toolkit can paint a focused control with a 3px ring *outside* its
+//! border. This window's rows clip their content — a name is cut with an
+//! ellipsis, a tree row is a fixed height — so that ring is cut off exactly
+//! where a keyboard user needs to see it. [`install`] turns the ring off, and
+//! the toolkit's other treatment takes over: a 1px line on the control's own
+//! edge for padded controls, rather than a wide outer halo.
+//!
+//! Where that line lands depends on the control: a control that has a
+//! border of its own — a field, an ordinary button — turns that border the
+//! ring colour; a filled button without one draws a hairline inside its own
+//! edge in its own ink; a borderless one draws the ring colour on its edge;
+//! and the toolkit's text variant — the one with no padding at all — draws it
+//! just outside the text, where a clipped row can cut it.
 //!
 //! ## Dark only
 //!
@@ -31,13 +47,9 @@
 
 use std::sync::Arc;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::highlighter::{HighlightTheme, HighlightThemeStyle, LanguageConfig};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{
-    px, rgb, rgba, App, ElementId, Hsla, InteractiveElement, StatefulInteractiveElement, Styled,
-};
+use gpui_kit::{px, rgb, rgba, App, Hsla};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
@@ -404,7 +416,10 @@ pub fn install(cx: &mut App) {
         theme.button_secondary_hover = hover;
         theme.button_secondary_active = pressed;
         theme.button_secondary_foreground = text;
-        // Danger actions are outlined rather than solid red.
+        // A danger action is the danger ink and the wash it wears, never a
+        // solid red fill: the label is what says the action destroys, and a
+        // filled button that colour would shout over the decision the
+        // surrounding dialog is asking for.
         theme.danger = danger;
         theme.danger_foreground = danger_text;
         theme.danger_hover = danger.alpha(0.12);
@@ -448,66 +463,33 @@ pub fn install(cx: &mut App) {
         // surfaces remain aligned when the terminal font size changes.
         // `font_size` remains the toolkit's base UI scale.
         theme.mono_font_size = crate::terminal::FONT_SIZE;
-        // Zed's two corner radii, in the places the toolkit keeps them. A
-        // control in Zed is rounded 4px (`rounded_sm`) and an overlay — a
-        // dialog, a palette, a dropdown panel — is rounded 8px
-        // (`rounded_lg`).
+        // Two corner radii, in the two places the toolkit keeps them. The
+        // toolkit reads `radius` for a control *and* for the small overlays it
+        // draws itself — a menu, a popover, a picker's panel — and `radius_lg`
+        // for the large surfaces that sit over the window: a dialog, a
+        // notification, a command palette.
         //
-        // The toolkit keeps one `radius` for both roles and a `radius_lg` for
-        // the panels it knows are large, so `radius` is given Zed's *overlay*
-        // number: it is the one its dropdown menus and popovers read, and a
-        // menu that rounds 4px where every Zed menu rounds 8px is the one
-        // shape difference a menu cannot hide. The controls that share that
-        // token name their shape where they are built: 4px for buttons through
-        // [`zed_button`], square corners for form fields. Neither inherits the
-        // overlay radius, which would turn a compact field into a pill.
-        theme.radius = px(8.);
+        // Giving `radius` the control number keeps a menu, a field and a
+        // button on one scale instead of two, and it is what lets them wear
+        // the same corner without a call site naming it.
+        theme.radius = px(4.);
         theme.radius_lg = px(8.);
+        // The toolkit paints a focused control with a 3px ring *outside* its
+        // border. This window's rows clip their content — a name is cut with
+        // an ellipsis, a tree row is a fixed height — so that ring is cut off
+        // exactly where a keyboard user needs to see it.
+        //
+        // The toolkit's other focus treatment is a 1px line, and where it is
+        // drawn depends on the control: a control that has a border of its
+        // own — a field, an ordinary button — turns that border the ring
+        // colour, a filled button without one draws a hairline inside its own
+        // edge in its own ink, and a borderless one draws the ring colour on
+        // its edge. A variant with no padding at all — the toolkit's text —
+        // is the one exception: its line sits just outside the text, where a
+        // clipped row can cut it.
+        theme.focus_ring = false;
         theme.highlight_theme = Arc::new(content_highlight_theme(theme));
     });
-}
-
-/// A button wearing the shape Zed draws one in, in this app's colours.
-///
-/// Zed fills a control and rounds it 4px, with no outline at all: the only edge
-/// a button has is the contrast between its fill and the surface behind it. The
-/// toolkit's default variant is the opposite — the same fill inside a 1px
-/// hairline box — so a button drawn that way reads as a text field rather than
-/// as something to press, which is the shape a user asked this app to stop
-/// drawing.
-///
-/// `Secondary` is that same default without its border: [`install`] gives
-/// `button`, `button_hover`, `button_active` and their foregrounds to both
-/// variants, so the fill, the pointer ramp and the ink are unchanged and only
-/// the outline goes.
-///
-/// A control that means to be one of Zed's *other* buttons says so after this
-/// — `.ghost()`, `.text()` and `.custom(..)` each replace the variant — so this
-/// is the shape a button wears unless the call site names another.
-///
-/// The 4px corner is named here rather than left to [`Theme::radius`], which
-/// carries the *overlay's* radius: a button is a control, and Zed rounds a
-/// control `rounded_sm`.
-///
-/// One state does move: a disabled control keeps its fill and dims its ink,
-/// where the default variant dimmed the fill as well. That is what every
-/// borderless variant in the toolkit does, and a dimmed label on an unchanged
-/// fill still says "not now" next to a pointer that no longer answers.
-///
-/// The native arrow cursor is explicit because the toolkit's text variant
-/// otherwise opts into a pointing hand intended for link-like content.
-pub fn zed_button(id: impl Into<ElementId>) -> Button {
-    Button::new(id).secondary().rounded(px(4.)).cursor_default()
-}
-
-/// A checkbox with a quiet hover surface and a distinct pressed state.
-/// The toolkit keeps ownership of its checkmark, keyboard focus and activation.
-pub fn checkbox(id: impl Into<ElementId>, roles: Roles) -> Checkbox {
-    Checkbox::new(id)
-        .p_1()
-        .cursor_default()
-        .hover(move |style| style.bg(roles.hover))
-        .active(move |style| style.bg(roles.pressed))
 }
 
 /// Every capture name a grammar this app compiles in can emit, and the Legacy
@@ -815,8 +797,6 @@ pub struct Roles {
     pub focus: Hsla,
     /// The primary action and small affirmative marks such as selected checkmarks.
     pub accent: Hsla,
-    /// The wash a control that cannot be used wears instead of its own.
-    pub disabled_surface: Hsla,
     // ---- meaning --------------------------------------------------------
     pub status: Status,
     /// The marker a row drag draws: the slot's outline and its label.
@@ -861,7 +841,6 @@ impl Roles {
             focus: theme.ring,
             // The theme's own accent, which is what its primary controls wear.
             accent: theme.primary,
-            disabled_surface: theme.muted,
             status: Status {
                 added: rgb(CONTENT_ADDED).into(),
                 removed: rgb(CONTENT_REMOVED).into(),
@@ -1128,7 +1107,6 @@ mod tests {
             }
             assert_eq!(roles.row_hover(true), roles.selected_hover);
             assert_eq!(roles.selected_hover, roles.selected);
-            assert_eq!(roles.disabled_surface, theme.muted);
         });
     }
 
@@ -1148,18 +1126,20 @@ mod tests {
         });
     }
 
-    /// Every overlay is rounded the way Zed rounds one.
+    /// A control and an overlay wear two different corners, and the controls
+    /// wear theirs without naming it.
     ///
-    /// The toolkit's own default is 6px, which is its design system's radius
-    /// rather than Zed's, and it is what a dropdown panel, a popover and a
-    /// dialog would all inherit. Zed rounds every one of those `rounded_lg`.
+    /// The toolkit reads `radius` for a control and for the small overlays it
+    /// draws itself, and `radius_lg` for the large ones — a dialog, a
+    /// notification, a command palette. The app's own rule is a 4px corner on
+    /// a control and an 8px one on a large surface, so `radius` is the
+    /// control number and the large surfaces keep the overlay number.
     ///
-    /// A *control* is not on this test: the toolkit keeps one token for both
-    /// roles, so `radius` holds the overlay's 8px and the controls name the
-    /// shape they wear where they are built — `zed_button` for 4px buttons,
-    /// and square corners for form fields.
+    /// A call site that named a corner would put the policy back in the place
+    /// it does not belong: the theme is what a button, a field and a picker
+    /// all read, and they are the same shape because of it.
     #[gpui_kit::test]
-    fn overlays_are_rounded_lg(cx: &mut TestAppContext) {
+    fn controls_and_overlays_wear_two_different_corners(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install(cx);
@@ -1168,15 +1148,39 @@ mod tests {
             let theme = Theme::global(cx);
             assert_eq!(
                 theme.radius,
-                px(8.),
-                "a dropdown, a popover and a dialog follow Zed's rounded_lg"
+                px(4.),
+                "a button, a field and a picker wear the control's corner"
             );
             assert_eq!(
                 theme.radius_lg,
                 px(8.),
-                "and so does the panel the toolkit knows is large"
+                "and a dialog, a notification and a palette wear the overlay's"
             );
-            assert_eq!(theme.radius_tokens().md, px(8.));
+            assert_eq!(theme.radius_tokens().sm, px(2.));
+            assert_eq!(theme.radius_tokens().md, px(4.));
+            assert_eq!(theme.radius_tokens().lg, px(8.));
+        });
+    }
+
+    /// Pin the thin-focus policy and its ink contrast, not rendered geometry.
+    #[gpui_kit::test]
+    fn thin_focus_policy_uses_legible_ink(cx: &mut TestAppContext) {
+        let roles = dark(cx);
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            assert!(
+                !theme.focus_ring,
+                "the outer ring is clipped by the rows that scroll and truncate"
+            );
+            // The colour the thin focus is painted with is the theme's ring,
+            // and it is the one the app names `focus` everywhere.
+            assert_eq!(theme.ring, roles.focus);
+            for surface in [roles.surface, roles.surface_raised, roles.hover] {
+                assert!(
+                    contrast(roles.focus, surface) >= 3.,
+                    "a focus line has to be readable against the surface it is drawn on"
+                );
+            }
         });
     }
 

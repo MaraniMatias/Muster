@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    button::{Button, ButtonVariants},
     command::{Command, CommandGroup, CommandItem, CommandState},
     popover::Popover,
     Disableable, Icon, IndexPath, Sizable, TitleBar,
@@ -31,7 +31,7 @@ use crate::app::{
 use crate::file_icons;
 use crate::navigation::{checkout_title, foreground_program, ForegroundProgram};
 use crate::sidebar::foreground_program_icon;
-use crate::theme::{zed_button, Roles};
+use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
 
 #[cfg(target_os = "macos")]
@@ -104,11 +104,13 @@ fn titlebar_crumb(
     // Account for the button's inset and glyph before fitting the text.
     let icon_width = if glyph.present() { 20. } else { 0. };
     let fitted = fitted_name(window, label, (budget - 8. - icon_width).max(0.), 14.);
-    let crumb = zed_button(id)
-        .text()
+    let crumb = Button::new(id)
+        .ghost()
         .small()
-        .rounded(px(0.))
-        .h(px(22.))
+        // A ghost button draws its own box: the toolkit's small size and its
+        // own padding. The crumb keeps the bar's line, so it says how tall it
+        // is and how much room it takes around its name.
+        .h(px(24.))
         .px(px(4.))
         .font_family(UI_FONT_FAMILY)
         .text_size(px(14.))
@@ -378,7 +380,7 @@ fn crumb_menu(
         .text_color(roles.text)
         .group(CommandGroup::new().label(group).items(items));
     menu = match action {
-        Some(action) => menu.footer(move |_, _, cx| {
+        Some(action) => menu.footer(move |_, _, _| {
             div()
                 .w_full()
                 .px(px(4.))
@@ -395,16 +397,10 @@ fn crumb_menu(
                 .child(
                     action()
                         .compact()
-                        .custom(
-                            ButtonCustomVariant::new(cx)
-                                .foreground(roles.text_muted)
-                                .hover(roles.hover)
-                                .active(roles.pressed),
-                        )
+                        .ghost()
                         .w_full()
                         .justify_start()
                         .h(px(28.))
-                        .rounded(px(4.))
                         .px(px(8.))
                         .font_family(UI_FONT_FAMILY)
                         .text_size(px(13.))
@@ -703,8 +699,8 @@ impl TerminalWindow {
                                     let chooser = chooser.clone();
                                     move || {
                                         let chooser = chooser.clone();
-                                        zed_button("workdir-open-directory")
-                                            .text()
+                                        Button::new("workdir-open-directory")
+                                            .ghost()
                                             .small()
                                             .label("Open directory")
                                             .icon(Icon::new(IconName::FolderPlus).size_4())
@@ -791,8 +787,8 @@ impl TerminalWindow {
                                         move || {
                                             let dialog = dialog.clone();
                                             let repo_id = repo_id.clone();
-                                            zed_button("worktree-new")
-                                                .text()
+                                            Button::new("worktree-new")
+                                                .ghost()
                                                 .small()
                                                 .label("New worktree")
                                                 .icon(Icon::new(IconName::GitBranchPlus).size_4())
@@ -867,8 +863,8 @@ impl TerminalWindow {
                                             move || {
                                                 let add = add.clone();
                                                 let checkout_id = checkout_id.clone();
-                                                zed_button("item-new-terminal")
-                                                    .text()
+                                                Button::new("item-new-terminal")
+                                                    .ghost()
                                                     .small()
                                                     .label("New terminal")
                                                     .icon(Icon::new(IconName::Plus).size_4())
@@ -919,11 +915,10 @@ impl TerminalWindow {
         bar.push(div().flex_1().min_w(px(8.)).into_any_element());
         let open_settings = view.clone();
         bar.push(
-            zed_button("settings")
-                .custom(crate::app::sidebar_action_style(cx))
+            Button::new("settings")
+                .ghost()
                 .small()
                 .compact()
-                .h(px(22.))
                 .mr(px(4.))
                 .icon(IconName::Settings)
                 .accessibility_label("Settings")
@@ -935,11 +930,10 @@ impl TerminalWindow {
                 .into_any_element(),
         );
         bar.push(
-            zed_button("toggle-panels")
-                .custom(crate::app::sidebar_action_style(cx))
+            Button::new("toggle-panels")
+                .ghost()
                 .small()
                 .compact()
-                .h(px(22.))
                 .icon(IconName::PanelLeftClose)
                 .accessibility_label("Toggle side panels")
                 .resting_tooltip(TOGGLE_PANELS_TOOLTIP)

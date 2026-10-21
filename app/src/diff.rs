@@ -1,11 +1,12 @@
 //! Retained, virtualized unified code review surface.
 use crate::{
     app::{InspectorTab, TerminalWindow, ViewKind, ViewPin, UI_FONT_FAMILY},
-    theme::{zed_button, Roles},
+    theme::Roles,
     tooltip::RestingTooltip,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
 };
@@ -955,7 +956,6 @@ impl TerminalWindow {
                                         Select::new(picker)
                                             .id("review-range-start")
                                             .xsmall()
-                                            .rounded_none()
                                             .bg(roles.surface_base)
                                             .menu_width(px(96.))
                                             .accessibility_label("First line of the range"),
@@ -971,7 +971,6 @@ impl TerminalWindow {
                                 .w_full()
                                 .mt_2()
                                 .bg(roles.surface_base)
-                                .rounded_none()
                                 .px_2()
                                 .py_1()
                                 .font_family(UI_FONT_FAMILY)
@@ -987,12 +986,9 @@ impl TerminalWindow {
                                 .mt_2()
                                 .flex_row_reverse()
                                 .child(
-                                    zed_button("save-review-note")
+                                    Button::new("save-review-note")
                                         .primary()
-                                        .small()
-                                        .compact()
-                                        .h(px(20.))
-                                        .text_size(px(12.))
+                                        .xsmall()
                                         .label("Save")
                                         .disabled(!composer_can_save)
                                         .on_click(move |_, _, cx| {
@@ -1001,12 +997,9 @@ impl TerminalWindow {
                                         }),
                                 )
                                 .child(
-                                    zed_button("cancel-review-note")
+                                    Button::new("cancel-review-note")
                                         .ghost()
-                                        .small()
-                                        .compact()
-                                        .h(px(20.))
-                                        .text_size(px(12.))
+                                        .xsmall()
                                         .label("Cancel")
                                         .on_click(move |_, _, cx| {
                                             let _ = cancel
@@ -1059,12 +1052,9 @@ impl TerminalWindow {
                                 )
                                 .child({
                                     let id = note_id.clone();
-                                    zed_button(format!("edit-review-{}", note.id))
+                                    Button::new(format!("edit-review-{}", note.id))
                                         .ghost()
-                                        .small()
-                                        .compact()
-                                        .h(px(20.))
-                                        .rounded(px(0.))
+                                        .xsmall()
                                         .icon(IconName::Pencil)
                                         .accessibility_label("Edit this note")
                                         .resting_tooltip("Edit this note")
@@ -1076,12 +1066,9 @@ impl TerminalWindow {
                                 })
                                 .child({
                                     let (checkout, id) = (checkout_id.clone(), note_id.clone());
-                                    zed_button(format!("delete-review-{}", note.id))
+                                    Button::new(format!("delete-review-{}", note.id))
                                         .ghost()
-                                        .small()
-                                        .compact()
-                                        .h(px(20.))
-                                        .rounded(px(0.))
+                                        .xsmall()
                                         .icon(IconName::X)
                                         .accessibility_label("Delete this note")
                                         .resting_tooltip("Delete this note")
@@ -1113,7 +1100,7 @@ impl TerminalWindow {
                         let checkout = checkout_id.clone();
                         card = card.child(
                             div().pt_1().child(
-                                zed_button(format!("accept-review-{}", note.id))
+                                Button::new(format!("accept-review-{}", note.id))
                                     .ghost()
                                     .small()
                                     .label("Accept")
@@ -1142,7 +1129,7 @@ impl TerminalWindow {
                     let weak = annotation_weak.clone();
                     let id = id.clone();
                     row = row.child(
-                        zed_button(format!("retry-diff-{path}"))
+                        Button::new(format!("retry-diff-{path}"))
                             .small()
                             .label("Retry")
                             .on_click(move |_, _, cx| {
@@ -1173,7 +1160,7 @@ impl TerminalWindow {
                 let weak = cx.weak_entity();
                 let checkout = checkout.clone();
                 empty = empty.child(
-                    zed_button("retry-change-set")
+                    Button::new("retry-change-set")
                         .small()
                         .label("Retry")
                         .on_click(move |_, _, cx| {
@@ -1219,9 +1206,9 @@ impl TerminalWindow {
                                 // to edge and rounded only at the outer corners, so
                                 // the chooser reads as part of the action rather than
                                 // as a second thing to press beside it. The inner
-                                // corners are named here because `zed_button`'s own 4px
-                                // is the control's radius — a split has to say which
-                                // corners it keeps.
+                                // corners are named here because a split has to say
+                                // which corners it keeps, and the outer one is the
+                                // theme's own control radius.
                                 .child({
                                     let send_action = weak.clone();
                                     let pi_action = weak.clone();
@@ -1237,9 +1224,9 @@ impl TerminalWindow {
                                     };
                                     div().id("review-export").test_support().flex().flex_none()
                                         .child(
-                                            zed_button("review-primary-action")
+                                            Button::new("review-primary-action")
                                                 .primary()
-                                                .small().compact().h(px(24.))
+                                                .small().compact()
                                                 .rounded_l(px(4.)).rounded_r_none()
                                                 // Markdown is the default destination, so the
                                                 // action says what it does and the chooser
@@ -1254,9 +1241,9 @@ impl TerminalWindow {
                                                 .when(!agent_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
                                         )
                                         .child(
-                                            zed_button("review-destination")
+                                            Button::new("review-destination")
                                                 .primary()
-                                                .small().compact().h(px(24.))
+                                                .small().compact()
                                                 .rounded_r(px(4.)).rounded_l_none()
                                                 .dropdown_caret(true)
                                                 .accessibility_label("Review destination")
@@ -1279,8 +1266,8 @@ impl TerminalWindow {
                                 })
                                 .when_some(source, |header, (repo, source_checkout, path)| {
                                     let weak = weak.clone();
-                                    header.child(zed_button(format!("diff-open-source-{path}"))
-                                        .text().small().compact().h(px(24.)).rounded(px(0.))
+                                    header.child(Button::new(format!("diff-open-source-{path}"))
+                                        .text().cursor_default().small().compact().h(px(24.))
                                         .label("Source").accessibility_label(format!("Show the source of {path}"))
                                         .resting_tooltip("Show this file's source")
                                         .on_click(move |_, window, cx| {
@@ -1288,9 +1275,9 @@ impl TerminalWindow {
                                             let _ = weak.update(cx, |app, cx| app.request_document(repo, checkout, path, window, cx));
                                         }))
                                 })
-                                .child(zed_button("close-diff")
-                                    .custom(crate::app::sidebar_action_style(cx))
-                                    .small().compact().h(px(24.)).rounded(px(0.))
+                                .child(Button::new("close-diff")
+                                    .ghost()
+                                    .small().compact()
                                     .icon(IconName::X).accessibility_label("Close preview").resting_tooltip("Close preview")
                                     .on_click(move |_, window, cx| {
                                         let _ = close.update(cx, |app, cx| {
@@ -1311,7 +1298,7 @@ impl TerminalWindow {
                                 .text_color(roles.text_muted).child(format!("{note_count} {}", if note_count == 1 { "note" } else { "notes" }))))
                             .when(has_outdated, |row| {
                                 let toggle = weak.clone();
-                                row.child(crate::theme::checkbox("review-outdated", roles)
+                                row.child(Checkbox::new("review-outdated")
                                     .checked(include_outdated).label("Include outdated notes")
                                     .on_change(move |_, _, cx| { let _ = toggle.update(cx, |app, cx| app.toggle_include_outdated(cx)); }))
                             })
@@ -1328,8 +1315,13 @@ impl TerminalWindow {
                                         .child(path.clone()))
                                     // Legacy's document toolbar: the path, and the icon that
                                     // puts it on the clipboard beside it.
-                                    .child(zed_button("copy-review-export-path")
-                                        .text().small().compact().h(px(20.)).rounded(px(0.))
+                                    .child(Button::new("copy-review-export-path")
+                                        // A text button draws no box of its own: the
+                                        // toolkit's size ladder reaches the button
+                                        // variants that fill one, and not this one.
+                                        // The height is the target this control
+                                        // offers, so it is named here.
+                                        .text().cursor_default().small().compact().h(px(20.))
                                         .icon(IconName::Copy)
                                         .accessibility_label("Copy the saved review's path")
                                         .resting_tooltip(path.clone())
@@ -1351,18 +1343,14 @@ impl TerminalWindow {
                                                     .id("review-opencode-search")
                                                     .small()
                                                     .bg(roles.surface_base)
-                                                    .rounded_none()
                                                     .aria_label("Search OpenCode sessions")
                                                     .w(px(150.)),
                                             )
                                         })
                                     });
                                 searched.child(
-                                    zed_button("review-opencode-session")
-                                        .small()
-                                        .compact()
-                                        .h(px(20.))
-                                        .rounded(px(0.))
+                                    Button::new("review-opencode-session")
+                                        .xsmall()
                                         .label(opencode_target_label.clone())
                                         .accessibility_label("OpenCode session")
                                         .resting_tooltip(opencode_target_label.clone())
@@ -1408,8 +1396,8 @@ impl TerminalWindow {
                                         ),
                                 )
                             })
-                            .when_some(opencode_session, |row, session| row.child(zed_button("copy-opencode-session-id")
-                                .text().small().compact().h(px(20.)).label("Copy session ID").resting_tooltip(session.clone())
+                            .when_some(opencode_session, |row, session| row.child(Button::new("copy-opencode-session-id")
+                                .text().cursor_default().small().compact().h(px(20.)).label("Copy session ID").resting_tooltip(session.clone())
                                 .accessibility_label("Copy the app-created OpenCode session id")
                                 .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(session.clone())))))
                             .when_some(opencode_status, |row, status| row.child(div().id("opencode-review-status").test_support()
@@ -1422,7 +1410,7 @@ impl TerminalWindow {
                                     let reconcile = weak.clone();
                                     let reconcile_id = round_id.clone();
                                     let weak = weak.clone();
-                                    let button = zed_button("resolve-opencode-round").small().compact();
+                                    let button = Button::new("resolve-opencode-round").small().compact();
                                     let button = match status {
                                         muster_core::opencode::RoundStatus::Queued => button.label("Retry queued review").on_click(move |_, window, cx| {
                                             let _ = weak.update(cx, |app, cx| app.retry_queued_opencode_rounds(window, cx));
@@ -1442,7 +1430,7 @@ impl TerminalWindow {
                                     };
                                     row.child(button.disabled(destination_busy || opencode_loading))
                                         .when(status == muster_core::opencode::RoundStatus::Unknown, |row| row.child(
-                                            zed_button("recheck-unknown-opencode-round").small().compact().label("Check delivery again")
+                                            Button::new("recheck-unknown-opencode-round").small().compact().label("Check delivery again")
                                                 .disabled(destination_busy || opencode_loading)
                                                 .on_click(move |_, window, cx| {
                                                     let _ = reconcile.update(cx, |app, cx| app.reconcile_opencode_round(&reconcile_id, window, cx));

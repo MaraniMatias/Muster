@@ -1,9 +1,9 @@
 //! The central document: read as a reading, edited as its source.
 use crate::app::TerminalWindow;
-use crate::theme::{zed_button, Roles};
+use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState};
@@ -1790,7 +1790,7 @@ impl TerminalWindow {
                 .gap_2()
                 .child(div().text_color(roles.status.warning).child(error.clone()))
                 .child(
-                    zed_button(format!("retry-read-{path}"))
+                    Button::new(format!("retry-read-{path}"))
                         .ghost()
                         .small()
                         .label("Retry")
@@ -1819,7 +1819,7 @@ impl TerminalWindow {
                     let checkout = open_checkout.clone().expect("asked for");
                     let opened = path.clone();
                     pane.child(
-                        zed_button(format!("open-externally-{path}"))
+                        Button::new(format!("open-externally-{path}"))
                             .ghost()
                             .small()
                             .label("Open externally")
@@ -1944,8 +1944,9 @@ impl TerminalWindow {
                     .border_color(roles.border_strong)
                     .rounded(px(8.))
                     .trigger(
-                        zed_button("document-grammar")
+                        Button::new("document-grammar")
                             .text()
+                            .cursor_default()
                             .small()
                             .compact()
                             .label(trigger_label.clone())
@@ -2015,11 +2016,11 @@ impl TerminalWindow {
                         .when_some(grammar_selector, |header, selector| header.child(selector))
                         .when(markdown, |header| {
                             header.child(
-                                zed_button("document-toggle-reading")
+                                Button::new("document-toggle-reading")
                                     .text()
+                                    .cursor_default()
                                     .small()
                                     .compact()
-                                    .rounded(px(0.))
                                     .label(if rendered { "Source" } else { "Rendered" })
                                     .accessibility_label(if rendered {
                                         "Read this document as its source"
@@ -2054,11 +2055,11 @@ impl TerminalWindow {
                         .when_some(changes, |header, (added, removed)| {
                             header
                                 .child(
-                                    zed_button("document-open-changes")
+                                    Button::new("document-open-changes")
                                         .text()
+                                        .cursor_default()
                                         .small()
                                         .compact()
-                                        .rounded(px(0.))
                                         .label("Changes")
                                         .accessibility_label(format!("Show the changes to {path}"))
                                         .resting_tooltip("Show this file's changes")
@@ -2100,8 +2101,8 @@ impl TerminalWindow {
                                 })
                         })
                         .child(
-                            zed_button("close-document")
-                                .custom(crate::app::sidebar_action_style(cx))
+                            Button::new("close-document")
+                                .ghost()
                                 .small()
                                 .compact()
                                 .icon(IconName::X)
@@ -2140,8 +2141,8 @@ impl TerminalWindow {
                             // Legacy's format control: the braces it draws, on the flat
                             // hover wash its `document-action` wears rather than a button box.
                             .child(
-                                zed_button("format-document")
-                                    .custom(crate::app::sidebar_action_style(cx))
+                                Button::new("format-document")
+                                    .ghost()
                                     .small()
                                     .compact()
                                     .icon(IconName::Braces)
@@ -2161,7 +2162,7 @@ impl TerminalWindow {
                             )
                             .when(transition_pending, |footer| {
                                 footer.child(
-                                    zed_button("stay-in-document")
+                                    Button::new("stay-in-document")
                                         .ghost()
                                         .small()
                                         .compact()
@@ -2182,7 +2183,7 @@ impl TerminalWindow {
                                         .gap_2()
                                         .when(dirty, |actions| {
                                             actions.child(
-                                                zed_button("cancel-document")
+                                                Button::new("cancel-document")
                                                     .ghost()
                                                     .small()
                                                     .compact()
@@ -2196,7 +2197,7 @@ impl TerminalWindow {
                                             )
                                         })
                                         .child(
-                                            zed_button("save-document")
+                                            Button::new("save-document")
                                                 .primary()
                                                 .small()
                                                 .compact()

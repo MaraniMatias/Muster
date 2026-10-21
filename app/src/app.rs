@@ -15,7 +15,7 @@ use std::time::Duration;
 #[cfg(test)]
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    button::{Button, ButtonCustomVariant, ButtonVariant},
+    button::{Button, ButtonVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, ResizableState},
     window_border, Disableable, TitleBar,
@@ -55,7 +55,7 @@ use crate::sidebar::{
 };
 use crate::state_writer::StateWriter;
 use crate::terminal::{ShellState, TerminalSession, TerminalSessionConfig, TerminalView};
-use crate::theme::{zed_button, Roles};
+use crate::theme::Roles;
 use crate::titlebar::Crumb;
 use crate::tooltip::Tooltips;
 use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
@@ -226,23 +226,11 @@ pub(crate) fn sidebar_row_focus(
     (handle, focused)
 }
 
-/// The chrome a sidebar control wears.
+/// The ink a quiet control wears at rest.
 ///
-/// A custom variant keeps the same hover and press surfaces as an application
-/// row while retaining Button's native default arrow cursor.
-pub(crate) fn sidebar_action_style(cx: &App) -> ButtonCustomVariant {
-    let roles = Roles::of(cx);
-    ButtonCustomVariant::new(cx)
-        .foreground(roles.text_muted)
-        .hover(roles.hover)
-        .active(roles.pressed)
-}
-
-/// The ink a sidebar control wears at rest.
-///
-/// Set on the control rather than in a variant so the variant's hover ink can
-/// win: GPUI refines a hover style after the rest style, which is what makes a
-/// control lift to primary ink on hover happen here at all.
+/// Set on the control rather than in its variant so the variant's hover ink
+/// can win: GPUI refines a hover style after the rest style, which is what
+/// makes a control lift to full ink on hover happen here at all.
 pub(crate) fn sidebar_faint_ink(cx: &App) -> gpui_kit::Hsla {
     Roles::of(cx).text_muted
 }
@@ -3245,19 +3233,13 @@ impl Render for TerminalWindow {
                     "Open a directory to get started."
                 })
                 .child(
-                    zed_button("empty-action")
+                    Button::new("empty-action")
                         .label(if available {
                             "New terminal"
                         } else {
                             "Open directory"
                         })
                         .disabled(self.opening || self.closing)
-                        .when(self.opening || self.closing, |button| {
-                            button
-                                .bg(roles.disabled_surface)
-                                .text_color(roles.text_disabled)
-                                .border_color(gpui_kit::transparent_black())
-                        })
                         .on_click(cx.listener(move |app, _, window, cx| {
                             if available {
                                 if let Some(id) = app.navigation.active_checkout.clone() {

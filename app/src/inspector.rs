@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
@@ -20,7 +20,7 @@ use crate::{
         measured_width, ButtonA11y, InspectorTab, TerminalWindow, ViewKind, ViewPin, WidthCache,
     },
     file_icons,
-    theme::{zed_button, Roles},
+    theme::Roles,
     tooltip::RestingTooltip,
 };
 
@@ -128,7 +128,7 @@ fn note_row(
                     .child(message.to_owned()),
             )
             .child(
-                zed_button(format!("retry-list-{path}"))
+                Button::new(format!("retry-list-{path}"))
                     .ghost()
                     .small()
                     .compact()
@@ -163,9 +163,9 @@ fn row_control(
     expanded: Option<bool>,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
-    zed_button(id)
+    Button::new(id)
         .text()
-        .rounded(px(0.))
+        .cursor_default()
         .absolute()
         .inset_0()
         .p_0()
@@ -201,9 +201,9 @@ fn fold_control(
     left: gpui_kit::Pixels,
     on_click: impl Fn(&mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
-    zed_button(id)
+    Button::new(id)
         .text()
-        .rounded(px(0.))
+        .cursor_default()
         .absolute()
         .left(left)
         .top(px((ROW_HEIGHT - 16.) / 2.))
@@ -274,9 +274,9 @@ fn inspector_tab(
                 }),
         )
         .child(
-            zed_button(id)
+            Button::new(id)
                 .text()
-                .rounded(px(0.))
+                .cursor_default()
                 .absolute()
                 .inset_0()
                 .p_0()
@@ -1467,7 +1467,7 @@ impl TerminalWindow {
                             .child(error.clone()),
                     )
                     .child(
-                        zed_button("retry-status")
+                        Button::new("retry-status")
                             .ghost()
                             .small()
                             .label("Retry")
@@ -1935,7 +1935,7 @@ impl TerminalWindow {
             let rrepo = repo.clone();
             let rcheckout = checkout.clone();
             body = body.child(
-                zed_button("retry-list-root")
+                Button::new("retry-list-root")
                     .ghost()
                     .small()
                     .label("Retry")
@@ -1987,10 +1987,10 @@ impl TerminalWindow {
                     .text_color(roles.status.warning)
                     .child(div().min_w_0().truncate().child(message))
                     .child(
-                        zed_button(format!("dismiss-external-{path}"))
+                        Button::new(format!("dismiss-external-{path}"))
                             .text()
+                            .cursor_default()
                             .small()
-                            .rounded(px(0.))
                             .label("Dismiss")
                             .accessibility_label("Dismiss the message about this file")
                             .on_click(cx.listener(move |app, _, _, _| {

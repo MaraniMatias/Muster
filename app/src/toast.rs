@@ -2,17 +2,14 @@
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::Sizable;
 use gpui_kit::{
     div, px, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Role,
     StatefulInteractiveElement, Styled, TestSupportExt,
 };
 
-use crate::{
-    app::TerminalWindow,
-    theme::{zed_button, Roles},
-};
+use crate::{app::TerminalWindow, theme::Roles};
 
 const MAX_TOASTS: usize = 3;
 
@@ -209,8 +206,8 @@ impl TerminalWindow {
                         )
                         .child(div().flex_1().min_w_0().child(message.clone()))
                         .child(
-                            zed_button(format!("dismiss-toast-{id}"))
-                                .text()
+                            Button::new(format!("dismiss-toast-{id}"))
+                                .ghost()
                                 .small()
                                 .compact()
                                 .icon(IconName::X)
