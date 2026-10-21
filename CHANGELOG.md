@@ -6,6 +6,11 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## 1.0.0-rc.7
+
+- Prepare the next native testing candidate for Ubuntu 24.04 amd64 and macOS
+  arm64. No application behavior changes from rc.6.
+
 ## 1.0.0-rc.6
 
 - Render inline images from Pi and OpenCode through the Kitty graphics protocol,
