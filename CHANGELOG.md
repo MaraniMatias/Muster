@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.9
 
 - **The app fills the window on Linux.** The window's own frame kept a
   twenty-pixel band for a shadow the window manager draws, and that band was a
