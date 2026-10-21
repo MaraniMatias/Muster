@@ -4557,6 +4557,97 @@ async fn native_directory_picker_adds_a_checkout_without_spawning_a_shell(cx: &m
     dispose(&fixture, cx);
 }
 
+/// A machine whose picker cannot open still gets a directory.
+///
+/// The native picker is the first answer; the path is the second. Without it,
+/// adding a directory would be a button that does nothing at all on a machine
+/// with no desktop portal.
+#[gpui_kit::test]
+async fn a_typed_path_opens_a_checkout_when_the_picker_cannot(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    let checkout = muster_core::workspace::checkout_id_for_path(canonical.to_str().unwrap());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.open_directory_fallback(window, cx));
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("open-directory-submit").is_some());
+        window.input(canonical.to_str().unwrap(), cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-directory-submit", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .navigation
+            .checkout(&checkout)
+            .is_some()
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.navigation.active_checkout.as_deref(),
+            Some(checkout.as_str())
+        );
+        assert!(
+            app.open_directory.is_none(),
+            "the dialog closes once the directory is open"
+        );
+    });
+    dispose(&fixture, cx);
+}
+
+/// A path that is not a directory says so, and the dialog stays open.
+///
+/// The dialog is the second answer, so it has to be able to say no: a path
+/// that cannot be opened leaves the person where they were, with the reason.
+#[gpui_kit::test]
+async fn a_path_that_is_not_a_directory_is_refused(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.open_directory_fallback(window, cx));
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("/definitely/not/a/directory", cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-directory-submit", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_directory
+            .as_ref()
+            .is_some_and(|draft| draft.error.is_some())
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.open_directory.is_some(),
+            "the dialog stays open with the reason on it"
+        );
+    });
+    dispose(&fixture, cx);
+}
+
 #[gpui_kit::test]
 async fn a_plain_folder_with_a_running_terminal_still_leaves_the_panel(cx: &mut TestAppContext) {
     let fixture = open(cx);

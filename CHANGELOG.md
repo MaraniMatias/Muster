@@ -6,6 +6,21 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The app fills the window on Linux.** The window's own frame kept a
+  twenty-pixel band for a shadow the window manager draws, and that band was a
+  margin around the app: the window's controls sat away from the corner the
+  pointer goes to, and the band was gone when the window was maximized, so the
+  app looked different maximized than it does not. The frame reserves nothing
+  now, and the app fills the window either way.
+
+- **A directory can be opened where the picker cannot.** The native picker is
+  the desktop portal on Linux, which is a service the desktop session may not
+  run: without it, adding a directory was a button that did nothing. The path
+  is asked for instead when the picker cannot open, and the package now
+  depends on the portal so that a fresh install has one.
+
 ## 1.0.0-rc.8
 
 - **The chrome wears the toolkit's own controls.** Buttons, checkboxes and

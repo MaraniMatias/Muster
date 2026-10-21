@@ -133,6 +133,23 @@ fn measured_width_cache_has_fixed_size_and_font_cardinality_limits() {
     assert_eq!(widths.len(), 0, "new size keys cannot grow without bound");
 }
 
+/// The window's frame reserves no band of its own.
+///
+/// The toolkit's Linux default keeps one for a shadow the window manager
+/// draws, and that band is a margin around the app: the window's own
+/// controls sit away from the corner the pointer goes to, and the app is
+/// framed rather than filling the window. The band is gone when the window is
+/// tiled, so the app would look different maximized than it does not. The app
+/// fills the window either way.
+#[test]
+fn the_window_frame_reserves_no_band() {
+    assert_eq!(
+        FRAME_SHADOW,
+        px(0.),
+        "the frame reserves no band: the app fills the window"
+    );
+}
+
 #[gpui_kit::test]
 fn the_terminal_renders_at_every_window_size(cx: &mut TestAppContext) {
     let backend = Arc::new(TerminalBackend::default());

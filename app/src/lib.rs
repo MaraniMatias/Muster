@@ -36,6 +36,9 @@ pub mod sidebar;
 /// Navigation projection and selection/merge rules for the native sidebar.
 mod navigation;
 
+/// The directory a person typed, for the machines whose picker cannot open.
+pub mod open_directory;
+
 /// The worktree creation and removal dialogs.
 pub mod worktree_dialog;
 

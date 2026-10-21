@@ -40,6 +40,7 @@ use muster_core::workspace::{
 };
 
 use crate::navigation::{session_title, Navigation};
+use crate::open_directory::OpenDirectoryDraft;
 use crate::pty::TerminalBackend;
 // The test suites drive these two through the window, so the parent module
 // names them rather than each suite reaching into the module that owns them.
@@ -61,6 +62,16 @@ use crate::tooltip::Tooltips;
 use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// The band the window's frame reserves for itself.
+///
+/// Zero. The toolkit's Linux default keeps one for a shadow the window manager
+/// draws, and that band is a margin around the app: the window's own
+/// controls sit twenty pixels away from the corner the pointer goes to, and
+/// the app is framed rather than filling the window. The band is gone when the
+/// window is tiled, so the app would look different maximized than it does
+/// not. The app fills the window either way.
+pub(crate) const FRAME_SHADOW: Pixels = px(0.);
 
 /// The platform UI face used for app chrome and the text measured to fit it.
 pub(crate) const UI_FONT_FAMILY: &str = ".SystemUIFont";
@@ -624,6 +635,8 @@ pub struct TerminalWindow {
     pub(crate) next_file_request: u64,
     pub(crate) worktree: Option<WorktreeDraft>,
     pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
+    /// The directory being typed, for the machines whose picker cannot open.
+    pub(crate) open_directory: Option<OpenDirectoryDraft>,
     /// The preferences panel's own draft, while it is open.
     ///
     /// A field rather than part of `Navigation`, because a preference is not workspace state
@@ -786,6 +799,7 @@ impl TerminalWindow {
             next_file_request: 0,
             worktree: None,
             worktree_removal: None,
+            open_directory: None,
             owner: SessionOwner::new(backend, owns_backend),
             toasts: crate::toast::ToastStack::default(),
             opening: false,
@@ -1163,6 +1177,12 @@ impl TerminalWindow {
         }
     }
 
+    /// Ask the platform for a directory and open it.
+    ///
+    /// The native picker is the first answer. When it cannot open — on Linux
+    /// it is the desktop portal, which a machine may not run — the path is
+    /// asked for instead, so that adding a directory is never a button that
+    /// does nothing.
     pub(crate) fn choose_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening || self.closing {
             return;
@@ -1180,7 +1200,9 @@ impl TerminalWindow {
             let result = match prompt.await {
                 Ok(Ok(Some(paths))) if !paths.is_empty() => {
                     let path = paths[0].clone();
-                    background.spawn(async move { navigation::open_directory(&path).map(Some) }).await
+                    background
+                        .spawn(async move { navigation::open_directory(&path).map(Some) })
+                        .await
                 }
                 Ok(Ok(_)) => Ok(None),
                 Ok(Err(error)) => Err(error.to_string()),
@@ -1191,28 +1213,127 @@ impl TerminalWindow {
                 if !app.closing {
                     match result {
                         Ok(Some(opened)) => {
-                            if app.navigation.archived.contains(&opened.checkout_id) {
-                                app.push_error(
-                                    "This worktree is archived. Restore it from its repository menu first.",
-                                    cx,
-                                );
-                            } else {
-                                let select = app.navigation.revision == revision;
-                                app.navigation.merge(opened, select);
-                                app.membership_revision += 1;
-                                app.persist();
-                                app.refresh_diff_totals(cx);
-                                if select { app.focus_terminal(window, cx); }
-                            }
+                            app.merge_opened_directory(opened, revision, window, cx)
                         }
                         Ok(None) => (),
-                        Err(error) => app.push_error(error, cx),
+                        Err(error) => {
+                            app.push_error(error, cx);
+                            // The picker could not open, so the path is asked
+                            // for instead.
+                            app.open_directory_fallback(window, cx);
+                        }
                     }
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// The second answer to "open a directory": the path, typed.
+    ///
+    /// The native picker is the first answer. On Linux it is the desktop
+    /// portal, which is a service the desktop session may not run: without
+    /// this, adding a directory would be a button that does nothing at all.
+    pub(crate) fn open_directory_fallback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_directory.is_some() || self.closing {
+            return;
+        }
+        let path = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.select_all(window, cx);
+            input
+        });
+        path.read(cx).focus_handle(cx).focus(window, cx);
+        self.open_directory = Some(OpenDirectoryDraft {
+            path,
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    /// Open the directory whose path is being typed.
+    ///
+    /// The read is Git's, so it runs off the UI thread, and the dialog stays
+    /// open with what went wrong when it fails.
+    pub(crate) fn submit_open_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.open_directory.as_ref() else {
+            return;
+        };
+        if draft.busy {
+            return;
+        }
+        let typed = draft.path.read(cx).value().trim().to_owned();
+        if typed.is_empty() {
+            if let Some(draft) = self.open_directory.as_mut() {
+                draft.error = Some("Type the path of the directory to open.".into());
+            }
+            cx.notify();
+            return;
+        }
+        let path = PathBuf::from(typed);
+        let revision = self.navigation.revision;
+        if let Some(draft) = self.open_directory.as_mut() {
+            draft.busy = true;
+            draft.error = None;
+        }
+        let background = cx.background_executor().clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = background
+                .spawn(async move { navigation::open_directory(&path) })
+                .await;
+            let _ = view.update_in(cx, |app, window, cx| {
+                let Some(draft) = app.open_directory.as_mut() else {
+                    return;
+                };
+                draft.busy = false;
+                match result {
+                    Ok(opened) => {
+                        app.open_directory = None;
+                        if !app.closing {
+                            app.merge_opened_directory(opened, revision, window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        draft.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Add an opened directory to the workspace, and make it the one on screen.
+    ///
+    /// The directory is selected only when nothing else changed the workspace
+    /// while it was being opened: a selection made by the person since then
+    /// is theirs, not this one's.
+    fn merge_opened_directory(
+        &mut self,
+        opened: navigation::OpenedDirectory,
+        revision: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation.archived.contains(&opened.checkout_id) {
+            self.push_error(
+                "This worktree is archived. Restore it from its repository menu first.",
+                cx,
+            );
+            return;
+        }
+        let select = self.navigation.revision == revision;
+        self.navigation.merge(opened, select);
+        self.membership_revision += 1;
+        self.persist();
+        self.refresh_diff_totals(cx);
+        if select {
+            self.focus_terminal(window, cx);
+        }
     }
 
     /// The window's background loop: one wake every [`TICK`], and on each wake
@@ -3306,6 +3427,11 @@ impl Render for TerminalWindow {
             .or_else(|| self.opencode_choice_dialog(cx))
             .or_else(|| self.opencode_forget_dialog(cx))
             .or_else(|| self.review_delete_dialog(cx))
+            .or_else(|| {
+                self.open_directory
+                    .as_ref()
+                    .map(|draft| self.open_directory_dialog(draft, cx))
+            })
             // Last, so a confirmation raised from inside the panel is the dialog on screen
             // rather than the panel behind it.
             .or_else(|| {
@@ -3314,9 +3440,9 @@ impl Render for TerminalWindow {
                     .map(|draft| self.settings_dialog(draft, cx))
             });
         // On a target whose window has no frame of its own, the frame is this
-        // one: it insets the content out of the shadow, draws the border and
-        // owns the resize band. It is a pass-through everywhere else.
-        window_border().child(
+        // one: it draws the border and owns the resize band. It is a
+        // pass-through everywhere else.
+        window_border().shadow_size(FRAME_SHADOW).child(
             div()
                 .id("workspace-root")
                 .relative()
