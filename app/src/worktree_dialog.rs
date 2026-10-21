@@ -567,6 +567,20 @@ impl TerminalWindow {
             })
             .footer(
                 DialogFooter::new()
+                    // The destructive action comes first and stands on its own:
+                    // it is the one button here that cannot be taken back.
+                    .child(
+                        Button::new("worktree-delete")
+                            .danger()
+                            .label(if busy { "Deleting…" } else { "Delete worktree" })
+                            .disabled(!can_delete)
+                            .on_click(move |_, window, cx| {
+                                let _ = delete.update(cx, |app, cx| {
+                                    app.submit_worktree_delete(window, cx)
+                                });
+                            }),
+                    )
+                    .child(div().w_4())
                     .child(
                         Button::new("worktree-removal-cancel")
                             .label("Cancel")
@@ -583,17 +597,6 @@ impl TerminalWindow {
                             .disabled(!can_archive)
                             .on_click(move |_, _, cx| {
                                 let _ = archive.update(cx, |app, cx| app.submit_worktree_archive(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("worktree-delete")
-                            .danger()
-                            .label(if busy { "Deleting…" } else { "Delete worktree" })
-                            .disabled(!can_delete)
-                            .on_click(move |_, window, cx| {
-                                let _ = delete.update(cx, |app, cx| {
-                                    app.submit_worktree_delete(window, cx)
-                                });
                             }),
                     ),
             )
