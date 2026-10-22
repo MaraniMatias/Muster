@@ -31,13 +31,16 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 ## Install
 
-The current candidate is **v1.0.0-rc.10**:
-[`Muster_1.0.0-rc.10_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.10/Muster_1.0.0-rc.10_arm64.zip) for macOS,
-[`muster_1.0.0-rc.10_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.10/muster_1.0.0-rc.10_amd64.deb) for Ubuntu.
+The current candidate is **v1.0.0-rc.11**:
+[`Muster_1.0.0-rc.11_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.11/Muster_1.0.0-rc.11_arm64.zip) for macOS on Apple Silicon,
+[`Muster_1.0.0-rc.11_x86_64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.11/Muster_1.0.0-rc.11_x86_64.zip) for macOS on Intel,
+[`muster_1.0.0-rc.11_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.11/muster_1.0.0-rc.11_amd64.deb) for Ubuntu on x86_64,
+[`muster_1.0.0-rc.11_arm64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.11/muster_1.0.0-rc.11_arm64.deb) for Ubuntu on arm64.
 
 It is a pre-release, so GitHub's `Latest` badge still selects the frozen Legacy
 release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Muster/releases)
-page. Existing candidates may contain only a macOS archive; the new workflow adds Linux packages to future releases.
+page. Candidates before v1.0.0-rc.11 may carry only a macOS archive and one
+Linux package; every candidate from v1.0.0-rc.11 on carries all four.
 
 - **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
 - **macOS 15+ (Intel):** Unzip `Muster_<version>_x86_64.zip` and move `Muster.app` to Applications. Same bundle, same ad-hoc signature.
