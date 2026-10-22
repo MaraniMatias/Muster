@@ -129,13 +129,14 @@ repository() {
   printf '%s' "${remote%.git}"
 }
 
-# The run that publishes this commit. It is looked up by the commit it builds,
-# so a run of an earlier release is never mistaken for this one.
+# The run that publishes this commit. It is looked up by the commit it builds
+# and by when it was created, so a run of an earlier attempt against the same
+# commit is never mistaken for this one.
 publish_run() {
-  local sha="$1" run_id="" attempt
+  local sha="$1" since="$2" run_id="" attempt
   for attempt in $(seq 1 30); do
     run_id="$(gh run list --workflow linux-release.yml --branch main --event workflow_dispatch --limit 20 \
-      --json databaseId,headSha --jq "[.[] | select(.headSha == \"$sha\")] | first | .databaseId")"
+      --json databaseId,headSha,createdAt --jq "[.[] | select(.headSha == \"$sha\") | select(.createdAt >= \"$since\")] | first | .databaseId")"
     if [[ -n "$run_id" && "$run_id" != "null" ]]; then
       printf '%s' "$run_id"
       return 0
@@ -177,7 +178,7 @@ require_publishable() {
 # Publish the version this tree already carries. The workflow builds every
 # target, validates them and creates the tag and the release; this asks it to.
 publish() {
-  local version="${1:-}" repo sha run_id url
+  local version="${1:-}" repo sha run_id url since
   local tag="v$version"
   require_version "$version"
   if [[ "$(manifest_version)" != "$version" || "$(lock_version)" != "$version" ]]; then
@@ -188,8 +189,9 @@ publish() {
   command -v gh >/dev/null || { echo 'release: publish: the GitHub CLI (gh) is required' >&2; exit 1; }
   sha="$(git rev-parse HEAD)"
   repo="$(repository)"
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   gh workflow run linux-release.yml --ref main -f sha="$sha" -f mode=publish -f tag="$tag"
-  run_id="$(publish_run "$sha")"
+  run_id="$(publish_run "$sha" "$since")"
   url="https://github.com/$repo/actions/runs/$run_id"
   echo "release: publish: the run is $url"
   if ! gh run watch "$run_id" --exit-status; then
