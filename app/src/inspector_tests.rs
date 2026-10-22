@@ -5305,6 +5305,65 @@ async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut Te
     close(&fixture, cx);
 }
 
+/// The file's path is a path somebody pastes somewhere else, so the icon beside
+/// the name in the document's header puts it on the clipboard.
+///
+/// It is the file's own path on the disk and not the name it has inside the
+/// checkout: a name is only a path for the checkout it is in.
+#[gpui_kit::test]
+async fn the_document_header_copies_the_files_path(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("notes.md"), "# Notes\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "notes.md".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_document.is_some()
+    })
+    .await;
+    assert!(draw_until(&fixture, cx, "copy-document-path"));
+    let expected = fixture.view.read_with(cx, |app, _| {
+        let root = app
+            .navigation
+            .checkout(&fixture.checkout)
+            .unwrap()
+            .path
+            .clone();
+        std::path::Path::new(&root)
+            .join("notes.md")
+            .display()
+            .to_string()
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // The icon is beside the name and not at the end of the header, which is
+        // where the name of a file and the path of the same file meet.
+        let name = window.find("document-path").bounds();
+        let icon = window.find("copy-document-path").bounds();
+        let gap = icon.left().as_f32() - name.right().as_f32();
+        assert!(
+            (0. ..=16.).contains(&gap),
+            "the icon is drawn beside the name of the file, not at the end of the header"
+        );
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "something else".to_owned(),
+        ));
+        window.click("copy-document-path", cx);
+        assert_eq!(
+            cx.read_from_clipboard().map(|item| item.text()),
+            Some(Some(expected.clone())),
+            "the icon beside the name is what puts the file's path on the clipboard"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// The path the diff's title names is a path somebody pastes somewhere else, so
 /// the icon beside it puts that very path on the clipboard.
 #[gpui_kit::test]

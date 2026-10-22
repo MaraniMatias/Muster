@@ -1896,6 +1896,13 @@ impl TerminalWindow {
                     self.pending_document_transition.is_some(),
                 )
             });
+        // The file's own path on the disk, which is what the icon beside the name
+        // puts on the clipboard: a name inside the checkout is not a path anybody
+        // can paste somewhere else.
+        let copy_path = self
+            .navigation
+            .checkout(&checkout_id)
+            .map(|checkout| Path::new(&checkout.path).join(&path).display().to_string());
         let format_language = self
             .document_language_overrides
             .get(&grammar_key)
@@ -2016,10 +2023,45 @@ impl TerminalWindow {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(roles.text_muted)
-                                .child(path.clone()),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("document-path")
+                                        .test_support()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(roles.text_muted)
+                                        .child(path.clone()),
+                                )
+                                // The icon that puts the file's path on the
+                                // clipboard, beside the name that says which
+                                // file it is.
+                                .when_some(copy_path, |row, copy| {
+                                    row.child(
+                                        Button::new("copy-document-path")
+                                            .ghost()
+                                            .cursor_default()
+                                            .small()
+                                            .compact()
+                                            .icon(IconName::Copy)
+                                            .accessibility_label(format!(
+                                                "Copy the full path of {path}"
+                                            ))
+                                            .resting_tooltip(format!(
+                                                "Copy the full path of {path}"
+                                            ))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui_kit::ClipboardItem::new_string(
+                                                        copy.clone(),
+                                                    ),
+                                                );
+                                            }),
+                                    )
+                                }),
                         )
                         .when_some(grammar_selector, |header, selector| header.child(selector))
                         .when(markdown, |header| {

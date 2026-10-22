@@ -14,6 +14,11 @@ here still gets its generated notes.
   colour, the title a header carries wears a title's, a tag and a comment and a
   quoted string wear theirs, and the prose in between stays prose.
 
+- **The document's header copies the file's path.** The name in the header is a
+  name inside the checkout, and a path somebody pastes into a terminal or a
+  message is the file's own path on the disk. An icon beside the name puts it on
+  the clipboard, the way the diff's title does for a change.
+
 ## 1.0.0-rc.13
 
 - **A row is the font size and not the face's line box.** The grid's row was

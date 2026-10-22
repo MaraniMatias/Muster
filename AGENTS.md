@@ -376,6 +376,14 @@ Three rules it depends on, each pinned by a test:
   editor's rope against the loaded text, so an undo back to what the file holds
   ends the draft instead of leaving a state a draft can be stuck in.
 
+**The header's icon copies the file's path.** The name in the header is a name
+inside the checkout, and the path a person pastes into a terminal or a message is
+the file's own path on the disk, so that is what the icon beside the name puts on
+the clipboard and what its tooltip names. It is drawn beside the name and not at
+the end of the header, and it is the one control in the header that is only an
+icon. `the_document_header_copies_the_files_path` in
+`app/src/inspector_tests.rs` pins it.
+
 **The caret is drawn, and it takes a frame to say so.** The toolkit's editor
 paints its caret only once it has been told it is focused, and that answer comes
 with a frame's report of what holds the keyboard. A reading built in the frame
