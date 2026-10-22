@@ -98,6 +98,26 @@ gh workflow run linux-release.yml --ref main \
   -f sha=<full-commit-sha> -f mode=publish -f tag=v1.0.0-rc.3
 ```
 
+### Cutting the candidate
+
+`scripts/release.sh candidate <version>` is that procedure as one command. It
+writes the version into the manifest and the lock file, renames the changelog's
+`Unreleased` heading to it, points the README's download block at the new
+candidate, commits that on `main`, pushes it, and dispatches the workflow above
+in publish mode with the new commit and the tag. The workflow is what creates
+the tag and the GitHub release, so the script never creates either.
+
+```sh
+scripts/release.sh candidate 1.0.0-rc.12
+scripts/release.sh candidate 1.0.0-rc.12 --dry-run   # prepare, publish nothing
+```
+
+The command refuses what the workflow refuses, before it touches the tree: a
+version that is not `v0.<minor>.<patch>` or `v1.0.0-rc.<n>`, a dirty tree, a
+branch that is not `main`, a `main` that is not the commit `origin/main` points
+at, a tag that already exists, and a version the tree already carries. A dry
+run leaves the tree as the release would leave it and commits nothing.
+
 Publication must be dispatched from `main`, for a commit on `main`, and the new
 tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`
 or `v1.0.0-rc.N`; final `v1.0.0` remains a separate deliberate decision.
