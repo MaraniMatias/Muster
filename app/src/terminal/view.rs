@@ -35,6 +35,8 @@ use gpui_kit::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use muster_core::settings::TerminalScrollbarMode;
+
 use super::input::{self, FocusState};
 use super::links::{self, LinkTarget};
 use super::{
@@ -627,6 +629,19 @@ pub struct InputRefused(pub String);
 
 impl gpui_kit::EventEmitter<InputRefused> for TerminalView {}
 
+/// A shell that could not be started, and why.
+///
+/// Its own event rather than an input refusal: the terminal is not refusing
+/// anything, it never got a shell, and the window has to close it.
+pub struct ShellFailed(pub String);
+
+impl gpui_kit::EventEmitter<ShellFailed> for TerminalView {}
+
+/// A shell that started, and is about to read what it was handed.
+pub struct ShellStarted;
+
+impl gpui_kit::EventEmitter<ShellStarted> for TerminalView {}
+
 // What the line under the pointer offers, and that the person asked for it.
 //
 // The terminal knows what the text says and the window knows what the checkout
@@ -674,6 +689,13 @@ pub struct TerminalView {
     left_mouse: Option<(f32, f32)>,
     dragged: bool,
     canvas_origin: Rc<Cell<gpui_kit::Point<Pixels>>>,
+    /// Why the shell could not be started, if it could not.
+    ///
+    /// The start happens where the size is measured, which is the paint pass
+    /// and not the render: the failure is reported from the frame that follows.
+    start_error: Rc<Cell<Option<String>>>,
+    /// Whether the shell has started, so the window is told once.
+    started: Rc<Cell<bool>>,
     /// Only images used by the last frame are retained in the GPU atlas.
     graphic_images: Vec<Arc<gpui_kit::RenderImage>>,
 
@@ -811,6 +833,8 @@ impl TerminalView {
             left_mouse: None,
             dragged: false,
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
+            start_error: Rc::new(Cell::new(None)),
+            started: Rc::new(Cell::new(false)),
             graphic_images: Vec::new(),
         }
     }
@@ -1661,6 +1685,10 @@ impl Frame {
     }
 
     /// The scrollback thumb, drawn over the right edge of the grid.
+    ///
+    /// Whether it is drawn at all is a preference: `Hidden` draws no thumb,
+    /// `While scrolling` draws one where there is somewhere to scroll to, and
+    /// `Always` draws one even when there is nothing to scroll.
     fn paint_scrollbar(
         &self,
         bounds: Bounds<Pixels>,
@@ -1669,13 +1697,20 @@ impl Frame {
         window: &mut Window,
         cx: &App,
     ) {
+        let mode = crate::settings::preferences().terminal.scrollbar;
+        if mode == TerminalScrollbarMode::Hidden {
+            return;
+        }
         let geometry = scrollbar_geometry(
             snapshot.history_size,
             snapshot.display_offset,
             rows as usize,
             bounds.size.height.as_f32(),
         );
-        if !geometry.scrollable || geometry.height <= 0. {
+        if mode != TerminalScrollbarMode::Always && !geometry.scrollable {
+            return;
+        }
+        if geometry.height <= 0. {
             return;
         }
         let height = px(geometry.height.min(bounds.size.height.as_f32()));
@@ -2102,6 +2137,14 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.repaint.borrow_mut().rendered();
         self.measure(window);
+        // A shell that could not be started is said out loud, once, and a shell
+        // that started is announced so the window can hand over what it was
+        // given to read.
+        if let Some(error) = self.start_error.take() {
+            cx.emit(ShellFailed(error));
+        } else if self.started.replace(false) {
+            cx.emit(ShellStarted);
+        }
 
         // The cursor is drawn differently when the window is not the one being
         // typed into, and nothing else changes when that flips.
@@ -2294,6 +2337,8 @@ impl Render for TerminalView {
                     {
                         let applied = Rc::clone(&applied);
                         let view = Arc::clone(&self.session);
+                        let start_error = Rc::clone(&self.start_error);
+                        let started = Rc::clone(&self.started);
                         move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
                             canvas_origin.set(bounds.origin);
                             let cell = cell?;
@@ -2307,8 +2352,16 @@ impl Render for TerminalView {
                             // asking sixty times a second.
                             if size.0 > 0 && size.1 > 0 && applied.get() != size {
                                 applied.set(size);
-                                if let Err(error) = view.resize(size.0, size.1) {
-                                    log::warn!("muster: the grid was not resized: {error}");
+                                // The shell is told the size of the grid it draws
+                                // into before it draws anything, so its first
+                                // prompt is drawn once: a shell that is asked for
+                                // another size redraws that prompt from the
+                                // cursor, and the drawing it replaces stays on
+                                // screen.
+                                if let Err(error) = view.start_at(size.0, size.1) {
+                                    start_error.set(Some(error.to_string()));
+                                } else {
+                                    started.set(true);
                                 }
                             }
                             Some((cell, size))
@@ -3609,7 +3662,12 @@ mod tests {
         );
         config.args = Some(vec!["-c".to_owned(), script.to_owned()]);
         config.drain_deadline = Duration::from_millis(500);
-        TerminalSession::spawn(Arc::clone(&backend), config).expect("the test session spawns")
+        let session =
+            TerminalSession::spawn(Arc::clone(&backend), config).expect("the test session spawns");
+        // The child starts once the size it will keep is known: a session with
+        // no view is sized here.
+        session.resize(80, 24).expect("the session takes its size");
+        session
     }
 
     /// Whether the grid holds `wanted`, within a bounded wait.
@@ -3755,7 +3813,12 @@ mod tests {
                 .to_owned(),
         ]);
         config.drain_deadline = Duration::from_millis(500);
-        TerminalSession::spawn(Arc::clone(&backend), config).expect("the prompt session spawns")
+        let session = TerminalSession::spawn(Arc::clone(&backend), config)
+            .expect("the prompt session spawns");
+        // The child starts once the size it will keep is known: a session with
+        // no view is sized here.
+        session.resize(80, 24).expect("the session takes its size");
+        session
     }
 
     /// What the child answered, once it has answered.

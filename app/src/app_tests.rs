@@ -51,7 +51,14 @@ fn session_in(backend: &Arc<TerminalBackend>, script: &str, cwd: &Path) -> Termi
     config.args = Some(vec!["-c".to_owned(), script.to_owned()]);
     config.status_interval = Duration::from_millis(20);
     config.drain_deadline = Duration::from_millis(500);
-    TerminalSession::spawn(Arc::clone(backend), config).expect("the test session spawns")
+    let session =
+        TerminalSession::spawn(Arc::clone(backend), config).expect("the test session spawns");
+    // The child starts once the size it will keep is known: a session with no
+    // view is sized here.
+    session
+        .resize(INITIAL_COLUMNS, INITIAL_ROWS)
+        .expect("the session takes the size it was opened at");
+    session
 }
 
 /// Open a window over an existing session, at a size.
@@ -354,6 +361,7 @@ async fn a_path_the_terminal_printed_opens_the_file_in_the_preview(cx: &mut Test
                     checkout_id: checkout.clone(),
                     view: terminal.clone(),
                     shell,
+                    prompt: None,
                 },
             );
             app.attach_links(&terminal, &checkout, window, cx);

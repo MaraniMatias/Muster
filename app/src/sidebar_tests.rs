@@ -1489,6 +1489,12 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
                     config.args = Some(vec!["-c".into(), "set -m; cat; :".into()]);
                     config.status_interval = Duration::from_millis(20);
                     let shell = app.owner.spawn(config).unwrap();
+                    // The child starts once the size it will keep is known: a
+                    // terminal that is never on screen is sized here.
+                    shell
+                        .session
+                        .resize(80, 24)
+                        .expect("the session takes its size");
                     let terminal = cx.new(|cx| {
                         TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
                     });
@@ -1498,6 +1504,7 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
                             checkout_id: checkout.clone(),
                             view: terminal,
                             shell,
+                            prompt: None,
                         },
                     );
                     app.navigation.add_session(
@@ -1833,6 +1840,7 @@ fn add_terminal(fixture: &GitFixture, cx: &mut TestAppContext) -> String {
                 checkout_id: checkout.clone(),
                 view: terminal,
                 shell,
+                prompt: None,
             },
         );
         app.navigation.add_session(
@@ -4820,6 +4828,7 @@ async fn a_pi_terminal_row_says_what_pi_is_doing(cx: &mut TestAppContext) {
                 checkout_id: checkout.clone(),
                 view: terminal,
                 shell: shell.clone(),
+                prompt: None,
             },
         );
         app.navigation.add_session(

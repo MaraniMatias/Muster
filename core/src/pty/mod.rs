@@ -283,11 +283,17 @@ impl TerminalBackend {
             let mut state = session.child.lock().map_err(|error| error.to_string())?;
             state.child = Some(child);
         }
-        *session.process_id.lock().map_err(|error| error.to_string())? = process_id;
+        *session
+            .process_id
+            .lock()
+            .map_err(|error| error.to_string())? = process_id;
         #[cfg(unix)]
         {
             let session_id = process_session_id(process_id);
-            *session.terminal_session_id.lock().map_err(|error| error.to_string())? = session_id;
+            *session
+                .terminal_session_id
+                .lock()
+                .map_err(|error| error.to_string())? = session_id;
         }
         Ok(())
     }

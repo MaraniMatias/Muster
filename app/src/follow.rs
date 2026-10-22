@@ -895,6 +895,9 @@ mod tests {
         config.args = Some(vec!["-c".into(), "set -m; cat; :".into()]);
         config.status_interval = Duration::from_millis(10);
         let shell = crate::terminal::TerminalSession::spawn(backend.clone(), config).unwrap();
+        // The child starts once the size it will keep is known: a session with
+        // no view is sized here.
+        shell.resize(80, 24).expect("the session takes its size");
         let deadline = Instant::now() + Duration::from_secs(5);
         while shell.status().foreground.app.as_deref() != Some("cat") {
             assert!(
@@ -1122,6 +1125,7 @@ mod tests {
                 checkout_id: live.checkout_id.clone(),
                 view: live.view.clone(),
                 shell: live.shell.clone(),
+                prompt: None,
             };
             app.terminals.insert("second-row".into(), second);
         });

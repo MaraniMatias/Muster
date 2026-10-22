@@ -423,6 +423,11 @@ pub(crate) struct LiveTerminal {
     pub(crate) checkout_id: String,
     pub(crate) view: Entity<TerminalView>,
     pub(crate) shell: Arc<OwnedShell>,
+    /// The prompt the program in this terminal is about to read.
+    ///
+    /// It is owned here until the shell has started, because a shell that
+    /// never starts is a prompt nobody will read: the file is removed with it.
+    pub(crate) prompt: Option<muster_core::pi::PromptFile>,
 }
 
 /// A terminal that is about to be opened.
@@ -894,6 +899,7 @@ impl TerminalWindow {
                 checkout_id: String::new(),
                 view,
                 shell: shell.clone(),
+                prompt: None,
             },
         );
         app.navigation.active_session = Some(id);
@@ -925,6 +931,49 @@ impl TerminalWindow {
             app.push_error(event.0.clone(), cx);
             cx.notify();
         })
+        .detach();
+        // A shell that never started is a terminal that cannot be used, and the
+        // window says so and closes it rather than leaving a row that leads
+        // nowhere.
+        let view_id = view.entity_id();
+        cx.subscribe(
+            view,
+            move |app, _, event: &crate::terminal::ShellFailed, cx| {
+                app.push_error(event.0.clone(), cx);
+                let id = app
+                    .terminals
+                    .iter()
+                    .find(|(_, terminal)| terminal.view.entity_id() == view_id)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = id {
+                    app.terminals.remove(&id);
+                    app.navigation.remove_session(&id);
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        // The prompt is handed over when the shell has started: a program that
+        // is about to read it reads the file, and a prompt nobody reads is
+        // removed with the terminal that never ran it.
+        cx.subscribe(
+            view,
+            move |app, _, _: &crate::terminal::ShellStarted, cx| {
+                let id = app
+                    .terminals
+                    .iter()
+                    .find(|(_, terminal)| terminal.view.entity_id() == view_id)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = id {
+                    if let Some(terminal) = app.terminals.get_mut(&id) {
+                        if let Some(prompt) = terminal.prompt.take() {
+                            prompt.hand_over();
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        )
         .detach();
     }
 
@@ -1138,8 +1187,17 @@ impl TerminalWindow {
             session_type,
             revision,
         } = request;
-        let mut config =
-            TerminalSessionConfig::new(id.clone(), cwd, INITIAL_COLUMNS, INITIAL_ROWS, program);
+        // The size of the pane this terminal will be drawn in, which is the size
+        // of the terminal already on screen: the shell is told this size before
+        // it draws anything, so its first prompt is drawn once. The first
+        // terminal in a window has no pane measured yet, and its own view
+        // measures it.
+        let measured = self
+            .terminal()
+            .map(|view| view.read(cx).applied_size())
+            .filter(|size| size.0 > 0 && size.1 > 0);
+        let (columns, rows) = measured.unwrap_or((INITIAL_COLUMNS, INITIAL_ROWS));
+        let mut config = TerminalSessionConfig::new(id.clone(), cwd, columns, rows, program);
         config.args = args;
         let owner = self.owner.clone();
         let worker = cx
@@ -1166,16 +1224,25 @@ impl TerminalWindow {
                                     .then_some(revision),
                             );
                         if accepted {
-                            // The terminal is live, and the program in it is
-                            // about to read the prompt: the file stays, because
-                            // a prompt removed before that is a review Pi
-                            // never saw.
-                            if let Some(prompt) = prompt {
-                                prompt.hand_over();
-                            }
                             let terminal = cx.new(|cx| {
                                 TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
                             });
+                            // A terminal that is not the one on screen is never
+                            // measured, and a shell that is never told a size
+                            // never starts: the size this pane is drawn at is
+                            // told here, and the shell begins.
+                            if let Some((columns, rows)) = measured {
+                                if let Err(error) = shell.session.start_at(columns, rows) {
+                                    app.push_error(error.to_string(), cx);
+                                    let owner = app.owner.clone();
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            let _ = owner.close_one(&id);
+                                        })
+                                        .detach();
+                                    return;
+                                }
+                            }
                             app.attach_refusals(&terminal, cx);
                             app.attach_links(&terminal, &terminal_checkout_id, window, cx);
                             app.terminals.insert(
@@ -1184,6 +1251,7 @@ impl TerminalWindow {
                                     checkout_id: terminal_checkout_id,
                                     view: terminal,
                                     shell,
+                                    prompt,
                                 },
                             );
                             // Only while the terminal is still what is being

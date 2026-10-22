@@ -737,6 +737,11 @@ struct Shared {
     /// The last size the PTY itself reported, which is the OS's answer and not
     /// this crate's bookkeeping.
     applied: Mutex<(u16, u16)>,
+    /// Whether the child has been started yet.
+    ///
+    /// It starts once the size it will keep is known, so the shell draws its
+    /// first prompt into the grid it is going to be shown in.
+    child_started: AtomicBool,
     /// Output chunks parsed. The unit the wake coalescing is measured in.
     chunks: AtomicU64,
     /// What Pi has said about the task in front of it.
@@ -764,7 +769,21 @@ impl Shared {
             chunks: AtomicU64::new(0),
             pi: Mutex::new(PiTracker::default()),
             pi_replies: AtomicU64::new(0),
+            child_started: AtomicBool::new(false),
         }
+    }
+
+    /// Start the child, once.
+    ///
+    /// The shell is told the size of the grid it will draw into before it
+    /// starts, so its first prompt is drawn once: a shell that is asked for
+    /// another size redraws that prompt from the cursor, and the drawing it
+    /// replaces stays on screen.
+    fn start_child(&self, backend: &TerminalBackend, id: &str) -> Result<(), String> {
+        if self.child_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        backend.start(id)
     }
 
     /// The parser, for the threads that look at it without parsing into it.
@@ -1014,8 +1033,6 @@ struct Inner {
     /// The view's end of the wake channel. A receiver cannot be cloned or
     /// shared, so it is stored here and handed over once, by `take_wake`.
     wake_receiver: Mutex<Option<TerminalWake>>,
-    /// Whether the child has been started yet.
-    child_started: AtomicBool,
 }
 
 impl Inner {
@@ -1041,13 +1058,8 @@ impl Inner {
     /// starts, so its first prompt is drawn once: a shell that is asked for
     /// another size redraws that prompt from the cursor, and the drawing it
     /// replaces stays on screen.
-    fn start_child(&self) {
-        if self.child_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Err(error) = self.backend.start(&self.id) {
-            log::warn!("terminal {} did not start: {error}", self.id);
-        }
+    fn start_child(&self) -> Result<(), String> {
+        self.side.shared.start_child(&self.backend, &self.id)
     }
 
     /// The reader's half of the pipeline, as the backend wants it: bytes in,
@@ -1335,7 +1347,9 @@ fn apply_resize(inner: &Inner, request: ResizeRequest) {
     // The child starts here, with the size the PTY has just been given: a
     // shell that is told one size and then asked for another redraws its
     // prompt, and the drawing it replaces stays on screen.
-    inner.start_child();
+    if let Err(error) = inner.start_child() {
+        log::warn!("terminal {} did not start: {error}", inner.id);
+    }
 }
 
 fn side_protocol_error(side: &ReaderSide) -> Option<String> {
@@ -1584,6 +1598,10 @@ impl TerminalSession {
                     let shared = Arc::clone(&shared);
                     let wake = Arc::clone(&wake);
                     move |bytes| {
+                        // A terminal that is used before it has been sized still
+                        // has a shell to run: the child starts here, and the
+                        // bytes wait in the line discipline for it.
+                        shared.start_child(&backend, &id).ok();
                         let result = backend.write(&id, bytes);
                         if let Err(error) = &result {
                             if !shared.closing.load(Ordering::Acquire) {
@@ -1616,7 +1634,6 @@ impl TerminalSession {
             status_interval: config.status_interval,
             drain_deadline: config.drain_deadline,
             wake_receiver: Mutex::new(Some(wake_receiver)),
-            child_started: AtomicBool::new(false),
         });
 
         backend
@@ -1884,6 +1901,29 @@ impl TerminalSession {
     /// The size the PTY itself last reported.
     pub fn applied_size(&self) -> (u16, u16) {
         self.inner.shared().applied()
+    }
+
+    /// The size the child is told, and the child itself.
+    ///
+    /// The grid and the PTY are given the size before the child starts, so the
+    /// shell draws its first prompt into the grid it will be shown in. A shell
+    /// that is asked for another size afterwards redraws that prompt from the
+    /// cursor, and the drawing it replaces stays on screen.
+    pub fn start_at(&self, cols: u16, rows: u16) -> Result<(), SessionError> {
+        if cols == 0 || rows == 0 {
+            return Err(SessionError::InvalidSize { cols, rows });
+        }
+        self.accept_new_work()?;
+        {
+            let mut core = self.inner.shared().core();
+            core.resize(cols, rows);
+        }
+        self.inner
+            .backend
+            .resize(&self.inner.id, cols, rows)
+            .map_err(SessionError::Spawn)?;
+        self.inner.shared().record_applied(cols, rows);
+        self.inner.start_child().map_err(SessionError::Spawn)
     }
 
     /// Output chunks parsed since the shell started. The unit the wake
@@ -2302,6 +2342,12 @@ mod tests {
         let backend = Arc::new(TerminalBackend::default());
         let session =
             TerminalSession::spawn(Arc::clone(&backend), config).expect("the session spawns");
+        // The child starts once the size it will keep is known, and a view is
+        // what knows it: a session with no view is sized here.
+        let (cols, rows) = session.applied_size();
+        session
+            .resize(cols, rows)
+            .expect("the session takes the size it was opened at");
         let wake = session
             .take_wake()
             .expect("a fresh session has a wake to take");
@@ -3050,9 +3096,12 @@ mod tests {
                 &format!("echo $$ > {}; sleep 30", pid_file.display()),
             );
             shell.id = format!("shutdown-test-{index}");
-            sessions.push(
-                TerminalSession::spawn(Arc::clone(&backend), shell).expect("the session spawns"),
-            );
+            let session =
+                TerminalSession::spawn(Arc::clone(&backend), shell).expect("the session spawns");
+            // The child starts once the size it will keep is known: a session
+            // with no view is sized here.
+            session.resize(80, 24).expect("the session takes its size");
+            sessions.push(session);
 
             let path = pid_file.clone();
             wait_for("the child to publish its pid", || path.exists());
@@ -3125,6 +3174,30 @@ mod tests {
         let pi = dir.join("pi");
         std::os::unix::fs::symlink("/bin/sh", &pi).expect("the shell is linked");
         pi
+    }
+
+    /// The shell is told the size of the grid it draws into, before it draws.
+    ///
+    /// A shell that is asked for another size redraws its prompt from the
+    /// cursor, and the drawing it replaces stays on screen: the prompt of a
+    /// terminal that has just opened is drawn twice. So the size is settled
+    /// before the child starts, and the child starts at that size.
+    #[test]
+    fn the_child_starts_at_the_size_it_is_told() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let backend = Arc::new(TerminalBackend::default());
+        let mut config = config(dir.path(), "stty size");
+        config.id = "the-size-the-child-starts-at".to_owned();
+        let session =
+            TerminalSession::spawn(Arc::clone(&backend), config).expect("the session spawns");
+        session
+            .start_at(70, 30)
+            .expect("the session starts its shell at that size");
+        wait_for("the shell to answer with its size", || {
+            grid(&session).contains("30 70")
+        });
+        session.close().wait().expect("the session closes");
+        backend.shutdown();
     }
 
     #[test]

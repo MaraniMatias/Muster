@@ -51,7 +51,9 @@ pub use self::session::{
 };
 /// The grid's own row ratio, which the document is drawn at too.
 pub(crate) use self::view::LINE_HEIGHT;
-pub use self::view::{xterm_256, CellSize, InputRefused, Palette, Placement, TerminalView};
+pub use self::view::{
+    xterm_256, CellSize, InputRefused, Palette, Placement, ShellFailed, ShellStarted, TerminalView,
+};
 pub use self::write_queue::{EnqueueError, WriteQueue, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS};
 
 /// The key context the grid answers keys in, and the two Tab bindings that
