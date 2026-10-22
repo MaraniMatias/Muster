@@ -218,7 +218,7 @@ impl SettingsDraft {
                 tree_sticky_scroll: self.draft.ui.tree_sticky_scroll,
             },
             terminal: TerminalSettings {
-                font_size: sized(&self.terminal_font_size, TERMINAL_FONT_SIZE_LIMITS, 16., cx),
+                font_size: sized(&self.terminal_font_size, TERMINAL_FONT_SIZE_LIMITS, 13., cx),
                 ligatures: self.draft.terminal.ligatures,
                 cursor_style: self.draft.terminal.cursor_style,
                 cursor_blink: self.draft.terminal.cursor_blink,

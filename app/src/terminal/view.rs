@@ -43,10 +43,16 @@ use super::{
 
 /// The terminal's font size and line spacing, matching the legacy terminal defaults.
 ///
+/// The size is the one Ghostty and iTerm2 use on macOS — 13pt — and the one the
+/// toolkit's own editor and diff are drawn at by default. Fira Code's line
+/// height is 1.2em, so a 13px grid is a 15.6px cell, which is what Ghostty
+/// draws at the same size. Legacy drew this grid at 16px, which read larger
+/// than the terminal it sat beside.
+///
 /// Published so the document and the diff can be drawn at this same size: the
 /// grid, a file and a diff are read in one window, and code three pixels
 /// smaller than the terminal beside it is the first thing anybody notices.
-pub(crate) const FONT_SIZE: Pixels = px(16.0);
+pub(crate) const FONT_SIZE: Pixels = px(13.0);
 const LINE_HEIGHT: f32 = 1.2;
 /// `--muster-cursor` from the legacy dark theme, which is also the editor's caret.
 const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);

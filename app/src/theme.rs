@@ -1187,10 +1187,10 @@ mod tests {
     /// The document and the diff are drawn at the grid's own size.
     ///
     /// Both are the app's code, and both are read next to a terminal in the
-    /// same window. Legacy drew its editor at 13px against a 16px grid, which
-    /// is why the file pane looked like it was set in a smaller type than the
-    /// terminal it sits beside: the value here is the terminal's, and the
-    /// editor and the toolkit's diff both read it from this one place.
+    /// same window. The grid is drawn at 13px — the size Ghostty and iTerm2 use
+    /// on macOS — and the editor and the toolkit's diff both read it from this
+    /// one place, so the file pane is not set in a smaller type than the
+    /// terminal it sits beside.
     #[gpui_kit::test]
     fn the_document_and_the_diff_read_at_the_terminals_own_size(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1200,12 +1200,15 @@ mod tests {
         cx.read(|cx| {
             let theme = Theme::global(cx);
             // The grid's own size, and not a number that happens to match it.
-            assert_eq!(crate::terminal::FONT_SIZE, px(16.));
+            assert_eq!(crate::terminal::FONT_SIZE, px(13.));
             // What the toolkit's editor and diff paint with: the same value.
             assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
-            // The chrome around the code stays where it was: a header is a
-            // header, and the code is what is being read.
-            assert!(theme.mono_font_size > px(13.));
+            // The size the preferences offer is the size the grid is drawn at, so
+            // the Settings panel does not answer with a number nothing draws at.
+            assert_eq!(
+                f32::from(theme.mono_font_size),
+                muster_core::settings::TerminalSettings::default().font_size as f32
+            );
         });
     }
 

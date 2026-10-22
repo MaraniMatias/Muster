@@ -165,7 +165,7 @@ pub struct TerminalSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
-            font_size: 16.0,
+            font_size: 13.0,
             ligatures: true,
             cursor_style: TerminalCursorStyle::Block,
             cursor_blink: true,
@@ -249,7 +249,7 @@ impl AppSettings {
                 tree_sticky_scroll: self.ui.tree_sticky_scroll,
             },
             terminal: TerminalSettings {
-                font_size: bounded(self.terminal.font_size, TERMINAL_FONT_SIZE_LIMITS, 16.0),
+                font_size: bounded(self.terminal.font_size, TERMINAL_FONT_SIZE_LIMITS, 13.0),
                 ligatures: self.terminal.ligatures,
                 cursor_style: self.terminal.cursor_style,
                 cursor_blink: self.terminal.cursor_blink,
