@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
-import { finalize, plistMinimumSystemVersion, readMachOMinimumOs, verifyMacBundleMinimumOs, verifyPayload, MACOS_MINIMUM_VERSION } from './finalize-native-release.mjs';
+import { finalize, plistMinimumSystemVersion, readMachOMinimumOs, verifyMacBundleMinimumOs, verifyPayload, MACOS_MINIMUM_VERSION, RELEASE_TARGETS } from './finalize-native-release.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = file => readFileSync(path.join(root, file), 'utf8');
@@ -45,10 +45,10 @@ function versionMinCommand(version, sdk = '15.0') {
   return command;
 }
 
-function machO(...commands) {
+function machO(arch, ...commands) {
   const header = Buffer.alloc(32);
   header.writeUInt32LE(0xfeedfacf, 0);
-  header.writeUInt32LE(0x100000c, 4);
+  header.writeUInt32LE(arch === 'x86_64' ? 0x01000007 : 0x0100000c, 4);
   header.writeUInt32LE(2, 12);
   header.writeUInt32LE(commands.length, 16);
   header.writeUInt32LE(commands.reduce((total, command) => total + command.length, 0), 20);
@@ -86,24 +86,28 @@ test('finalization refuses wrong SHA, tampering, missing targets and unexpected 
 }));
 
 test('the packaged binary states its minimum macOS version in its load commands', () => {
-  assert.deepEqual(readMachOMinimumOs(machO(buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
-  assert.deepEqual(readMachOMinimumOs(machO(versionMinCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  assert.deepEqual(readMachOMinimumOs(machO('arm64', buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  assert.deepEqual(readMachOMinimumOs(machO('arm64', versionMinCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  // The CPU type is what says which architecture a binary is, so a bundle
+  // that carries the other one is refused rather than published.
+  assert.throws(() => readMachOMinimumOs(machO('x86_64', buildVersionCommand('15.0')), 'arm64'), /not macOS arm64/);
+  assert.deepEqual(readMachOMinimumOs(machO('x86_64', buildVersionCommand('15.0')), 'x86_64'), { major: 15, minor: 0, patch: 0 });
   // A binary that says nothing about the floor states no floor.
-  assert.throws(() => readMachOMinimumOs(machO()), /declares no minimum macOS version/);
+  assert.throws(() => readMachOMinimumOs(machO('arm64')), /declares no minimum macOS version/);
   // Two commands that disagree leave nothing to check against.
-  assert.throws(() => readMachOMinimumOs(machO(buildVersionCommand('15.0'), versionMinCommand('14.0'))), /conflicting minimum macOS versions/);
+  assert.throws(() => readMachOMinimumOs(machO('arm64', buildVersionCommand('15.0'), versionMinCommand('14.0'))), /conflicting minimum macOS versions/);
   // A command that runs past the end of the load commands is not a floor.
-  const overrun = machO(buildVersionCommand('15.0'));
+  const overrun = machO('arm64', buildVersionCommand('15.0'));
   overrun.writeUInt32LE(64, 36);
   assert.throws(() => readMachOMinimumOs(overrun), /malformed Mach-O load command bounds/);
   // A header that claims more commands than it carries.
-  const liar = machO(buildVersionCommand('15.0'));
+  const liar = machO('arm64', buildVersionCommand('15.0'));
   liar.writeUInt32LE(4, 16);
   assert.throws(() => readMachOMinimumOs(liar), /malformed Mach-O load commands/);
   // A platform that is not macOS is not this app's floor.
   const other = buildVersionCommand('15.0');
   other.writeUInt32LE(6, 8);
-  assert.throws(() => readMachOMinimumOs(machO(other)), /non-macOS platform/);
+  assert.throws(() => readMachOMinimumOs(machO('arm64', other)), /non-macOS platform/);
 });
 
 test('the bundle declares the floor the build enforces', () => {
@@ -118,78 +122,137 @@ test('the bundle declares the floor the build enforces', () => {
 });
 
 test('the binary and the bundle must agree on the floor', () => {
-  assert.deepEqual(verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
+  assert.deepEqual(verifyMacBundleMinimumOs(minimumPlist, machO('arm64', buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
   // The floor is what this build claims to need, so a binary that states a
   // different one is refused whichever way it differs: older as much as
   // newer, because a binary that says otherwise was not built by the decision
   // it is shipped under.
-  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('14.0'))), /the binary states macOS 14\.0\.0/);
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO('arm64', buildVersionCommand('14.0'))), /the binary states macOS 14\.0\.0/);
   // macOS 15 is followed by 26, so that is the next system a build could ask for.
-  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('26.0'))), /the binary states macOS 26\.0\.0/);
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO('arm64', buildVersionCommand('26.0'))), /the binary states macOS 26\.0\.0/);
   // A major that does not fit in the sixteen bits a packed version gives it
   // used to read as a negative number, and a negative number compared as
   // older than the floor. It is refused now, like any other mismatch.
-  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO(buildVersionCommand('32768.0'))), /the binary states macOS 32768\.0\.0/);
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO('arm64', buildVersionCommand('32768.0'))), /the binary states macOS 32768\.0\.0/);
   // A bundle that lowered its own claim is not the floor this build enforces,
   // and neither is one that raised it.
   const lowered = '<plist><dict><key>LSMinimumSystemVersion</key><string>14.0</string></dict></plist>';
-  assert.throws(() => verifyMacBundleMinimumOs(lowered, machO(buildVersionCommand('15.0'))), /the bundle declares macOS 14\.0\.0/);
+  assert.throws(() => verifyMacBundleMinimumOs(lowered, machO('arm64', buildVersionCommand('15.0'))), /the bundle declares macOS 14\.0\.0/);
   const raised = '<plist><dict><key>LSMinimumSystemVersion</key><string>26.0</string></dict></plist>';
-  assert.throws(() => verifyMacBundleMinimumOs(raised, machO(buildVersionCommand('15.0'))), /the bundle declares macOS 26\.0\.0/);
+  assert.throws(() => verifyMacBundleMinimumOs(raised, machO('arm64', buildVersionCommand('15.0'))), /the bundle declares macOS 26\.0\.0/);
+  // A bundle that claims an architecture it does not carry is refused too.
+  assert.throws(() => verifyMacBundleMinimumOs(minimumPlist, machO('arm64', buildVersionCommand('15.0')), 'x86_64'), /not macOS x86_64/);
 });
 
-test('finalization validates both package formats and refuses wrong bundle versions', { skip: process.platform !== 'linux' }, () => temporary(dir => {
+test('finalization validates every target and refuses wrong bundle versions', { skip: process.platform !== 'linux' }, () => temporary(dir => {
   const version = '1.0.0-rc.2';
-  const linuxDir = path.join(dir, `linux-${sha}`);
-  const macDir = path.join(dir, `macos-${sha}`);
   const stage = path.join(dir, 'stage');
   mkdirSync(path.join(stage, 'DEBIAN'), { recursive: true });
   for (const file of ['usr/bin/Muster', 'usr/share/applications/dev.muster.workspace.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
     mkdirSync(path.dirname(path.join(stage, file)), { recursive: true });
     writeFileSync(path.join(stage, file), 'fixture');
   }
-  writeFileSync(path.join(stage, 'DEBIAN/control'), 'Package: muster\nVersion: 1.0.0~rc.2\nArchitecture: amd64\nMaintainer: Test <test@example.test>\nDescription: Test fixture\n');
-  mkdirSync(linuxDir);
-  mkdirSync(macDir);
-  const deb = 'muster_1.0.0~rc.2_amd64.deb';
-  const mac = 'Muster_1.0.0-rc.2_arm64.zip';
   const run = (command, args, options = {}) => {
     const result = spawnSync(command, args, { encoding: 'utf8', ...options });
     assert.equal(result.status, 0, result.stderr);
   };
-  run('dpkg-deb', ['--build', stage, path.join(linuxDir, deb)]);
-  const contents = path.join(dir, 'Muster.app/Contents');
-  mkdirSync(path.join(contents, 'MacOS'), { recursive: true });
-  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('15.0')));
-  const plist = '<plist><dict><key>CFBundleShortVersionString</key><string>1.0.0-rc.2</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>';
-  writeFileSync(path.join(contents, 'Info.plist'), plist);
   const record = (directory, filename) => {
     writeFileSync(path.join(directory, 'SOURCE_SHA'), `${sha}\n`);
     writeFileSync(path.join(directory, 'SHA256SUMS'), `${createHash('sha256').update(readFileSync(path.join(directory, filename))).digest('hex')}  ${filename}\n`);
   };
-  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
-  record(linuxDir, deb);
-  record(macDir, mac);
+  // Each target is a directory of its own carrying one payload, so a payload
+  // is checked against its own checksum and its own architecture.
+  for (const arch of ['amd64', 'arm64']) {
+    writeFileSync(path.join(stage, 'DEBIAN/control'), `Package: muster\nVersion: 1.0.0~rc.2\nArchitecture: ${arch}\nMaintainer: Test <test@example.test>\nDescription: Test fixture\n`);
+    const linuxDir = path.join(dir, `linux-${arch}-${sha}`);
+    mkdirSync(linuxDir);
+    const deb = `muster_1.0.0~rc.2_${arch}.deb`;
+    run('dpkg-deb', ['--build', stage, path.join(linuxDir, deb)]);
+    record(linuxDir, deb);
+  }
+  const contents = path.join(dir, 'Muster.app/Contents');
+  mkdirSync(path.join(contents, 'MacOS'), { recursive: true });
+  const plist = '<plist><dict><key>CFBundleShortVersionString</key><string>1.0.0-rc.2</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>';
+  writeFileSync(path.join(contents, 'Info.plist'), plist);
+  const archive = (arch) => {
+    writeFileSync(path.join(contents, 'MacOS/Muster'), machO(arch, buildVersionCommand('15.0')));
+    const macDir = path.join(dir, `macos-${arch}-${sha}`);
+    mkdirSync(macDir, { recursive: true });
+    const mac = `Muster_1.0.0-rc.2_${arch}.zip`;
+    rmSync(path.join(macDir, mac), { force: true });
+    run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
+    record(macDir, mac);
+  };
+  archive('arm64');
+  archive('x86_64');
   const output = path.join(dir, 'final');
   finalize(dir, sha, version, output);
   assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /muster_1\.0\.0-rc\.2_amd64\.deb/);
-  assert.deepEqual(readFileSync(path.join(output, 'muster_1.0.0-rc.2_amd64.deb')), readFileSync(path.join(linuxDir, deb)));
+  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /muster_1\.0\.0-rc\.2_arm64\.deb/);
+  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /Muster_1\.0\.0-rc\.2_arm64\.zip/);
+  assert.match(readFileSync(path.join(output, 'SHA256SUMS'), 'utf8'), /Muster_1\.0\.0-rc\.2_x86_64\.zip/);
+  assert.deepEqual(readFileSync(path.join(output, 'muster_1.0.0-rc.2_amd64.deb')), readFileSync(path.join(dir, `linux-amd64-${sha}/muster_1.0.0~rc.2_amd64.deb`)));
+  // A package that names one architecture and carries the other's is refused:
+  // it installs and then refuses to start.
+  writeFileSync(path.join(stage, 'DEBIAN/control'), 'Package: muster\nVersion: 1.0.0~rc.2\nArchitecture: amd64\nMaintainer: Test <test@example.test>\nDescription: Test fixture\n');
+  const linuxArm = path.join(dir, `linux-arm64-${sha}`);
+  rmSync(path.join(linuxArm, 'muster_1.0.0~rc.2_arm64.deb'));
+  run('dpkg-deb', ['--build', stage, path.join(linuxArm, 'muster_1.0.0~rc.2_arm64.deb')]);
+  record(linuxArm, 'muster_1.0.0~rc.2_arm64.deb');
+  assert.throws(() => finalize(dir, sha, version, output));
+  writeFileSync(path.join(stage, 'DEBIAN/control'), 'Package: muster\nVersion: 1.0.0~rc.2\nArchitecture: arm64\nMaintainer: Test <test@example.test>\nDescription: Test fixture\n');
+  rmSync(path.join(linuxArm, 'muster_1.0.0~rc.2_arm64.deb'));
+  run('dpkg-deb', ['--build', stage, path.join(linuxArm, 'muster_1.0.0~rc.2_arm64.deb')]);
+  record(linuxArm, 'muster_1.0.0~rc.2_arm64.deb');
+  // A bundle whose binary is the other architecture is refused too.
+  const macIntel = path.join(dir, `macos-x86_64-${sha}`);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO('arm64', buildVersionCommand('15.0')));
+  rmSync(path.join(macIntel, 'Muster_1.0.0-rc.2_x86_64.zip'));
+  run('zip', ['-qr', path.join(macIntel, 'Muster_1.0.0-rc.2_x86_64.zip'), 'Muster.app'], { cwd: dir });
+  record(macIntel, 'Muster_1.0.0-rc.2_x86_64.zip');
+  assert.throws(() => finalize(dir, sha, version, output), /not macOS x86_64/);
+  archive('x86_64');
   writeFileSync(path.join(contents, 'Info.plist'), plist.replace('1.0.0-rc.2', '1.0.0-rc.1'));
-  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
-  record(macDir, mac);
+  const macArm = path.join(dir, `macos-arm64-${sha}`);
+  rmSync(path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'));
+  run('zip', ['-qr', path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'), 'Muster.app'], { cwd: dir });
+  record(macArm, 'Muster_1.0.0-rc.2_arm64.zip');
   assert.throws(() => finalize(dir, sha, version, output));
   // A binary that states a floor other than the one the bundle declares is
   // refused too, whichever way it differs.
   writeFileSync(path.join(contents, 'Info.plist'), plist);
-  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('26.0')));
-  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
-  record(macDir, mac);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO('arm64', buildVersionCommand('26.0')));
+  rmSync(path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'));
+  run('zip', ['-qr', path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'), 'Muster.app'], { cwd: dir });
+  record(macArm, 'Muster_1.0.0-rc.2_arm64.zip');
   assert.throws(() => finalize(dir, sha, version, output), /the binary states macOS 26\.0\.0/);
-  writeFileSync(path.join(contents, 'MacOS/Muster'), machO(buildVersionCommand('14.0')));
-  run('zip', ['-qr', path.join(macDir, mac), 'Muster.app'], { cwd: dir });
-  record(macDir, mac);
+  writeFileSync(path.join(contents, 'MacOS/Muster'), machO('arm64', buildVersionCommand('14.0')));
+  rmSync(path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'));
+  run('zip', ['-qr', path.join(macArm, 'Muster_1.0.0-rc.2_arm64.zip'), 'Muster.app'], { cwd: dir });
+  record(macArm, 'Muster_1.0.0-rc.2_arm64.zip');
   assert.throws(() => finalize(dir, sha, version, output), /the binary states macOS 14\.0\.0/);
 }));
+
+test('a release carries a build for every supported target', () => {
+  assert.deepEqual(RELEASE_TARGETS, [
+    { directory: 'linux-amd64', arch: 'amd64', format: 'deb' },
+    { directory: 'linux-arm64', arch: 'arm64', format: 'deb' },
+    { directory: 'macos-arm64', arch: 'arm64', format: 'zip' },
+    { directory: 'macos-x86_64', arch: 'x86_64', format: 'zip' },
+  ]);
+  const workflow = read('.github/workflows/linux-release.yml');
+  // Each target is built on a runner of its own architecture, so the binary
+  // in a package is the one that runner's toolchain made.
+  assert.match(workflow, /arch: amd64\n {12}runner: ubuntu-24\.04/);
+  assert.match(workflow, /arch: arm64\n {12}runner: ubuntu-24\.04-arm/);
+  assert.match(workflow, /arch: arm64\n {12}runner: macos-latest/);
+  assert.match(workflow, /arch: x86_64\n {12}runner: macos-15-intel/);
+  const publish = workflow.slice(workflow.indexOf('\n  publish:'));
+  assert.match(publish, /\[\[ \$\{#files\[@\]\} == 6 \]\]/);
+  for (const artifact of ['muster_${version}_amd64.deb', 'muster_${version}_arm64.deb', 'Muster_${version}_arm64.zip', 'Muster_${version}_x86_64.zip']) {
+    assert.ok(publish.includes(artifact), `the release does not carry ${artifact}`);
+  }
+});
 
 function smoke(dir, app, window, deadline = false) {
   const executable = (name, body) => {

@@ -10,9 +10,16 @@ command -v dpkg-deb >/dev/null && command -v dpkg-shlibdeps >/dev/null || { echo
 [[ "$(uname -s)" == Linux ]] || { echo 'package-linux-deb: Linux host required' >&2; exit 1; }
 [[ -x "$binary" ]] || { echo "package-linux-deb: executable not found: $binary" >&2; exit 1; }
 arch="$(dpkg --print-architecture)"
-[[ "$arch" == amd64 ]] || { echo "package-linux-deb: only amd64 is supported (got $arch)" >&2; exit 1; }
+# The package names the architecture it was built for, and the ELF machine has
+# to agree with it: a package that says arm64 and carries an x86_64 binary
+# installs and then refuses to start.
+case "$arch" in
+  amd64) machine='Advanced Micro Devices X86-64' ;;
+  arm64) machine='AArch64' ;;
+  *) echo "package-linux-deb: unsupported architecture: $arch" >&2; exit 1 ;;
+esac
 command -v readelf >/dev/null || { echo 'package-linux-deb: readelf is required' >&2; exit 1; }
-readelf -h "$binary" | grep -Eq 'Machine: +Advanced Micro Devices X86-64' || { echo 'package-linux-deb: binary is not x86_64 ELF' >&2; exit 1; }
+readelf -h "$binary" | grep -Eq "Machine: +$machine" || { echo "package-linux-deb: binary is not $arch ELF" >&2; exit 1; }
 semver="$(awk -F'"' '/^version = "/{ print $2; exit }' "$root/app/Cargo.toml")"
 version="$(bash "$root/scripts/debian-version.sh" "$semver")"
 mkdir -p "$out"
@@ -61,18 +68,18 @@ Package: muster
 Version: $version
 Section: utils
 Priority: optional
-Architecture: amd64
+Architecture: $arch
 Depends: $deps
 Maintainer: Marani Matias Ezequiel <maranimatias@gmail.com>
 Homepage: https://github.com/MaraniMatias/Muster
 Description: Desktop workspace for coding agents in Git worktrees
  Native Rust desktop application for terminals, worktrees, files and code review.
 CONTROL
-artifact="$out/muster_${version}_amd64.deb"
+artifact="$out/muster_${version}_${arch}.deb"
 dpkg-deb --root-owner-group --build "$stage" "$artifact" >/dev/null
 [[ "$(dpkg-deb -f "$artifact" Package)" == muster ]]
 [[ "$(dpkg-deb -f "$artifact" Version)" == "$version" ]]
-[[ "$(dpkg-deb -f "$artifact" Architecture)" == amd64 ]]
+[[ "$(dpkg-deb -f "$artifact" Architecture)" == "$arch" ]]
 contents="$(dpkg-deb --contents "$artifact")"
 for file in './usr/bin/Muster' './usr/share/applications/dev.muster.workspace.desktop' './usr/share/icons/hicolor/512x512/apps/muster.png' './usr/share/doc/muster/copyright'; do
   [[ "$contents" == *"$file"* ]] || { echo "package-linux-deb: missing payload $file" >&2; exit 1; }

@@ -68,8 +68,20 @@ jobs:
 
   linux:
     needs: source
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Two architectures, each built on a runner of its own: a package that
+    # names an architecture and carries the other one's binary installs and
+    # then refuses to start, so the ARM64 package is built by an ARM64
+    # toolchain rather than cross-compiled and renamed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -93,7 +105,7 @@ jobs:
       - run: scripts/package-linux-deb.sh
       - name: Install and launch in a clean runtime container
         run: |
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --platform linux/${{ matrix.arch }} \
             -v "$PWD/dist:/artifacts:ro" -v "$PWD/scripts:/smoke:ro" \
             ubuntu:24.04 bash /smoke/linux-package-smoke.sh /artifacts/$(basename dist/*.deb)
       - name: Checksum package and record source
@@ -102,7 +114,7 @@ jobs:
         run: cd dist && sha256sum *.deb > SHA256SUMS && printf '%s\n' "$SHA" > SOURCE_SHA
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: linux-${{ inputs.sha }}
+          name: linux-${{ matrix.arch }}-${{ inputs.sha }}
           path: |
             dist/*.deb
             dist/SHA256SUMS
@@ -112,8 +124,19 @@ jobs:
 
   macos:
     needs: source
-    runs-on: macos-latest
-    timeout-minutes: 60
+    # Apple Silicon and Intel are two builds, not one universal one: the
+    # bundle carries one binary, and each architecture is built on a runner of
+    # its own so the Mach-O it carries is the one the runner's toolchain made.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -135,16 +158,17 @@ jobs:
         env:
           SHA: ${{ inputs.sha }}
           VERSION: ${{ needs.source.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          [[ "$(lipo -archs dist/Muster.app/Contents/MacOS/Muster)" == arm64 ]]
+          [[ "$(lipo -archs dist/Muster.app/Contents/MacOS/Muster)" == "$ARCH" ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Muster.app/Contents/Info.plist)" == "$VERSION" ]]
           cd dist
-          ditto -c -k --sequesterRsrc --keepParent Muster.app "Muster_${VERSION}_arm64.zip"
-          shasum -a 256 "Muster_${VERSION}_arm64.zip" > SHA256SUMS
+          ditto -c -k --sequesterRsrc --keepParent Muster.app "Muster_${VERSION}_${ARCH}.zip"
+          shasum -a 256 "Muster_${VERSION}_${ARCH}.zip" > SHA256SUMS
           printf '%s\n' "$SHA" > SOURCE_SHA
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: macos-${{ inputs.sha }}
+          name: macos-${{ matrix.arch }}-${{ inputs.sha }}
           path: |
             dist/*.zip
             dist/SHA256SUMS
@@ -207,8 +231,9 @@ jobs:
           sha256sum -c SHA256SUMS
           shopt -s nullglob
           version="${TAG#v}"
-          files=(*); [[ ${#files[@]} == 4 ]]
-          [[ -s "muster_${version}_amd64.deb" && -s "Muster_${version}_arm64.zip" ]]
+          files=(*); [[ ${#files[@]} == 6 ]]
+          [[ -s "muster_${version}_amd64.deb" && -s "muster_${version}_arm64.deb" ]]
+          [[ -s "Muster_${version}_arm64.zip" && -s "Muster_${version}_x86_64.zip" ]]
           if git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG"; then
             echo "Tag already exists: $TAG"; exit 1
           else
@@ -218,5 +243,5 @@ jobs:
           gh api "repos/$REPO/git/refs" -X POST -f ref="refs/tags/$TAG" -f sha="$object"
           flags=()
           if [[ "$TAG" == *-* ]]; then flags+=(--prerelease --latest=false); fi
-          gh release create "$TAG" ./*.deb ./*.zip SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "Native macOS arm64 and Ubuntu 24.04 amd64 artifacts built and validated from $SHA." "${flags[@]}"
+          gh release create "$TAG" ./*.deb ./*.zip SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "Native macOS arm64 and x86_64 and Ubuntu 24.04 amd64 and arm64 artifacts built and validated from $SHA." "${flags[@]}"
           gh release edit "$TAG" --repo "$REPO" --draft=false "${flags[@]}"

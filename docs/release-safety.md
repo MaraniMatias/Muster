@@ -3,7 +3,13 @@
 ## Supported targets
 
 - macOS 15+, Apple Silicon: ad-hoc signed `.app` in a versioned ZIP, not notarized.
-- Ubuntu 24.04, x86_64: `.deb`. No native ARM64 Linux or AppImage promise yet.
+- macOS 15+, Intel: the same `.app` in a versioned ZIP, built on an Intel runner.
+- Ubuntu 24.04, x86_64 and arm64: `.deb`. No AppImage promise yet.
+
+Every target is built on a runner of its own architecture, so the binary inside
+a package is the one that runner's toolchain made. A package that names one
+architecture and carries the other's installs and then refuses to start, so the
+finalization step refuses to publish one.
 
 The macOS floor is one decision in three places: `LSMinimumSystemVersion 15.0`
 in the bundle's `Info.plist`, `MACOSX_DEPLOYMENT_TARGET` forced to 15.0 in
@@ -56,8 +62,9 @@ gh workflow run linux-release.yml --ref main \
   -f sha=<full-commit-sha> -f mode=validate
 ```
 
-Both platforms run the checks and create their bundles. Linux installs and launches
-the `.deb` in a fresh Ubuntu 24.04 container, with no development libraries, as an
+All four targets run the checks and create their bundles. Linux installs and
+launches the `.deb` in a fresh Ubuntu 24.04 container of its own architecture,
+with no development libraries, as an
 unprivileged user with an isolated HOME. Xvfb and Mesa lavapipe provide the test
 display and software Vulkan driver. The bounded check requires an application
 window and a process that remains alive; it is **not** a pixel-render or full
@@ -65,13 +72,17 @@ interaction test. The ordinary pull-request CI exercises Linux packaging and
 this runtime check too, before this manual workflow is available on `main`.
 
 A read-only finalization job checks source SHA, exact file lists, checksums,
-Debian version/architecture/payload and macOS bundle version/architecture. It
-also reads the minimum macOS version out of the packaged arm64 binary's own
+Debian version/architecture/payload and macOS bundle version/architecture, for
+each target in its own directory: a `.deb` that names an architecture its ELF
+does not have is refused, and a bundle whose Mach-O is the other architecture
+is refused. It also reads the minimum macOS version out of each packaged
+binary's own
 Mach-O load commands and refuses a bundle that declares a floor other than
 15.0, a binary that states no floor, a binary that states a floor other than
 15.0 -- older or newer -- and a binary whose own load commands disagree about
-it. It retains one `native-release-<sha>` artifact with the `.deb`, ZIP,
-`SHA256SUMS` and `SOURCE_SHA`. Validation never creates a tag or release.
+it. It retains one `native-release-<sha>` artifact with the two `.deb`
+packages, the two ZIPs, `SHA256SUMS` and `SOURCE_SHA`. Validation never creates
+a tag or release.
 
 Before publishing, inspect that artifact and manually verify real desktop
 rendering, terminal input/process shutdown, clipboard and links. Real GPU/IME,
@@ -91,7 +102,7 @@ Publication must be dispatched from `main`, for a commit on `main`, and the new
 tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`
 or `v1.0.0-rc.N`; final `v1.0.0` remains a separate deliberate decision.
 
-Publish mode builds and validates both platforms in the same run, then downloads
+Publish mode builds and validates every target in the same run, then downloads
 the final artifact without rebuilding it. Only this last job has write permission;
 it never checks out or executes source. It rechecks checksums and the source SHA,
 refuses existing tags (including a concurrent creation), creates an annotated tag,

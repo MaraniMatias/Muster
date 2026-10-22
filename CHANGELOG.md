@@ -6,6 +6,18 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## 1.0.0-rc.11
+
+- **Every release carries a build for every supported platform.** The release
+  pipeline built two artifacts: a macOS bundle on an Apple Silicon runner and an
+  Ubuntu package on an x86_64 one. An Intel Mac and an ARM64 Linux had no
+  build at all, so a candidate could not be installed on either. There are four
+  now -- macOS on Apple Silicon and on Intel, Ubuntu on x86_64 and on arm64 --
+  and each one is built on a runner of its own architecture, so the binary
+  inside a package is the one that runner's toolchain made. A package that
+  names one architecture and carries the other's installs and then refuses to
+  start, so the release check refuses to publish one.
+
 ## 1.0.0-rc.10
 
 - **On Linux the window manager draws the frame.** The app asked for

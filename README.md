@@ -40,7 +40,9 @@ release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Mu
 page. Existing candidates may contain only a macOS archive; the new workflow adds Linux packages to future releases.
 
 - **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
-- **Ubuntu 24.04 x86_64:** When the release includes a `.deb`, install it with `sudo apt install ./muster_<version>_amd64.deb`. Download filenames use `-rc.3`; the package's internal Debian version uses `~rc.3` for correct upgrade ordering. Linux ARM64 and AppImage are not provided by the native release path.
+- **macOS 15+ (Intel):** Unzip `Muster_<version>_x86_64.zip` and move `Muster.app` to Applications. Same bundle, same ad-hoc signature.
+- **Ubuntu 24.04 x86_64:** install the package with `sudo apt install ./muster_<version>_amd64.deb`. Download filenames use `-rc.3`; the package's internal Debian version uses `~rc.3` for correct upgrade ordering.
+- **Ubuntu 24.04 arm64:** the same command with `muster_<version>_arm64.deb`. AppImage is not provided by the native release path.
 - **Other Linux:** No native package is currently provided.
 
 For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.
@@ -164,11 +166,11 @@ Every script in `scripts/` belongs to this app's release path.
 | --- | --- | --- |
 | `release.sh` | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle | The entry point for every local build. `release` is macOS-only |
 | `bundle-macos.sh` | Assembles `dist/Muster.app` with the icon, name and version | Called by `release.sh release` and by CI |
-| `package-linux-deb.sh` | Builds `dist/muster_<version>_amd64.deb`, deriving runtime dependencies from the ELF | On Ubuntu, after `release.sh build` |
+| `package-linux-deb.sh` | Builds `dist/muster_<version>_<arch>.deb` for amd64 and arm64, deriving runtime dependencies from the ELF | On Ubuntu, after `release.sh build` |
 | `debian-version.sh` | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`) | Internal to packaging |
 | `linux-package-smoke.sh` | Installs the `.deb` in a clean Ubuntu container and launches it under Xvfb | Internal to CI; run it directly to reproduce the CI check |
 | `linux-window-smoke.sh` | The window and liveness half of that check | Internal to `linux-package-smoke.sh` |
-| `finalize-native-release.mjs` | Checks the built macOS and Linux payloads together before publication | Internal to the release workflow |
+| `finalize-native-release.mjs` | Checks the built macOS and Linux payloads of every target together before publication | Internal to the release workflow |
 | `audit-rust.mjs` | RustSec audit of the locked graph over OSV, refusing unpinned path packages | `release.sh check` and CI |
 | `perf-native.sh` | Runs the ignored terminal hot-path benchmarks | Development only |
 | `generate-native-file-icons.mjs` | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |

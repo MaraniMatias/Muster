@@ -14,6 +14,7 @@ export const MACOS_MINIMUM_VERSION = { major: 15, minor: 0, patch: 0 };
 
 const MACH_MAGIC_64 = 0xfeedfacf;
 const CPU_TYPE_ARM64 = 0x0100000c;
+const CPU_TYPE_X86_64 = 0x01000007;
 const MACH_HEADER_64_SIZE = 32;
 const LC_VERSION_MIN_MACOSX = 0x24;
 const LC_BUILD_VERSION = 0x32;
@@ -59,14 +60,21 @@ export function plistMinimumSystemVersion(plist) {
   return parseVersionText(match[1]);
 }
 
+// The two macOS architectures a release ships. The CPU type is what says
+// which one a binary is, so a bundle that claims one and carries the other
+// is refused rather than published.
+export const MACHO_ARCHITECTURES = { arm64: CPU_TYPE_ARM64, x86_64: CPU_TYPE_X86_64 };
+
 // The floor the binary itself carries, read from its load commands. A Mach-O
 // states it in `LC_BUILD_VERSION` (the modern command) or in the older
 // `LC_VERSION_MIN_MACOSX`; either one says it, and a binary that says two
 // different things says nothing.
-export function readMachOMinimumOs(bytes) {
+export function readMachOMinimumOs(bytes, arch = 'arm64') {
   assert.ok(bytes.length >= MACH_HEADER_64_SIZE, 'truncated Mach-O header');
   assert.equal(bytes.readUInt32LE(0), MACH_MAGIC_64, 'not a 64-bit Mach-O');
-  assert.equal(bytes.readUInt32LE(4), CPU_TYPE_ARM64, 'not macOS arm64');
+  const expected = MACHO_ARCHITECTURES[arch];
+  assert.ok(expected, `unknown macOS architecture: ${arch}`);
+  assert.equal(bytes.readUInt32LE(4), expected, `not macOS ${arch}`);
   const commands = bytes.readUInt32LE(16);
   const commandBytes = bytes.readUInt32LE(20);
   const end = MACH_HEADER_64_SIZE + commandBytes;
@@ -102,13 +110,13 @@ export function readMachOMinimumOs(bytes) {
 // older floor is refused as much as one that states a newer one: the floor is
 // what this build claims to need, and a binary that says otherwise was not
 // built by the decision it is shipped under.
-export function verifyMacBundleMinimumOs(plist, executable) {
+export function verifyMacBundleMinimumOs(plist, executable, arch = 'arm64') {
   const declared = plistMinimumSystemVersion(plist);
   assert.ok(
     sameVersion(declared, MACOS_MINIMUM_VERSION),
     `the bundle declares macOS ${formatVersion(declared)}; this build enforces ${formatVersion(MACOS_MINIMUM_VERSION)}, and the two must be the same version`,
   );
-  const binary = readMachOMinimumOs(executable);
+  const binary = readMachOMinimumOs(executable, arch);
   assert.ok(
     sameVersion(binary, MACOS_MINIMUM_VERSION),
     `the binary states macOS ${formatVersion(binary)}; this build enforces ${formatVersion(MACOS_MINIMUM_VERSION)}, and the two must be the same version`,
@@ -127,37 +135,52 @@ export function verifyPayload(directory, sha, filename) {
   return bytes;
 }
 
+// The four targets a release carries. Each one is a directory of its own with
+// exactly one payload in it, so a payload is verified against its own
+// checksum and its own source SHA rather than against a mixed set.
+export const RELEASE_TARGETS = [
+  { directory: 'linux-amd64', arch: 'amd64', format: 'deb' },
+  { directory: 'linux-arm64', arch: 'arm64', format: 'deb' },
+  { directory: 'macos-arm64', arch: 'arm64', format: 'zip' },
+  { directory: 'macos-x86_64', arch: 'x86_64', format: 'zip' },
+];
+
 export function finalize(base, sha, version, output) {
   assert.match(version, /^(?:0\.\d+\.\d+|1\.0\.0-rc\.\d+)$/, 'unsupported release version');
   const debVersion = version.replace('-', '~');
-  const deb = `muster_${debVersion}_amd64.deb`;
-  // GitHub replaces '~' in asset names; keep Debian ordering inside the package only.
-  const publishedDeb = `muster_${version}_amd64.deb`;
-  const mac = `Muster_${version}_arm64.zip`;
-  const linuxDir = path.join(base, `linux-${sha}`);
-  const macDir = path.join(base, `macos-${sha}`);
-  verifyPayload(linuxDir, sha, deb);
-  verifyPayload(macDir, sha, mac);
-  const debPath = path.join(linuxDir, deb);
-  const macPath = path.join(macDir, mac);
   const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  for (const [field, expected] of [['Package', 'muster'], ['Version', debVersion], ['Architecture', 'amd64']]) {
-    assert.equal(run('dpkg-deb', ['-f', debPath, field]).trim(), expected);
-  }
-  const contents = run('dpkg-deb', ['--contents', debPath]);
-  for (const file of ['usr/bin/Muster', 'usr/share/applications/dev.muster.workspace.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
-    assert.ok(contents.includes(`./${file}`), `missing ${file}`);
-  }
-  assert.ok(!contents.includes('./debian/'), 'source metadata leaked into package');
-  const plist = run('unzip', ['-p', macPath, 'Muster.app/Contents/Info.plist']);
-  assert.equal(plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]*)<\/string>/)?.[1], version);
-  const executable = execFileSync('unzip', ['-p', macPath, 'Muster.app/Contents/MacOS/Muster'], { maxBuffer: 256 * 1024 * 1024 });
-  verifyMacBundleMinimumOs(plist, executable);
+  const payloads = RELEASE_TARGETS.map(target => {
+    const directory = path.join(base, `${target.directory}-${sha}`);
+    const file = target.format === 'deb'
+      ? `muster_${debVersion}_${target.arch}.deb`
+      : `Muster_${version}_${target.arch}.zip`;
+    // GitHub replaces '~' in asset names; keep Debian ordering inside the package only.
+    const published = target.format === 'deb'
+      ? `muster_${version}_${target.arch}.deb`
+      : file;
+    verifyPayload(directory, sha, file);
+    const source = path.join(directory, file);
+    if (target.format === 'deb') {
+      for (const [field, expected] of [['Package', 'muster'], ['Version', debVersion], ['Architecture', target.arch]]) {
+        assert.equal(run('dpkg-deb', ['-f', source, field]).trim(), expected);
+      }
+      const contents = run('dpkg-deb', ['--contents', source]);
+      for (const entry of ['usr/bin/Muster', 'usr/share/applications/dev.muster.workspace.desktop', 'usr/share/icons/hicolor/512x512/apps/muster.png', 'usr/share/doc/muster/copyright']) {
+        assert.ok(contents.includes(`./${entry}`), `missing ${entry}`);
+      }
+      assert.ok(!contents.includes('./debian/'), 'source metadata leaked into package');
+    } else {
+      const plist = run('unzip', ['-p', source, 'Muster.app/Contents/Info.plist']);
+      assert.equal(plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]*)<\/string>/)?.[1], version);
+      const executable = execFileSync('unzip', ['-p', source, 'Muster.app/Contents/MacOS/Muster'], { maxBuffer: 256 * 1024 * 1024 });
+      verifyMacBundleMinimumOs(plist, executable, target.arch);
+    }
+    return { published, source };
+  });
   mkdirSync(output, { recursive: true });
-  copyFileSync(debPath, path.join(output, publishedDeb));
-  copyFileSync(macPath, path.join(output, mac));
+  for (const payload of payloads) copyFileSync(payload.source, path.join(output, payload.published));
   writeFileSync(path.join(output, 'SOURCE_SHA'), `${sha}\n`);
-  writeFileSync(path.join(output, 'SHA256SUMS'), [publishedDeb, mac].map(filename => `${createHash('sha256').update(readFileSync(path.join(output, filename))).digest('hex')}  ${filename}\n`).join(''));
+  writeFileSync(path.join(output, 'SHA256SUMS'), payloads.map(payload => `${createHash('sha256').update(readFileSync(path.join(output, payload.published))).digest('hex')}  ${payload.published}\n`).join(''));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
