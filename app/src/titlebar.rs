@@ -961,9 +961,11 @@ impl TerminalWindow {
             .border_b_1()
             .border_color(roles.border)
             .children(bar)
-            // Linux has no frame of its own, so the close it draws would
-            // otherwise take the window down without closing what is running
-            // in it. Only Linux draws these controls, and only Linux reads this.
+            // The window's own close control, for the window that draws its
+            // own frame: without this the close would take the window down
+            // without closing what is running in it. Only Linux draws that
+            // control, and only when the window manager is not drawing the
+            // frame itself.
             .on_close_window(move |_, _window, cx| {
                 let _ = close.update_in(cx, |app, window, cx| app.request_window_close(window, cx));
             })

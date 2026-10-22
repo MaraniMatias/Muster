@@ -160,15 +160,21 @@ reaches a third fewer rules than the theme defines.
 
 ## On Linux, the app fills the window
 
-Linux has no window frame of its own unless the window manager draws one, so
-the app draws its own: `window_border()` owns the border and the resize band.
-**The frame reserves no band for itself.** The toolkit's Linux default keeps
-one for a shadow the window manager draws, and that band is a margin around
-the app: the window's own controls sit twenty pixels away from the corner the
-pointer goes to, the app is framed rather than filling the window, and the
-band is gone when the window is tiled — so the app looks different maximized
-than it does not. `FRAME_SHADOW` in `app/src/app.rs` is that decision, and it
-is zero on every platform.
+**The window manager draws the frame.** The app does not ask for client-side
+decorations on Linux, so the window manager owns the caption and the window's
+controls. Two reasons, and both are the toolkit's client-side decorations
+rather than the app's own code: they reserve a twenty-pixel band on every side
+for the shadow they draw, and that band is a margin around the app — the
+window's own controls sit twenty pixels away from the corner the pointer goes
+to, the app is framed rather than filling the window, and the band is gone when
+the window is tiled, so the app looks different maximized than it does not; and
+the controls they draw do not answer the click, so minimize, maximize and close
+are three buttons that do nothing. The band belongs to the decorations and not
+to the app's own frame, so setting the app's frame to zero was never enough.
+
+Windows keeps the frame the app draws, because server-side decorations would
+stack a caption and a set of window controls over the bar this window draws for
+itself.
 
 The native directory picker is the desktop portal on Linux, and a portal is a
 service the desktop session may not run. **The picker is the first answer and
