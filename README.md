@@ -44,7 +44,7 @@ Linux package; every candidate from v1.0.0-rc.11 on carries all four.
 
 - **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
 - **macOS 15+ (Intel):** Unzip `Muster_<version>_x86_64.zip` and move `Muster.app` to Applications. Same bundle, same ad-hoc signature.
-- **Ubuntu 24.04 x86_64:** install the package with `sudo apt install ./muster_<version>_amd64.deb`. Download filenames use `-rc.3`; the package's internal Debian version uses `~rc.3` for correct upgrade ordering.
+- **Ubuntu 24.04 x86_64:** install the package with `sudo apt install ./muster_<version>_amd64.deb`. The download filename keeps the candidate's `-rc.<n>`; the package's internal Debian version uses `~rc.<n>` for correct upgrade ordering.
 - **Ubuntu 24.04 arm64:** the same command with `muster_<version>_arm64.deb`. AppImage is not provided by the native release path.
 - **Other Linux:** No native package is currently provided.
 

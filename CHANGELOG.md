@@ -19,6 +19,41 @@ here still gets its generated notes.
   message is the file's own path on the disk. An icon beside the name puts it on
   the clipboard, the way the diff's title does for a change.
 
+- **The delete action stands on its own in the worktree dialog's footer.** The
+  destructive action is the one button in that footer that cannot be taken
+  back, so it no longer sits among the two that keep the worktree: it goes to
+  the far end and the safe actions keep the other.
+
+- **The preferences are in four sections, and the panel is a card with a
+  sidebar.** Interface, Terminal, Editor and Review notes are the four
+  sections, and the panel draws a sidebar of them on the left and the rows of
+  the one on screen on the right: a card of a fixed size, where the sidebar
+  does not change with the section and a section with more rows than fit
+  scrolls inside the card rather than growing it. A section is a button, so it
+  is reached with the keyboard as well as with the pointer, and the section on
+  screen wears its own surface and ink rather than an accent bar. The section
+  on screen is window state, like the draft, and is never written to the file.
+
+- **A control wears an edge you can see.** The toolkit paints a field's
+  border, an ordinary button's and an unchecked checkbox's box with one ink,
+  and at the value the overlays were closed with that ink was the surface the
+  control is drawn on: a checkbox nobody can see is a checkbox nobody can find.
+  A control's own edge is a step stronger than the overlay hairline now, and it
+  is visible on every surface the app draws a control on.
+
+- **The shell starts at the size the grid is drawn at.** A terminal was opened
+  at a size it was never going to be shown at, and then corrected once the
+  window had measured the pane: the shell was asked for another size, and a
+  shell that is asked for another size redraws its prompt from the cursor,
+  which leaves the first row of the old prompt on screen. The PTY is now opened
+  without its child, and the child starts once the size it will keep is known:
+  the grid and the PTY are given that size before the fork, so the prompt is
+  drawn once, in the grid it is shown in. A terminal that is not the one on
+  screen is never measured, so the window tells it the size of the pane it
+  shares. The scrollbar reads its preference now: Hidden draws no thumb, While
+  scrolling draws one where there is somewhere to scroll to, and Always draws
+  one even when there is nothing to scroll.
+
 ## 1.0.0-rc.13
 
 - **A row is the font size and not the face's line box.** The grid's row was
