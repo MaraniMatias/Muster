@@ -8,6 +8,16 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **A terminal's row follows the work it is doing.** The panel filed a terminal
+  under the worktree it was opened in and left it there when the work behind it
+  moved: a shell that `cd`s into a sibling worktree, or an agent session that
+  starts working in one. The row follows both now -- the directory the shell is
+  sitting in, and the place an agent is working. Legacy followed the agent's work
+  out of the box; the shell's own directory is the other half of the same question,
+  and this build follows it too. What moves is the row: the process, its scrollback
+  and its window stay exactly where they are, and nothing here types a `cd` into a
+  shell. Settings says which of the two is followed, and `off` still means neither.
+
 - **A path in the terminal opens in the editor.** Ctrl+click -- cmd+click on
   macOS -- on a path the terminal printed opens that file in the preview, and on
   an address it opens the browser. The name is read the way the shell reads it:

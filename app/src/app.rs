@@ -3723,8 +3723,8 @@ pub fn working_directory() -> PathBuf {
 /// What a terminal follows when the work it is doing moves to another worktree.
 ///
 /// Read from the preferences file, which is where the panel writes it. A file that
-/// cannot be read leaves the follow off: following nothing is the answer that changes
-/// no rows by surprise.
+/// cannot be read leaves the follow at its default rather than refusing to start: a
+/// preference holds no work, and the default is what the file would have said.
 pub(crate) fn follow_setting() -> FollowWorktree {
     muster_core::settings::settings_path()
         .ok()

@@ -94,11 +94,15 @@ pub enum TerminalScrollbarMode {
 /// process's working directory or feeds a directory to a program in front of the
 /// shell: a row is a row, and where it is filed says which worktree the person is
 /// looking at.
+///
+/// Both is the default, and the reason is that a row's job is to say where the work
+/// is: the work is the directory the shell is sitting in, or the place an agent
+/// session is working, and a row that stays under the worktree a terminal was opened
+/// in says where it was opened rather than where it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FollowWorktree {
     /// Follow neither a shell's working directory nor an agent's work.
-    #[default]
     Off,
     /// Follow the directory the shell is in, when that is another registered worktree.
     Cd,
@@ -106,6 +110,7 @@ pub enum FollowWorktree {
     /// worktree.
     Agent,
     /// Follow both.
+    #[default]
     Both,
 }
 
@@ -172,7 +177,7 @@ impl Default for TerminalSettings {
             selection_copy: true,
             scrollbar: TerminalScrollbarMode::Hidden,
             shell_integration: true,
-            follow_worktree: FollowWorktree::Off,
+            follow_worktree: FollowWorktree::default(),
         }
     }
 }
@@ -418,6 +423,19 @@ mod tests {
         save(&path, &AppSettings::default()).unwrap();
         assert_eq!(load(&path).unwrap(), AppSettings::default());
         assert!(path.is_file());
+    }
+
+    /// A terminal's row follows the work it is doing out of the box.
+    ///
+    /// The shell's own directory and the agent's work are the two halves of the same
+    /// question, and Legacy followed both: a row under the worktree a terminal was
+    /// opened in says where it was opened, not where it is.
+    #[test]
+    fn the_follow_is_on_by_default() {
+        let follow = AppSettings::default().terminal.follow_worktree;
+        assert_eq!(follow, FollowWorktree::Both);
+        assert!(follow.follows_cd());
+        assert!(follow.follows_agent());
     }
 
     #[test]

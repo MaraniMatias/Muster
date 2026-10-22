@@ -406,8 +406,11 @@ Five rules it depends on, each pinned by a test:
   another start leaves the box where the person is typing; and the range is driven
   onto `DiffState::set_selected_lines` by one helper, so the lines the note covers
   are washed in the diff's own selection — visible while the note is open,
-  re-marked when the diff is rebuilt underneath it, and cleared when it is saved,
-  cancelled or deleted.
+  re-marked when the diff is rebuilt underneath it, and kept for the note that
+  was applied last: a saved note leaves its lines washed, because the mark is
+  what says which lines the comment is about. Another note takes the mark over,
+  a cancelled draft leaves nothing behind it, and a note that is deleted takes
+  its lines with it.
 - **Both sides are sides.** `begin_review_note` opens a draft on a `−` line as
   readily as on a `+` one, the picker offers the removed lines above it, the wash
   is drawn over them, and the saved note and its export say `old`. A note is a
@@ -587,8 +590,11 @@ work it is doing moves to another worktree. The process, its scrollback and its
 window stay exactly where they are: nothing here writes to a terminal, feeds a
 directory to a shell, or tells a program in front of the shell where to go. Two
 questions are followed separately — the shell's own directory, and the agent's work —
-and the setting says which of them (`off`, `cd`, `agent`, `both`). A move needs a
-destination that is a registered checkout: the deepest registered root wins, a nested
+and the setting says which of them (`off`, `cd`, `agent`, `both`). Both is the
+default: a row says where the work is, and the work is the directory the shell is
+sitting in or the place an agent is working, so a row left under the worktree a
+terminal was opened in says where it was opened rather than where it is. A move
+needs a destination that is a registered checkout: the deepest registered root wins, a nested
 Git checkout this app does not know about is never folded into its parent, and two
 roots that are one directory are ambiguous. Exactly one terminal may be showing the
 session, and a move the person made by hand is not undone by an observation that is
