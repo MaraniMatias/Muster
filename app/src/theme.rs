@@ -195,6 +195,49 @@ const PROTO_HIGHLIGHTS: &str = r#"
 (comment) @comment
 "#;
 
+/// The highlight query for Gherkin, the language a `.feature` file is written in.
+///
+/// The toolkit has no Gherkin grammar, and the vendored one this app registers
+/// ships no query either, so this is written here against the node names that
+/// grammar declares, in the capture vocabulary [`SYNTAX_TOKENS`] answers.
+///
+/// A Gherkin file is prose with a few words of structure: the word that opens a
+/// header, the word a step begins with, and the title the header carries.
+/// Everything else — the sentences of a description, the text of a step — is
+/// left in the editor's own ink, because it is prose and prose is prose.
+const GHERKIN_HIGHLIGHTS: &str = r#"
+; The words that open a header are anonymous nodes named after themselves.
+[
+  "Feature"
+  "Rule"
+  "Background"
+  "Scenario"
+  "Scenario Outline"
+  "Examples"
+] @keyword
+
+; The word a step begins with is a node of its own.
+(step_keyword) @keyword
+
+; What a header is called is the title of the thing it opens.
+(name_line) @title
+
+; A tag names the feature or the scenario it stands above.
+(tag) @tag
+
+; A quoted string and a placeholder in a step are both values.
+(quoted_string) @string
+(parameter) @string.special
+
+; A doc string is a block of text a step quotes.
+(doc_string) @string
+
+; The bars of a table are the punctuation around its cells.
+(table_row "|" @punctuation)
+
+(comment) @comment
+"#;
+
 /// The injections for Vue, which are the crate's own plus the one it is missing.
 ///
 /// `tree_sitter_vue_updated` injects a language into `<script>` and into a
@@ -326,6 +369,21 @@ pub fn install(cx: &mut App) {
                 tree_sitter_ini::LANGUAGE.into(),
                 Vec::new(),
                 tree_sitter_ini::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
+        );
+        // Gherkin is the language a `.feature` file is written in. The toolkit
+        // has no grammar for it, so the vendored one is registered here with
+        // the query above, and `syntax_language` reaches it by the name it
+        // already answers.
+        registry.register(
+            "gherkin",
+            &LanguageConfig::new(
+                "gherkin",
+                tree_sitter_gherkin::LANGUAGE.into(),
+                Vec::new(),
+                GHERKIN_HIGHLIGHTS,
                 "",
                 "",
             ),
@@ -1674,6 +1732,64 @@ mod tests {
             assert_eq!(painted("class"), Some(function), "a plain attribute");
             assert_eq!(painted("title"), Some(function), "a bound attribute");
             assert_eq!(painted("p"), Some(tag), "the tag beside them");
+        });
+    }
+
+    /// A `.feature` file is read with the Gherkin grammar, and the words that
+    /// carry its structure wear the colours they mean.
+    ///
+    /// Those words are the point of the file: a header opens with one and a step
+    /// begins with one, while the prose between them is prose. A grammar that
+    /// coloured the prose like a keyword would say the file is code where it is
+    /// not, so both are compared here rather than one of them alone.
+    #[gpui_kit::test]
+    fn a_gherkin_file_is_painted_with_its_own_words(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::Rope;
+
+        let source = "@smoke\nFeature: A feature\n  # a comment\n  Scenario: A scenario\n    Given I am signed in\n";
+        dark(cx);
+        cx.update(|cx| {
+            let mut highlighter =
+                gpui_kit::component::highlighter::SyntaxHighlighter::new("gherkin");
+            assert!(
+                highlighter.update(None, &Rope::from(source), None),
+                "the Gherkin grammar accepted its own file"
+            );
+            let theme = gpui_kit::component::Theme::global(cx);
+            let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+            let painted = |needle: &str| {
+                let at = source.find(needle).expect("the source has the needle");
+                styles
+                    .iter()
+                    .find(|(range, _)| range.start <= at && at < range.end)
+                    .and_then(|(_, style)| style.color)
+            };
+            let keyword = legacy("syntax-token-keyword");
+            assert_eq!(painted("Feature"), Some(keyword), "the header's word");
+            assert_eq!(painted("Scenario"), Some(keyword), "the scenario's word");
+            assert_eq!(painted("Given"), Some(keyword), "the step's word");
+            assert_eq!(
+                painted("@smoke"),
+                Some(legacy("syntax-token-string-expression")),
+                "the tag"
+            );
+            assert_eq!(
+                painted("# a comment"),
+                Some(legacy("syntax-token-comment")),
+                "the comment"
+            );
+            // The title a header carries is a title, and the text a step
+            // carries is prose rather than another keyword.
+            assert_eq!(
+                painted("A feature"),
+                Some(legacy("syntax-token-function")),
+                "the title a header carries"
+            );
+            assert_ne!(
+                painted("I am signed in"),
+                Some(keyword),
+                "the text of a step is not a keyword"
+            );
         });
     }
 

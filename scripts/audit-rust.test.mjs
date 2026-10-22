@@ -20,6 +20,13 @@ import {
   patchedAlacrittyTreeSha256,
 } from "./patched-alacritty.mjs";
 import {
+  auditedPatchedGherkin,
+  PATCHED_GHERKIN_ARCHIVE_SHA256,
+  PATCHED_GHERKIN_DIR,
+  PATCHED_GHERKIN_TREE_SHA256,
+  patchedGherkinTreeSha256,
+} from "./patched-gherkin.mjs";
+import {
   auditedPatchedGitignore,
   PATCHED_GITIGNORE_ARCHIVE_SHA256,
   PATCHED_GITIGNORE_DIR,
@@ -71,6 +78,22 @@ function patchedGitignorePackage() {
         id: `path+file://${manifestPath}#konomanoasa-tree-sitter-gitignore@0.3.1`,
         name: "konomanoasa-tree-sitter-gitignore",
         version: "0.3.1",
+        source: null,
+        manifest_path: manifestPath,
+      },
+    ],
+  })[0];
+}
+
+function patchedGherkinPackage() {
+  const manifestPath = join(PATCHED_GHERKIN_DIR, "Cargo.toml");
+  return parseCargoMetadata({
+    workspace_members: [APP_ID],
+    packages: [
+      {
+        id: `path+file://${manifestPath}#tree-sitter-gherkin@0.0.1`,
+        name: "tree-sitter-gherkin",
+        version: "0.0.1",
         source: null,
         manifest_path: manifestPath,
       },
@@ -186,6 +209,28 @@ test("editing the vendored Gitignore grammar breaks its pinned hash", (t) => {
   const patched = join(copy, "src/scanner.c");
   writeFileSync(patched, `${readFileSync(patched, "utf8")}\n/* quiet edit */\n`);
   assert.notEqual(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
+});
+
+test("the Gherkin grammar is accepted only with its pinned source tree", () => {
+  assert.equal(patchedGherkinTreeSha256(), PATCHED_GHERKIN_TREE_SHA256);
+  assert.match(PATCHED_GHERKIN_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
+
+  const grammar = patchedGherkinPackage();
+  assert.equal(grammar.name, "tree-sitter-gherkin");
+  assert.equal(grammar.version, "0.0.1");
+  assert.equal(grammar.source, null);
+});
+
+test("editing the vendored Gherkin grammar breaks its pinned hash", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "muster-vendored-gherkin-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const copy = join(directory, "gherkin");
+  cpSync(PATCHED_GHERKIN_DIR, copy, { recursive: true });
+  assert.equal(patchedGherkinTreeSha256(copy), PATCHED_GHERKIN_TREE_SHA256);
+
+  const patched = join(copy, "src/parser.c");
+  writeFileSync(patched, `${readFileSync(patched, "utf8")}\n/* quiet edit */\n`);
+  assert.notEqual(patchedGherkinTreeSha256(copy), PATCHED_GHERKIN_TREE_SHA256);
 });
 
 test("a registry-sourced alacritty_terminal is not the patched package", () => {

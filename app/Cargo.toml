@@ -83,6 +83,9 @@ tree-sitter-vue-updated = "0.1.0"
 # The toolkit has no Gitignore parser. This pinned upstream grammar is built with
 # the workspace's compatible cc release; its tree hash is checked by the RustSec audit.
 tree-sitter-gitignore = { package = "konomanoasa-tree-sitter-gitignore", path = "../vendor/konomanoasa-tree-sitter-gitignore-0.3.1" }
+# The toolkit has no Gherkin parser either. This vendored upstream grammar is the
+# one a `.feature` file is read with; its tree hash is checked by the RustSec audit.
+tree-sitter-gherkin = { path = "../vendor/tree-sitter-gherkin-ceeb7c8" }
 tree-sitter-ini = "1.4.0"
 # Already in the graph through the toolkit. Needed because a toolkit
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by

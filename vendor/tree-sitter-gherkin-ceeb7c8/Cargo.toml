@@ -1,0 +1,27 @@
+# Muster's copy of the upstream grammar, with the Rust binding written here:
+# the upstream repository ships none. See PATCHES.md; do not edit by hand.
+
+[package]
+edition = "2021"
+name = "tree-sitter-gherkin"
+version = "0.0.1"
+build = "bindings/rust/build.rs"
+links = "tree-sitter-gherkin"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Tree-sitter grammar for Gherkin, the language a `.feature` file is written in."
+license = "MIT"
+repository = "https://github.com/DevAbdullahUk/tree-sitter-gherkin"
+
+[lib]
+name = "tree_sitter_gherkin"
+path = "bindings/rust/lib.rs"
+
+[dependencies.tree-sitter-language]
+version = "0.1.8"
+
+[build-dependencies.cc]
+version = "~1.2.1"

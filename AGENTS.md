@@ -160,6 +160,12 @@ name it emits is in one of the two.
 contract from the grammar's side, and
 `every_grammar_has_had_its_captures_renamed` fails if the pass missed one.
 
+The toolkit ships no Gherkin grammar, so the one a `.feature` file is read with
+is vendored under `vendor/` and registered by `theme::install`, with its query
+written there against the node names that grammar declares. Its tree is
+hash-pinned by `scripts/patched-gherkin.mjs`, like every other vendored crate
+the audit is asked to trust.
+
 ### File icons: their own palette, and their own generator
 
 `theme::Ink` is the second contract that is not the app's chrome. A file icon is

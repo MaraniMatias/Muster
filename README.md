@@ -177,7 +177,7 @@ Every script in `scripts/` belongs to this app's release path.
 | `audit-rust.mjs` | RustSec audit of the locked graph over OSV, refusing unpinned path packages | `release.sh check` and CI |
 | `perf-native.sh` | Runs the ignored terminal hot-path benchmarks | Development only |
 | `generate-native-file-icons.mjs` | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |
-| `patched-alacritty.mjs`, `patched-gitignore.mjs` | Hash-pin the vendored crates so the audit can trust them | Internal to `audit-rust.mjs` |
+| `patched-alacritty.mjs`, `patched-gitignore.mjs`, `patched-gherkin.mjs` | Hash-pin the vendored crates so the audit can trust them | Internal to `audit-rust.mjs` |
 | `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs` | Tests for the audit, the release commands and the packaging/publish gate | Run by `release.sh check` and CI |
 
 The full release procedure is in [release safety](docs/release-safety.md).

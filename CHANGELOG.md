@@ -6,6 +6,14 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A `.feature` file is read with Gherkin's own words.** A Cucumber feature
+  file is prose with a few words of structure, and it opened as plain text. The
+  word that opens a header and the word a step begins with wear the keywords'
+  colour, the title a header carries wears a title's, a tag and a comment and a
+  quoted string wear theirs, and the prose in between stays prose.
+
 ## 1.0.0-rc.13
 
 - **A row is the font size and not the face's line box.** The grid's row was

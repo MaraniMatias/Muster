@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { auditedPatchedAlacritty } from "./patched-alacritty.mjs";
+import { auditedPatchedGherkin } from "./patched-gherkin.mjs";
 import { auditedPatchedGitignore } from "./patched-gitignore.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,7 +55,7 @@ export function parseCargoMetadata(json) {
     } else if (pkg.source !== null) {
       throw new Error(`unsupported external dependency source for ${label}`);
     } else {
-      const audited = auditedPatchedAlacritty(pkg) ?? auditedPatchedGitignore(pkg);
+      const audited = auditedPatchedAlacritty(pkg) ?? auditedPatchedGherkin(pkg) ?? auditedPatchedGitignore(pkg);
       if (audited) {
         const key = `patched\0${pkg.name}@${pkg.version}`;
         packages.set(key, audited);
