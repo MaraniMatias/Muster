@@ -573,6 +573,10 @@ impl TerminalWindow {
                     .child(
                         Button::new("worktree-delete")
                             .danger()
+                            // The destructive action wears an edge of its own:
+                            // it is a button like the two beside it, and the
+                            // one that cannot be taken back.
+                            .outline()
                             .label(if busy { "Deleting…" } else { "Delete worktree" })
                             .disabled(!can_delete)
                             .on_click(move |_, window, cx| {

@@ -1,4 +1,4 @@
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -80,12 +80,29 @@ struct Session {
     master_fd: libc::c_int,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<ChildState>,
-    process_id: Option<u32>,
+    /// The child that has been described but not started yet.
+    ///
+    /// `None` once the child has started. The slave is held here rather than
+    /// dropped, because the PTY it belongs to is the one the child will run in.
+    pending: Mutex<Option<PendingChild>>,
+    process_id: Mutex<Option<u32>>,
     /// Direct Pi launches have no shell parent to distinguish as a foreground job.
     direct_pi: bool,
     #[cfg(unix)]
-    terminal_session_id: Option<u32>,
+    terminal_session_id: Mutex<Option<u32>>,
     closing: AtomicBool,
+}
+
+/// A child that has been described but not forked.
+///
+/// The PTY is open and the command is ready; what is missing is the fork. A
+/// host that knows the size the child will keep tells the PTY that size first
+/// and starts the child after, so the child never draws into a size that is
+/// about to be replaced: a shell that is asked for another size redraws its
+/// prompt, and the drawing it replaces stays on screen.
+struct PendingChild {
+    slave: Box<dyn SlavePty + Send>,
+    command: CommandBuilder,
 }
 
 struct ChildState {
@@ -117,6 +134,26 @@ pub struct TerminalBackend {
 
 impl TerminalBackend {
     pub fn spawn(
+        &self,
+        id: String,
+        options: SpawnOptions,
+        output: OutputSink,
+    ) -> Result<(), String> {
+        self.open(id.clone(), options, output)?;
+        if let Err(error) = self.start(&id) {
+            let _ = self.close(&id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Open a PTY and describe the child that will run in it.
+    ///
+    /// The child is not started: [`Self::start`] does that, and the host calls
+    /// it once the size the child will keep is known. A shell that is told one
+    /// size and then asked for another redraws its prompt, and the drawing it
+    /// replaces stays on screen — so the size is settled before the fork.
+    pub fn open(
         &self,
         id: String,
         options: SpawnOptions,
@@ -175,28 +212,24 @@ impl TerminalBackend {
             .master
             .take_writer()
             .map_err(|error| error.to_string())?;
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| error.to_string())?;
-        let process_id = child.process_id();
-        #[cfg(unix)]
-        let terminal_session_id = process_session_id(process_id);
-        drop(pair.slave);
 
         let session = Arc::new(Session {
             master: Mutex::new(pair.master),
             master_fd,
             writer: Mutex::new(writer),
             child: Mutex::new(ChildState {
-                child: Some(child),
+                child: None,
                 exit_code: None,
                 child_released: false,
             }),
-            process_id,
+            pending: Mutex::new(Some(PendingChild {
+                slave: pair.slave,
+                command,
+            })),
+            process_id: Mutex::new(None),
             direct_pi,
             #[cfg(unix)]
-            terminal_session_id,
+            terminal_session_id: Mutex::new(None),
             closing: AtomicBool::new(false),
         });
         let reader_session = Arc::clone(&session);
@@ -224,6 +257,37 @@ impl TerminalBackend {
         if let Err(error) = inserted {
             let _ = terminate_session(&session, &id);
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Start the child of a PTY that was opened without one.
+    ///
+    /// The size the PTY was opened at is the size the child is told, so a child
+    /// that starts here draws into the size it will keep.
+    pub fn start(&self, id: &str) -> Result<(), String> {
+        let session = self.session(id)?;
+        let pending = {
+            let mut pending = session.pending.lock().map_err(|error| error.to_string())?;
+            pending.take()
+        };
+        let Some(PendingChild { slave, command }) = pending else {
+            return Err(format!("terminal session {id} has no child to start"));
+        };
+        let child = slave
+            .spawn_command(command)
+            .map_err(|error| error.to_string())?;
+        let process_id = child.process_id();
+        drop(slave);
+        {
+            let mut state = session.child.lock().map_err(|error| error.to_string())?;
+            state.child = Some(child);
+        }
+        *session.process_id.lock().map_err(|error| error.to_string())? = process_id;
+        #[cfg(unix)]
+        {
+            let session_id = process_session_id(process_id);
+            *session.terminal_session_id.lock().map_err(|error| error.to_string())? = session_id;
         }
         Ok(())
     }
@@ -278,13 +342,18 @@ impl TerminalBackend {
             return Err(format!("terminal session {id} is closing"));
         }
         if process.exit_code.is_none() {
-            if let Some(status) = process
-                .child
-                .as_mut()
-                .ok_or_else(|| format!("terminal session {id} is closing"))?
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
+            // A child that has not started yet has no exit code to report, and
+            // the terminal it belongs to is starting rather than gone.
+            let Some(child) = process.child.as_mut() else {
+                return Ok(TerminalSessionStatus {
+                    state: TerminalProcessState::Running,
+                    exit_code: None,
+                    foreground_process: false,
+                    foreground_app: None,
+                    working_directory: None,
+                });
+            };
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                 process.exit_code = Some(status.exit_code());
             }
         }
@@ -329,7 +398,7 @@ impl TerminalBackend {
                 continue;
             }
             let pid = if session.direct_pi {
-                session.process_id
+                session.process_id()
             } else {
                 let Some(pid) = session.foreground_group() else {
                     continue;
@@ -394,16 +463,28 @@ impl TerminalBackend {
 }
 
 impl Session {
+    /// The child's process id, once it has started.
+    ///
+    /// `None` while the child is still waiting to be started.
+    fn process_id(&self) -> Option<u32> {
+        self.process_id.lock().ok().and_then(|id| *id)
+    }
+
+    /// The session the child belongs to, once it has started.
+    #[cfg(unix)]
+    fn terminal_session_id(&self) -> Option<u32> {
+        self.terminal_session_id.lock().ok().and_then(|id| *id)
+    }
+
     fn is_running(&self) -> Result<bool, String> {
         let mut process = self.child.lock().map_err(|error| error.to_string())?;
         if process.exit_code.is_none() {
-            if let Some(status) = process
-                .child
-                .as_mut()
-                .ok_or_else(|| "terminal child is unavailable".to_string())?
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
+            // A child that has not started yet is not running, and asking it
+            // anything would be asking a process that does not exist.
+            let Some(child) = process.child.as_mut() else {
+                return Ok(false);
+            };
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                 process.exit_code = Some(status.exit_code());
             }
         }
@@ -420,7 +501,7 @@ impl Session {
 
     fn foreground_process(&self) -> bool {
         self.foreground_group()
-            .zip(self.process_id)
+            .zip(self.process_id())
             .is_some_and(|(group, shell)| group != shell)
     }
 
@@ -430,7 +511,7 @@ impl Session {
     /// the group's id *is* that process's pid and the OS can name it. Resolving the group
     /// rather than a fixed pid is what keeps the answer right after a job is replaced.
     fn foreground_app(&self) -> Option<String> {
-        let (group, shell) = self.foreground_group().zip(self.process_id)?;
+        let (group, shell) = self.foreground_group().zip(self.process_id())?;
         (group != shell)
             .then(|| process::executable_name(group))
             .flatten()
@@ -443,7 +524,7 @@ impl Session {
     /// whose row moved because a build ran with a `-C` flag would be moved by nothing the person
     /// did.
     fn working_directory(&self) -> Option<String> {
-        let shell = self.process_id?;
+        let shell = self.process_id()?;
         process::current_directory(shell).map(|directory| directory.to_string_lossy().into_owned())
     }
 
@@ -668,6 +749,10 @@ fn finish_child(process: &mut ChildState, id: &str) -> Result<(), String> {
     if process.child_released {
         return Ok(());
     }
+    // A child that never started has nothing to kill and nothing to reap.
+    if process.child.is_none() {
+        return Ok(());
+    }
     if process.exit_code.is_none() {
         if let Some(child) = process.child.as_mut() {
             if let Err(error) = child.kill() {
@@ -787,7 +872,7 @@ fn signal_foreground_group(
         return Ok(());
     };
     let expected_session = session
-        .terminal_session_id
+        .terminal_session_id()
         .and_then(|sid| libc::pid_t::try_from(sid).ok())
         .ok_or_else(|| format!("terminal {id} session could not be verified"))?;
     let fd = master
@@ -825,8 +910,10 @@ fn signal_foreground_group(
 
 #[cfg(unix)]
 fn signal_shell_group(session: &Session, signal: libc::c_int, id: &str) -> Result<(), String> {
-    signal_process_group(session.process_id, session.terminal_session_id, signal, id)?;
-    signal_process(session.process_id, session.terminal_session_id, signal, id)
+    let process_id = session.process_id();
+    let session_id = session.terminal_session_id();
+    signal_process_group(process_id, session_id, signal, id)?;
+    signal_process(process_id, session_id, signal, id)
 }
 
 #[cfg(unix)]

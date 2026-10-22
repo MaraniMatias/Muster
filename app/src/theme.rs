@@ -53,6 +53,14 @@ use gpui_kit::{px, rgb, rgba, App, Hsla};
 
 const TEXT_DISABLED: u32 = 0x565b67;
 const BORDER_STRONG: u32 = 0x3a404c;
+/// The edge a control wears: a field's border, an ordinary button's, and the
+/// box of an unchecked checkbox.
+///
+/// A step above the hairline an overlay is closed with, because a control
+/// stands *on* a surface rather than closing one: at the hairline's own value
+/// the edge is the surface it is drawn on, and an unchecked checkbox is a box
+/// nobody can see.
+const CONTROL_EDGE: u32 = 0x454c5b;
 const CONTENT_ADDED: u32 = 0xa1c181;
 const CONTENT_REMOVED: u32 = 0xd97f84;
 
@@ -427,10 +435,16 @@ pub fn install(cx: &mut App) {
         theme.background = base;
         theme.foreground = text;
         // One hairline everywhere the toolkit draws an edge: `border` for the
-        // overlays it paints itself, `input` for a field and `sidebar_border`
-        // for the panel.
+        // overlays it paints itself, `input` for a control's own edge and
+        // `sidebar_border` for the panel.
+        //
+        // The control edge is a step stronger than the overlay hairline,
+        // because the toolkit paints a field's border, an ordinary button's and
+        // an unchecked checkbox's box with it. At the hairline's own value that
+        // box is the surface it stands on, and a checkbox nobody can see is a
+        // checkbox nobody can find.
         theme.border = border;
-        theme.input = border;
+        theme.input = rgb(CONTROL_EDGE).into();
         theme.muted = control;
         theme.muted_foreground = muted;
         theme.popover = control;
@@ -480,11 +494,15 @@ pub fn install(cx: &mut App) {
         // surrounding dialog is asking for.
         theme.danger = danger;
         theme.danger_foreground = danger_text;
-        theme.danger_hover = danger.alpha(0.12);
-        theme.danger_active = danger.alpha(0.20);
+        // The outlined danger button wears an edge instead of a fill, and the
+        // toolkit scales its wash by opacity, so the inks it reads have to be
+        // the danger ink itself. The wash belongs to the filled-less danger
+        // button below, which is the one that wears it.
+        theme.danger_hover = danger;
+        theme.danger_active = danger;
         theme.button_danger = transparent;
-        theme.button_danger_hover = theme.danger_hover;
-        theme.button_danger_active = theme.danger_active;
+        theme.button_danger_hover = danger.alpha(0.12);
+        theme.button_danger_active = danger.alpha(0.20);
         theme.button_danger_foreground = danger_text;
         theme.success = success;
         theme.success_foreground = success;
@@ -1315,6 +1333,36 @@ mod tests {
             assert_eq!(theme.overlay, theme.background.alpha(0.8));
             assert_eq!(theme.button_danger_hover, theme.danger.alpha(0.12));
             assert_eq!(theme.button_danger_active, theme.danger.alpha(0.20));
+            // The outlined danger button scales its wash by opacity, so the
+            // inks it reads have to be the danger ink itself.
+            assert_eq!(theme.danger_hover, theme.danger);
+            assert_eq!(theme.danger_active, theme.danger);
+        });
+    }
+
+    /// A control's own edge is visible on the surface it stands on.
+    ///
+    /// The toolkit paints a field's border, an ordinary button's and an
+    /// unchecked checkbox's box with the theme's `input` token, so that token
+    /// is the edge the person is looking at. At the value the overlays are
+    /// closed with it is the surface it is drawn on, and the control
+    /// disappears into it.
+    #[gpui_kit::test]
+    fn a_control_edge_is_visible_on_the_surface_it_stands_on(cx: &mut TestAppContext) {
+        let roles = dark(cx);
+        cx.read(|cx| {
+            let theme = Theme::global(cx);
+            for surface in [
+                roles.surface_base,
+                roles.surface,
+                roles.surface_raised,
+                roles.surface_inset,
+            ] {
+                assert!(
+                    contrast(theme.input, surface) >= 1.5,
+                    "a control's edge has to be visible on the surface it is drawn on"
+                );
+            }
         });
     }
 

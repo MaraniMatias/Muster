@@ -1014,6 +1014,8 @@ struct Inner {
     /// The view's end of the wake channel. A receiver cannot be cloned or
     /// shared, so it is stored here and handed over once, by `take_wake`.
     wake_receiver: Mutex<Option<TerminalWake>>,
+    /// Whether the child has been started yet.
+    child_started: AtomicBool,
 }
 
 impl Inner {
@@ -1031,6 +1033,21 @@ impl Inner {
             return Err(SessionError::Closing);
         }
         self.side.queue.push(bytes).map_err(SessionError::Queue)
+    }
+
+    /// Start the child, once.
+    ///
+    /// The shell is told the size of the grid it will draw into before it
+    /// starts, so its first prompt is drawn once: a shell that is asked for
+    /// another size redraws that prompt from the cursor, and the drawing it
+    /// replaces stays on screen.
+    fn start_child(&self) {
+        if self.child_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(error) = self.backend.start(&self.id) {
+            log::warn!("terminal {} did not start: {error}", self.id);
+        }
     }
 
     /// The reader's half of the pipeline, as the backend wants it: bytes in,
@@ -1315,6 +1332,10 @@ fn apply_resize(inner: &Inner, request: ResizeRequest) {
         Ok((cols, rows)) => inner.shared().record_applied(cols, rows),
         Err(error) => log::warn!("terminal {} could not be resized: {error}", inner.id),
     }
+    // The child starts here, with the size the PTY has just been given: a
+    // shell that is told one size and then asked for another redraws its
+    // prompt, and the drawing it replaces stays on screen.
+    inner.start_child();
 }
 
 fn side_protocol_error(side: &ReaderSide) -> Option<String> {
@@ -1595,10 +1616,11 @@ impl TerminalSession {
             status_interval: config.status_interval,
             drain_deadline: config.drain_deadline,
             wake_receiver: Mutex::new(Some(wake_receiver)),
+            child_started: AtomicBool::new(false),
         });
 
         backend
-            .spawn(
+            .open(
                 config.id,
                 SpawnOptions {
                     program,

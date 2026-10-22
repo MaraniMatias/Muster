@@ -901,7 +901,6 @@ impl TerminalWindow {
                     DialogFooter::new()
                         .child(
                             Button::new("settings-reset")
-                                .ghost()
                                 .label("Reset to defaults")
                                 .disabled(is_default || saving)
                                 .on_click(move |_, window, cx| {
