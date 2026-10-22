@@ -2984,7 +2984,14 @@ mod tests {
         for _ in 0..3 {
             cx.update(|window, cx| window.render_frame(cx));
         }
-        assert!(wait_for_char(&session, 'l'));
+        // The whole word, not one of its letters: a double click selects the
+        // word under the pointer, and a half-written word is not a word.
+        assert!(wait_for_text(&session, "alpha"));
+        // The grid is measured when the view draws it, and the rows it shows
+        // are applied to the terminal then. A click before that lands on
+        // nothing at all, so the frame the word arrives in is drawn before
+        // the click, not after it.
+        cx.update(|window, cx| window.render_frame(cx));
         let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
         cx.simulate_click(
             point(origin.x + cell.width * 0.2, origin.y),
@@ -3522,6 +3529,29 @@ mod tests {
                 .iter()
                 .any(|row| row.cells.iter().any(|cell| cell.c == wanted))
             {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether the grid holds `wanted` as text, within a bounded wait.
+    ///
+    /// A word is what a selection is made of, so this is what waits for the
+    /// whole of one rather than for a letter of it.
+    fn wait_for_text(session: &TerminalSession, wanted: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if session.snapshot().rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains(wanted)
+            }) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
