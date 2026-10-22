@@ -6,6 +6,28 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A row is the font size and not the face's line box.** The grid's row was
+  the face's own ascent and descent multiplied by the line height ratio, and a
+  face's line box is already taller than the em it is drawn in -- Fira Code's
+  is 1.23 of it -- so every row was a quarter taller than the glyph in it. The
+  glyph was painted at the foot of the cell as well, which left a gap above
+  every row a block element filled, so a bar of blocks read as a row of
+  separate tiles. A row is the font size times the ratio now, and the line box
+  starts at the top of the cell, so a block fills the row it is in.
+
+- **The file beside the terminal is set like the code it sits next to.** The
+  document's rows were drawn at the toolkit's one and a half times the size,
+  which is a quarter taller than the grid's, so a file read beside a terminal
+  was set apart from it. The document is drawn at the grid's own ratio now.
+
+- **The grid and the file beside it have a size each.** The panel's terminal
+  size is the size the grid is drawn at and its editor size is the size the
+  document and the diff are drawn at, so a preference is never a number
+  nothing draws at. Both are read when the app starts, so a size that changes
+  needs a restart, and each row says so.
+
 ## 1.0.0-rc.12
 
 - **A terminal's row follows the work it is doing.** The panel filed a terminal
