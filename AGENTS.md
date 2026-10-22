@@ -405,12 +405,14 @@ Five rules it depends on, each pinned by a test:
   composer's **anchor** — the line the `+` or `−` was clicked on — so choosing
   another start leaves the box where the person is typing; and the range is driven
   onto `DiffState::set_selected_lines` by one helper, so the lines the note covers
-  are washed in the diff's own selection — visible while the note is open,
-  re-marked when the diff is rebuilt underneath it, and kept for the note that
-  was applied last: a saved note leaves its lines washed, because the mark is
-  what says which lines the comment is about. Another note takes the mark over,
-  a cancelled draft leaves nothing behind it, and a note that is deleted takes
-  its lines with it.
+  are washed in the diff's own selection. The wash belongs to a **note**, not to a
+  draft: it is visible while the note is being written, it is kept when the note
+  is applied — the wash is what says which lines the comment is about — and it
+  goes back to the note that was applied last when a draft is dropped. Another
+  note takes the mark over, and a note that is deleted takes its lines with it.
+  The toolkit's selection is a text selection, so anything that clears the
+  window's selection takes the wash with it; the window puts it back while the
+  diff has nothing selected, and a selection of the person's own is left alone.
 - **Both sides are sides.** `begin_review_note` opens a draft on a `−` line as
   readily as on a `+` one, the picker offers the removed lines above it, the wash
   is drawn over them, and the saved note and its export say `old`. A note is a

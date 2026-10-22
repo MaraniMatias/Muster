@@ -558,6 +558,17 @@ impl TerminalWindow {
                 self.sync_review_note_selection(cx);
             }
         }
+        // The wash belongs to a note, and the toolkit's selection is a text
+        // selection: anything that clears it takes the note's lines with it.
+        // The mark is put back while the diff has nothing selected, and a
+        // selection of the person's own is left alone.
+        if self
+            .diff_view
+            .as_ref()
+            .is_some_and(|view| view.state.read(cx).selected_lines().is_none())
+        {
+            self.sync_review_note_selection(cx);
+        }
         let view = self.diff_view.as_ref()?;
         notices.extend(
             view.parse_errors

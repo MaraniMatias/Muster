@@ -27,6 +27,27 @@ static NEXT_NOTE_ID: AtomicU64 = AtomicU64::new(0);
 type AnchorHashes = HashMap<(ReviewSide, usize), Option<String>>;
 type AnchorHashCache = HashMap<(String, String), (String, AnchorHashes)>;
 
+/// The range a note covers, in the coordinates the diff's own selection speaks.
+///
+/// A note names a side and the lines on it, and the diff washes a range in
+/// those same terms, so the two are one thing said twice.
+fn review_note_range(
+    path: &str,
+    side: ReviewSide,
+    line_start: usize,
+    line_end: usize,
+) -> DiffLineRange {
+    DiffLineRange::new(
+        path.to_owned(),
+        match side {
+            ReviewSide::Old => DiffSide::Original,
+            ReviewSide::New => DiffSide::Modified,
+        },
+        line_start,
+        line_end,
+    )
+}
+
 /// Candidate first lines for a note range: every line from the top of its own hunk down to the
 /// line it ends on, on either side.
 ///
@@ -170,6 +191,13 @@ pub(crate) struct ReviewState {
     pub(crate) notes: HashMap<String, Vec<ReviewNote>>,
     pub(crate) anchor_hashes: AnchorHashCache,
     pub(crate) composer: Option<ReviewComposer>,
+    /// The note whose lines are washed on the diff.
+    ///
+    /// The mark belongs to a note rather than to a draft: a note that has been
+    /// applied says which lines it is about, and that stays on the diff until
+    /// another note takes the mark over or that note is deleted. A draft borrows
+    /// it while it is being written.
+    pub(crate) marked: Option<String>,
     pub(crate) include_outdated: bool,
     /// The note a person asked to delete, with the checkout it belongs to, until
     /// they say whether they meant to.
@@ -576,7 +604,7 @@ impl TerminalWindow {
         cx.notify();
     }
 
-    /// The lines a draft covers, washed in the diff's own selection.
+    /// The lines a note covers, washed in the diff's own selection.
     ///
     /// A note is about a range, and a range is invisible while the box that writes
     /// it floats over the diff: the start moves, the end does not, and nothing on
@@ -586,17 +614,47 @@ impl TerminalWindow {
     /// is opened, moved or dropped, and from a diff that was rebuilt underneath
     /// one: a fresh state starts with nothing selected.
     pub(crate) fn sync_review_note_selection(&mut self, cx: &mut Context<Self>) {
-        let range = self.review.composer.as_ref().map(|composer| {
-            DiffLineRange::new(
-                composer.path.clone(),
-                match composer.side {
-                    ReviewSide::Old => DiffSide::Original,
-                    ReviewSide::New => DiffSide::Modified,
-                },
+        let range = self.review_selection_range();
+        self.apply_diff_selection(range, cx);
+    }
+
+    /// The lines the diff's own selection wears: the draft being written, or
+    /// the note that was applied last.
+    ///
+    /// A draft borrows the mark while it is written, because the range it
+    /// covers is the one the composer is changing. With no draft, the note that
+    /// was applied last owns it, so the lines a comment is about stay washed on
+    /// the diff.
+    fn review_selection_range(&self) -> Option<DiffLineRange> {
+        if let Some(composer) = self.review.composer.as_ref() {
+            return Some(review_note_range(
+                &composer.path,
+                composer.side,
                 composer.line_start,
                 composer.line_end,
-            )
-        });
+            ));
+        }
+        let id = self.review.marked.as_ref()?;
+        let note = self
+            .review
+            .notes
+            .values()
+            .flatten()
+            .find(|note| &note.id == id)?;
+        Some(review_note_range(
+            &note.path,
+            note.side,
+            note.line_start,
+            note.line_end.unwrap_or(note.line_start),
+        ))
+    }
+
+    /// The range the diff's own selection wears, applied to the diff on screen.
+    ///
+    /// The selection is the diff's own, so a range that is not on screen is
+    /// simply not drawn: the toolkit washes the lines it can find and leaves
+    /// the rest alone.
+    fn apply_diff_selection(&mut self, range: Option<DiffLineRange>, cx: &mut Context<Self>) {
         if let Some(view) = self.diff_view.as_ref() {
             view.state
                 .update(cx, |state, cx| state.set_selected_lines(range, cx));
@@ -679,7 +737,17 @@ impl TerminalWindow {
             self.push_error("A review note cannot anchor more than 8 KiB of code.", cx);
             return;
         }
+        // The lines the note covers, kept for the diff: a note that is applied
+        // leaves its range washed on the diff, because the mark is what says
+        // which lines the comment is about.
+        let range = review_note_range(
+            &composer.path,
+            composer.side,
+            composer.line_start,
+            composer.line_end,
+        );
         let composer = self.review.composer.take().expect("composer was checked");
+        let mut applied = composer.editing_id.clone();
         if composer.editing_id.is_none() {
             self.review
                 .anchor_hashes
@@ -721,7 +789,7 @@ impl TerminalWindow {
                 .as_nanos();
             let id = format!("note-{}-{epoch}-{serial}", std::process::id());
             notes.push(ReviewNote {
-                id,
+                id: id.clone(),
                 checkout_id: composer.checkout_id,
                 path: composer.path,
                 side: composer.side,
@@ -732,8 +800,12 @@ impl TerminalWindow {
                 code: composer.code,
                 outdated: false,
             });
+            applied = Some(id);
         }
-        self.sync_review_note_selection(cx);
+        // The note that was applied owns the mark: its lines stay washed on the
+        // diff until another note takes the mark over or that note is deleted.
+        self.review.marked = applied;
+        self.apply_diff_selection(Some(range), cx);
         cx.notify();
     }
 
@@ -787,6 +859,12 @@ impl TerminalWindow {
         }
         if let Some(notes) = self.review.notes.get_mut(checkout_id) {
             notes.retain(|note| note.id != id);
+        }
+        // A note that is gone takes its lines with it: the mark belongs to the
+        // note, so a note that is not there owns nothing.
+        if self.review.marked.as_deref() == Some(id) {
+            self.review.marked = None;
+            self.apply_diff_selection(None, cx);
         }
         if self
             .review

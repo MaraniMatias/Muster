@@ -5465,17 +5465,14 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
             );
         });
         window.click("save-review-note", cx);
-        // A saved note is an annotation of its own now, so the lines it covered
-        // are no longer the diff's selection.
+        // A saved note leaves its lines washed on the diff: the mark is what
+        // says which lines the comment is about.
         fixture.view.read_with(cx, |app, cx| {
-            assert!(app
-                .diff_view
-                .as_ref()
-                .unwrap()
-                .state
-                .read(cx)
-                .selected_lines()
-                .is_none());
+            let state = &app.diff_view.as_ref().unwrap().state;
+            assert_eq!(
+                state.read(cx).selected_lines(),
+                Some(DiffLineRange::new("change.txt", DiffSide::Modified, 1, 3))
+            );
         });
         let note_id = fixture.view.update(cx, |app, cx| {
             let note = &mut app.review.notes.get_mut(&fixture.checkout).unwrap()[0];
@@ -5526,15 +5523,13 @@ async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut T
     .unwrap();
     fixture.view.read_with(cx, |app, cx| {
         assert!(app.review.composer.is_none());
-        assert!(
-            app.diff_view
-                .as_ref()
-                .unwrap()
-                .state
-                .read(cx)
-                .selected_lines()
-                .is_none(),
-            "a cancelled note leaves no selection behind it"
+        // A cancelled draft gives the mark back to the note it came from: the
+        // note that was applied last still says which lines it is about.
+        let state = &app.diff_view.as_ref().unwrap().state;
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Modified, 1, 3)),
+            "a cancelled draft leaves the applied note's lines marked"
         );
     });
     close(&fixture, cx);
@@ -5587,6 +5582,15 @@ async fn a_saved_note_is_edited_and_deleted_from_two_icons(cx: &mut TestAppConte
         window.click("save-review-note", cx);
     })
     .unwrap();
+    // A saved note leaves its lines washed on the diff: the mark is what says
+    // which lines the comment is about.
+    fixture.view.read_with(cx, |app, cx| {
+        let state = &app.diff_view.as_ref().unwrap().state;
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3))
+        );
+    });
     let note_id = fixture.view.read_with(cx, |app, _| {
         app.review
             .notes
@@ -5656,13 +5660,25 @@ async fn a_saved_note_is_edited_and_deleted_from_two_icons(cx: &mut TestAppConte
         window.click("confirm-delete-review-note", cx);
     })
     .unwrap();
-    fixture.view.read_with(cx, |app, _| {
+    fixture.view.read_with(cx, |app, cx| {
         assert!(
             app.review
                 .notes
                 .get(&fixture.checkout)
                 .is_none_or(Vec::is_empty),
             "a cross that was not answered leaves the note alone, and an answered one removes it"
+        );
+        // A note that is gone takes its lines with it: the mark belongs to the
+        // note, so a note that is not there owns nothing.
+        assert!(
+            app.diff_view
+                .as_ref()
+                .unwrap()
+                .state
+                .read(cx)
+                .selected_lines()
+                .is_none(),
+            "a deleted note leaves no lines marked behind it"
         );
     });
     close(&fixture, cx);
