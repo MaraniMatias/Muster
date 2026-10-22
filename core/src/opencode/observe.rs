@@ -887,8 +887,13 @@ mod tests {
             // cheap; the reads the deadline has to cut off are not. A loaded runner
             // schedules a thread later than a workstation does, and this test is about the
             // deadline rather than about the machine.
+            //
+            // The sleeps have to add up past the deadline, or the read that is
+            // meant to be cut off lands inside it: two of them and a third
+            // that starts late is more than the budget, and the third read is
+            // the one this test is about.
             if request.path != "/api/info" {
-                std::thread::sleep(Duration::from_millis(60));
+                std::thread::sleep(Duration::from_millis(80));
             }
             mock::reply(200, serde_json::json!({"data": data}))
         });
