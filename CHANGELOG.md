@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.10
 
 - **On Linux the window manager draws the frame.** The app asked for
   client-side decorations, and the band that reserved was the toolkit's own:
