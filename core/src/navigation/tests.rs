@@ -497,19 +497,23 @@ fn oversized_save_preserves_last_good_file() {
 #[test]
 fn overflowing_git_output_is_refused_instead_of_truncated() {
     let temp = tempdir().unwrap();
-    let began = std::time::Instant::now();
     // Thirty-two megabytes of zeros, written as fast as the pipe takes them:
     // twice the cap, and quick. A flood that produces its bytes slowly lets
     // the deadline arrive before the cap, and the test would then be about the
     // deadline rather than about the cap.
+    //
+    // The deadline is generous on purpose. What this test is about is the cap,
+    // and the error says which of the two ended the read: a read that ran out
+    // of time says it timed out, and a read that ran past the cap says it
+    // exceeded it. A deadline as tight as the flood needs on a loaded machine
+    // would make the test about that machine instead.
     let error = git_output(
         temp.path(),
         &["-c", "alias.flood=!head -c 33554432 /dev/zero", "flood"],
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .unwrap_err();
     assert!(error.contains("exceeded"), "{error}");
-    assert!(began.elapsed() < Duration::from_secs(5));
 }
 
 fn main_repo(base: &Path) -> Repo {
