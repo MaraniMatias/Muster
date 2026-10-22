@@ -31,9 +31,9 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 ## Install
 
-The current candidate is **v1.0.0-rc.9**:
-[`Muster_1.0.0-rc.9_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.9/Muster_1.0.0-rc.9_arm64.zip) for macOS,
-[`muster_1.0.0-rc.9_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.9/muster_1.0.0-rc.9_amd64.deb) for Ubuntu.
+The current candidate is **v1.0.0-rc.10**:
+[`Muster_1.0.0-rc.10_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.10/Muster_1.0.0-rc.10_arm64.zip) for macOS,
+[`muster_1.0.0-rc.10_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.10/muster_1.0.0-rc.10_amd64.deb) for Ubuntu.
 
 It is a pre-release, so GitHub's `Latest` badge still selects the frozen Legacy
 release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Muster/releases)
