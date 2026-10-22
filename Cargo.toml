@@ -36,3 +36,5 @@ opt-level = 2
 # buys nothing to lose. `scripts/release.test.mjs` pins this.
 [profile.release]
 strip = "none"
+incremental = false
+debug = 0
