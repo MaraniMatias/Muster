@@ -567,8 +567,9 @@ impl TerminalWindow {
             })
             .footer(
                 DialogFooter::new()
-                    // The destructive action comes first and stands on its own:
-                    // it is the one button here that cannot be taken back.
+                    // The destructive action stands on its own at the far end of
+                    // the footer: it is the one button here that cannot be taken
+                    // back, and the two that keep the worktree are on the other.
                     .child(
                         Button::new("worktree-delete")
                             .danger()
@@ -580,7 +581,7 @@ impl TerminalWindow {
                                 });
                             }),
                     )
-                    .child(div().w_4())
+                    .child(div().flex_1())
                     .child(
                         Button::new("worktree-removal-cancel")
                             .label("Cancel")
