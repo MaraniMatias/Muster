@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.14
 
 - **A `.feature` file is read with Gherkin's own words.** A Cucumber feature
   file is prose with a few words of structure, and it opened as plain text. The
