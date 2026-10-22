@@ -17,6 +17,7 @@ Commands:
   build      Run check, then build the optimized native app
   release    Run check/build and package the macOS app (macOS only)
   candidate  Prepare, push and publish a release candidate (version argument)
+  publish    Publish the version this tree already carries (version argument)
   help       Show this help
 
 Requires Rust/rustup 1.97.1 and Node.js. Linux build prerequisites are listed
@@ -26,11 +27,13 @@ not publish, sign for distribution, notarize, or create a git tag.
 `candidate <version> [--dry-run]` takes 0.<minor>.<patch> or 1.0.0-rc.<n>. It
 writes the version into the manifest and the lock file, renames the
 changelog's `Unreleased` heading, points the README at the new candidate,
-commits that on `main`, pushes it, and asks the Native release workflow to
-publish it. The workflow is what creates the tag and the release, so this
-script never creates either, and it refuses a version whose tag already
-exists. `--dry-run` stops after the preparation: the tree is left as it would
-be, and nothing is committed, pushed or published.
+commits that on `main`, pushes it, and publishes it. `publish <version>` is the
+last half on its own: it publishes the version the tree already carries, which
+is what a retry after a failed build does. The Native release workflow is what
+creates the tag and the release, so this script never creates either, and it
+refuses a version whose tag already exists. `--dry-run` stops after the
+preparation: the tree is left as it would be, and nothing is committed,
+pushed or published.
 HELP
 }
 
@@ -38,7 +41,7 @@ command="${1:-help}"
 case "$command" in
   -h|--help|help) usage; exit 0 ;;
   check|build|release) ;;
-  candidate) ;;
+  candidate|publish) ;;
   *) echo "release: unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -139,8 +142,61 @@ publish_run() {
     fi
     sleep 2
   done
-  echo 'release: candidate: the publish run did not start' >&2
+  echo 'release: publish: the run did not start' >&2
   exit 1
+}
+
+# A version is one of the two shapes a release is published in. The final
+# `1.0.0` is a deliberate act of its own and is not one of them.
+require_version() {
+  local version="${1:-}"
+  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ ]]; then
+    echo "release: unsupported version: ${version:-<none>}" >&2
+    echo 'release: a version is 0.<minor>.<patch> or 1.0.0-rc.<n>' >&2
+    exit 2
+  fi
+}
+
+# The state a publication needs: a clean tree on `main`, at the commit
+# `origin/main` points at, with a tag that does not exist yet.
+require_publishable() {
+  local tag="$1"
+  [[ -z "$(git status --porcelain)" ]] || { echo 'release: the working tree is not clean' >&2; exit 1; }
+  [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo 'release: run this on main' >&2; exit 1; }
+  git fetch --quiet origin main
+  [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
+    echo 'release: main is not the commit origin/main points at; push or pull first' >&2
+    exit 1
+  }
+  if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+    echo "release: the tag $tag already exists" >&2
+    exit 1
+  fi
+}
+
+# Publish the version this tree already carries. The workflow builds every
+# target, validates them and creates the tag and the release; this asks it to.
+publish() {
+  local version="${1:-}" repo sha run_id url
+  local tag="v$version"
+  require_version "$version"
+  if [[ "$(manifest_version)" != "$version" || "$(lock_version)" != "$version" ]]; then
+    echo "release: publish: the tree does not carry $version" >&2
+    exit 1
+  fi
+  require_publishable "$tag"
+  command -v gh >/dev/null || { echo 'release: publish: the GitHub CLI (gh) is required' >&2; exit 1; }
+  sha="$(git rev-parse HEAD)"
+  repo="$(repository)"
+  gh workflow run linux-release.yml --ref main -f sha="$sha" -f mode=publish -f tag="$tag"
+  run_id="$(publish_run "$sha")"
+  url="https://github.com/$repo/actions/runs/$run_id"
+  echo "release: publish: the run is $url"
+  if ! gh run watch "$run_id" --exit-status; then
+    echo "release: publish: the run failed; the tag is $tag and the draft is at $url" >&2
+    exit 1
+  fi
+  gh release view "$tag" --repo "$repo" --json url --jq '"release: publish: published at " + .url'
 }
 
 # One candidate, from this tree to the release page.
@@ -152,26 +208,12 @@ publish_run() {
 candidate() {
   local version="${1:-}" dry_run=false
   if [[ "${2:-}" == "--dry-run" ]]; then dry_run=true; fi
-  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ ]]; then
-    echo "release: candidate: unsupported version: ${version:-<none>}" >&2
-    echo 'release: a version is 0.<minor>.<patch> or 1.0.0-rc.<n>' >&2
-    exit 2
-  fi
-  local tag="v$version" repo sha run_id url
+  require_version "$version"
+  local tag="v$version"
   if [[ "$dry_run" != true ]]; then
     command -v gh >/dev/null || { echo 'release: candidate: the GitHub CLI (gh) is required' >&2; exit 1; }
   fi
-  [[ -z "$(git status --porcelain)" ]] || { echo 'release: candidate: the working tree is not clean' >&2; exit 1; }
-  [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo 'release: candidate: run this on main' >&2; exit 1; }
-  git fetch --quiet origin main
-  [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
-    echo 'release: candidate: main is not the commit origin/main points at; push or pull first' >&2
-    exit 1
-  }
-  if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-    echo "release: candidate: the tag $tag already exists" >&2
-    exit 1
-  fi
+  require_publishable "$tag"
   [[ "$(manifest_version)" != "$version" ]] || { echo "release: candidate: the tree is already $version" >&2; exit 1; }
 
   prepare_version "$version"
@@ -193,21 +235,15 @@ candidate() {
     -m "The next native testing candidate. The Native release workflow builds and validates every target, and it is what creates the tag and the release."
   git push origin main
 
-  sha="$(git rev-parse HEAD)"
-  repo="$(repository)"
-  gh workflow run linux-release.yml --ref main -f sha="$sha" -f mode=publish -f tag="$tag"
-  run_id="$(publish_run "$sha")"
-  url="https://github.com/$repo/actions/runs/$run_id"
-  echo "release: candidate: the publish run is $url"
-  if ! gh run watch "$run_id" --exit-status; then
-    echo "release: candidate: the publish run failed; the tag is $tag and the draft is at $url" >&2
-    exit 1
-  fi
-  gh release view "$tag" --repo "$repo" --json url --jq '"release: candidate: published at " + .url'
+  publish "$version"
 }
 
 if [[ "$command" == candidate ]]; then
   candidate "${2:-}" "${3:-}"
+  exit 0
+fi
+if [[ "$command" == publish ]]; then
+  publish "${2:-}"
   exit 0
 fi
 

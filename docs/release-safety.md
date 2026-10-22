@@ -110,6 +110,7 @@ the tag and the GitHub release, so the script never creates either.
 ```sh
 scripts/release.sh candidate 1.0.0-rc.12
 scripts/release.sh candidate 1.0.0-rc.12 --dry-run   # prepare, publish nothing
+scripts/release.sh publish 1.0.0-rc.12                # publish a prepared tree
 ```
 
 The command refuses what the workflow refuses, before it touches the tree: a
@@ -117,6 +118,12 @@ version that is not `v0.<minor>.<patch>` or `v1.0.0-rc.<n>`, a dirty tree, a
 branch that is not `main`, a `main` that is not the commit `origin/main` points
 at, a tag that already exists, and a version the tree already carries. A dry
 run leaves the tree as the release would leave it and commits nothing.
+
+`publish` is the last half on its own, for the retry after a build that
+failed: it publishes the version the tree already carries, so the tree is left
+as the release left it and the run is dispatched again against the same
+commit. It refuses a version the manifest and the lock file do not carry, and
+a tag that already exists.
 
 Publication must be dispatched from `main`, for a commit on `main`, and the new
 tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`

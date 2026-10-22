@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -20,6 +20,19 @@ function git(cwd, ...args) {
   return result.stdout;
 }
 
+const escape = text => text.replace(/\./g, '\\.');
+
+// The version this tree carries, and the one after it. The candidate a test
+// cuts is the one after the manifest's, so a test says nothing about which
+// version the tree happens to carry: a release moves it, and the tests keep
+// holding.
+const carried = /^version = "(.+)"$/m.exec(readFileSync(path.join(root, 'app/Cargo.toml'), 'utf8'))[1];
+const next = /^1\.0\.0-rc\.(\d+)$/.test(carried)
+  ? `1.0.0-rc.${Number(/^1\.0\.0-rc\.(\d+)$/.exec(carried)[1]) + 1}`
+  : /^0\.(\d+)\.(\d+)$/.test(carried)
+    ? `0.${/^0\.(\d+)\.(\d+)$/.exec(carried)[1]}.${Number(/^0\.(\d+)\.(\d+)$/.exec(carried)[2]) + 1}`
+    : '1.0.0-rc.1';
+
 // A repository a candidate can be cut from: the four files the release edits,
 // on a branch called `main`, with a remote to push to. The remote is a
 // directory of its own, so the working tree stays clean.
@@ -29,9 +42,19 @@ function candidateRepository() {
   mkdirSync(path.join(dir, 'scripts'), { recursive: true });
   mkdirSync(path.join(dir, 'app'), { recursive: true });
   copyFileSync(path.join(root, 'scripts/release.sh'), path.join(dir, 'scripts/release.sh'));
-  for (const file of ['app/Cargo.toml', 'Cargo.lock', 'CHANGELOG.md', 'README.md']) {
+  for (const file of ['app/Cargo.toml', 'Cargo.lock', 'README.md']) {
     copyFileSync(path.join(root, file), path.join(dir, file));
   }
+  // The changelog keeps the newest work under `Unreleased`, and the heading
+  // is what a release renames. A tree whose newest work is already released
+  // has no such heading, so one is put back for the release to rename.
+  const changelog = readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+  writeFileSync(
+    path.join(dir, 'CHANGELOG.md'),
+    /^## Unreleased$/m.test(changelog)
+      ? changelog
+      : changelog.replace(/^## /m, '## Unreleased\n\n- **The newest work.** The work this candidate carries.\n\n## '),
+  );
   git(dir, 'init', '--quiet');
   git(dir, 'checkout', '--quiet', '-b', 'main');
   git(dir, 'config', 'user.email', 'test@example.test');
@@ -54,9 +77,9 @@ test('help describes every command without requiring Rust', () => {
 });
 
 test('unknown commands fail before doing build work', () => {
-  const result = run('publish');
+  const result = run('ship');
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /unknown command: publish/);
+  assert.match(result.stderr, /unknown command: ship/);
 });
 
 test('the candidate command refuses a version it does not publish, and a missing one', () => {
@@ -74,22 +97,22 @@ test('the candidate command writes the version where the release reads it, and p
   const { dir, remote } = candidateRepository();
   try {
     const before = git(dir, 'rev-parse', 'HEAD').trim();
-    const result = spawnSync(path.join(dir, 'scripts/release.sh'), ['candidate', '1.0.0-rc.12', '--dry-run'], { cwd: dir, encoding: 'utf8' });
+    const result = spawnSync(path.join(dir, 'scripts/release.sh'), ['candidate', next, '--dry-run'], { cwd: dir, encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /nothing was committed, pushed or published/);
     // The manifest and the lock file are what the build and the workflow read
     // the version from, and they have to carry the same one.
-    assert.match(readFileSync(path.join(dir, 'app/Cargo.toml'), 'utf8'), /^version = "1\.0\.0-rc\.12"$/m);
-    assert.match(readFileSync(path.join(dir, 'Cargo.lock'), 'utf8'), /^version = "1\.0\.0-rc\.12"$/m);
+    assert.match(readFileSync(path.join(dir, 'app/Cargo.toml'), 'utf8'), new RegExp(`^version = "${escape(next)}"$`, 'm'));
+    assert.match(readFileSync(path.join(dir, 'Cargo.lock'), 'utf8'), new RegExp(`^version = "${escape(next)}"$`, 'm'));
     // The changelog keeps the newest work under `Unreleased` and renames that
     // heading to the version when it is tagged.
-    assert.match(readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'), /^## 1\.0\.0-rc\.12$/m);
+    assert.match(readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'), new RegExp(`^## ${escape(next)}$`, 'm'));
     // The README names the candidate people download, in its links and in its
     // one line about it.
     const readme = readFileSync(path.join(dir, 'README.md'), 'utf8');
-    assert.match(readme, /The current candidate is \*\*v1\.0\.0-rc\.12\*\*:/);
-    assert.match(readme, /releases\/download\/v1\.0\.0-rc\.12\/Muster_1\.0\.0-rc\.12_arm64\.zip/);
-    assert.match(readme, /releases\/download\/v1\.0\.0-rc\.12\/muster_1\.0\.0-rc\.12_amd64\.deb/);
+    assert.match(readme, new RegExp(`The current candidate is \\*\\*v${escape(next)}\\*\\*:`));
+    assert.match(readme, new RegExp(`releases/download/v${escape(next)}/Muster_${escape(next)}_arm64\\.zip`));
+    assert.match(readme, new RegExp(`releases/download/v${escape(next)}/muster_${escape(next)}_amd64\\.deb`));
     // The sentence about the candidates that carry all four builds is about
     // the past, so it keeps the version it was written for.
     assert.match(readme, /Candidates before v1\.0\.0-rc\.11 may carry only a macOS archive/);
@@ -97,6 +120,18 @@ test('the candidate command writes the version where the release reads it, and p
     // the remote has no tag.
     assert.equal(git(dir, 'rev-parse', 'HEAD').trim(), before);
     assert.equal(git(dir, 'ls-remote', '--tags', 'origin').trim(), '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+  }
+});
+
+test('the publish command refuses a version the tree does not carry', () => {
+  const { dir, remote } = candidateRepository();
+  try {
+    const result = spawnSync(path.join(dir, 'scripts/release.sh'), ['publish', '1.0.0-rc.999'], { cwd: dir, encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /the tree does not carry 1\.0\.0-rc\.999/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(remote, { recursive: true, force: true });

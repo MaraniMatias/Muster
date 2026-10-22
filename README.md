@@ -167,7 +167,7 @@ Every script in `scripts/` belongs to this app's release path.
 
 | Script | What it does | When you run it |
 | --- | --- | --- |
-| `release.sh` | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle; `candidate <version>` cuts and publishes a release candidate | The entry point for every local build. `release` is macOS-only, `candidate` needs `gh` and publishes |
+| `release.sh` | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle; `candidate <version>` cuts and publishes a release candidate, `publish <version>` publishes a prepared one | The entry point for every local build. `release` is macOS-only, `candidate` and `publish` need `gh` and publish |
 | `bundle-macos.sh` | Assembles `dist/Muster.app` with the icon, name and version | Called by `release.sh release` and by CI |
 | `package-linux-deb.sh` | Builds `dist/muster_<version>_<arch>.deb` for amd64 and arm64, deriving runtime dependencies from the ELF | On Ubuntu, after `release.sh build` |
 | `debian-version.sh` | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`) | Internal to packaging |
