@@ -5,6 +5,13 @@
 //! The schema is `muster_core::settings`: the defaults, the ranges and the shape live there,
 //! and the rows below are the whole panel.
 //!
+//! ## What the panel is
+//!
+//! A card with a sidebar of sections on the left and the rows of the one on screen on the
+//! right. The card is one size: the sidebar does not change with the section it has
+//! selected, and a section with more rows than fit scrolls inside the card rather than
+//! growing it.
+//!
 //! ## Why a draft
 //!
 //! Nothing here reaches the app or the file until Apply. That is what makes Cancel possible
@@ -28,18 +35,17 @@
 //! next run, which is when the app reads the file again.
 
 use gpui_kit::component::{
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     checkbox::Checkbox,
-    collapsible::Collapsible,
     dialog::{Dialog, DialogFooter},
     input::{Input, InputState},
     select::{Select, SelectEvent, SelectState},
-    Disableable, Icon, IconName, IndexPath, Sizable,
+    Disableable, IndexPath, Sizable,
 };
 use gpui_kit::{
-    div, percentage, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Div, Entity,
-    InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Subscription,
-    TestSupportExt, Window,
+    div, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Div, Entity,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, TestSupportExt, Window,
 };
 use muster_core::review::ReviewStorage;
 use muster_core::settings::{
@@ -57,7 +63,7 @@ use std::sync::{
 static NEXT_SETTINGS_DRAFT: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-use crate::app::TerminalWindow;
+use crate::app::{ButtonA11y, TerminalWindow};
 use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
 
@@ -191,10 +197,11 @@ fn storage_for_row(row: usize) -> ReviewStorage {
     review_storage(row)
 }
 
-/// The groups the panel is drawn in.
+/// The sections the panel is drawn in.
 ///
-/// A group's name and the id its header is found by are one row here, and the
-/// order is the panel's: the open groups are remembered by their position in it.
+/// A section's name and the id its row is found by are one entry here, and the
+/// order is the panel's: the sidebar names them in this order, and the rows on
+/// screen are the ones of the section it has selected.
 const SECTIONS: [(&str, &str); 4] = [
     ("Interface", "settings-section-interface"),
     ("Terminal", "settings-section-terminal"),
@@ -202,13 +209,16 @@ const SECTIONS: [(&str, &str); 4] = [
     ("Review notes", "settings-section-review"),
 ];
 
-/// How far the rows of a group sit under the group's name.
+/// How wide the sidebar of sections is.
+const SECTION_BAR_WIDTH: f32 = 168.;
+
+/// How wide the panel is, and how tall its body is.
 ///
-/// The header is a button with a chevron in front of the name, so the name
-/// starts the button's own padding, the chevron and the gap between them
-/// further right than the panel's edge. The rows line up with the name, which
-/// is the spine of the group.
-const GROUP_INDENT: f32 = 34.;
+/// The panel is a card of one size: the sidebar of sections does not change
+/// with the section on it, and a section with more rows than fit scrolls
+/// inside the card rather than growing it.
+const PANEL_WIDTH: f32 = 720.;
+const PANEL_HEIGHT: f32 = 360.;
 
 const CURSOR_WORDS: [&str; 3] = ["Block", "Bar", "Underline"];
 const SCROLLBAR_WORDS: [&str; 3] = ["Hidden", "While scrolling", "Always"];
@@ -242,12 +252,11 @@ pub(crate) struct SettingsDraft {
     pub(crate) review_storage_picker: Entity<SelectState<Vec<SharedString>>>,
     /// What a terminal follows when its work moves to another worktree.
     pub(crate) follow_worktree: Entity<SelectState<Vec<SharedString>>>,
-    /// The groups of the panel that are open.
+    /// The section of the panel that is on screen.
     ///
-    /// A group is a disclosure: the panel opens with the groups folded, which
-    /// is what keeps seventeen preferences in a dialog the size of a card, and
-    /// a group a person opened stays open for as long as the draft lives.
-    pub(crate) open_sections: Vec<usize>,
+    /// The panel is a sidebar of sections and the rows of the one it has
+    /// selected, so this is the only navigation state the draft holds.
+    pub(crate) selected_section: usize,
     pub(crate) error: Option<String>,
     draft_id: u64,
     pub(crate) saving: bool,
@@ -398,59 +407,40 @@ fn settings_actions(
         .into_any_element()
 }
 
-/// One group of the panel: the header that opens it and the rows it holds.
+/// One row of the sidebar of sections.
 ///
-/// The header is a button, so a group opens with the keyboard as well as with
-/// the pointer, and the chevron says which way it opens. The rows are in a
-/// collapsible, which holds them while the group is folded.
-fn settings_section(
-    title: &'static str,
-    open_sections: &[usize],
+/// The row is a button, so a section is reached with the keyboard as well as
+/// with the pointer, and the section on screen wears its own surface and ink
+/// rather than an accent bar.
+fn settings_section_row(
     view: gpui_kit::WeakEntity<TerminalWindow>,
-    roles: Roles,
-    rows: Vec<AnyElement>,
-) -> Div {
-    let index = SECTIONS
-        .iter()
-        .position(|(name, _)| *name == title)
-        .expect("a group of the panel is one of the panel's groups");
-    let (_, id) = SECTIONS[index];
-    let open = open_sections.contains(&index);
-    div()
-        // The space between the groups is a margin, not a gap: this toolkit
-        // lays a column's items out without the gap between them.
-        .mt(px(16.))
+    section: usize,
+    id: &'static str,
+    title: &'static str,
+    colors: ButtonCustomVariant,
+    selected: bool,
+) -> AnyElement {
+    Button::new(id)
+        .custom(colors)
+        .small()
+        .w_full()
+        .justify_start()
+        // The name is a child rather than a label: the toolkit centres a
+        // label in its button, and a section names itself from the left.
         .child(
-            Button::new(id)
-                .ghost()
-                .w_full()
-                .justify_start()
-                .icon(
-                    Icon::new(IconName::ChevronDown)
-                        .text_color(roles.text_muted)
-                        .rotate(percentage(if open { 0.5 } else { 0. })),
-                )
-                .label(title)
-                .on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |app, cx| {
-                        if let Some(draft) = app.settings.as_mut() {
-                            match draft.open_sections.iter().position(|open| *open == index) {
-                                Some(at) => {
-                                    draft.open_sections.remove(at);
-                                }
-                                None => draft.open_sections.push(index),
-                            }
-                        }
-                        cx.notify();
-                    });
-                }),
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.))
+                .text_ellipsis()
+                .child(title),
         )
-        .child(
-            Collapsible::new()
-                .open(open)
-                // The rows sit under the group's name, not under its chevron.
-                .content(div().pt(px(4.)).pl(px(GROUP_INDENT)).children(rows)),
-        )
+        .accessibility_label(title)
+        .aria_selected(selected)
+        .on_click(move |_, _, cx| {
+            let _ = view.update(cx, |app, cx| app.select_settings_section(section, cx));
+        })
+        .into_any_element()
 }
 
 /// A row whose control is a checkbox, named by the field it writes.
@@ -686,7 +676,7 @@ impl TerminalWindow {
             indent_with,
             review_storage_picker,
             follow_worktree,
-            open_sections: Vec::new(),
+            selected_section: 0,
             error: failure,
             draft_id: NEXT_SETTINGS_DRAFT.fetch_add(1, Ordering::Relaxed),
             saving: false,
@@ -724,6 +714,17 @@ impl TerminalWindow {
         if let Some(draft) = self.settings.as_mut().filter(|draft| !draft.saving) {
             draft.review_storage = storage;
             draft.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Show one section of the panel.
+    ///
+    /// The panel is a sidebar of sections and the rows of the one on it, so
+    /// this is all the navigation the sidebar does.
+    pub(crate) fn select_settings_section(&mut self, section: usize, cx: &mut Context<Self>) {
+        if let Some(draft) = self.settings.as_mut() {
+            draft.selected_section = section;
             cx.notify();
         }
     }
@@ -870,349 +871,71 @@ impl TerminalWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let roles = Roles::of(cx);
-        let view = cx.weak_entity();
         let reset = cx.weak_entity();
         let apply = cx.weak_entity();
-        let clear = cx.weak_entity();
-        let forget = cx.weak_entity();
         let cancel = cx.weak_entity();
-
-        // The body builder runs again on every repaint and has to own everything it draws, so
-        // the draft's entities are taken out here rather than borrowed into it.
-        let ui_font_size = draft.ui_font_size.clone();
-        let terminal_font_size = draft.terminal_font_size.clone();
-        let editor_font_size = draft.editor_font_size.clone();
-        let indent_size = draft.indent_size.clone();
-        let cursor = draft.cursor.clone();
-        let scrollbar = draft.scrollbar.clone();
-        let indent_with = draft.indent_with.clone();
-        let storage_picker = draft.review_storage_picker.clone();
-        let follow_worktree = draft.follow_worktree.clone();
-        let terminal = draft.draft.terminal;
-        let editor = draft.draft.editor;
-        let sticky = draft.draft.ui.tree_sticky_scroll;
-        let storage = draft.review_storage;
-        let error = draft.error.clone();
         let saving = draft.saving;
-        let is_default =
-            draft.resolve(cx) == AppSettings::default() && storage == ReviewStorage::default();
-        // Where a round would be written for the mode this row is showing, which is not
-        // necessarily the one on file yet: it is a draft, and the row answers for the draft.
-        let folder = self
-            .open_diff
-            .as_ref()
-            .map(|(id, _)| id.as_str())
-            .or(self.navigation.active_checkout.as_deref())
-            .and_then(|id| self.document_source(id))
-            .map(|(repo, checkout)| {
-                muster_core::files::review_export_folder(&repo, &checkout, storage)
-            })
-            .map(|result| match result {
-                Ok(path) => path.display().to_string(),
-                Err(error) => format!("unavailable: {error}"),
-            });
-        // The default cache is one folder under the home directory that every checkout
-        // writes to, so what clearing it needs is a checkout rather than a diff open:
-        // the panel is opened from the title bar, where no diff is open.
-        let can_clear = storage == ReviewStorage::Default
-            && (self.open_diff.is_some() || self.navigation.active_checkout.is_some());
-        // A control that cannot be pressed says why: this one is unavailable for two
-        // different reasons, and a person who cannot press it has no other way to ask.
-        let clear_reason = match (storage, can_clear) {
-            (ReviewStorage::Workdir, _) => {
-                "Rounds are written inside the checkout, so there is no cache to clear."
-            }
-            (_, false) => "Select a checkout first.",
-            _ => "",
-        };
-        let can_forget = !self.review.forgetting;
+        let is_default = draft.resolve(cx) == AppSettings::default()
+            && draft.review_storage == ReviewStorage::default();
 
         Dialog::new(cx)
             .bg(roles.surface_raised)
             .border_color(roles.border_strong)
-            .width(px(520.))
-            .title("Settings")
-            // The rows are taller than the dialog is allowed to be, so the body goes in as a
-            // child rather than through `content`: a child is the dialog's own scroll area,
-            // and a content column is only ever cut off at the footer.
-            .child({
-                let mut body = div().flex_col().gap(px(16.)).child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(roles.text_muted)
-                        .child("Saved to ~/.muster/settings.json"),
-                );
-                // The groups are a disclosure: the panel opens with the groups
-                // folded, and a person opens the one they came for.
-                let mut groups = div().flex_col();
-                groups = groups.child(settings_section(
-                    "Interface",
-                    &draft.open_sections,
-                    view.clone(),
-                    roles,
-                    vec![
-                        size_row(
-                            "settings-ui-font-size",
-                            "Font size",
-                            "Scales every size the interface draws itself in.",
-                            roles,
-                            &ui_font_size,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-ui-sticky",
-                            "Sticky folder rows",
-                            "Keep parent folders visible while scrolling the Files tree.",
-                            roles,
-                            sticky,
-                            |settings, checked| settings.ui.tree_sticky_scroll = checked,
-                            saving,
-                        ),
-                    ],
-                ));
-                groups = groups.child(settings_section(
-                    "Terminal",
-                    &draft.open_sections,
-                    view.clone(),
-                    roles,
-                    vec![
-                        size_row(
-                            "settings-terminal-font-size",
-                            "Font size",
-                            "The size the grid is drawn at. Read when the app starts.",
-                            roles,
-                            &terminal_font_size,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-terminal-ligatures",
-                            "Ligatures",
-                            "Joins the sequences the font draws as one glyph, such as => or !=.",
-                            roles,
-                            terminal.ligatures,
-                            |settings, checked| settings.terminal.ligatures = checked,
-                            saving,
-                        ),
-                        select_row(
-                            "settings-terminal-cursor",
-                            "Cursor",
-                            "The cell it fills, a line beside it, or a line under it.",
-                            None,
-                            roles,
-                            &cursor,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-terminal-cursor-blink",
-                            "Blink cursor",
-                            "",
-                            roles,
-                            terminal.cursor_blink,
-                            |settings, checked| settings.terminal.cursor_blink = checked,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-terminal-selection-copy",
-                            "Copy on selection",
-                            "Puts what a selection gesture selects in the terminal on the clipboard.",
-                            roles,
-                            terminal.selection_copy,
-                            |settings, checked| settings.terminal.selection_copy = checked,
-                            saving,
-                        ),
-                        select_row(
-                            "settings-terminal-scrollbar",
-                            "Scrollbar",
-                            "",
-                            None,
-                            roles,
-                            &scrollbar,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-terminal-shell-integration",
-                            "Report failed commands",
-                            "Reports failures in zsh and bash without clearing startup output. Applies to new terminals only.",
-                            roles,
-                            terminal.shell_integration,
-                            |settings, checked| settings.terminal.shell_integration = checked,
-                            saving,
-                        ),
-                        select_row(
-                            "settings-terminal-follow-worktree",
-                            "Follow worktree",
-                            "Moves a terminal's row when its work moves to another worktree. The process and its scrollback stay as they are.",
-                            None,
-                            roles,
-                            &follow_worktree,
-                            saving,
-                        ),
-                    ],
-                ));
-                groups = groups.child(settings_section(
-                    "Editor",
-                    &draft.open_sections,
-                    view.clone(),
-                    roles,
-                    vec![
-                        size_row(
-                            "settings-editor-font-size",
-                            "Font size",
-                            "The size the document and the diff are drawn at. Read when the app starts.",
-                            roles,
-                            &editor_font_size,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-editor-ligatures",
-                            "Ligatures",
-                            "",
-                            roles,
-                            editor.ligatures,
-                            |settings, checked| settings.editor.ligatures = checked,
-                            saving,
-                        ),
-                        toggle_row(
-                            view.clone(),
-                            "settings-editor-cursor-blink",
-                            "Blink cursor",
-                            "",
-                            roles,
-                            editor.cursor_blink,
-                            |settings, checked| settings.editor.cursor_blink = checked,
-                            saving,
-                        ),
-                        select_row(
-                            "settings-editor-indent-with",
-                            "Indent with",
-                            "",
-                            None,
-                            roles,
-                            &indent_with,
-                            saving,
-                        ),
-                        size_row(
-                            "settings-editor-indent-size",
-                            "Indent size",
-                            "Columns one level of indent is.",
-                            roles,
-                            &indent_size,
-                            saving,
-                        ),
-                    ],
-                ));
-
-                let clear_button = clear.clone();
-                let forget_button = forget.clone();
-                groups = groups.child(settings_section(
-                    "Review notes",
-                    &draft.open_sections,
-                    view.clone(),
-                    roles,
-                    vec![
-                        select_row(
-                            "settings-review-storage",
-                            "Exported notes",
-                            "Where a review round is written when it is sent as a file rather than to an agent.",
-                            folder.map(|folder| ("settings-review-folder", folder)),
-                            roles,
-                            &storage_picker,
-                            saving,
-                        ),
-                        settings_actions(
-                            "Stored rounds",
-                            "Cached exports and delivered rounds stay where they are until one of these removes them.",
-                            roles,
-                            vec![
-                                Button::new("settings-review-clear")
-                                    .small()
-                                    .label("Clear cached exports")
-                                    .disabled(!can_clear)
-                                    .when(!can_clear, |button| {
-                                        button.resting_tooltip(clear_reason)
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        let _ = clear_button.update(cx, |app, cx| {
-                                            app.open_review_clear_confirmation(cx)
-                                        });
-                                    })
-                                    .into_any_element(),
-                                Button::new("settings-review-forget")
-                                    .small()
-                                    .label("Forget delivered reviews")
-                                    .disabled(!can_forget)
-                                    .when(!can_forget, |button| {
-                                        button.resting_tooltip("Forgetting delivered reviews…")
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        let _ = forget_button.update(cx, |app, cx| {
-                                            app.open_opencode_forget_confirmation(cx)
-                                        });
-                                    })
-                                    .into_any_element(),
-                            ],
-                        ),
-                    ],
-                ));
-                body = body.child(groups);
-
-                if let Some(error) = error.clone() {
-                    body = body.child(
-                        div()
-                            .mt_3()
-                            .text_size(px(12.))
-                            .line_height(px(16.))
-                            .text_color(roles.status.danger_text)
-                            .child(error),
-                    );
-                }
-                body
-            })
+            .width(px(PANEL_WIDTH))
+            // The panel draws its own edges: the sidebar of sections runs to the
+            // card's left edge, so the card's padding belongs to the panel and
+            // not to the dialog.
+            .pl(px(0.))
+            .pr(px(0.))
+            .title(div().px(px(20.)).child("Settings"))
+            .child(
+                div()
+                    .h(px(PANEL_HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .child(self.settings_sections(draft, roles, cx))
+                    .child(self.settings_content(draft, roles, cx)),
+            )
             .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new("settings-reset")
-                            .ghost()
-                            .label("Reset to defaults")
-                            .disabled(is_default || saving)
-                            .on_click(move |_, window, cx| {
-                                let _ = reset.update(cx, |app, cx| {
-                                    app.reset_settings_draft(window, cx)
-                                });
-                            }),
-                    )
-                    .child(div().flex_1())
-                    .child({
-                        let cancel = cancel.clone();
-                        Button::new("settings-cancel")
-                            .label("Cancel")
-                            .disabled(saving)
-                            .on_click(move |_, _, cx| {
-                                let _ = cancel.update(cx, |app, cx| {
-                                    if !app.settings.as_ref().is_some_and(|draft| draft.saving) {
-                                        app.settings = None;
-                                        cx.notify();
-                                    }
-                                });
-                            })
-                    })
-                    .child(
-                        Button::new("settings-apply")
-                            .primary()
-                            .label(if saving { "Saving…" } else { "Apply" })
-                            .disabled(saving)
-                            .on_click(move |_, window, cx| {
-                                let _ = apply.update(cx, |app, cx| {
-                                    app.apply_settings_draft(window, cx)
-                                });
-                            }),
-                    ),
+                div().px(px(20.)).child(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("settings-reset")
+                                .ghost()
+                                .label("Reset to defaults")
+                                .disabled(is_default || saving)
+                                .on_click(move |_, window, cx| {
+                                    let _ = reset
+                                        .update(cx, |app, cx| app.reset_settings_draft(window, cx));
+                                }),
+                        )
+                        .child(div().flex_1())
+                        .child({
+                            let cancel = cancel.clone();
+                            Button::new("settings-cancel")
+                                .label("Cancel")
+                                .disabled(saving)
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel.update(cx, |app, cx| {
+                                        if !app.settings.as_ref().is_some_and(|draft| draft.saving)
+                                        {
+                                            app.settings = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                        })
+                        .child(
+                            Button::new("settings-apply")
+                                .primary()
+                                .label(if saving { "Saving…" } else { "Apply" })
+                                .disabled(saving)
+                                .on_click(move |_, window, cx| {
+                                    let _ = apply
+                                        .update(cx, |app, cx| app.apply_settings_draft(window, cx));
+                                }),
+                        ),
+                ),
             )
             .on_cancel(move |_, _, cx| {
                 let _ = cancel.update(cx, |app, cx| {
@@ -1224,5 +947,347 @@ impl TerminalWindow {
                 true
             })
             .into_any_element()
+    }
+
+    /// The sidebar of sections: the four places the preferences live.
+    ///
+    /// The section on screen wears its own surface, and the rows of the others
+    /// are not drawn at all: the panel shows one section, not all of them.
+    fn settings_sections(
+        &self,
+        draft: &SettingsDraft,
+        roles: Roles,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.weak_entity();
+        let on_screen = ButtonCustomVariant::new(cx)
+            .color(roles.row_rest(true))
+            .foreground(roles.text)
+            .hover(roles.row_hover(true))
+            .active(roles.pressed);
+        let other = ButtonCustomVariant::new(cx)
+            .color(roles.row_rest(false))
+            .foreground(roles.text_muted)
+            .hover(roles.row_hover(false))
+            .active(roles.pressed);
+        div()
+            .id("settings-sections")
+            .test_support()
+            .w(px(SECTION_BAR_WIDTH))
+            .flex_shrink_0()
+            .h_full()
+            .bg(roles.surface)
+            .border_r_1()
+            .border_color(roles.border)
+            .py(px(8.))
+            .pl(px(12.))
+            .pr(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(SECTIONS.iter().enumerate().map(|(section, (title, id))| {
+                let selected = section == draft.selected_section;
+                settings_section_row(
+                    view.clone(),
+                    section,
+                    id,
+                    title,
+                    if selected { on_screen } else { other },
+                    selected,
+                )
+            }))
+            .into_any_element()
+    }
+
+    /// The rows of the section on screen.
+    ///
+    /// This column scrolls on its own: the sidebar of sections stays where it
+    /// is while a section with more rows than fit is read.
+    fn settings_content(
+        &self,
+        draft: &SettingsDraft,
+        roles: Roles,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let error = draft.error.clone();
+        div()
+            .id("settings-content")
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .px(px(20.))
+            .py(px(8.))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(roles.text_muted)
+                    .child("Saved to ~/.muster/settings.json"),
+            )
+            .child(
+                div()
+                    .mt(px(8.))
+                    .flex()
+                    .flex_col()
+                    .children(self.settings_rows(draft, roles, cx)),
+            )
+            .when_some(error, |content, error| {
+                content.child(
+                    div()
+                        .mt_3()
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(roles.status.danger_text)
+                        .child(error),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The rows of one section.
+    ///
+    /// Each section is a list of preferences, and each preference is a row and
+    /// a closure: the shape of the preference is `core::settings`'s, and the
+    /// panel draws it.
+    fn settings_rows(
+        &self,
+        draft: &SettingsDraft,
+        roles: Roles,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let view = cx.weak_entity();
+        let saving = draft.saving;
+        let terminal = draft.draft.terminal;
+        let editor = draft.draft.editor;
+        let sticky = draft.draft.ui.tree_sticky_scroll;
+        match draft.selected_section {
+            0 => vec![
+                size_row(
+                    "settings-ui-font-size",
+                    "Font size",
+                    "Scales every size the interface draws itself in.",
+                    roles,
+                    &draft.ui_font_size,
+                    saving,
+                ),
+                toggle_row(
+                    view,
+                    "settings-ui-sticky",
+                    "Sticky folder rows",
+                    "Keep parent folders visible while scrolling the Files tree.",
+                    roles,
+                    sticky,
+                    |settings, checked| settings.ui.tree_sticky_scroll = checked,
+                    saving,
+                ),
+            ],
+            1 => vec![
+                size_row(
+                    "settings-terminal-font-size",
+                    "Font size",
+                    "The size the grid is drawn at. Read when the app starts.",
+                    roles,
+                    &draft.terminal_font_size,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-terminal-ligatures",
+                    "Ligatures",
+                    "Joins the sequences the font draws as one glyph, such as => or !=.",
+                    roles,
+                    terminal.ligatures,
+                    |settings, checked| settings.terminal.ligatures = checked,
+                    saving,
+                ),
+                select_row(
+                    "settings-terminal-cursor",
+                    "Cursor",
+                    "The cell it fills, a line beside it, or a line under it.",
+                    None,
+                    roles,
+                    &draft.cursor,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-terminal-cursor-blink",
+                    "Blink cursor",
+                    "",
+                    roles,
+                    terminal.cursor_blink,
+                    |settings, checked| settings.terminal.cursor_blink = checked,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-terminal-selection-copy",
+                    "Copy on selection",
+                    "Puts what a selection gesture selects in the terminal on the clipboard.",
+                    roles,
+                    terminal.selection_copy,
+                    |settings, checked| settings.terminal.selection_copy = checked,
+                    saving,
+                ),
+                select_row(
+                    "settings-terminal-scrollbar",
+                    "Scrollbar",
+                    "",
+                    None,
+                    roles,
+                    &draft.scrollbar,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-terminal-shell-integration",
+                    "Report failed commands",
+                    "Reports failures in zsh and bash without clearing startup output. Applies to new terminals only.",
+                    roles,
+                    terminal.shell_integration,
+                    |settings, checked| settings.terminal.shell_integration = checked,
+                    saving,
+                ),
+                select_row(
+                    "settings-terminal-follow-worktree",
+                    "Follow worktree",
+                    "Moves a terminal's row when its work moves to another worktree. The process and its scrollback stay as they are.",
+                    None,
+                    roles,
+                    &draft.follow_worktree,
+                    saving,
+                ),
+            ],
+            2 => vec![
+                size_row(
+                    "settings-editor-font-size",
+                    "Font size",
+                    "The size the document and the diff are drawn at. Read when the app starts.",
+                    roles,
+                    &draft.editor_font_size,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-editor-ligatures",
+                    "Ligatures",
+                    "",
+                    roles,
+                    editor.ligatures,
+                    |settings, checked| settings.editor.ligatures = checked,
+                    saving,
+                ),
+                toggle_row(
+                    view.clone(),
+                    "settings-editor-cursor-blink",
+                    "Blink cursor",
+                    "",
+                    roles,
+                    editor.cursor_blink,
+                    |settings, checked| settings.editor.cursor_blink = checked,
+                    saving,
+                ),
+                select_row(
+                    "settings-editor-indent-with",
+                    "Indent with",
+                    "",
+                    None,
+                    roles,
+                    &draft.indent_with,
+                    saving,
+                ),
+                size_row(
+                    "settings-editor-indent-size",
+                    "Indent size",
+                    "Columns one level of indent is.",
+                    roles,
+                    &draft.indent_size,
+                    saving,
+                ),
+            ],
+            _ => {
+                let storage = draft.review_storage;
+                // Where a round would be written for the mode this row is showing, which is not
+                // necessarily the one on file yet: it is a draft, and the row answers for the draft.
+                let folder = self
+                    .open_diff
+                    .as_ref()
+                    .map(|(id, _)| id.as_str())
+                    .or(self.navigation.active_checkout.as_deref())
+                    .and_then(|id| self.document_source(id))
+                    .map(|(repo, checkout)| {
+                        muster_core::files::review_export_folder(&repo, &checkout, storage)
+                    })
+                    .map(|result| match result {
+                        Ok(path) => path.display().to_string(),
+                        Err(error) => format!("unavailable: {error}"),
+                    });
+                // The default cache is one folder under the home directory that every checkout
+                // writes to, so what clearing it needs is a checkout rather than a diff open:
+                // the panel is opened from the title bar, where no diff is open.
+                let can_clear = storage == ReviewStorage::Default
+                    && (self.open_diff.is_some() || self.navigation.active_checkout.is_some());
+                // A control that cannot be pressed says why: this one is unavailable for two
+                // different reasons, and a person who cannot press it has no other way to ask.
+                let clear_reason = match (storage, can_clear) {
+                    (ReviewStorage::Workdir, _) => {
+                        "Rounds are written inside the checkout, so there is no cache to clear."
+                    }
+                    (_, false) => "Select a checkout first.",
+                    _ => "",
+                };
+                let can_forget = !self.review.forgetting;
+                let clear = cx.weak_entity();
+                let forget = cx.weak_entity();
+                vec![
+                    select_row(
+                        "settings-review-storage",
+                        "Exported notes",
+                        "Where a review round is written when it is sent as a file rather than to an agent.",
+                        folder.map(|folder| ("settings-review-folder", folder)),
+                        roles,
+                        &draft.review_storage_picker,
+                        saving,
+                    ),
+                    settings_actions(
+                        "Stored rounds",
+                        "Cached exports and delivered rounds stay where they are until one of these removes them.",
+                        roles,
+                        vec![
+                            Button::new("settings-review-clear")
+                                .small()
+                                .label("Clear cached exports")
+                                .disabled(!can_clear)
+                                .when(!can_clear, |button| {
+                                    button.resting_tooltip(clear_reason)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    let _ = clear.update(cx, |app, cx| {
+                                        app.open_review_clear_confirmation(cx)
+                                    });
+                                })
+                                .into_any_element(),
+                            Button::new("settings-review-forget")
+                                .small()
+                                .label("Forget delivered reviews")
+                                .disabled(!can_forget)
+                                .when(!can_forget, |button| {
+                                    button.resting_tooltip("Forgetting delivered reviews…")
+                                })
+                                .on_click(move |_, _, cx| {
+                                    let _ = forget.update(cx, |app, cx| {
+                                        app.open_opencode_forget_confirmation(cx)
+                                    });
+                                })
+                                .into_any_element(),
+                        ],
+                    ),
+                ]
+            }
+        }
     }
 }

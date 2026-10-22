@@ -58,53 +58,100 @@ fn open_panel(cx: &mut TestAppContext) -> Panel {
     panel
 }
 
-/// What the wheel is aimed at, in the order it is tried.
+/// The sections the panel is drawn in, and the rows each one shows.
 ///
-/// A wheel reaches the scroll area it is over, so the anchor has to be an
-/// element of the panel that is on screen: a group header, in the order the
-/// groups are drawn, or a row of a group that is open.
-const ANCHORS: [&str; 8] = [
-    "settings-section-interface",
-    "settings-section-terminal",
-    "settings-section-editor",
-    "settings-section-review",
-    "settings-ui-font-size",
-    "settings-terminal-font-size",
-    "settings-editor-font-size",
-    "settings-review-storage",
+/// The rows are looked for a section at a time: the panel shows one section,
+/// and the rows of the others are not drawn at all.
+const SECTIONS: [(&str, &[&str]); 4] = [
+    (
+        "settings-section-interface",
+        &["settings-ui-font-size", "settings-ui-sticky"],
+    ),
+    (
+        "settings-section-terminal",
+        &[
+            "settings-terminal-font-size",
+            "settings-terminal-ligatures",
+            "settings-terminal-cursor",
+            "settings-terminal-cursor-blink",
+            "settings-terminal-selection-copy",
+            "settings-terminal-scrollbar",
+            "settings-terminal-shell-integration",
+            "settings-terminal-follow-worktree",
+        ],
+    ),
+    (
+        "settings-section-editor",
+        &[
+            "settings-editor-font-size",
+            "settings-editor-ligatures",
+            "settings-editor-cursor-blink",
+            "settings-editor-indent-with",
+            "settings-editor-indent-size",
+        ],
+    ),
+    (
+        "settings-section-review",
+        &[
+            "settings-review-storage",
+            "settings-review-clear",
+            "settings-review-forget",
+        ],
+    ),
 ];
 
-/// The groups of the panel that are open.
-fn open_groups(cx: &mut TestAppContext, panel: &Panel) -> Vec<usize> {
+/// The section the panel is showing.
+fn selected_section(cx: &mut TestAppContext, panel: &Panel) -> usize {
     panel.fixture.view.read_with(cx, |app, _| {
         app.settings
             .as_ref()
             .expect("the panel is open")
-            .open_sections
-            .clone()
+            .selected_section
     })
 }
 
-/// Where the panel's body is scrolled to, read off the first group's header.
+/// Show one section of the panel.
+///
+/// The sidebar is not a scroll area, so the section is always on screen and
+/// the click lands on it.
+fn select_section(cx: &mut TestAppContext, panel: &Panel, section: usize) {
+    let id = SECTIONS[section].0;
+    // The click is retried: a click that lands while the card is still
+    // settling into place is a click on nothing.
+    for _ in 0..5 {
+        if selected_section(cx, panel) == section {
+            return;
+        }
+        cx.update_window(panel.fixture.handle, |_, window, cx| {
+            window.click(id, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    panic!("the section {id} could not be chosen");
+}
+
+/// Where the panel's rows are scrolled to, read off the first row of the
+/// section on screen.
 fn body_offset(cx: &mut TestAppContext, panel: &Panel) -> Option<gpui_kit::Pixels> {
+    let first = SECTIONS[selected_section(cx, panel)].1[0];
     cx.update_window(panel.fixture.handle, |_, window, _| {
-        window
-            .try_find("settings-section-interface")
-            .map(|header| header.bounds().origin.y)
+        window.try_find(first).map(|row| row.bounds().origin.y)
     })
     .unwrap()
 }
 
-/// Scroll the panel's body by `delta` pixels.
+/// Scroll the panel's rows by `delta` pixels.
 ///
-/// GPUI's sign: a negative delta is down. A wheel only reaches the scroll area
-/// it is over, so the anchor is an element of the panel that is on screen, and
-/// the scroll is made where the panel is drawn rather than where the window is.
+/// A wheel only reaches the scroll area it is over, so the anchor is a row of
+/// the section on screen, and the scroll is made where the panel is drawn
+/// rather than where the window is.
 fn scroll_body(cx: &mut TestAppContext, panel: &Panel, delta: f32) {
-    for anchor in ANCHORS {
+    let section = selected_section(cx, panel);
+    for anchor in SECTIONS[section].1 {
         let visible = cx
             .update_window(panel.fixture.handle, |_, window, _| {
-                window.try_find(anchor).map(|found| found.visible()) == Some(true)
+                window.try_find(*anchor).map(|found| found.visible()) == Some(true)
             })
             .unwrap();
         if !visible {
@@ -112,7 +159,7 @@ fn scroll_body(cx: &mut TestAppContext, panel: &Panel, delta: f32) {
         }
         let before = body_offset(cx, panel);
         cx.update_window(panel.fixture.handle, |_, window, cx| {
-            window.scroll(anchor, ScrollDelta::Pixels(point(px(0.), px(delta))), cx);
+            window.scroll(*anchor, ScrollDelta::Pixels(point(px(0.), px(delta))), cx);
         })
         .unwrap();
         if body_offset(cx, panel) != before {
@@ -121,44 +168,12 @@ fn scroll_body(cx: &mut TestAppContext, panel: &Panel, delta: f32) {
     }
 }
 
-/// Scroll the panel's body to the top, so the panel is read from its first row.
+/// Scroll the panel's rows to the top, so the section is read from its first row.
 fn scroll_to_the_top(cx: &mut TestAppContext, panel: &Panel) {
     for _ in 0..40 {
         let before = body_offset(cx, panel);
         scroll_body(cx, panel, 200.);
         if body_offset(cx, panel) == before {
-            return;
-        }
-    }
-}
-
-/// Open a group of the panel.
-///
-/// The groups are a disclosure, so a row is only in the panel once its group is
-/// open, and the panel is a scroll area: a group whose header is off screen is
-/// scrolled to before it is clicked. The click lands on the top of the header,
-/// because a header that is half under the footer has its lower half clipped
-/// away, and a click in a clipped half is a click on nothing.
-fn open_group(cx: &mut TestAppContext, panel: &Panel, group: &'static str) {
-    scroll_to_the_top(cx, panel);
-    for _ in 0..40 {
-        let on_screen = cx
-            .update_window(panel.fixture.handle, |_, window, _| {
-                window.try_find(group).map(|header| header.visible()) == Some(true)
-            })
-            .unwrap();
-        if on_screen {
-            break;
-        }
-        scroll_body(cx, panel, -120.);
-    }
-    for _ in 0..3 {
-        let before = open_groups(cx, panel);
-        cx.update_window(panel.fixture.handle, |_, window, cx| {
-            window.click_at(group, point(px(8.), px(4.)), cx);
-        })
-        .unwrap();
-        if open_groups(cx, panel) != before {
             return;
         }
     }
@@ -401,22 +416,21 @@ fn a_size_out_of_range_is_clamped_and_the_field_is_told(cx: &mut TestAppContext)
 #[gpui_kit::test]
 fn the_body_scrolls_to_the_rows_that_do_not_fit(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    open_group(cx, &panel, "settings-section-terminal");
-    open_group(cx, &panel, "settings-section-editor");
-    open_group(cx, &panel, "settings-section-review");
+    // The terminal section is the longest one, so it is the one that does not fit.
+    select_section(cx, &panel, 1);
     scroll_to_the_top(cx, &panel);
     cx.update_window(panel.fixture.handle, |_, window, _| {
         assert!(
-            !window.find("settings-review-storage").visible(),
-            "the last row of the panel is below the fold, which is what has to be reachable"
+            !window.find("settings-terminal-follow-worktree").visible(),
+            "the last row of the section is below the fold, which is what has to be reachable"
         );
     })
     .unwrap();
     scroll_body(cx, &panel, -600.);
     cx.update_window(panel.fixture.handle, |_, window, _| {
         assert!(
-            window.find("settings-review-storage").visible(),
-            "the wheel reaches the rows the dialog could not show"
+            window.find("settings-terminal-follow-worktree").visible(),
+            "the wheel reaches the rows the card could not show"
         );
     })
     .unwrap();
@@ -425,56 +439,32 @@ fn the_body_scrolls_to_the_rows_that_do_not_fit(cx: &mut TestAppContext) {
 
 /// Every preference this build keeps has a row, and nothing it has no answer for is offered.
 ///
-/// The rows are looked for a group at a time, because a row is only in the panel while its
-/// group is open.
+/// The rows are looked for a section at a time, because a row is only in the
+/// panel while its section is the one on screen.
 #[gpui_kit::test]
 fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    for (group, rows) in [
-        (
-            "settings-section-interface",
-            vec!["settings-ui-font-size", "settings-ui-sticky"],
-        ),
-        (
-            "settings-section-terminal",
-            vec![
-                "settings-terminal-font-size",
-                "settings-terminal-ligatures",
-                "settings-terminal-cursor",
-                "settings-terminal-cursor-blink",
-                "settings-terminal-selection-copy",
-                "settings-terminal-scrollbar",
-                "settings-terminal-shell-integration",
-            ],
-        ),
-        (
-            "settings-section-editor",
-            vec![
-                "settings-editor-font-size",
-                "settings-editor-ligatures",
-                "settings-editor-cursor-blink",
-                "settings-editor-indent-with",
-                "settings-editor-indent-size",
-            ],
-        ),
-        ("settings-section-review", vec!["settings-review-storage"]),
-    ] {
-        open_group(cx, &panel, group);
+    for (section, (_, rows)) in SECTIONS.iter().enumerate() {
+        select_section(cx, &panel, section);
         cx.update_window(panel.fixture.handle, |_, window, _| {
-            for id in rows {
-                assert!(window.try_find(id).is_some(), "{id} is a row of the panel");
+            for id in *rows {
+                assert!(window.try_find(*id).is_some(), "{id} is a row of the panel");
             }
         })
         .unwrap();
-        // The group is folded again, so the next one opens with the panel as
-        // short as it was.
-        open_group(cx, &panel, group);
     }
+    select_section(cx, &panel, 0);
     cx.update_window(panel.fixture.handle, |_, window, _| {
-        assert!(
-            window.try_find("settings-ui-font-size").is_none(),
-            "a folded group has no rows in the panel"
-        );
+        for absent in [
+            "settings-terminal-cursor",
+            "settings-editor-font-size",
+            "settings-review-storage",
+        ] {
+            assert!(
+                window.try_find(absent).is_none(),
+                "{absent} belongs to a section that is not on screen"
+            );
+        }
         // The theme, the editor background and the interface scale are not preferences this
         // build has: one appearance is dark and `theme.rs` is its only authority.
         for absent in [
@@ -492,48 +482,68 @@ fn every_preference_has_a_row_and_nothing_else_does(cx: &mut TestAppContext) {
     dispose(&panel.fixture, cx);
 }
 
-/// A group of the panel is a disclosure: folding it away takes its rows with it.
+/// The sidebar of sections stands beside the rows, not above them.
 ///
-/// The panel opens with its groups folded — seventeen preferences do not fit in a dialog — and
-/// a group a person opened is open for as long as the draft lives.
+/// The panel is a card with the sections on the left and the rows of the one
+/// on screen on the right: the sections are where a person goes, and the rows
+/// are what they came for.
 #[gpui_kit::test]
-fn a_folded_group_takes_its_rows_with_it(cx: &mut TestAppContext) {
+fn the_sections_stand_beside_the_rows(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    let open_groups = |cx: &mut TestAppContext| {
-        panel.fixture.view.read_with(cx, |app, _| {
-            app.settings
-                .as_ref()
-                .expect("the panel is open")
-                .open_sections
-                .clone()
-        })
-    };
-    assert!(
-        open_groups(cx).is_empty(),
-        "the panel opens with its groups folded"
-    );
-    open_group(cx, &panel, "settings-section-terminal");
+    cx.update_window(panel.fixture.handle, |_, window, _| {
+        let section = window.find("settings-section-interface").bounds();
+        let content = window.find("settings-content").bounds();
+        let row = window.find("settings-ui-font-size").bounds();
+        assert!(
+            section.right() <= content.left(),
+            "the sidebar is on the left of the rows: {section:?} {content:?}"
+        );
+        assert!(
+            content.left() <= row.left(),
+            "the rows are on the right of the sidebar: {content:?} {row:?}"
+        );
+        assert!(
+            content.size.height >= section.size.height,
+            "the sidebar runs the height of the card: {section:?} {content:?}"
+        );
+    })
+    .unwrap();
+    dispose(&panel.fixture, cx);
+}
+
+/// The sidebar chooses the section, and only that section's rows are drawn.
+///
+/// The panel is a sidebar of sections and the rows of the one on it, so a
+/// section a person did not choose is not on screen at all.
+#[gpui_kit::test]
+fn the_sidebar_shows_one_section_at_a_time(cx: &mut TestAppContext) {
+    let panel = open_panel(cx);
     assert_eq!(
-        open_groups(cx),
-        vec![1],
-        "the terminal group is the one that was opened"
+        selected_section(cx, &panel),
+        0,
+        "the panel opens on the first section"
+    );
+    cx.update_window(panel.fixture.handle, |_, window, _| {
+        assert!(
+            window.find("settings-ui-font-size").visible(),
+            "the rows of the section on screen are on screen"
+        );
+    })
+    .unwrap();
+    select_section(cx, &panel, 1);
+    assert_eq!(
+        selected_section(cx, &panel),
+        1,
+        "the terminal section is the one that was chosen"
     );
     cx.update_window(panel.fixture.handle, |_, window, _| {
         assert!(
             window.find("settings-terminal-cursor").visible(),
-            "the rows of an open group are in the panel"
+            "the rows of the chosen section are on screen"
         );
-    })
-    .unwrap();
-    open_group(cx, &panel, "settings-section-terminal");
-    assert!(
-        open_groups(cx).is_empty(),
-        "and folding it again takes the group back"
-    );
-    cx.update_window(panel.fixture.handle, |_, window, _| {
         assert!(
-            window.try_find("settings-terminal-cursor").is_none(),
-            "the folded group took its rows with it"
+            window.try_find("settings-ui-font-size").is_none(),
+            "the rows of the other sections are not drawn"
         );
     })
     .unwrap();
@@ -544,16 +554,23 @@ fn a_folded_group_takes_its_rows_with_it(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    open_group(cx, &panel, "settings-section-interface");
-    open_group(cx, &panel, "settings-section-terminal");
+    select_section(cx, &panel, 0);
+    cx.update_window(panel.fixture.handle, |_, window, _| {
+        let checkbox = window
+            .find("settings-ui-sticky")
+            .bounds()
+            .size
+            .height
+            .as_f32();
+        assert!(
+            (checkbox - 43.).abs() <= 1.,
+            "the checkbox covers the text and the row's padding: {checkbox}"
+        );
+    })
+    .unwrap();
+    select_section(cx, &panel, 1);
     cx.update_window(panel.fixture.handle, |_, window, _| {
         let heights = [
-            window
-                .find("settings-ui-sticky")
-                .bounds()
-                .size
-                .height
-                .as_f32(),
             window
                 .find("settings-terminal-cursor")
                 .bounds()
@@ -568,11 +585,7 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
                 .as_f32(),
         ];
         assert!(
-            (heights[0] - 43.).abs() <= 1.,
-            "the checkbox covers the text and the row's padding: {heights:?}"
-        );
-        assert!(
-            (heights[1] - heights[2]).abs() <= 1.,
+            (heights[0] - heights[1]).abs() <= 1.,
             "picker and number field should share a height: {heights:?}"
         );
     })
@@ -583,7 +596,7 @@ fn settings_form_controls_share_a_compact_height(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_checkbox_changes_only_the_draft_until_apply(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    open_group(cx, &panel, "settings-section-interface");
+    select_section(cx, &panel, 0);
     let checked = panel.fixture.view.read_with(cx, |app, _| {
         app.settings.as_ref().unwrap().draft.ui.tree_sticky_scroll
     });
@@ -621,7 +634,7 @@ fn a_checkbox_changes_only_the_draft_until_apply(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_review_actions_share_a_line_and_are_not_the_width_of_the_panel(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    open_group(cx, &panel, "settings-section-review");
+    select_section(cx, &panel, 3);
     cx.update_window(panel.fixture.handle, |_, window, _| {
         let row = window.find("settings-review-storage").bounds();
         let clear = window.find("settings-review-clear").bounds();
@@ -650,7 +663,7 @@ fn the_review_actions_share_a_line_and_are_not_the_width_of_the_panel(cx: &mut T
 #[gpui_kit::test]
 fn the_review_folder_is_named_in_full_after_the_pointer_rests_on_it(cx: &mut TestAppContext) {
     let panel = open_panel(cx);
-    open_group(cx, &panel, "settings-section-review");
+    select_section(cx, &panel, 3);
     cx.update_window(panel.fixture.handle, |_, window, cx| {
         assert!(
             {
@@ -711,8 +724,7 @@ fn clearing_cached_exports_is_offered_with_no_diff_open(cx: &mut TestAppContext)
             .read_with(cx, |app, _| app.open_diff.is_none()),
         "the panel is opened from the title bar, with no diff open"
     );
-    open_group(cx, &panel, "settings-section-interface");
-    open_group(cx, &panel, "settings-section-review");
+    select_section(cx, &panel, 3);
     cx.update_window(panel.fixture.handle, |_, window, cx| {
         window.click("settings-review-clear", cx);
         window.render_frame(cx);

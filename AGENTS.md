@@ -677,13 +677,15 @@ Three things about it are decisions rather than arrangement:
   can fix it, so the fields show the defaults with the failure beside them — and
   Apply refuses, because that file is the only copy of somebody's preferences.
 
-**The preferences are in four groups, and the groups are a disclosure.** Interface,
-Terminal, Editor and Review notes each have a header that opens them, and the
-panel opens with the groups folded: seventeen preferences do not fit in a dialog
-the size of a card, and a person opens the one they came for. A group is a
-button, so it opens with the keyboard as well as with the pointer; the chevron
-says which way it opens. The open groups are window state, like the draft, and
-are never written to the file.
+**The preferences are in four sections, and the panel is a card with a sidebar.**
+Interface, Terminal, Editor and Review notes are the four sections, and the panel
+draws a sidebar of them on the left and the rows of the one on screen on the
+right: a card of a fixed size, where the sidebar does not change with the section
+and a section with more rows than fit scrolls inside the card rather than
+growing it. A section is a button, so it is reached with the keyboard as well as
+with the pointer, and the section on screen wears its own surface and ink rather
+than an accent bar. The section on screen is window state, like the draft, and is
+never written to the file.
 
 **Apply writes the file and the review location, and it does not repaint a live
 terminal.** Nothing in this app can change a running grid's font, cursor or

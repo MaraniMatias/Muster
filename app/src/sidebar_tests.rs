@@ -1455,6 +1455,9 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
         gpui_kit::init(cx);
         load_fonts(cx);
         crate::theme::install(cx);
+        // A card slides into place when it opens, and a click that lands while
+        // it moves is a click on nothing: the tests draw the frame as it is.
+        cx.set_reduce_motion(true);
     });
     let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(window_bounds(cx), cx, |window, cx| {
@@ -2973,6 +2976,9 @@ pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
         gpui_kit::init(cx);
         load_fonts(cx);
         crate::theme::install(cx);
+        // A card slides into place when it opens, and a click that lands while
+        // it moves is a click on nothing: the tests draw the frame as it is.
+        cx.set_reduce_motion(true);
     });
     let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(window_bounds(cx), cx, |_window, cx| {
