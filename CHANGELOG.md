@@ -33,6 +33,35 @@ here still gets its generated notes.
   toolbar did: the copy is of the very path the title shows, and a whole change
   set names no file, so it has nothing to copy.
 
+- **A note's lines stay washed on the diff.** The wash that says which lines a
+  comment is about belonged to the draft: saving the note dropped it, so the
+  diff went back to saying nothing about those lines while the note's card
+  named them in a header. The wash belongs to the note now. It is kept when the
+  note is applied, another note takes the mark over, a dropped draft gives it
+  back to the note that was applied last, and a deleted note takes its lines
+  with it. The toolkit's selection is a text selection, so anything that clears
+  the window's selection takes the wash with it: the window puts it back while
+  the diff has nothing selected, and a selection of the person's own is left
+  alone.
+
+- **The characters a modifier spells reach the terminal as text.** A Mac layout
+  spells a symbol with Option -- ⌥2 is @ on a Spanish layout and ⌥E is ~, and
+  ⌥⇧H is ◊ on a US one -- and the terminal only knew the Option+Shift spelling
+  of that: Option on its own was the meta key, so the character was never sent.
+  The character the platform produced is the input now, and the terminal's meta
+  prefix does not turn it into a command the shell never asked for. Option on a
+  key that carries no character of its own stays the meta key, which is what a
+  shell reads as ESC. Ctrl with Option is the layout's third level -- that is
+  how Windows and Linux report AltGr -- and the character spelled there is a
+  character and not a control code.
+
+- **The terminal and the file beside it are drawn at the same size.** The grid
+  was 16 pixels and the editor and the diff were 13, so the file pane read as
+  set in a smaller type than the terminal it sat beside. The grid is 13 pixels
+  now -- the size Ghostty and iTerm2 use on macOS -- and the editor and the
+  diff read that same size from it, so a file and a change are read at the size
+  of the terminal next to them.
+
 ## 1.0.0-rc.11
 
 - **Every release carries a build for every supported platform.** The release
