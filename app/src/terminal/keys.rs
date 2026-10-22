@@ -208,8 +208,12 @@ fn encode_press(press: &KeyPress, modes: &TerminalModes) -> Option<Vec<u8>> {
 /// it: the terminal has one byte for "control-a" and it is not an `a`. Below
 /// that the text wins over the character, because an IME commit arrives as text
 /// and the `Key::Char` it rode in on says nothing about what was typed.
+///
+/// Ctrl with Alt is the one exception: that is how Windows and Linux report
+/// AltGr, the layout's third level, and a character spelled there is a
+/// character and not a control code.
 fn encode_char(c: char, press: &KeyPress) -> Option<Vec<u8>> {
-    if press.ctrl {
+    if press.ctrl && !press.alt {
         // A longer commit under Ctrl has no control encoding in any terminal,
         // so it is refused instead of being sent as though Ctrl were not held.
         let letter = match press.text.as_deref() {
@@ -675,6 +679,27 @@ mod tests {
         assert_eq!(
             encode_key(&with_ctrl(press(Key::Char('-'))), &unnegotiated()),
             None
+        );
+    }
+
+    #[test]
+    fn ctrl_with_alt_is_the_layouts_third_level_and_types_its_character() {
+        // Windows and Linux report AltGr as Ctrl+Alt, and the character it
+        // spells is a character: @ on a Spanish layout, a `€` on a French one.
+        // A control byte -- or nothing at all -- would leave the child
+        // without the character the layout meant.
+        assert_eq!(
+            encode_key(&with_ctrl(with_alt(press(Key::Char('@')))), &unnegotiated()),
+            Some(b"@".to_vec())
+        );
+        assert_eq!(
+            encode_key(&with_ctrl(with_alt(press(Key::Char('€')))), &unnegotiated()),
+            Some("€".as_bytes().to_vec())
+        );
+        // Ctrl on its own is still the control code.
+        assert_eq!(
+            encode_key(&with_ctrl(press(Key::Char('c'))), &unnegotiated()),
+            Some(vec![0x03])
         );
     }
 

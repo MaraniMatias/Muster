@@ -21,10 +21,11 @@ pub enum Input {
     Press(KeyPress),
     /// Send this text to the child, byte for byte.
     ///
-    /// A Mac layout spells a symbol with Option and Shift together -- ⌥⇧H is
-    /// ◊ on a US layout -- and that is text rather than a key: the terminal's
-    /// meta prefix would turn it into a command the shell never asked for,
-    /// and the platform's text input only ever sees the key.
+    /// A Mac layout spells a symbol with Option -- ⌥2 is @ on a Spanish
+    /// layout, and ⌥⇧H is ◊ on a US one -- and that is text rather than a
+    /// key: the terminal's meta prefix would turn it into a command the
+    /// shell never asked for, and the platform's text input only ever sees
+    /// the key.
     Text(String),
     /// The application owns this key. Nothing is sent, and nothing is logged:
     /// every window has keys that are not the terminal's, and one of them
@@ -87,13 +88,19 @@ pub fn press(keystroke: &Keystroke) -> Input {
         return Input::Application;
     }
 
-    // A Mac layout spells a symbol with Option and Shift together: ⌥⇧H is ◊
-    // on a US layout, and something else on every other one, so the character
-    // is asked of the platform rather than named here. It is text, not a key,
-    // and the app is the one that sends it. Option on its own stays the meta
-    // key, which is what a shell reads as ESC.
-    if cfg!(target_os = "macos") && modifiers.alt && modifiers.shift {
-        if let Some(text) = printable(keystroke) {
+    // A Mac layout spells a symbol with Option: ⌥2 is @ and ⌥E is ~ on a
+    // Spanish layout, and ⌥⇧H is ◊ on a US one, so the character is asked of
+    // the platform rather than named here. It is text, not a key, and the app
+    // is the one that sends it.
+    //
+    // Option on a key that carries no character of its own stays the meta key,
+    // which is what a shell reads as ESC: ⌥Left is a word to the left and ⌥F3
+    // is a function key, and neither of them is a character.
+    //
+    // Ctrl with Option is not that: Ctrl is a modifier the child reads as a
+    // control code, and macOS spells no character behind both.
+    if cfg!(target_os = "macos") && modifiers.alt && !modifiers.control {
+        if let Some(text) = produced(keystroke) {
             return Input::Text(text);
         }
     }
@@ -156,20 +163,28 @@ fn named_key(key: &str) -> Option<Key> {
     })
 }
 
-/// The text this press typed, or `None` when it typed none.
+/// The character the platform produced for this press, if it produced one.
 ///
-/// `key_char` first: on a layout where the character is not on the key -- a
-/// dead key, Option on macOS, a Dvorak -- it is the only place the character
-/// appears. The bare key name is the fallback for Ctrl, which arrives with no
-/// character at all and is exactly the case that has to keep working.
-fn printable(keystroke: &Keystroke) -> Option<String> {
-    if let Some(text) = keystroke
+/// `key_char` is the only place the character appears on a layout where the
+/// character is not on the key -- a dead key, Option on macOS, a Dvorak -- and
+/// it is the only answer for a modifier the layout put in front of the key.
+fn produced(keystroke: &Keystroke) -> Option<String> {
+    keystroke
         .key_char
         .as_deref()
         .filter(|text| !text.is_empty())
         .filter(|text| !text.chars().next().is_some_and(char::is_control))
-    {
-        return Some(text.to_owned());
+        .map(str::to_owned)
+}
+
+/// The text this press typed, or `None` when it typed none.
+///
+/// The character the platform produced first, and the bare key name as the
+/// fallback for Ctrl, which arrives with no character at all and is exactly
+/// the case that has to keep working.
+fn printable(keystroke: &Keystroke) -> Option<String> {
+    if let Some(text) = produced(keystroke) {
+        return Some(text);
     }
 
     let mut chars = keystroke.key.chars();
@@ -464,14 +479,38 @@ mod tests {
         assert_eq!(press.key, Key::Char('ß'));
     }
 
-    /// A Mac layout's symbol is text, and Option on its own is still meta.
+    /// A Mac layout's symbol is text, and the meta prefix is for the keys
+    /// that carry no character.
     ///
-    /// ⌥⇧H is ◊ on a US layout, and the terminal's meta prefix would turn it
-    /// into something the shell reads as a command rather than a character.
-    /// Option alone is the shell's meta key, and stays one.
+    /// ⌥2 is @ and ⌥E is ~ on a Spanish layout, and ⌥⇧H is ◊ on a US one:
+    /// the character the platform produced is the input, and the terminal's
+    /// meta prefix would turn it into a command the shell never asked for.
+    /// Option on a key with no character of its own is still the meta key.
     #[cfg(target_os = "macos")]
     #[test]
-    fn option_and_shift_spell_a_symbol_where_option_alone_is_meta() {
+    fn option_spells_the_characters_the_layout_put_behind_it() {
+        assert_eq!(
+            press(&keystroke(
+                "2",
+                Some("@"),
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::none()
+                },
+            )),
+            Input::Text("@".to_owned())
+        );
+        assert_eq!(
+            press(&keystroke(
+                "e",
+                Some("~"),
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::none()
+                },
+            )),
+            Input::Text("~".to_owned())
+        );
         assert_eq!(
             press(&keystroke(
                 "h",
@@ -486,16 +525,19 @@ mod tests {
         );
 
         let Input::Press(press) = press(&keystroke(
-            "h",
-            Some("˙"),
+            "left",
+            None,
             Modifiers {
                 alt: true,
                 ..Modifiers::none()
             },
         )) else {
-            panic!("Option alone stopped being a key");
+            panic!("Option+Left stopped being a key");
         };
-        assert!(press.meta, "Option alone is the shell's meta key");
+        assert!(
+            press.meta,
+            "Option on a key with no character is the shell's meta key"
+        );
     }
 
     #[test]
