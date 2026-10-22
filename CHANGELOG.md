@@ -6,6 +6,21 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **On Linux the window manager draws the frame.** The app asked for
+  client-side decorations, and the band that reserved was the toolkit's own:
+  twenty pixels on every side, for the shadow those decorations draw. That band
+  was a margin around the app -- the window's controls sat twenty pixels away
+  from the corner the pointer goes to, and the band was gone when the window
+  was maximized, so the app looked different maximized than it does not. The
+  controls those decorations draw did not answer the click either, so minimize,
+  maximize and close were three buttons that did nothing. The window manager
+  draws the frame now: the app fills the window, and the window's controls are
+  the ones the manager draws, which are the ones that work. The app's own bar
+  sits under the manager's caption, and it is still the bar that carries the
+  crumbs and the window's actions.
+
 ## 1.0.0-rc.9
 
 - **The app fills the window on Linux.** The window's own frame kept a

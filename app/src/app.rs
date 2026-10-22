@@ -18,7 +18,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, ResizableState},
-    window_border, Disableable, TitleBar,
+    Disableable, TitleBar,
 };
 use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
@@ -27,10 +27,10 @@ use gpui_kit::{
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
-// The frame is the app's own on the targets that do not draw one: server-side
-// decorations would stack a caption and a set of window controls over the bar
-// this window draws for itself.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+// The frame is the app's own on Windows: server-side decorations would stack
+// a caption and a set of window controls over the bar this window draws for
+// itself. On Linux the window manager draws it.
+#[cfg(target_os = "windows")]
 use gpui_kit::WindowDecorations;
 use muster_core::files::FilePreview;
 use muster_core::navigation::{self, DiffTotals, GitReadBudget};
@@ -62,16 +62,6 @@ use crate::tooltip::Tooltips;
 use crate::worktree_dialog::{WorktreeDraft, WorktreeRemovalDraft};
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
-
-/// The band the window's frame reserves for itself.
-///
-/// Zero. The toolkit's Linux default keeps one for a shadow the window manager
-/// draws, and that band is a margin around the app: the window's own
-/// controls sit twenty pixels away from the corner the pointer goes to, and
-/// the app is framed rather than filling the window. The band is gone when the
-/// window is tiled, so the app would look different maximized than it does
-/// not. The app fills the window either way.
-pub(crate) const FRAME_SHADOW: Pixels = px(0.);
 
 /// The platform UI face used for app chrome and the text measured to fit it.
 pub(crate) const UI_FONT_FAMILY: &str = ".SystemUIFont";
@@ -3439,25 +3429,23 @@ impl Render for TerminalWindow {
                     .as_ref()
                     .map(|draft| self.settings_dialog(draft, cx))
             });
-        // On a target whose window has no frame of its own, the frame is this
-        // one: it draws the border and owns the resize band. It is a
-        // pass-through everywhere else.
-        window_border().shadow_size(FRAME_SHADOW).child(
-            div()
-                .id("workspace-root")
-                .relative()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(background)
-                .text_color(text)
-                .capture_key_down(cx.listener(Self::on_key))
-                .child(self.titlebar(window, cx))
-                .child(content)
-                .child(self.tooltips.clone())
-                .when_some(self.toast_element(cx), |root, toasts| root.child(toasts))
-                .when_some(dialog, |root, dialog| root.child(dialog)),
-        )
+        // The frame is the toolkit's own: it draws the border and owns the
+        // resize band on the targets that draw their own decorations, and it
+        // is a pass-through on the ones that do not.
+        div()
+            .id("workspace-root")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(background)
+            .text_color(text)
+            .capture_key_down(cx.listener(Self::on_key))
+            .child(self.titlebar(window, cx))
+            .child(content)
+            .child(self.tooltips.clone())
+            .when_some(self.toast_element(cx), |root, toasts| root.child(toasts))
+            .when_some(dialog, |root, dialog| root.child(dialog))
     }
 }
 impl Drop for TerminalWindow {
@@ -3680,7 +3668,20 @@ pub fn window_bounds(cx: &App) -> WindowOptions {
         // background: a transparent launch shows the desktop through a window
         // that has nothing transparent to show.
         window_background: WindowBackgroundAppearance::Opaque,
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        // On Windows the frame is the app's own, because server-side
+        // decorations would stack a caption and a set of window controls over
+        // the bar this window draws for itself.
+        //
+        // On Linux the window manager draws it. The toolkit's client-side
+        // decorations reserve a twenty-pixel band on every side for the shadow
+        // they draw, and that band is a margin around the app: the window's
+        // own controls sit twenty pixels away from the corner the pointer
+        // goes to, and the app looks framed rather than filling the window.
+        // The band is gone when the window is tiled, so the app would look
+        // different maximized than it does not. With the frame drawn by the
+        // window manager the app fills the window, and the window's controls
+        // are the ones the manager draws -- which are the ones that work.
+        #[cfg(target_os = "windows")]
         window_decorations: Some(WindowDecorations::Client),
         // The bar draws and moves the window itself, so AppKit must not also
         // read a title bar there.
