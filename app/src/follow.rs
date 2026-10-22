@@ -896,8 +896,11 @@ mod tests {
         config.status_interval = Duration::from_millis(10);
         let shell = crate::terminal::TerminalSession::spawn(backend.clone(), config).unwrap();
         // The child starts once the size it will keep is known: a session with
-        // no view is sized here.
-        shell.resize(80, 24).expect("the session takes its size");
+        // no view is sized here. `start_at` applies that size and starts the
+        // child in one step, so the size is settled before the view measures
+        // its own: a queued resize would land after the view's size and put
+        // the grid back at the older one.
+        shell.start_at(80, 24).expect("the session takes its size");
         let deadline = Instant::now() + Duration::from_secs(5);
         while shell.status().foreground.app.as_deref() != Some("cat") {
             assert!(

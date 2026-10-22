@@ -1490,10 +1490,14 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
                     config.status_interval = Duration::from_millis(20);
                     let shell = app.owner.spawn(config).unwrap();
                     // The child starts once the size it will keep is known: a
-                    // terminal that is never on screen is sized here.
+                    // terminal that is never on screen is sized here. `start_at`
+                    // applies that size and starts the child in one step, so
+                    // the size is settled before any view measures its own: a
+                    // queued resize would land after the view's size and put
+                    // the grid back at the older one.
                     shell
                         .session
-                        .resize(80, 24)
+                        .start_at(80, 24)
                         .expect("the session takes its size");
                     let terminal = cx.new(|cx| {
                         TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)

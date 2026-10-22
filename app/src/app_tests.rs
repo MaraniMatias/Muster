@@ -54,9 +54,12 @@ fn session_in(backend: &Arc<TerminalBackend>, script: &str, cwd: &Path) -> Termi
     let session =
         TerminalSession::spawn(Arc::clone(backend), config).expect("the test session spawns");
     // The child starts once the size it will keep is known: a session with no
-    // view is sized here.
+    // view is sized here. `start_at` applies that size and starts the child in
+    // one step, so the size is settled before the view measures its own: a
+    // queued resize would land after the view's size and put the grid back at
+    // the older one.
     session
-        .resize(INITIAL_COLUMNS, INITIAL_ROWS)
+        .start_at(INITIAL_COLUMNS, INITIAL_ROWS)
         .expect("the session takes the size it was opened at");
     session
 }

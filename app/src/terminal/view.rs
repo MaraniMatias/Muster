@@ -3665,8 +3665,13 @@ mod tests {
         let session =
             TerminalSession::spawn(Arc::clone(&backend), config).expect("the test session spawns");
         // The child starts once the size it will keep is known: a session with
-        // no view is sized here.
-        session.resize(80, 24).expect("the session takes its size");
+        // no view is sized here. `start_at` applies that size and starts the
+        // child in one step, so the size is settled before the view measures
+        // its own: a queued resize would land after the view's size and put
+        // the grid back at the older one.
+        session
+            .start_at(80, 24)
+            .expect("the session takes its size");
         session
     }
 
@@ -3816,8 +3821,13 @@ mod tests {
         let session = TerminalSession::spawn(Arc::clone(&backend), config)
             .expect("the prompt session spawns");
         // The child starts once the size it will keep is known: a session with
-        // no view is sized here.
-        session.resize(80, 24).expect("the session takes its size");
+        // no view is sized here. `start_at` applies that size and starts the
+        // child in one step, so the size is settled before the view measures
+        // its own: a queued resize would land after the view's size and put
+        // the grid back at the older one.
+        session
+            .start_at(80, 24)
+            .expect("the session takes its size");
         session
     }
 
