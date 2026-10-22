@@ -444,6 +444,40 @@ exit flushes the tail. Graphics never reads paths or shared memory named by outp
 Pi's explicit `PI_IMAGE_PROTOCOL=kitty` default is child environment only, respects
 configured values and does not change `TERM_PROGRAM=Muster` or spoof a Kitty identity.
 
+## The links in the terminal
+
+Legacy drew the paths and the addresses a terminal printed as links: hovering
+one underlined it, and ctrl+click opened it. The click is what came back.
+
+**The modifier is the whole gesture.** Ctrl+click, or cmd+click on macOS, and
+nothing else: a plain click on a path stays a click that selects nothing.
+Terminal output is not the person's own text, so nothing in a build log opens a
+browser on its own. A click a program asked for -- a terminal in mouse-reporting
+mode -- is the program's, and no link is offered.
+
+**A path is read the way the shell reads it.** A bare name is the file where
+the shell is sitting, because an `ls` prints `LICENSE` with no directory on it,
+and the shell's own directory is the operating system's answer rather than the
+checkout's. An absolute spelling is what it says it is. The name is then
+resolved through the checkout the terminal belongs to, and only a file that
+checkout holds is opened: a path that leaves it names nothing here, and the
+pane does not move.
+
+**A page is the browser's.** An address names a page rather than a file, so it
+is its own evidence: it is offered from the text itself and nothing is asked
+about the disk. `http` and `https` only, which is the pair the opener refuses
+everything outside of.
+
+The rules it depends on, each pinned by a test:
+
+- `a_control_click_on_a_page_offers_it`, `a_control_click_on_a_path_offers_it`
+  and `a_control_click_on_a_word_offers_nothing` in
+  `app/src/terminal/view.rs`.
+- `a_printed_name_is_read_against_the_shells_directory` in
+  `core/src/files.rs`.
+- `a_path_the_terminal_printed_opens_the_file_in_the_preview` in
+  `app/src/app_tests.rs`.
+
 ## The Pi integration
 
 Pi is an agent this app can watch and can send a review to. It is not OpenCode

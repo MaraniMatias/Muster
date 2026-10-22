@@ -3,13 +3,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::VisualTestContext;
 use gpui_kit::{
     AnyWindowHandle, AppContext, ClipboardItem, MouseButton, Pixels, Size, TestAppContext,
 };
 
 use super::*;
+use crate::app::sidebar_tests::{close, open_git};
 use crate::terminal::Palette;
 
 /// How long a test waits for a child before deciding it is not coming.
@@ -32,9 +33,17 @@ fn next_id() -> String {
 /// Not the login shell: a suite must not depend on which shell the person
 /// running it has, nor on what their startup files do to a PTY.
 fn session(backend: &Arc<TerminalBackend>, script: &str) -> TerminalSession {
+    session_in(backend, script, &std::env::temp_dir())
+}
+
+/// The same session, in a directory of its own.
+///
+/// The directory is the shell's own, and a bare name is read against it: a
+/// terminal that prints `LICENSE` means the file where the shell is sitting.
+fn session_in(backend: &Arc<TerminalBackend>, script: &str, cwd: &Path) -> TerminalSession {
     let mut config = TerminalSessionConfig::new(
         next_id(),
-        std::env::temp_dir(),
+        cwd.to_owned(),
         INITIAL_COLUMNS,
         INITIAL_ROWS,
         Some(PathBuf::from("/bin/sh")),
@@ -316,6 +325,86 @@ fn an_uncounted_checkout_draws_nothing_rather_than_zero() {
         Some((3, 1)),
     );
 }
+/// A path the terminal printed opens the file in the preview, when the file is
+/// one the checkout holds.
+///
+/// The gesture is the terminal's own and it is pinned in the terminal's tests;
+/// what is pinned here is the hop from the terminal's event to the window's
+/// answer: the name is resolved through the checkout, and a name that is not a
+/// file of this checkout opens nothing.
+#[gpui_kit::test]
+async fn a_path_the_terminal_printed_opens_the_file_in_the_preview(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let checkout = fixture.checkout.clone();
+    std::fs::write(fixture.root.join("code.rs"), "fn main() {}\n").unwrap();
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session_in(&backend, "cat", &fixture.root);
+    // The terminal the path was printed by, wired the way the window wires one.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let shell = Arc::new(crate::session_owner::OwnedShell {
+                session: session.clone(),
+                metrics: Arc::new(Mutex::new(crate::session_owner::UNMEASURED_CELL)),
+            });
+            let terminal =
+                cx.new(|cx| TerminalView::new(session.clone(), Arc::clone(&shell.metrics), cx));
+            app.terminals.insert(
+                "link-test".to_owned(),
+                LiveTerminal {
+                    checkout_id: checkout.clone(),
+                    view: terminal.clone(),
+                    shell,
+                },
+            );
+            app.attach_links(&terminal, &checkout, window, cx);
+            terminal.update(cx, |_, cx| {
+                cx.emit(crate::terminal::LinkTarget::Path("code.rs".into()));
+            });
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(id, preview)| id == &checkout && preview.path == "code.rs")
+    })
+    .await;
+
+    // A name that is not a file of this checkout opens nothing, and says
+    // nothing: the pane stays on the file it was showing.
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let terminal = app
+                .terminals
+                .get("link-test")
+                .expect("the terminal the path was printed by")
+                .view
+                .clone();
+            terminal.update(cx, |_, cx| {
+                cx.emit(crate::terminal::LinkTarget::Path("../outside.rs".into()));
+            });
+        });
+    })
+    .unwrap();
+    for _ in 0..8 {
+        cx.run_until_parked();
+    }
+    let shown = fixture.view.read_with(cx, |app, _| {
+        app.open_document
+            .as_ref()
+            .map(|(_, preview)| preview.path.clone())
+    });
+    assert_eq!(
+        shown.as_deref(),
+        Some("code.rs"),
+        "a name outside the checkout took the pane off the file it was showing"
+    );
+    close(&fixture, cx);
+}
+
 /// A refusal reaches the window's toast stack.
 ///
 /// Through the real window, because that is the whole claim: the terminal view

@@ -36,12 +36,13 @@ use gpui_kit::{
 use unicode_width::UnicodeWidthStr;
 
 use super::input::{self, FocusState};
+use super::links::{self, LinkTarget};
 use super::{
     CellMetrics, CellSnapshot, ColorSnapshot, CursorShapeSnapshot, GridRange, TerminalSession,
     TerminalShiftTab, TerminalSnapshot, TerminalTab,
 };
 
-/// The terminal's font size and line spacing, matching the legacy terminal defaults.
+/// The terminal's font size and line spacing.
 ///
 /// The size is the one Ghostty and iTerm2 use on macOS — 13pt — and the one the
 /// toolkit's own editor and diff are drawn at by default. Fira Code's line
@@ -611,6 +612,13 @@ pub struct InputRefused(pub String);
 
 impl gpui_kit::EventEmitter<InputRefused> for TerminalView {}
 
+// What the line under the pointer offers, and that the person asked for it.
+//
+// The terminal knows what the text says and the window knows what the checkout
+// holds, so the two meet here: a page is the browser's and a file is the
+// preview's.
+impl gpui_kit::EventEmitter<LinkTarget> for TerminalView {}
+
 /// One terminal view retaining its session, but never its workers.
 pub struct TerminalView {
     session: Arc<TerminalSession>,
@@ -1144,6 +1152,18 @@ impl TerminalView {
         )
     }
 
+    /// What the line under the pointer offers, when the line offers something.
+    ///
+    /// The grid is the only place the answer is: the text of the row, and the
+    /// characters of it that a path or a page covers. Nothing is asked about the
+    /// disk here -- whether the file is there is the checkout's own question.
+    fn link_at(&self, point: (usize, usize)) -> Option<LinkTarget> {
+        let (row, column) = point;
+        let snapshot = self.session.painting_snapshot();
+        let cells = snapshot.rows.get(row)?.cells.as_slice();
+        links::RowText::of(cells).link_at(column)
+    }
+
     fn report_mouse(
         &self,
         position: gpui_kit::Point<Pixels>,
@@ -1192,6 +1212,19 @@ impl TerminalView {
             }
         } else if event.button == MouseButton::Left {
             let point = self.point_at(event.position);
+            // A link is opened by the modifier and only by it: a plain click on a
+            // path or a page stays a click that selects nothing. Terminal output
+            // is not the person's own text, so nothing in a build log opens a
+            // browser on its own.
+            if event.modifiers.control || event.modifiers.platform {
+                if let Some(target) = self.link_at(point) {
+                    cx.emit(target);
+                    self.reset_blink();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+            }
             let now = std::time::Instant::now();
             self.click_count = self
                 .last_click
@@ -3148,6 +3181,171 @@ mod tests {
             "x".repeat(MAX_PASTE_BYTES + 1),
         ));
         _cx.simulate_keystrokes("cmd-v");
+    }
+
+    /// A page the terminal printed is opened by the modifier and by nothing else.
+    ///
+    /// Terminal output is not the person's own text, so a plain click on an
+    /// address stays a click that selects nothing: nothing in a build log opens a
+    /// browser on its own.
+    #[gpui_kit::test]
+    fn a_control_click_on_a_page_offers_it(cx: &mut gpui_kit::TestAppContext) {
+        let session = script_session("printf 'curl https://example.com/\\n'; cat");
+        let heard: Rc<RefCell<Vec<LinkTarget>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&heard);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session.clone(),
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        view.update(cx, |_, cx| {
+            cx.subscribe(&view, move |_, _, event: &LinkTarget, _| {
+                recorder.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        assert!(
+            wait_for_char(&session, 'c'),
+            "the child never drew its text"
+        );
+        focus_grid(cx, &view);
+        let (origin, cell) = view.read_with(cx, |view, _| {
+            (
+                view.canvas_origin.get(),
+                view.cell.expect("the grid measured a cell"),
+            )
+        });
+        // The address starts at the sixth column of the first row.
+        let on_the_address =
+            gpui_kit::point(origin.x + cell.width * 6., origin.y + cell.height * 0.5);
+        cx.simulate_click(
+            on_the_address,
+            gpui_kit::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            heard.borrow().as_slice(),
+            &[LinkTarget::Url("https://example.com/".into())],
+            "the window was not told what the line offers"
+        );
+
+        // A plain click on the same address opens nothing.
+        heard.borrow_mut().clear();
+        cx.simulate_click(on_the_address, Default::default());
+        assert!(
+            heard.borrow().is_empty(),
+            "a plain click opened something: {:?}",
+            heard.borrow()
+        );
+        let _ = session.close().wait();
+    }
+
+    /// A path the terminal printed is offered the same way a page is.
+    #[gpui_kit::test]
+    fn a_control_click_on_a_path_offers_it(cx: &mut gpui_kit::TestAppContext) {
+        let session = script_session("printf 'error in src/lib/foo.rs\\n'; cat");
+        let heard: Rc<RefCell<Vec<LinkTarget>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&heard);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session.clone(),
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        view.update(cx, |_, cx| {
+            cx.subscribe(&view, move |_, _, event: &LinkTarget, _| {
+                recorder.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        assert!(
+            wait_for_char(&session, 'e'),
+            "the child never drew its text"
+        );
+        focus_grid(cx, &view);
+        let (origin, cell) = view.read_with(cx, |view, _| {
+            (
+                view.canvas_origin.get(),
+                view.cell.expect("the grid measured a cell"),
+            )
+        });
+        // The path starts at the tenth column of the first row.
+        let on_the_path =
+            gpui_kit::point(origin.x + cell.width * 11., origin.y + cell.height * 0.5);
+        cx.simulate_click(
+            on_the_path,
+            gpui_kit::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            heard.borrow().as_slice(),
+            &[LinkTarget::Path("src/lib/foo.rs".into())],
+            "the window was not told what the line offers"
+        );
+        let _ = session.close().wait();
+    }
+
+    /// A word in a log is not a link: nothing in a build log is opened by a
+    /// click on it.
+    #[gpui_kit::test]
+    fn a_control_click_on_a_word_offers_nothing(cx: &mut gpui_kit::TestAppContext) {
+        let session = script_session("printf 'the build failed\\n'; cat");
+        let heard: Rc<RefCell<Vec<LinkTarget>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&heard);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                session.clone(),
+                Arc::new(Mutex::new(CellMetrics {
+                    width: 8,
+                    height: 16,
+                })),
+                cx,
+            )
+        });
+        view.update(cx, |_, cx| {
+            cx.subscribe(&view, move |_, _, event: &LinkTarget, _| {
+                recorder.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        assert!(
+            wait_for_char(&session, 't'),
+            "the child never drew its text"
+        );
+        focus_grid(cx, &view);
+        let (origin, cell) = view.read_with(cx, |view, _| {
+            (
+                view.canvas_origin.get(),
+                view.cell.expect("the grid measured a cell"),
+            )
+        });
+        let on_the_word = gpui_kit::point(origin.x + cell.width * 5., origin.y + cell.height * 0.5);
+        cx.simulate_click(
+            on_the_word,
+            gpui_kit::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            heard.borrow().is_empty(),
+            "a word was offered: {:?}",
+            heard.borrow()
+        );
+        let _ = session.close().wait();
     }
 
     #[gpui_kit::test]

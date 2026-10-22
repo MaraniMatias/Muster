@@ -6,6 +6,17 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A path in the terminal opens in the editor.** Ctrl+click -- cmd+click on
+  macOS -- on a path the terminal printed opens that file in the preview, and on
+  an address it opens the browser. The name is read the way the shell reads it:
+  a bare name is the file where the shell is sitting, because an `ls` prints
+  `LICENSE` with no directory on it. Only a file the worktree holds is opened,
+  so a path that leaves it opens nothing. A plain click is still a click that
+  selects nothing: terminal output is not the person's own text, and nothing in
+  a build log opens a browser on its own.
+
 ## 1.0.0-rc.11
 
 - **Every release carries a build for every supported platform.** The release

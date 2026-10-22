@@ -23,6 +23,7 @@ mod graphics;
 mod graphics_handler;
 mod input;
 mod keys;
+mod links;
 mod modes;
 mod paste;
 mod pi_status;
@@ -38,6 +39,7 @@ pub use self::core::{
 pub use self::graphics::GraphicSnapshot;
 pub use self::input::{FocusState, Input, MouseReport};
 pub use self::keys::{encode_key, Key, KeyPress};
+pub use self::links::LinkTarget;
 pub use self::modes::TerminalModes;
 pub use self::paste::{encode_paste, PasteError, MAX_PASTE_BYTES};
 pub use self::pi_status::{pi_task_note, PiTaskState};

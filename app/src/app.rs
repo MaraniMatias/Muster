@@ -928,6 +928,101 @@ impl TerminalWindow {
         .detach();
     }
 
+    /// Route one terminal view's links into this window.
+    ///
+    /// The terminal knows what the line under the pointer says and the window
+    /// knows what the checkout holds, so the two meet here: a page is the
+    /// browser's and a file is the preview's.
+    fn attach_links(
+        &mut self,
+        view: &Entity<TerminalView>,
+        checkout_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout_id = checkout_id.to_owned();
+        cx.subscribe_in(
+            view,
+            window,
+            move |app, view, event: &crate::terminal::LinkTarget, window, cx| {
+                // A bare name is relative to where the shell is sitting, which is
+                // the operating system's answer rather than the checkout's.
+                let working_directory = view.read_with(cx, |view, _| {
+                    view.session().status().working_directory.clone()
+                });
+                app.open_terminal_link(&checkout_id, event.clone(), working_directory, window, cx);
+            },
+        )
+        .detach();
+    }
+
+    /// Open what a terminal line offered under the pointer.
+    ///
+    /// A page is the browser's and a file is the preview's: the same gesture and
+    /// two different places. A file is one this checkout holds, so a path is
+    /// resolved through the checkout it belongs to before it is opened.
+    fn open_terminal_link(
+        &mut self,
+        checkout_id: &str,
+        target: crate::terminal::LinkTarget,
+        working_directory: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            crate::terminal::LinkTarget::Url(url) => self.open_link(url, window, cx),
+            crate::terminal::LinkTarget::Path(path) => {
+                self.open_terminal_path(checkout_id, path, working_directory, window, cx)
+            }
+        }
+    }
+
+    /// Open the file a terminal printed, in the preview.
+    ///
+    /// The file has to be one this checkout holds: the name is resolved through
+    /// the checkout, and one that leaves it names nothing here. The read is on
+    /// the background executor, because it is a question about the disk.
+    fn open_terminal_path(
+        &mut self,
+        checkout_id: &str,
+        printed: String,
+        working_directory: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repo, checkout)) = self.document_source(checkout_id) else {
+            return;
+        };
+        let worker = {
+            let repo = repo.clone();
+            let checkout = checkout.clone();
+            cx.background_executor().spawn(async move {
+                let Some(relative) = muster_core::files::resolve_printed_path(
+                    &repo,
+                    &checkout,
+                    &printed,
+                    working_directory.as_deref(),
+                ) else {
+                    return Ok::<Option<String>, String>(None);
+                };
+                let resolved = muster_core::files::external_path(&repo, &checkout, &relative)?;
+                // A folder is something to open in another application, not
+                // something the preview can draw.
+                Ok(resolved.is_file().then_some(relative))
+            })
+        };
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Some(relative)) = worker.await else {
+                return;
+            };
+            let _ = view.update_in(cx, |app, window, cx| {
+                app.request_document(repo, checkout, relative, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn persist(&self) {
         self.owner.persist(self.navigation.persistent_state());
     }
@@ -1082,6 +1177,7 @@ impl TerminalWindow {
                                 TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
                             });
                             app.attach_refusals(&terminal, cx);
+                            app.attach_links(&terminal, &terminal_checkout_id, window, cx);
                             app.terminals.insert(
                                 id.clone(),
                                 LiveTerminal {

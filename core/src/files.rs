@@ -1082,6 +1082,76 @@ pub fn external_path(repo: &Repo, checkout: &Checkout, path: &str) -> Result<Pat
     }
 }
 
+/// The checkout-relative path a terminal printed names, when it names something
+/// in this checkout.
+///
+/// A terminal starts in its checkout and moves when its shell is told to, so the
+/// shell's own directory is the base a bare name is read against: an `ls` prints
+/// `LICENSE` with no directory on it, and that name is the file where the shell
+/// is sitting. An absolute spelling is already what it says it is, and the base
+/// only ever joins onto a relative one.
+///
+/// Containment is asked of the checkout and not of the base: the canonical file
+/// has to be inside the registered root, and what comes out is the name the
+/// preview reads through. A path that leaves the checkout names nothing here,
+/// and so does one that is not there at all.
+pub fn resolve_printed_path(
+    repo: &Repo,
+    checkout: &Checkout,
+    printed: &str,
+    working_directory: Option<&str>,
+) -> Option<String> {
+    let printed = printed.trim();
+    if printed.is_empty() || printed.contains('\0') {
+        return None;
+    }
+    let root = root(repo, checkout).ok()?;
+    let printed = Path::new(printed);
+    let target = if printed.is_absolute() {
+        printed.to_path_buf()
+    } else {
+        base_directory(working_directory)
+            .unwrap_or_else(|| root.clone())
+            .join(printed)
+    };
+    // Canonicalization is what proves the file is there, and it is what makes
+    // containment a question about the real thing rather than about a spelling.
+    let target = target.canonicalize().ok()?;
+    let relative = target.strip_prefix(&root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        // `..` cannot survive the canonicalization above, and a root or a `.` is
+        // not a name inside the checkout either.
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        let part = part.to_str()?;
+        // `.git` is the object store, which this tree never browses.
+        if part == ".git" {
+            return None;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// The directory a relative name is read against, when the terminal knows one.
+///
+/// A relative answer is refused rather than joined onto anything: resolving it
+/// here would resolve it against whichever directory this process is in, which
+/// has nothing to do with the terminal that printed the path.
+fn base_directory(working_directory: Option<&str>) -> Option<PathBuf> {
+    let directory = working_directory.map(str::trim)?;
+    if directory.is_empty() || directory.contains('\0') {
+        return None;
+    }
+    let directory = Path::new(directory);
+    directory.is_absolute().then(|| directory.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,6 +1769,83 @@ mod tests {
         forged.canonical_path = forged.path.clone();
         forged.id = checkout_id_for_path(&forged.canonical_path);
         assert!(external_path(&repo, &forged, "secret.txt").is_err());
+    }
+
+    /// A name a terminal printed is read against the directory the shell is
+    /// sitting in, and it only names something when it is inside the checkout.
+    #[test]
+    fn a_printed_name_is_read_against_the_shells_directory() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/notes.txt"), "x").unwrap();
+        fs::write(dir.path().join("LICENSE"), "x").unwrap();
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        let (repo, checkout) = checkout_of(&dir);
+        let docs = dir.path().join("docs").display().to_string();
+
+        // A bare name is the file where the shell is sitting: an `ls` prints
+        // `notes.txt` with no directory on it.
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "notes.txt", Some(&docs)).as_deref(),
+            Some("docs/notes.txt")
+        );
+        // With no directory to read, the root of the checkout is the only base.
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "LICENSE", None).as_deref(),
+            Some("LICENSE")
+        );
+        // A relative directory is refused rather than resolved against wherever
+        // this process happens to be, so the root is the base that answers.
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "notes.txt", Some("docs")).as_deref(),
+            Some("notes.txt")
+        );
+        // An absolute spelling is already what it says it is.
+        assert_eq!(
+            resolve_printed_path(
+                &repo,
+                &checkout,
+                &dir.path().join("docs/notes.txt").display().to_string(),
+                None
+            )
+            .as_deref(),
+            Some("docs/notes.txt")
+        );
+
+        // What is not inside the checkout names nothing here, however it is
+        // spelled.
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "missing.txt", None),
+            None,
+            "a name that is not there is not a file"
+        );
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "..", Some(&docs)),
+            None,
+            "the checkout itself is not a file in it"
+        );
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "x").unwrap();
+        assert_eq!(
+            resolve_printed_path(
+                &repo,
+                &checkout,
+                &outside.path().join("secret.txt").display().to_string(),
+                None
+            ),
+            None,
+            "a file outside the checkout is not this checkout's"
+        );
+        // A name that climbs out of the checkout is a name somewhere else, and
+        // this checkout does not hold it.
+        let escape = dir.path().parent().unwrap().join("muster-printed-escape");
+        fs::write(&escape, "x").unwrap();
+        assert_eq!(
+            resolve_printed_path(&repo, &checkout, "../../muster-printed-escape", Some(&docs)),
+            None,
+            "a name that climbs out of the checkout names nothing here"
+        );
+        fs::remove_file(&escape).unwrap();
     }
 
     /// A FIFO is not a file to hand a desktop application: opening one would
