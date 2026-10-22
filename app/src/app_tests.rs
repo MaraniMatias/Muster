@@ -133,24 +133,24 @@ fn measured_width_cache_has_fixed_size_and_font_cardinality_limits() {
     assert_eq!(widths.len(), 0, "new size keys cannot grow without bound");
 }
 
-/// The window manager draws the frame on Linux.
+/// The window manager draws the frame, everywhere but Windows.
 ///
 /// The toolkit's client-side decorations reserve a twenty-pixel band on every
 /// side for the shadow they draw, and that band is a margin around the app:
 /// the window's own controls sit twenty pixels away from the corner the
 /// pointer goes to, and the app looks framed rather than filling the window.
 /// The band is gone when the window is tiled, so the app would look different
-/// maximized than it does not. Asking for the window manager's own frame is
-/// what keeps the app filling the window either way.
-#[cfg(target_os = "linux")]
-#[gpui_kit::test]
-fn the_window_manager_draws_the_frame_on_linux(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        assert!(
-            window_bounds(cx).window_decorations.is_none(),
-            "the window asks for the window manager's frame, not for one of its own"
-        );
-    });
+/// maximized than it does not. The controls those decorations draw do not
+/// answer the click either, so minimize, maximize and close were three buttons
+/// that did nothing.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn the_window_manager_draws_the_frame() {
+    assert_eq!(
+        window_frame(),
+        None,
+        "the window asks the window manager for its frame, not for one of its own"
+    );
 }
 
 #[gpui_kit::test]

@@ -25,13 +25,8 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
     PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
-// The frame is the app's own on Windows: server-side decorations would stack
-// a caption and a set of window controls over the bar this window draws for
-// itself. On Linux the window manager draws it.
-#[cfg(target_os = "windows")]
-use gpui_kit::WindowDecorations;
 use muster_core::files::FilePreview;
 use muster_core::navigation::{self, DiffTotals, GitReadBudget};
 use muster_core::settings::FollowWorktree;
@@ -3647,6 +3642,31 @@ fn directory_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<
         .map(PathBuf::from)
         .find(|path| path.is_dir())
 }
+/// The frame the window asks for.
+///
+/// `None` is the window manager's own frame, and it is what every platform
+/// but Windows asks for.
+///
+/// On Linux the toolkit's client-side decorations reserve a twenty-pixel band
+/// on every side for the shadow they draw, and that band is a margin around
+/// the app: the window's own controls sit twenty pixels away from the corner
+/// the pointer goes to, the app is framed rather than filling the window, and
+/// the band is gone when the window is tiled, so the app looks different
+/// maximized than it does not. The controls those decorations draw do not
+/// answer the click either, so minimize, maximize and close were three buttons
+/// that did nothing.
+///
+/// Windows keeps the frame the app draws, because server-side decorations
+/// would stack a caption and a set of window controls over the bar this window
+/// draws for itself.
+pub(crate) fn window_frame() -> Option<WindowDecorations> {
+    if cfg!(target_os = "windows") {
+        Some(WindowDecorations::Client)
+    } else {
+        None
+    }
+}
+
 pub fn window_bounds(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -3668,21 +3688,7 @@ pub fn window_bounds(cx: &App) -> WindowOptions {
         // background: a transparent launch shows the desktop through a window
         // that has nothing transparent to show.
         window_background: WindowBackgroundAppearance::Opaque,
-        // On Windows the frame is the app's own, because server-side
-        // decorations would stack a caption and a set of window controls over
-        // the bar this window draws for itself.
-        //
-        // On Linux the window manager draws it. The toolkit's client-side
-        // decorations reserve a twenty-pixel band on every side for the shadow
-        // they draw, and that band is a margin around the app: the window's
-        // own controls sit twenty pixels away from the corner the pointer
-        // goes to, and the app looks framed rather than filling the window.
-        // The band is gone when the window is tiled, so the app would look
-        // different maximized than it does not. With the frame drawn by the
-        // window manager the app fills the window, and the window's controls
-        // are the ones the manager draws -- which are the ones that work.
-        #[cfg(target_os = "windows")]
-        window_decorations: Some(WindowDecorations::Client),
+        window_decorations: window_frame(),
         // The bar draws and moves the window itself, so AppKit must not also
         // read a title bar there.
         ..TitleBar::window_options()
