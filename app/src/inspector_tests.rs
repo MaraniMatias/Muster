@@ -5305,6 +5305,45 @@ async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut Te
     close(&fixture, cx);
 }
 
+/// The path the diff's title names is a path somebody pastes somewhere else, so
+/// the icon beside it puts that very path on the clipboard.
+#[gpui_kit::test]
+async fn the_diff_title_copies_the_path_it_names(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    assert!(draw_until(&fixture, cx, "copy-diff-path"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "something else".to_owned(),
+        ));
+        window.click("copy-diff-path", cx);
+        assert_eq!(
+            cx.read_from_clipboard().map(|item| item.text()),
+            Some(Some("change.txt".to_owned())),
+            "the icon beside the path is what puts it on the clipboard"
+        );
+    })
+    .unwrap();
+    // A whole change set names no file, so there is no path to copy.
+    fixture
+        .view
+        .update(cx, |app, cx| app.open_changes(&fixture.checkout, None, cx));
+    assert!(!draw_until(&fixture, cx, "copy-diff-path"));
+    close(&fixture, cx);
+}
+
 #[gpui_kit::test]
 async fn review_composer_keeps_text_while_widening_and_escape_cancels(cx: &mut TestAppContext) {
     use gpui_kit::component::diff::{DiffLineRange, DiffSide};

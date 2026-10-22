@@ -27,6 +27,12 @@ here still gets its generated notes.
   selects nothing: terminal output is not the person's own text, and nothing in
   a build log opens a browser on its own.
 
+- **The diff's title copies the path it names.** A change on screen is named by
+  its path, and that path is what somebody pastes into a terminal, a ticket or
+  a message. An icon beside it puts it on the clipboard, the way the document
+  toolbar did: the copy is of the very path the title shows, and a whole change
+  set names no file, so it has nothing to copy.
+
 ## 1.0.0-rc.11
 
 - **Every release carries a build for every supported platform.** The release

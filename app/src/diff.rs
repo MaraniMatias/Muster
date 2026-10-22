@@ -1196,10 +1196,31 @@ impl TerminalWindow {
                             div().id("review-title-row").test_support()
                                 .flex().items_center().gap_2().min_w_0()
                                 .child(
-                                    div().flex_1().min_w_0().truncate()
-                                        .text_size(px(DIFF_CHROME_PX))
-                                        .text_color(roles.text_muted)
-                                        .child(selected.clone().unwrap_or_else(|| "All changes".into())),
+                                    div().flex_1().min_w_0().flex().items_center().gap_2()
+                                        .child(
+                                            div().min_w_0().truncate()
+                                                .text_size(px(DIFF_CHROME_PX))
+                                                .text_color(roles.text_muted)
+                                                .child(selected.clone().unwrap_or_else(|| "All changes".into())),
+                                        )
+                                        // Legacy's document toolbar: the path, and the
+                                        // icon that puts it on the clipboard beside it.
+                                        // The copy is of the very path the title names,
+                                        // and a whole change set names no file, so it
+                                        // has nothing to copy.
+                                        .when_some(selected.clone(), |row, path| {
+                                            let copy = path.clone();
+                                            row.child(
+                                                Button::new("copy-diff-path")
+                                                    .text().cursor_default().small().compact().h(px(20.)).flex_none()
+                                                    .icon(IconName::Copy)
+                                                    .accessibility_label(format!("Copy the path of {path}"))
+                                                    .resting_tooltip(format!("Copy the path of {path}"))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+                                                    }),
+                                            )
+                                        }),
                                 )
                                 // The action and the destination chooser are one
                                 // control: two halves of the same button, joined edge
