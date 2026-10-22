@@ -49,8 +49,8 @@ pub use self::session::{
     TerminalSessionConfig, TerminalSnapshot, TerminalWake, DEFAULT_DRAIN_DEADLINE,
     DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_INTERVAL,
 };
-/// The grid's own size, which the document and the diff are drawn at.
-pub(crate) use self::view::FONT_SIZE;
+/// The grid's own row ratio, which the document is drawn at too.
+pub(crate) use self::view::LINE_HEIGHT;
 pub use self::view::{xterm_256, CellSize, InputRefused, Palette, Placement, TerminalView};
 pub use self::write_queue::{EnqueueError, WriteQueue, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS};
 

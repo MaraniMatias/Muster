@@ -13,6 +13,7 @@ use gpui_kit::component::diff::{
 use gpui_kit::component::select::Select;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::Sizable;
+use gpui_kit::component::Theme;
 use gpui_kit::component::{
     input::Textarea,
     menu::{DropdownMenu, PopupMenuItem},
@@ -403,6 +404,9 @@ impl TerminalWindow {
             return None;
         }
         let roles = Roles::of(cx);
+        // The size the code in the diff is drawn at, which is the size the
+        // document beside it is drawn at too.
+        let mono = Theme::global(cx).mono_font_size;
         // The source of the file whose change is on screen, when there is one to
         // read. A whole change set names no file, so it names no source either.
         let source = selected.as_deref().and_then(|path| {
@@ -1132,7 +1136,7 @@ impl TerminalWindow {
                     div()
                         .id(format!("diff-notice-text-{path}"))
                         .test_support()
-                        .text_size(px(f32::from(crate::terminal::FONT_SIZE)))
+                        .text_size(mono)
                         .text_color(roles.text_muted)
                         .child(message),
                 );

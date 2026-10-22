@@ -44,17 +44,25 @@ use super::{
 
 /// The terminal's font size and line spacing.
 ///
-/// The size is the one Ghostty and iTerm2 use on macOS — 13pt — and the one the
-/// toolkit's own editor and diff are drawn at by default. Fira Code's line
-/// height is 1.2em, so a 13px grid is a 15.6px cell, which is what Ghostty
-/// draws at the same size. Legacy drew this grid at 16px, which read larger
-/// than the terminal it sat beside.
+/// The size is the terminal's own preference: the panel offers it, and the size
+/// the panel says is the size the grid is drawn at. Its default is the one
+/// Ghostty and iTerm2 use on macOS — 13pt.
+pub(crate) fn font_size() -> Pixels {
+    px(crate::settings::preferences().terminal.font_size as f32)
+}
+
+/// A row's height, as a fraction of the font size.
 ///
-/// Published so the document and the diff can be drawn at this same size: the
-/// grid, a file and a diff are read in one window, and code three pixels
-/// smaller than the terminal beside it is the first thing anybody notices.
-pub(crate) const FONT_SIZE: Pixels = px(13.0);
-const LINE_HEIGHT: f32 = 1.2;
+/// A 13px grid is a 15.6px cell, which is what Ghostty draws at the same size.
+/// It is not the face's own ascent and descent, which are already taller than
+/// the em they are drawn in — Fira Code's line box is 1.23 of it — and
+/// multiplying those by the ratio again gave a row a quarter taller than the
+/// glyph in it, with a gap above every row a block element filled.
+///
+/// Published so the document can be drawn at this same ratio: the grid, a file
+/// and a diff are read in one window, and code set in a taller row than the
+/// terminal beside it is the first thing anybody notices.
+pub(crate) const LINE_HEIGHT: f32 = 1.2;
 /// `--muster-cursor` from the legacy dark theme, which is also the editor's caret.
 const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);
 
@@ -446,9 +454,16 @@ impl CellSize {
         let probe = text_system.shape_line("M".into(), font_size, &[style.to_run(1)], None);
         let measured = Self {
             width: probe.width(),
-            // Whole pixels, preserving the legacy 1.2 line height. The font's
-            // own ascent and descent may be fractional, so round only after spacing.
-            height: ((probe.ascent + probe.descent) * LINE_HEIGHT).ceil(),
+            // Whole pixels, so a row is a whole row: the font's own ascent and
+            // descent may be fractional, so round only after spacing.
+            //
+            // The height is the size times the ratio rather than the face's own
+            // ascent and descent. A face's line box is already taller than its em
+            // -- Fira Code's is 1.23 of it -- so multiplying that by the ratio
+            // again made every row a quarter taller than the glyph in it, and
+            // left a gap above every row a block element filled, because the
+            // face draws a block across its whole line box.
+            height: (font_size * LINE_HEIGHT).ceil(),
         };
         (measured.width > px(0.0) && measured.height > px(0.0)).then_some(measured)
     }
@@ -769,7 +784,7 @@ impl TerminalView {
             cell: None,
             bold_font_loaded: false,
             style: TextStyle {
-                font_size: FONT_SIZE.into(),
+                font_size: font_size().into(),
                 line_height: gpui_kit::DefiniteLength::Fraction(LINE_HEIGHT),
                 ..TextStyle::default()
             },
@@ -1786,11 +1801,11 @@ impl Frame {
         // Ligature advances can exceed the terminal's fixed grid columns. Paint
         // within the run's full shaped extent; the next run still starts at its
         // grid coordinate, so we neither clip nor accumulate shaping advances.
+        // The line box sits at the top of the cell, so the baseline is the face's
+        // own ascent below the cell's top edge and a block element -- which the
+        // face draws across its whole line box -- fills the cell it is in.
         let paint_height = shaped.ascent + shaped.descent;
-        let paint_origin = point(
-            bounds.origin.x,
-            bounds.origin.y + bounds.size.height - paint_height,
-        );
+        let paint_origin = point(bounds.origin.x, bounds.origin.y);
         if let Err(error) = shaped.paint(
             paint_origin,
             paint_height,
@@ -2784,6 +2799,84 @@ mod tests {
                 ))
                 .child(self.view.clone())
         }
+    }
+
+    /// The bundled face draws a block element across its whole line box.
+    ///
+    /// That is what makes a row the size of the ratio filled by one: the ink of a
+    /// block reaches from the face's descent to its ascent, which is the line box
+    /// the row is drawn in, so a bar of blocks reads as a bar. A face that drew
+    /// its blocks shorter would leave a gap above every row it filled.
+    #[test]
+    fn a_block_element_is_drawn_across_the_faces_line_box() {
+        let face = ttf_parser::Face::parse(
+            include_bytes!("../../assets/fonts/FiraCode-Regular.ttf").as_slice(),
+            0,
+        )
+        .expect("the bundled face parses");
+        let block = face
+            .glyph_index('\u{2588}')
+            .expect("the face carries a full block");
+        let ink = face
+            .glyph_bounding_box(block)
+            .expect("the block has an outline");
+        assert_eq!(ink.y_min, face.descender(), "a block reaches the foot");
+        assert_eq!(ink.y_max, face.ascender(), "a block reaches the head");
+        // The line box is the box the glyph is drawn in, so the row has to be it:
+        // a row much taller would leave a gap above every row a block filled.
+        let line_box = (face.ascender() - face.descender()) as f32 / face.units_per_em() as f32;
+        assert!(
+            (line_box - LINE_HEIGHT).abs() < 0.05,
+            "the face's line box is {line_box} of the size and a row is {LINE_HEIGHT} of it"
+        );
+    }
+
+    /// A row is the font size times the line-height ratio.
+    ///
+    /// Not the face's own ascent and descent: a face's line box is already taller
+    /// than the em it is drawn in — Fira Code's is 1.23 of it — so multiplying that
+    /// by the ratio again gave every row a quarter of empty space above the glyph
+    /// in it. A block element, which the face draws across its whole line box,
+    /// then left a gap above every row it filled, and a bar of blocks read as a
+    /// row of separate tiles rather than as a bar.
+    ///
+    /// The size is the one the preferences say, so the panel does not offer a
+    /// number the grid is not drawn at.
+    #[gpui_kit::test]
+    fn a_row_is_the_font_size_times_the_line_height(cx: &mut gpui_kit::TestAppContext) {
+        let session = echo_session();
+        let metrics = Arc::new(Mutex::new(CellMetrics {
+            width: 8,
+            height: 16,
+        }));
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = gpui_kit::AppContext::new(cx, |cx| {
+                TerminalView::new(session, Arc::clone(&metrics), cx)
+            });
+            Chrome {
+                view,
+                header: px(40.),
+            }
+        });
+        let view = terminal.read_with(cx, |chrome, _| chrome.view.clone());
+        let session = view.read_with(cx, |view, _| Arc::clone(view.session()));
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| window.render_frame(cx));
+        let cell = view.read_with(cx, |view, _| view.cell.expect("the grid measured a cell"));
+        let size = font_size();
+        assert_eq!(
+            cell.height,
+            (size * LINE_HEIGHT).ceil(),
+            "a row of {} for a {size} font is not the size times the ratio",
+            cell.height
+        );
+        assert_eq!(
+            size,
+            px(crate::settings::preferences().terminal.font_size as f32),
+            "the grid is drawn at the size the panel offers"
+        );
+
+        let _ = session.close().wait();
     }
 
     #[gpui_kit::test]

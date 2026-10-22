@@ -24,7 +24,8 @@
 //!
 //! It writes the file and the review location. It does not repaint a live terminal at the new
 //! size: nothing here can change a running grid's font, cursor or scrollback yet, and a panel
-//! that pretended otherwise would lie about what a preference does.
+//! that pretended otherwise would lie about what a preference does. A size is drawn from the
+//! next run, which is when the app reads the file again.
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
@@ -58,6 +59,26 @@ static SETTINGS_SAVE_LOCK: Mutex<()> = Mutex::new(());
 use crate::app::TerminalWindow;
 use crate::theme::Roles;
 use crate::tooltip::RestingTooltip;
+
+/// The preferences as they are on file, read once per run.
+///
+/// The panel writes the file; this is what the rest of the app draws from. Read once
+/// because the sizes in it are the app's rather than a window's: the grid, the document
+/// and the diff are read side by side, and a file that changed while the app was running
+/// would leave them drawn at different sizes.
+///
+/// A file that cannot be read leaves the defaults, which are the sizes the file would
+/// have said: a preference holds no work, and refusing to draw at all over one would be
+/// a worse answer than the default.
+pub(crate) fn preferences() -> &'static AppSettings {
+    static PREFERENCES: std::sync::OnceLock<AppSettings> = std::sync::OnceLock::new();
+    PREFERENCES.get_or_init(|| {
+        settings::settings_path()
+            .ok()
+            .and_then(|path| settings::load(&path).ok())
+            .unwrap_or_default()
+    })
+}
 
 /// The options a closed setting offers, and the row the current one sits on.
 ///
@@ -885,7 +906,7 @@ impl TerminalWindow {
                         size_row(
                             "settings-terminal-font-size",
                             "Font size",
-                            "",
+                            "The size the grid is drawn at. Read when the app starts.",
                             roles,
                             &terminal_font_size,
                             saving,
@@ -966,7 +987,7 @@ impl TerminalWindow {
                         size_row(
                             "settings-editor-font-size",
                             "Font size",
-                            "",
+                            "The size the document and the diff are drawn at. Read when the app starts.",
                             roles,
                             &editor_font_size,
                             saving,

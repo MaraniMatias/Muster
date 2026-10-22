@@ -459,10 +459,11 @@ pub fn install(cx: &mut App) {
         // native without changing the terminal, document or diff typography.
         theme.font_family = crate::app::UI_FONT_FAMILY.into();
         theme.mono_font_family = crate::app::MONO_FONT_FAMILY.into();
-        // The grid, document and diff share one monospace size so adjacent code
-        // surfaces remain aligned when the terminal font size changes.
+        // The document and the diff share one monospace size, so the two code
+        // surfaces beside a terminal are set alike; the grid has its own, which
+        // is the terminal's own preference.
         // `font_size` remains the toolkit's base UI scale.
-        theme.mono_font_size = crate::terminal::FONT_SIZE;
+        theme.mono_font_size = px(crate::settings::preferences().editor.font_size as f32);
         // Two corner radii, in the two places the toolkit keeps them. The
         // toolkit reads `radius` for a control *and* for the small overlays it
         // draws itself — a menu, a popover, a picker's panel — and `radius_lg`
@@ -1000,6 +1001,11 @@ mod tests {
     use gpui_kit::component::highlighter::{FontStyle, FontWeightContent};
     use gpui_kit::{px, TestAppContext};
 
+    /// The size the document and the diff are drawn at, as the preferences say.
+    fn editor_font_size() -> f32 {
+        crate::settings::preferences().editor.font_size as f32
+    }
+
     /// The capture names a grammar emits on purpose for the theme to leave
     /// alone: markdown's own prose, a spell hint that rides beside a real
     /// token, and Makefile's own diagnostics.
@@ -1121,7 +1127,7 @@ mod tests {
             assert_eq!(theme.font_family, crate::app::UI_FONT_FAMILY);
             assert_eq!(theme.mono_font_family, crate::app::MONO_FONT_FAMILY);
             assert_ne!(theme.font_family, theme.mono_font_family);
-            assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
+            assert_eq!(theme.mono_font_size, px(editor_font_size()));
             assert_eq!(theme.font_size, px(16.));
         });
     }
@@ -1184,31 +1190,23 @@ mod tests {
         });
     }
 
-    /// The document and the diff are drawn at the grid's own size.
+    /// The document and the diff are drawn at the editor's own size.
     ///
-    /// Both are the app's code, and both are read next to a terminal in the
-    /// same window. The grid is drawn at 13px — the size Ghostty and iTerm2 use
-    /// on macOS — and the editor and the toolkit's diff both read it from this
-    /// one place, so the file pane is not set in a smaller type than the
-    /// terminal it sits beside.
+    /// Both are the app's code, and both are read next to a terminal in the same
+    /// window. Each surface wears the size the preferences give it, so the
+    /// Settings panel does not answer with a number nothing draws at.
     #[gpui_kit::test]
-    fn the_document_and_the_diff_read_at_the_terminals_own_size(cx: &mut TestAppContext) {
+    fn the_document_and_the_diff_are_drawn_at_the_size_the_preferences_say(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install(cx);
         });
         cx.read(|cx| {
             let theme = Theme::global(cx);
-            // The grid's own size, and not a number that happens to match it.
-            assert_eq!(crate::terminal::FONT_SIZE, px(13.));
-            // What the toolkit's editor and diff paint with: the same value.
-            assert_eq!(theme.mono_font_size, crate::terminal::FONT_SIZE);
-            // The size the preferences offer is the size the grid is drawn at, so
-            // the Settings panel does not answer with a number nothing draws at.
-            assert_eq!(
-                f32::from(theme.mono_font_size),
-                muster_core::settings::TerminalSettings::default().font_size as f32
-            );
+            // What the toolkit's editor and diff paint with: the editor's own.
+            assert_eq!(theme.mono_font_size, px(editor_font_size()));
         });
     }
 
