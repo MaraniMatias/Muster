@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.12
 
 - **A terminal's row follows the work it is doing.** The panel filed a terminal
   under the worktree it was opened in and left it there when the work behind it
