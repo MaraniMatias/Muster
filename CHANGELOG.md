@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.13
 
 - **A row is the font size and not the face's line box.** The grid's row was
   the face's own ascent and descent multiplied by the line height ratio, and a
