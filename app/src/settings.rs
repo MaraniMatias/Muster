@@ -30,13 +30,14 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    collapsible::Collapsible,
     dialog::{Dialog, DialogFooter},
     input::{Input, InputState},
     select::{Select, SelectEvent, SelectState},
-    Disableable, IndexPath, Sizable,
+    Disableable, Icon, IconName, IndexPath, Sizable,
 };
 use gpui_kit::{
-    div, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Div, Entity,
+    div, percentage, prelude::FluentBuilder, px, AnyElement, App, AppContext, Context, Div, Entity,
     InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Subscription,
     TestSupportExt, Window,
 };
@@ -190,6 +191,25 @@ fn storage_for_row(row: usize) -> ReviewStorage {
     review_storage(row)
 }
 
+/// The groups the panel is drawn in.
+///
+/// A group's name and the id its header is found by are one row here, and the
+/// order is the panel's: the open groups are remembered by their position in it.
+const SECTIONS: [(&str, &str); 4] = [
+    ("Interface", "settings-section-interface"),
+    ("Terminal", "settings-section-terminal"),
+    ("Editor", "settings-section-editor"),
+    ("Review notes", "settings-section-review"),
+];
+
+/// How far the rows of a group sit under the group's name.
+///
+/// The header is a button with a chevron in front of the name, so the name
+/// starts the button's own padding, the chevron and the gap between them
+/// further right than the panel's edge. The rows line up with the name, which
+/// is the spine of the group.
+const GROUP_INDENT: f32 = 34.;
+
 const CURSOR_WORDS: [&str; 3] = ["Block", "Bar", "Underline"];
 const SCROLLBAR_WORDS: [&str; 3] = ["Hidden", "While scrolling", "Always"];
 const INDENT_WORDS: [&str; 2] = ["Spaces", "Tabs"];
@@ -222,6 +242,12 @@ pub(crate) struct SettingsDraft {
     pub(crate) review_storage_picker: Entity<SelectState<Vec<SharedString>>>,
     /// What a terminal follows when its work moves to another worktree.
     pub(crate) follow_worktree: Entity<SelectState<Vec<SharedString>>>,
+    /// The groups of the panel that are open.
+    ///
+    /// A group is a disclosure: the panel opens with the groups folded, which
+    /// is what keeps seventeen preferences in a dialog the size of a card, and
+    /// a group a person opened stays open for as long as the draft lives.
+    pub(crate) open_sections: Vec<usize>,
     pub(crate) error: Option<String>,
     draft_id: u64,
     pub(crate) saving: bool,
@@ -372,19 +398,59 @@ fn settings_actions(
         .into_any_element()
 }
 
-/// A titled run of rows.
-fn settings_section(title: &'static str, roles: Roles, rows: Vec<AnyElement>) -> AnyElement {
+/// One group of the panel: the header that opens it and the rows it holds.
+///
+/// The header is a button, so a group opens with the keyboard as well as with
+/// the pointer, and the chevron says which way it opens. The rows are in a
+/// collapsible, which holds them while the group is folded.
+fn settings_section(
+    title: &'static str,
+    open_sections: &[usize],
+    view: gpui_kit::WeakEntity<TerminalWindow>,
+    roles: Roles,
+    rows: Vec<AnyElement>,
+) -> Div {
+    let index = SECTIONS
+        .iter()
+        .position(|(name, _)| *name == title)
+        .expect("a group of the panel is one of the panel's groups");
+    let (_, id) = SECTIONS[index];
+    let open = open_sections.contains(&index);
     div()
-        .mt_4()
+        // The space between the groups is a margin, not a gap: this toolkit
+        // lays a column's items out without the gap between them.
+        .mt(px(16.))
         .child(
-            div()
-                .mb_1()
-                .text_size(px(11.))
-                .text_color(roles.text_muted)
-                .child(title),
+            Button::new(id)
+                .ghost()
+                .w_full()
+                .justify_start()
+                .icon(
+                    Icon::new(IconName::ChevronDown)
+                        .text_color(roles.text_muted)
+                        .rotate(percentage(if open { 0.5 } else { 0. })),
+                )
+                .label(title)
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |app, cx| {
+                        if let Some(draft) = app.settings.as_mut() {
+                            match draft.open_sections.iter().position(|open| *open == index) {
+                                Some(at) => {
+                                    draft.open_sections.remove(at);
+                                }
+                                None => draft.open_sections.push(index),
+                            }
+                        }
+                        cx.notify();
+                    });
+                }),
         )
-        .children(rows)
-        .into_any_element()
+        .child(
+            Collapsible::new()
+                .open(open)
+                // The rows sit under the group's name, not under its chevron.
+                .content(div().pt(px(4.)).pl(px(GROUP_INDENT)).children(rows)),
+        )
 }
 
 /// A row whose control is a checkbox, named by the field it writes.
@@ -620,6 +686,7 @@ impl TerminalWindow {
             indent_with,
             review_storage_picker,
             follow_worktree,
+            open_sections: Vec::new(),
             error: failure,
             draft_id: NEXT_SETTINGS_DRAFT.fetch_add(1, Ordering::Relaxed),
             saving: false,
@@ -875,8 +942,13 @@ impl TerminalWindow {
                         .text_color(roles.text_muted)
                         .child("Saved to ~/.muster/settings.json"),
                 );
-                body = body.child(settings_section(
+                // The groups are a disclosure: the panel opens with the groups
+                // folded, and a person opens the one they came for.
+                let mut groups = div().flex_col();
+                groups = groups.child(settings_section(
                     "Interface",
+                    &draft.open_sections,
+                    view.clone(),
                     roles,
                     vec![
                         size_row(
@@ -899,8 +971,10 @@ impl TerminalWindow {
                         ),
                     ],
                 ));
-                body = body.child(settings_section(
+                groups = groups.child(settings_section(
                     "Terminal",
+                    &draft.open_sections,
+                    view.clone(),
                     roles,
                     vec![
                         size_row(
@@ -980,8 +1054,10 @@ impl TerminalWindow {
                         ),
                     ],
                 ));
-                body = body.child(settings_section(
+                groups = groups.child(settings_section(
                     "Editor",
+                    &draft.open_sections,
+                    view.clone(),
                     roles,
                     vec![
                         size_row(
@@ -1034,8 +1110,10 @@ impl TerminalWindow {
 
                 let clear_button = clear.clone();
                 let forget_button = forget.clone();
-                body = body.child(settings_section(
+                groups = groups.child(settings_section(
                     "Review notes",
+                    &draft.open_sections,
+                    view.clone(),
                     roles,
                     vec![
                         select_row(
@@ -1082,6 +1160,7 @@ impl TerminalWindow {
                         ),
                     ],
                 ));
+                body = body.child(groups);
 
                 if let Some(error) = error.clone() {
                     body = body.child(
