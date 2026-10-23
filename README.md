@@ -188,7 +188,8 @@ The native app is a **terminal with the workspace panel around it**:
 repositories and worktrees in a sidebar, live terminals grouped under them,
 line counts counted against Git, a searchable worktree picker in the title bar,
 worktree creation and archive-or-delete dialogs, drag to reorder or move a
-terminal between worktrees, and a window state file.
+terminal between worktrees, drag to reorder the workdirs themselves, and a
+window state file.
 
 The native app includes review notes and agent delivery/export, editable
 preferences, file activation and terminal search.

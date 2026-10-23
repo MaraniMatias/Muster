@@ -214,6 +214,90 @@ impl Navigation {
         Ok(())
     }
 
+    /// The panel's home workdir, and where it sits in the panel's order.
+    ///
+    /// It is the workdir that owns the home checkout, and it is where the
+    /// panel starts: it keeps its place, and nothing is put above it.
+    pub fn home_index(&self) -> Option<usize> {
+        let home = self.home.as_deref()?;
+        self.repos
+            .iter()
+            .position(|repo| repo.checkouts.iter().any(|checkout| checkout.id == home))
+    }
+
+    /// Whether a workdir may take a slot in the panel's order.
+    ///
+    /// The home workdir is a wall: it keeps its place, and no workdir crosses
+    /// it, so nothing is ever put above it. Every other workdir is free.
+    fn allowed_slot(&self, from: usize, slot: usize) -> bool {
+        let Some(home) = self.home_index() else {
+            return true;
+        };
+        if from == home {
+            return false;
+        }
+        if from < home {
+            slot < home
+        } else {
+            slot > home
+        }
+    }
+
+    /// The slot a workdir takes when it is moved one place up or down.
+    ///
+    /// The slot is the index the workdir takes in the panel's order after the
+    /// move. `None` is a move that is not there: the workdir is already at
+    /// the end of the panel, or the home workdir is in the way.
+    pub fn step_slot(&self, id: &str, up: bool) -> Option<usize> {
+        let from = self.repos.iter().position(|repo| repo.id == id)?;
+        let slot = if up { from.checked_sub(1)? } else { from + 1 };
+        if slot >= self.repos.len() {
+            return None;
+        }
+        self.allowed_slot(from, slot).then_some(slot)
+    }
+
+    /// The slot a workdir takes when it is put down at a boundary.
+    ///
+    /// The boundary is a place between two workdirs in the panel's order: `0`
+    /// is above the first one and the count of workdirs is below the last one.
+    /// The slot is the index the workdir takes in the panel's order after the
+    /// move. `None` is a drop that moves nothing: the workdir is already
+    /// there, or it would be put above the home workdir.
+    pub fn workdir_slot(&self, id: &str, boundary: usize) -> Option<usize> {
+        let from = self.repos.iter().position(|repo| repo.id == id)?;
+        // The boundary is counted in the panel's order as it is drawn, and the
+        // workdir that is carried is still on it: the workdir it lands before
+        // is one place further down when the carried one is above it.
+        let slot = boundary - usize::from(from < boundary);
+        if slot == from || !self.allowed_slot(from, slot) {
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// Move a workdir to another place in the panel.
+    ///
+    /// The slot is the index the workdir takes in the panel's order after the
+    /// move: the number of workdirs that end up above it. The home workdir is
+    /// the one that does not move, and nothing is put above it.
+    pub fn move_repo(&mut self, id: &str, slot: usize) -> Result<(), String> {
+        let from = self
+            .repos
+            .iter()
+            .position(|repo| repo.id == id)
+            .ok_or("This workdir is no longer registered.")?;
+        if self.home_index() == Some(from) {
+            return Err("The home workdir always comes first.".into());
+        }
+        if !self.allowed_slot(from, slot) {
+            return Err("Nothing is put above the home workdir.".into());
+        }
+        let repo = self.repos.remove(from);
+        self.repos.insert(slot.min(self.repos.len()), repo);
+        Ok(())
+    }
+
     pub fn archive(&mut self, id: &str) -> Result<(), String> {
         let checkout = self.checkout(id).ok_or("This worktree no longer exists.")?;
         if checkout.is_primary
@@ -449,6 +533,149 @@ mod tests {
             session_type: SessionType::Shell,
             status: SessionStatus::Active,
         }
+    }
+
+    /// A workdir added to the panel, and the identity it is known by.
+    fn extra_workdir(nav: &mut Navigation) -> String {
+        let repo = Repo::plain(tempdir().unwrap().path(), "now").unwrap();
+        let id = repo.checkouts[0].id.clone();
+        nav.merge(
+            OpenedDirectory {
+                repo,
+                checkout_id: id.clone(),
+            },
+            false,
+        );
+        nav.repos.last().unwrap().id.clone()
+    }
+
+    fn panel_order(nav: &Navigation) -> Vec<String> {
+        nav.repos.iter().map(|repo| repo.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_workdir_moves_to_another_place_in_the_panel() {
+        let (_dir, mut nav, home) = fixture();
+        nav.home = Some(home.clone());
+        let first = nav.repos[0].id.clone();
+        let second = extra_workdir(&mut nav);
+        let third = extra_workdir(&mut nav);
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), second.clone(), third.clone()]
+        );
+
+        // The last workdir lands above the one before it.
+        nav.move_repo(&third, 1).unwrap();
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), third.clone(), second.clone()]
+        );
+
+        // And it can go back to the end of the panel.
+        nav.move_repo(&third, 2).unwrap();
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), second.clone(), third.clone()]
+        );
+    }
+
+    #[test]
+    fn the_home_workdir_is_where_the_panel_starts() {
+        let (_dir, mut nav, home) = fixture();
+        nav.home = Some(home.clone());
+        let first = nav.repos[0].id.clone();
+        let second = extra_workdir(&mut nav);
+        assert_eq!(nav.home_index(), Some(0));
+
+        // The home workdir does not move.
+        assert!(nav.move_repo(&first, 1).is_err());
+        assert_eq!(panel_order(&nav), vec![first.clone(), second.clone()]);
+
+        // And nothing is put above it.
+        assert!(nav.move_repo(&second, 0).is_err());
+        assert_eq!(panel_order(&nav), vec![first.clone(), second.clone()]);
+
+        // The workdir below the home one cannot move up either.
+        assert_eq!(nav.step_slot(&second, true), None);
+        assert_eq!(nav.step_slot(&first, true), None);
+        // And it is the last one, so there is no place below it.
+        assert_eq!(nav.step_slot(&second, false), None);
+    }
+
+    #[test]
+    fn a_workdir_steps_one_place_up_or_down_the_panel() {
+        let (_dir, mut nav, home) = fixture();
+        nav.home = Some(home.clone());
+        let first = nav.repos[0].id.clone();
+        let second = extra_workdir(&mut nav);
+        let third = extra_workdir(&mut nav);
+
+        assert_eq!(nav.step_slot(&third, true), Some(1));
+        assert_eq!(nav.step_slot(&third, false), None);
+        assert_eq!(nav.step_slot(&second, true), None);
+        assert_eq!(nav.step_slot(&second, false), Some(2));
+
+        nav.move_repo(&third, nav.step_slot(&third, true).unwrap())
+            .unwrap();
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), third.clone(), second.clone()]
+        );
+        assert_eq!(nav.step_slot(&third, false), Some(2));
+    }
+
+    #[test]
+    fn a_workdir_dropped_on_a_boundary_takes_its_place() {
+        let (_dir, mut nav, home) = fixture();
+        nav.home = Some(home.clone());
+        let first = nav.repos[0].id.clone();
+        let second = extra_workdir(&mut nav);
+        let third = extra_workdir(&mut nav);
+
+        // The boundary is the number of workdirs that stay above it: the
+        // workdir lands before the one that is drawn there.
+        assert_eq!(nav.workdir_slot(&third, 1), Some(1));
+        assert_eq!(nav.workdir_slot(&second, 3), Some(2));
+
+        // A boundary that moves nothing is not a drop: the workdir is
+        // already there.
+        assert_eq!(nav.workdir_slot(&third, 2), None);
+        assert_eq!(nav.workdir_slot(&second, 2), None);
+
+        // And nothing is put above the home workdir.
+        assert_eq!(nav.workdir_slot(&second, 0), None);
+        assert_eq!(nav.workdir_slot(&first, 1), None);
+
+        nav.move_repo(&third, nav.workdir_slot(&third, 1).unwrap())
+            .unwrap();
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), third.clone(), second.clone()]
+        );
+    }
+
+    #[test]
+    fn the_panel_order_is_the_order_the_workspace_file_keeps() {
+        let (_dir, mut nav, home) = fixture();
+        nav.home = Some(home.clone());
+        let first = nav.repos[0].id.clone();
+        let second = extra_workdir(&mut nav);
+        let third = extra_workdir(&mut nav);
+        let before = nav.persistent_state().roots;
+        nav.move_repo(&third, 1).unwrap();
+
+        // The file keeps the workdirs in the order they are drawn in, so the
+        // next launch draws them where they were left.
+        let after = nav.persistent_state().roots;
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[1], before[2]);
+        assert_eq!(after[2], before[1]);
+        assert_eq!(
+            panel_order(&nav),
+            vec![first.clone(), third.clone(), second.clone()]
+        );
     }
     #[test]
     fn restored_checkout_overrides_launch_selection_only_when_available() {

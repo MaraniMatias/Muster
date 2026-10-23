@@ -415,19 +415,49 @@ impl TerminalWindow {
     }
 }
 
+/// What the panel's drag is carrying.
+///
+/// One gesture and two things: a terminal that can be dropped into another
+/// workdir, and a workdir that can be moved up or down the panel.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct SidebarDropTarget {
-    pub(crate) checkout_id: String,
-    pub(crate) index: usize,
+pub(crate) enum SidebarDragKind {
+    Terminal {
+        session_id: String,
+        source_checkout: String,
+    },
+    Workdir {
+        repo_id: String,
+    },
 }
 
 pub(crate) struct SidebarDrag {
-    pub(crate) session_id: String,
-    pub(crate) source_checkout: String,
+    pub(crate) kind: SidebarDragKind,
     pub(crate) origin: (f32, f32),
     pub(crate) position: (f32, f32),
     pub(crate) started: bool,
     pub(crate) target: Option<SidebarDropTarget>,
+}
+
+impl SidebarDrag {
+    /// Whether the drag is carrying this terminal.
+    pub(crate) fn carries_terminal(&self, id: &str) -> bool {
+        matches!(&self.kind, SidebarDragKind::Terminal { session_id, .. } if session_id == id)
+    }
+
+    /// Whether the drag is carrying a terminal at all.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self.kind, SidebarDragKind::Terminal { .. })
+    }
+}
+
+/// Where a drop lands.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SidebarDropTarget {
+    /// A terminal slot inside a workdir.
+    Terminal { checkout_id: String, index: usize },
+    /// The boundary a workdir lands on: the number of workdirs that stay
+    /// above it, counted in the panel's order as it is drawn.
+    Workdir { boundary: usize },
 }
 
 #[derive(Clone)]
@@ -435,6 +465,9 @@ pub(crate) enum SidebarDropRegion {
     Session { checkout_id: String, index: usize },
     Append { checkout_id: String, index: usize },
     Insertion { checkout_id: String, index: usize },
+    // A workdir heading: the pointer's half of it says whether the workdir
+    // lands above the heading or below it.
+    Workdir { index: usize },
 }
 
 pub(crate) struct SidebarRowBounds {
@@ -461,14 +494,14 @@ pub(crate) fn sidebar_drag_geometry(
 
 pub(crate) fn sidebar_drop_marker(
     cx: &App,
-    target: SidebarDropTarget,
+    checkout_id: String,
+    index: usize,
     rows: Rc<RefCell<Vec<SidebarRowBounds>>>,
 ) -> AnyElement {
     let roles = Roles::of(cx);
     div()
         .id(SharedString::from(format!(
-            "drop-slot-{}-{}",
-            target.checkout_id, target.index
+            "drop-slot-{checkout_id}-{index}"
         )))
         .relative()
         .flex()
@@ -485,10 +518,7 @@ pub(crate) fn sidebar_drop_marker(
         .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
         .child("Drop terminal here")
         .child(sidebar_drag_geometry(
-            SidebarDropRegion::Insertion {
-                checkout_id: target.checkout_id,
-                index: target.index,
-            },
+            SidebarDropRegion::Insertion { checkout_id, index },
             rows,
         ))
         .into_any_element()
@@ -554,8 +584,17 @@ impl TerminalWindow {
             .checkouts
             .iter()
             .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
-        move |menu, _, _| {
+        // Where the workdir sits in the panel's own order, so it can be moved
+        // there. The home workdir is where the panel starts, so the workdir
+        // directly below it has no place to move up to.
+        let up = self.navigation.step_slot(&id, true);
+        let down = self.navigation.step_slot(&id, false);
+        move |menu, _, cx| {
+            let roles = Roles::of(cx);
             let mut menu = menu.min_w(px(224.));
+            // A separator is a line between two groups of rows, so it is only
+            // drawn between two groups that are both there.
+            let mut grouped = false;
             if can_add {
                 let id = id.clone();
                 let view = view.clone();
@@ -568,6 +607,7 @@ impl TerminalWindow {
                             });
                         }),
                 );
+                grouped = true;
             }
             if can_add && archived > 0 {
                 let id = id.clone();
@@ -580,11 +620,56 @@ impl TerminalWindow {
                                 view.update(cx, |app, cx| app.restore_archived(&id, window, cx));
                         }),
                 );
+                grouped = true;
+            }
+            if up.is_some() || down.is_some() {
+                let id = id.clone();
+                let view = view.clone();
+                if grouped {
+                    menu = menu.separator();
+                }
+                for (label, slot, available) in [
+                    ("Move up", up, up.is_some()),
+                    ("Move down", down, down.is_some()),
+                ] {
+                    let id = id.clone();
+                    let view = view.clone();
+                    // The toolkit keeps the secondary foreground on a row it
+                    // draws as disabled, so the two rows that are out of range
+                    // are drawn here instead of asked of the toolkit.
+                    let ink = if available {
+                        roles.text
+                    } else {
+                        roles.text_disabled
+                    };
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .flex_1()
+                                .text_color(ink)
+                                .when(!available, |row| {
+                                    row.cursor(gpui_kit::CursorStyle::OperationNotAllowed)
+                                })
+                                .child(label)
+                        })
+                        .disabled(!available)
+                        .on_click(move |_, _window, cx| {
+                            let Some(slot) = slot else {
+                                return;
+                            };
+                            let _ = view.update(cx, |app, cx| app.move_workdir(&id, slot, cx));
+                        }),
+                    );
+                }
+                grouped = true;
             }
             if can_close {
                 let id = id.clone();
                 let view = view.clone();
-                menu = menu.separator().item(
+                if grouped {
+                    menu = menu.separator();
+                }
+                menu = menu.item(
                     PopupMenuItem::new("Remove from panel")
                         .icon(IconName::FolderMinus)
                         .on_click(move |_, window, cx| {
@@ -707,6 +792,16 @@ impl TerminalWindow {
         let roles = Roles::of(cx);
         let weak = cx.weak_entity();
         let dragging = self.sidebar_drag.as_ref().is_some_and(|drag| drag.started);
+        // The two gestures share one drag surface, so each of them asks what
+        // the panel is carrying.
+        let dragging_terminal = self
+            .sidebar_drag
+            .as_ref()
+            .is_some_and(|drag| drag.is_terminal());
+        let dragging_workdir = self
+            .sidebar_drag
+            .as_ref()
+            .is_some_and(|drag| !drag.is_terminal());
         let drag_rows = Rc::new(RefCell::new(Vec::new()));
         let drag_dispatcher = self.sidebar_drag.is_some().then(|| {
             let move_view = weak.clone();
@@ -776,10 +871,21 @@ impl TerminalWindow {
         let path_lift =
             baseline_from_bottom(window, HEADING_NAME_SIZE, gpui_kit::FontWeight::MEDIUM)
                 - baseline_from_bottom(window, HEADING_PATH_SIZE, gpui_kit::FontWeight::NORMAL);
-        for repo in &self.navigation.repos {
+        // The boundary the carried workdir lands on: the number of workdirs
+        // that stay above it, in the panel's order as it is drawn.
+        let insertion = match self
+            .sidebar_drag
+            .as_ref()
+            .and_then(|drag| drag.target.as_ref())
+        {
+            Some(SidebarDropTarget::Workdir { boundary }) => Some(*boundary),
+            _ => None,
+        };
+        for (repo_index, repo) in self.navigation.repos.iter().enumerate() {
             let id = repo.id.clone();
             let folded = self.navigation.folded_repos.contains(&id);
             let toggle_id = id.clone();
+            let drag_id = id.clone();
             let has_menu = (repo.kind == RepoKind::Git
                 && repo
                     .checkouts
@@ -789,6 +895,12 @@ impl TerminalWindow {
                     .checkouts
                     .iter()
                     .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
+            // The workdir the gesture is carrying: it is still on the panel
+            // while it is held, and it is dimmed until it is put down.
+            let carried = self.sidebar_drag.as_ref().is_some_and(|drag| {
+                drag.started
+                    && matches!(&drag.kind, SidebarDragKind::Workdir { repo_id } if repo_id == &id)
+            });
             let heading = div()
                 .id(SharedString::from(format!("heading-{id}")))
                 .group(SharedString::from(format!("repo-heading-{id}")))
@@ -801,6 +913,28 @@ impl TerminalWindow {
                 .pr(px(8.))
                 .pt(px(8.))
                 .pb(px(4.))
+                // The workdir that is being carried is still on the panel, and
+                // it is dimmed while it is held.
+                .when(carried, |heading| heading.opacity(0.42))
+                // The line is the boundary the workdir lands on, and it is the
+                // top of the workdir that moves down.
+                .when(insertion == Some(repo_index), |heading| {
+                    heading.child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .right(px(0.))
+                            .top_0()
+                            .h(px(2.))
+                            .bg(roles.accent),
+                    )
+                })
+                .when(dragging_workdir, |heading| {
+                    heading.child(sidebar_drag_geometry(
+                        SidebarDropRegion::Workdir { index: repo_index },
+                        drag_rows.clone(),
+                    ))
+                })
                 .child(
                     Button::new(SharedString::from(format!("fold-repo-{id}")))
                         .text()
@@ -824,7 +958,22 @@ impl TerminalWindow {
                             repo.name,
                             repo.root
                         ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let drag_id = drag_id.clone();
+                                move |app, event: &MouseDownEvent, _, cx| {
+                                    app.begin_workdir_drag(&drag_id, event.position, cx);
+                                }
+                            }),
+                        )
                         .on_click(cx.listener(move |app, _, _, cx| {
+                            // A row that was picked up and put down is not a
+                            // row that was folded.
+                            if app.suppress_sidebar_click {
+                                app.suppress_sidebar_click = false;
+                                return;
+                            }
                             toggle(&mut app.navigation.folded_repos, &toggle_id);
                             cx.notify();
                         })),
@@ -1264,21 +1413,22 @@ impl TerminalWindow {
                     && self.sidebar_drag.as_ref().is_some_and(|drag| {
                         drag.started
                             && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == id
-                                    && target.index
+                                matches!(target, SidebarDropTarget::Terminal { checkout_id, index }
+                                if checkout_id == &id
+                                    && *index
                                         == self.sidebar_drop_slot(
                                             &checkout.id,
                                             checkout.sessions.len(),
-                                        )
+                                        ))
                             })
                     });
                 row = row.when(
                     self.sidebar_drag.as_ref().is_some_and(|drag| {
                         drag.started
-                            && drag
-                                .target
-                                .as_ref()
-                                .is_some_and(|target| target.checkout_id == id)
+                            && drag.target.as_ref().is_some_and(|target| {
+                                matches!(target, SidebarDropTarget::Terminal { checkout_id, .. }
+                                        if checkout_id == &id)
+                            })
                     }),
                     |row| {
                         row.child(
@@ -1292,7 +1442,7 @@ impl TerminalWindow {
                         )
                     },
                 );
-                if !checkout.is_missing && self.sidebar_drag.is_some() {
+                if !checkout.is_missing && dragging_terminal {
                     row = row.child(sidebar_drag_geometry(
                         SidebarDropRegion::Append {
                             checkout_id: id.clone(),
@@ -1304,14 +1454,18 @@ impl TerminalWindow {
                 if folded || checkout.is_missing {
                     rows.push(row.into_any_element());
                     if folded_append_marker {
-                        rows.push(sidebar_drop_marker(
-                            cx,
-                            self.sidebar_drag
-                                .as_ref()
-                                .and_then(|drag| drag.target.clone())
-                                .unwrap(),
-                            drag_rows.clone(),
-                        ));
+                        if let Some(SidebarDropTarget::Terminal { checkout_id, index }) = self
+                            .sidebar_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.clone())
+                        {
+                            rows.push(sidebar_drop_marker(
+                                cx,
+                                checkout_id,
+                                index,
+                                drag_rows.clone(),
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -1551,7 +1705,7 @@ impl TerminalWindow {
                         .when(
                             self.sidebar_drag
                                 .as_ref()
-                                .is_some_and(|drag| drag.started && drag.session_id == id),
+                                .is_some_and(|drag| drag.started && drag.carries_terminal(&id)),
                             |row| row.opacity(0.42),
                         )
                         // Hover refines after the rest style: a selected row
@@ -1660,28 +1814,33 @@ impl TerminalWindow {
                         );
                     let marker_before = self.sidebar_drag.as_ref().is_some_and(|drag| {
                         drag.started
+                            && !drag.carries_terminal(&session.id)
                             && drag.target.as_ref().is_some_and(|target| {
-                                target.checkout_id == checkout.id
-                                    && target.index
-                                        == self.sidebar_drop_slot(&checkout.id, session_index)
-                                    && drag.session_id != session.id
+                                matches!(target, SidebarDropTarget::Terminal { checkout_id, index }
+                                    if checkout_id == &checkout.id
+                                        && *index
+                                            == self.sidebar_drop_slot(&checkout.id, session_index))
                             })
                     });
                     if marker_before {
-                        checkout_children.push(sidebar_drop_marker(
-                            cx,
-                            self.sidebar_drag
-                                .as_ref()
-                                .and_then(|drag| drag.target.clone())
-                                .unwrap(),
-                            drag_rows.clone(),
-                        ));
+                        if let Some(SidebarDropTarget::Terminal { checkout_id, index }) = self
+                            .sidebar_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.clone())
+                        {
+                            checkout_children.push(sidebar_drop_marker(
+                                cx,
+                                checkout_id,
+                                index,
+                                drag_rows.clone(),
+                            ));
+                        }
                     }
                     checkout_children.push(
                         row.when(
-                            self.sidebar_drag
-                                .as_ref()
-                                .is_some_and(|drag| drag.session_id != session.id),
+                            self.sidebar_drag.as_ref().is_some_and(|drag| {
+                                dragging_terminal && !drag.carries_terminal(&session.id)
+                            }),
                             |row| {
                                 row.child(sidebar_drag_geometry(
                                     SidebarDropRegion::Session {
@@ -1957,20 +2116,28 @@ impl TerminalWindow {
                 let append_marker = self.sidebar_drag.as_ref().is_some_and(|drag| {
                     drag.started
                         && drag.target.as_ref().is_some_and(|target| {
-                            target.checkout_id == checkout.id
-                                && target.index
-                                    == self.sidebar_drop_slot(&checkout.id, checkout.sessions.len())
+                            matches!(target, SidebarDropTarget::Terminal { checkout_id, index }
+                            if checkout_id == &checkout.id
+                                && *index
+                                    == self.sidebar_drop_slot(
+                                        &checkout.id,
+                                        checkout.sessions.len(),
+                                    ))
                         })
                 });
                 if append_marker {
-                    checkout_children.push(sidebar_drop_marker(
-                        cx,
-                        self.sidebar_drag
-                            .as_ref()
-                            .and_then(|drag| drag.target.clone())
-                            .unwrap(),
-                        drag_rows.clone(),
-                    ));
+                    if let Some(SidebarDropTarget::Terminal { checkout_id, index }) = self
+                        .sidebar_drag
+                        .as_ref()
+                        .and_then(|drag| drag.target.clone())
+                    {
+                        checkout_children.push(sidebar_drop_marker(
+                            cx,
+                            checkout_id,
+                            index,
+                            drag_rows.clone(),
+                        ));
+                    }
                 }
                 // Centred across the panel rather than on the terminal rows'
                 // glyph axis: it is the one row in a group that is not about one
@@ -1980,7 +2147,7 @@ impl TerminalWindow {
                     .relative()
                     .w_full()
                     .hover(|style| style.bg(roles.hover))
-                    .when(self.sidebar_drag.is_some(), |row| {
+                    .when(dragging_terminal, |row| {
                         row.child(sidebar_drag_geometry(
                             SidebarDropRegion::Append {
                                 checkout_id: checkout.id.clone(),
@@ -2050,6 +2217,11 @@ impl TerminalWindow {
             }
             rows.push(div().h(px(8.)).into_any_element());
         }
+        // The last boundary is below the last workdir, and there is no
+        // heading there to draw the line on: the line is the end of the panel.
+        if insertion == Some(self.navigation.repos.len()) {
+            rows.push(div().h(px(2.)).w_full().bg(roles.accent).into_any_element());
+        }
         if rows.is_empty() {
             rows.push(
                 div()
@@ -2070,24 +2242,34 @@ impl TerminalWindow {
             .as_ref()
             .filter(|drag| drag.started)
             .and_then(|drag| {
-                self.navigation.session(&drag.session_id).map(|session| {
-                    let title = self
-                        .terminals
-                        .get(&session.id)
-                        .map(|terminal| {
-                            let status = terminal.shell.session.status();
-                            // The title alone: a full snapshot would build the
-                            // whole visible grid to read one string the grid
-                            // already holds.
-                            session_title(
-                                &session.name,
-                                status.foreground.app.as_deref(),
-                                terminal.shell.session.title().as_deref(),
-                            )
-                        })
-                        .unwrap_or_else(|| session.name.clone());
-                    (drag.position, title)
-                })
+                let name = match &drag.kind {
+                    SidebarDragKind::Terminal { session_id, .. } => {
+                        let session = self.navigation.session(session_id)?;
+                        let title = self
+                            .terminals
+                            .get(&session.id)
+                            .map(|terminal| {
+                                let status = terminal.shell.session.status();
+                                // The title alone: a full snapshot would build the
+                                // whole visible grid to read one string the grid
+                                // already holds.
+                                session_title(
+                                    &session.name,
+                                    status.foreground.app.as_deref(),
+                                    terminal.shell.session.title().as_deref(),
+                                )
+                            })
+                            .unwrap_or_else(|| session.name.clone());
+                        title
+                    }
+                    SidebarDragKind::Workdir { repo_id } => self
+                        .navigation
+                        .repos
+                        .iter()
+                        .find(|repo| &repo.id == repo_id)
+                        .map(|repo| repo.name.clone())?,
+                };
+                Some((drag.position, name, drag.is_terminal()))
             });
         div()
             .id("navigation-panel")
@@ -2145,7 +2327,7 @@ impl TerminalWindow {
                 ),
             )
             .when_some(drag_dispatcher, |panel, dispatcher| panel.child(dispatcher))
-            .when_some(ghost, |panel, (position, name)| {
+            .when_some(ghost, |panel, (position, name, terminal)| {
                 panel.child(
                     gpui_kit::deferred(
                         gpui_kit::anchored()
@@ -2168,7 +2350,14 @@ impl TerminalWindow {
                                     .border_color(roles.accent)
                                     .bg(roles.surface_raised)
                                     .shadow_md()
-                                    .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
+                                    .child(
+                                        Icon::new(if terminal {
+                                            IconName::SquareTerminal
+                                        } else {
+                                            IconName::Folder
+                                        })
+                                        .size(px(14.)),
+                                    )
                                     .child(
                                         div()
                                             .min_w_0()

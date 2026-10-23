@@ -301,6 +301,45 @@ directory — the only way to add one from the panel — was simply not there.
 `the_sidebar_keeps_its_footer_inside_the_window` in `app/src/sidebar_tests.rs`
 pins it.
 
+## The order of the workdirs
+
+The workdirs are the rows that name a repository or a plain directory, and the
+panel draws them in the order the workspace file keeps them in. A workdir is
+picked up by its heading and put down in another place, and the heading under
+the pointer says where it lands: the upper half of a heading is the place
+above that workdir and the lower half is the place below it. The line is
+drawn at the top of the heading that will be under the carried workdir, and
+the carried workdir stays where it is, dimmed, until it is put down.
+
+**The home workdir is where the panel starts.** It does not move, and nothing
+is put above it, so the workdir directly below it cannot move up either. That
+is the same rule Legacy drew as *Home is always the first workdir*, and it is
+the reason `Navigation::home_index` exists: the panel's order has a first
+place that is not a choice.
+
+A move is **one gesture and one state**: the drag carries either a terminal or
+a workdir (`SidebarDragKind`), and the drop says where it lands
+(`SidebarDropTarget`). The same move is in the workdir's menu, as **Move up**
+and **Move down**, so it is reached with the keyboard as well as with the
+pointer; `Navigation::step_slot` is what decides whether there is a place to go.
+
+Four rules the rows depend on, each pinned by a test:
+
+- **A workdir moves to the place it is dropped on.**
+  `a_workdir_row_is_dragged_to_another_place_in_the_panel` in
+  `app/src/sidebar_tests.rs`.
+- **The menu moves it too.**
+  `a_workdir_is_moved_one_place_by_its_menu` in `app/src/sidebar_tests.rs`.
+- **The home workdir stays where the panel starts.**
+  `the_home_workdir_stays_where_the_panel_starts` in
+  `app/src/sidebar_tests.rs`, and `the_home_workdir_is_where_the_panel_starts`
+  in `app/src/navigation.rs`.
+- **The order is the file's order.** `persistent_state` writes the roots in the
+  panel's order and `restore_navigation` reads them back in it, so the next
+  launch draws the workdirs where they were left.
+  `the_panel_order_is_the_order_the_workspace_file_keeps` in
+  `app/src/navigation.rs`.
+
 ## The view the pane is on
 
 The centre pane shows a terminal, a file, or a change. A file is a **preview**

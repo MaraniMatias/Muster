@@ -46,8 +46,8 @@ use crate::worktree_dialog::close_worktree_dialog;
 
 use crate::session_owner::{OwnedShell, SessionOwner, UNMEASURED_CELL};
 use crate::sidebar::{
-    sidebar_scroll_step, SidebarDrag, SidebarDropRegion, SidebarDropTarget, SidebarRowBounds,
-    SIDEBAR_DRAG_THRESHOLD, SIDEBAR_SCROLL_EDGE,
+    sidebar_scroll_step, SidebarDrag, SidebarDragKind, SidebarDropRegion, SidebarDropTarget,
+    SidebarRowBounds, SIDEBAR_DRAG_THRESHOLD, SIDEBAR_SCROLL_EDGE,
 };
 use crate::state_writer::StateWriter;
 use crate::terminal::{ShellState, TerminalSession, TerminalSessionConfig, TerminalView};
@@ -2413,13 +2413,59 @@ impl TerminalWindow {
         }
         let point = (position.x.as_f32(), position.y.as_f32());
         self.sidebar_drag = Some(SidebarDrag {
-            session_id: id.into(),
-            source_checkout,
+            kind: SidebarDragKind::Terminal {
+                session_id: id.into(),
+                source_checkout,
+            },
             origin: point,
             position: point,
             started: false,
             target: None,
         });
+        cx.notify();
+    }
+
+    /// Pick a workdir up, to move it to another place in the panel.
+    ///
+    /// The home workdir is the one that does not move: it is where the panel
+    /// starts, and nothing is put above it.
+    pub(crate) fn begin_workdir_drag(
+        &mut self,
+        id: &str,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.suppress_sidebar_click = false;
+        let Some(index) = self.navigation.repos.iter().position(|repo| repo.id == id) else {
+            return;
+        };
+        if self.navigation.home_index() == Some(index) || self.navigation.repos.len() < 2 {
+            self.sidebar_drag = None;
+            return;
+        }
+        let point = (position.x.as_f32(), position.y.as_f32());
+        self.sidebar_drag = Some(SidebarDrag {
+            kind: SidebarDragKind::Workdir { repo_id: id.into() },
+            origin: point,
+            position: point,
+            started: false,
+            target: None,
+        });
+        cx.notify();
+    }
+
+    /// Move a workdir to another place in the panel.
+    ///
+    /// The slot is the index the workdir takes in the panel's order after the
+    /// move: the number of workdirs that end up above it. The panel's order
+    /// is the workspace file's order, so the move is written down and the next
+    /// launch draws the workdirs where they were left.
+    pub(crate) fn move_workdir(&mut self, id: &str, slot: usize, cx: &mut Context<Self>) {
+        if let Err(error) = self.navigation.move_repo(id, slot) {
+            self.push_error(error, cx);
+        } else {
+            self.persist();
+        }
         cx.notify();
     }
 
@@ -2434,13 +2480,23 @@ impl TerminalWindow {
         let source_index = self
             .sidebar_drag
             .as_ref()
-            .filter(|drag| drag.started && drag.source_checkout == checkout_id)
+            .filter(|drag| drag.started)
             .and_then(|drag| {
+                let SidebarDragKind::Terminal {
+                    session_id,
+                    source_checkout,
+                } = &drag.kind
+                else {
+                    return None;
+                };
+                if source_checkout != checkout_id {
+                    return None;
+                }
                 self.navigation.checkout(checkout_id).and_then(|checkout| {
                     checkout
                         .sessions
                         .iter()
-                        .position(|session| session.id == drag.session_id)
+                        .position(|session| session.id == *session_id)
                 })
             });
         index - usize::from(source_index.is_some_and(|source| source < index))
@@ -2460,45 +2516,75 @@ impl TerminalWindow {
                 && position.y <= row.bounds.bottom()
         })?;
         let target = match &row.region {
-            SidebarDropRegion::Insertion { checkout_id, index } => SidebarDropTarget {
+            SidebarDropRegion::Insertion { checkout_id, index } => SidebarDropTarget::Terminal {
                 checkout_id: checkout_id.clone(),
                 index: *index,
             },
-            SidebarDropRegion::Append { checkout_id, index } => SidebarDropTarget {
+            SidebarDropRegion::Append { checkout_id, index } => SidebarDropTarget::Terminal {
                 checkout_id: checkout_id.clone(),
                 index: self.sidebar_drop_slot(checkout_id, *index),
             },
-            SidebarDropRegion::Session { checkout_id, index } => SidebarDropTarget {
+            SidebarDropRegion::Session { checkout_id, index } => SidebarDropTarget::Terminal {
                 checkout_id: checkout_id.clone(),
                 index: self.sidebar_drop_slot(
                     checkout_id,
                     index + usize::from(position.y >= row.bounds.center().y),
                 ),
             },
+            SidebarDropRegion::Workdir { index } => {
+                // The pointer's half of the heading says whether the workdir
+                // lands above the heading or below it. The boundary is the
+                // place between two workdirs, and a workdir is a whole block:
+                // its heading and everything under it.
+                SidebarDropTarget::Workdir {
+                    boundary: index + usize::from(position.y >= row.bounds.center().y),
+                }
+            }
         };
-        let checkout = self.navigation.checkout(&target.checkout_id)?;
-        if checkout.is_missing
-            || self.navigation.archived.contains(&target.checkout_id)
-            || self.removing_checkouts.contains(&target.checkout_id)
-            || self.removing_checkouts.contains(&drag.source_checkout)
-            || (target.checkout_id == drag.source_checkout
-                && !checkout
-                    .sessions
-                    .iter()
-                    .any(|session| session.id != drag.session_id))
-        {
-            return None;
+        match (&drag.kind, target) {
+            (SidebarDragKind::Workdir { repo_id }, SidebarDropTarget::Workdir { boundary }) => {
+                // A boundary that moves nothing is not a target: the workdir
+                // is already there, or the home workdir would be pushed down.
+                self.navigation.workdir_slot(repo_id, boundary)?;
+                Some(SidebarDropTarget::Workdir { boundary })
+            }
+            (SidebarDragKind::Terminal { .. }, target) => {
+                let SidebarDropTarget::Terminal { checkout_id, index } = &target else {
+                    return None;
+                };
+                let checkout = self.navigation.checkout(checkout_id)?;
+                let SidebarDragKind::Terminal {
+                    session_id,
+                    source_checkout,
+                } = &drag.kind
+                else {
+                    return None;
+                };
+                if checkout.is_missing
+                    || self.navigation.archived.contains(checkout_id)
+                    || self.removing_checkouts.contains(checkout_id)
+                    || self.removing_checkouts.contains(source_checkout)
+                    || (checkout_id == source_checkout
+                        && !checkout
+                            .sessions
+                            .iter()
+                            .any(|session| session.id != *session_id))
+                {
+                    return None;
+                }
+                if checkout_id == source_checkout
+                    && checkout
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == *session_id)
+                        == Some(*index)
+                {
+                    return None;
+                }
+                Some(target)
+            }
+            _ => None,
         }
-        if target.checkout_id == drag.source_checkout
-            && checkout
-                .sessions
-                .iter()
-                .position(|session| session.id == drag.session_id)
-                == Some(target.index)
-        {
-            return None;
-        }
-        Some(target)
     }
 
     pub(crate) fn update_sidebar_drag(
@@ -2549,28 +2635,41 @@ impl TerminalWindow {
         };
         if drag.started {
             self.suppress_sidebar_click = true;
-            if let Some(target) = drag.target {
-                let source_index =
-                    self.navigation
-                        .checkout(&drag.source_checkout)
-                        .and_then(|checkout| {
-                            checkout
-                                .sessions
-                                .iter()
-                                .position(|session| session.id == drag.session_id)
-                        });
-                if let Some(source_index) = source_index {
-                    let index = target.index;
-                    if target.checkout_id != drag.source_checkout || index != source_index {
-                        self.move_terminal(
-                            &drag.session_id,
-                            &target.checkout_id,
-                            index,
-                            window,
-                            cx,
-                        );
+            match (&drag.kind, drag.target.as_ref()) {
+                (
+                    SidebarDragKind::Workdir { repo_id },
+                    Some(SidebarDropTarget::Workdir { boundary }),
+                ) => {
+                    let repo_id = repo_id.clone();
+                    let boundary = *boundary;
+                    if let Some(slot) = self.navigation.workdir_slot(&repo_id, boundary) {
+                        self.move_workdir(&repo_id, slot, cx);
                     }
                 }
+                (
+                    SidebarDragKind::Terminal {
+                        session_id,
+                        source_checkout,
+                    },
+                    Some(SidebarDropTarget::Terminal { checkout_id, index }),
+                ) => {
+                    let source_index =
+                        self.navigation
+                            .checkout(source_checkout)
+                            .and_then(|checkout| {
+                                checkout
+                                    .sessions
+                                    .iter()
+                                    .position(|session| session.id == *session_id)
+                            });
+                    if let Some(source_index) = source_index {
+                        let index = *index;
+                        if checkout_id != source_checkout || index != source_index {
+                            self.move_terminal(session_id, checkout_id, index, window, cx);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         cx.notify();

@@ -6,6 +6,19 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The workdirs can be put in the order you want them in.** The panel drew
+  the workdirs in the order they were opened in, and there was no way to say
+  otherwise. A workdir is now picked up by its heading and put down in another
+  place, and the heading under the pointer says where it will go: the upper
+  half of a heading is the place above that workdir and the lower half is the
+  place below it, with a line drawn where the workdir will be. The order is
+  the workspace file's order, so it is the order the next launch draws. The
+  home workdir is where the panel starts: it does not move, and nothing is put
+  above it. The same move is in the workdir's menu, as **Move up** and **Move
+  down**, so it is reached with the keyboard as well as with the pointer.
+
 ## 1.0.0-rc.14
 
 - **A `.feature` file is read with Gherkin's own words.** A Cucumber feature

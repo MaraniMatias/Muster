@@ -1101,9 +1101,11 @@ fn insertion_row_does_not_change_a_stationary_drag_target(cx: &mut TestAppContex
                         .unwrap()
                         .target
                         .as_ref()
-                        .unwrap()
-                        .index,
-                    0
+                        .and_then(|target| match target {
+                            SidebarDropTarget::Terminal { index, .. } => Some(*index),
+                            SidebarDropTarget::Workdir { .. } => None,
+                        }),
+                    Some(0)
                 );
             });
         }
@@ -2797,7 +2799,12 @@ fn sidebar_drag_moves_a_terminal_to_another_checkout_without_restarting_it(
                 .sidebar_drag
                 .as_ref()
                 .and_then(|drag| drag.target.as_ref())
-                .map(|target| (target.checkout_id.as_str(), target.index)),
+                .map(|target| match target {
+                    SidebarDropTarget::Terminal { checkout_id, index } => {
+                        (checkout_id.as_str(), *index)
+                    }
+                    SidebarDropTarget::Workdir { .. } => ("", 0),
+                }),
             Some((target.as_str(), 0))
         );
         pointer_up(window, to, cx);
@@ -2962,6 +2969,220 @@ fn escape_cancels_a_sidebar_drag_without_reordering_or_selecting_the_drop_row(
             app.navigation.active_session.as_deref(),
             Some(other.as_str())
         );
+    });
+    dispose(&fixture, cx);
+}
+
+/// A workdir is picked up and put down in another place in the panel.
+#[gpui_kit::test]
+fn a_workdir_row_is_dragged_to_another_place_in_the_panel(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let directory = tempfile::tempdir().unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            for index in 0..2 {
+                let path = directory.path().join(format!("extra-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                let repo = Repo::plain(&path, format!("extra-{index}")).unwrap();
+                let checkout_id = repo.checkouts[0].id.clone();
+                app.navigation
+                    .merge(navigation::OpenedDirectory { repo, checkout_id }, false);
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let ids = fixture.view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids.len(), 3);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The last workdir is picked up and put down above the one before it.
+        let from = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[2])))
+            .bounds()
+            .center();
+        let target = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[1])))
+            .bounds();
+        let to = gpui_kit::point(target.center().x, target.top() + px(3.));
+        drag_pointer(window, from, to, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = app
+            .navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[0].clone(), ids[2].clone(), ids[1].clone()]);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The lower half of a heading is the place below that workdir, so
+        // the first one goes under the one it is dropped on.
+        let from = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[0])))
+            .bounds()
+            .center();
+        let target = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[2])))
+            .bounds();
+        let to = gpui_kit::point(target.center().x, target.bottom() - px(3.));
+        drag_pointer(window, from, to, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = app
+            .navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]);
+    });
+    dispose(&fixture, cx);
+}
+
+/// A workdir is moved up and down the panel from its own menu.
+#[gpui_kit::test]
+fn a_workdir_is_moved_one_place_by_its_menu(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let directory = tempfile::tempdir().unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            for index in 0..2 {
+                let path = directory.path().join(format!("extra-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                let repo = Repo::plain(&path, format!("extra-{index}")).unwrap();
+                let checkout_id = repo.checkouts[0].id.clone();
+                app.navigation
+                    .merge(navigation::OpenedDirectory { repo, checkout_id }, false);
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let ids = fixture.view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids.len(), 3);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The menu of the middle workdir, chosen with the keyboard: the
+        // pointer is taken off the menu first, so the row the arrow reaches
+        // is the one the arrow lands on.
+        window.hover(format!("fold-repo-{}", ids[1]), cx);
+        window.click(format!("actions-{}", ids[1]), cx);
+        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = app
+            .navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // And down again: the workdir goes back to the place it was.
+        window.hover(format!("fold-repo-{}", ids[1]), cx);
+        window.click(format!("actions-{}", ids[1]), cx);
+        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
+        window.press("down", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = app
+            .navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[0].clone(), ids[1].clone(), ids[2].clone()]);
+    });
+    dispose(&fixture, cx);
+}
+
+/// The home workdir is where the panel starts: it does not move, and nothing
+/// is put above it.
+#[gpui_kit::test]
+fn the_home_workdir_stays_where_the_panel_starts(cx: &mut TestAppContext) {
+    let fixture = open(cx);
+    let directory = tempfile::tempdir().unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let path = directory.path().join("extra");
+            std::fs::create_dir(&path).unwrap();
+            let repo = Repo::plain(&path, "extra").unwrap();
+            let checkout_id = repo.checkouts[0].id.clone();
+            app.navigation
+                .merge(navigation::OpenedDirectory { repo, checkout_id }, false);
+            // The panel's first workdir is the home one.
+            app.navigation.home = Some(app.navigation.repos[0].checkouts[0].id.clone());
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let ids = fixture.view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids.len(), 2);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        // The home workdir is not picked up at all.
+        let home = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[0])))
+            .bounds()
+            .center();
+        pointer_move(window, home, None, cx);
+        pointer_down(window, home, cx);
+        pointer_move(window, home, Some(MouseButton::Left), cx);
+        assert!(fixture.view.read(cx).sidebar_drag.is_none());
+        pointer_up(window, home, cx);
+        // And the other workdir is not put above it.
+        let other = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[1])))
+            .bounds()
+            .center();
+        let target = window
+            .find(SharedString::from(format!("fold-repo-{}", ids[0])))
+            .bounds();
+        let to = gpui_kit::point(target.center().x, target.top() + px(3.));
+        pointer_move(window, other, None, cx);
+        pointer_down(window, other, cx);
+        pointer_move(window, to, Some(MouseButton::Left), cx);
+        pointer_up(window, to, cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        let order = app
+            .navigation
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[0].clone(), ids[1].clone()]);
+        assert_eq!(app.navigation.home_index(), Some(0));
     });
     dispose(&fixture, cx);
 }
