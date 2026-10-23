@@ -292,6 +292,15 @@ per platform — so the two share the name's baseline and the path's caps start
 where the name's lowercase starts. `the_repository_heading_shares_one_baseline`
 in `app/src/sidebar_tests.rs` pins it.
 
+The footer that adds a directory is **the room under the tree**, and the tree
+scrolls above it. The panels take the window's height less the title bar's, and
+not the window's height: a group sized to the window hangs a title bar's height
+below the window's edge, and a tree taller than its own panel then held that
+height against the group and took the footer with it. The button that adds a
+directory — the only way to add one from the panel — was simply not there.
+`the_sidebar_keeps_its_footer_inside_the_window` in `app/src/sidebar_tests.rs`
+pins it.
+
 ## The view the pane is on
 
 The centre pane shows a terminal, a file, or a change. A file is a **preview**

@@ -766,11 +766,20 @@ async fn a_stacked_folder_keeps_its_own_click(cx: &mut TestAppContext) {
         window.render_frame(cx);
         // The row the stack is drawn over, and where it sits: a click on the
         // stacked name lands on this row's box, which is the whole defect.
+        // Which row that is follows the tree's own box, so it is looked for
+        // rather than named: the stack covers the top of the tree, and the
+        // tree's height is not a number this test may hold.
         let stack = window.find("file-stack-name-src/nested").bounds();
-        let hidden = window.find("file-slot-src/nested/f12.txt").bounds();
+        let hidden = (0..40)
+            .filter_map(|index| {
+                window
+                    .try_find(format!("file-slot-src/nested/f{index:02}.txt"))
+                    .map(|slot| slot.bounds())
+            })
+            .find(|slot| stack.origin.y < slot.bottom() && stack.bottom() > slot.origin.y);
         assert!(
-            stack.origin.y < hidden.bottom() && stack.bottom() > hidden.origin.y,
-            "the stacked name is drawn over a real tree row"
+            hidden.is_some(),
+            "the stacked name is drawn over no tree row at all"
         );
         window.click("file-stack-name-src/nested", cx);
     })

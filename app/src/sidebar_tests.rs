@@ -4876,3 +4876,46 @@ async fn a_pi_terminal_row_says_what_pi_is_doing(cx: &mut TestAppContext) {
     .unwrap();
     dispose(&fixture, cx);
 }
+
+/// The button that adds a directory stays inside the window.
+///
+/// A tree taller than the panel used to push the footer below the window's
+/// edge, where the panel's own clip hid it: the panel held the height of its
+/// tree against the group of panels, and that group was the whole window, so
+/// the title bar's height and the tree's height both landed below the edge.
+#[gpui_kit::test]
+fn the_sidebar_keeps_its_footer_inside_the_window(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // More rows than fit above the footer: the panel is the window's height
+    // less the title bar and the footer, and a tree taller than that is what
+    // used to take the footer with it.
+    let directory = tempfile::tempdir().unwrap();
+    for index in 0..12 {
+        let root = directory.path().join(format!("root-{index}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let opened = navigation::open_directory(&root).unwrap();
+        fixture
+            .view
+            .update(cx, |app, _| app.navigation.merge(opened, true));
+    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        let panel = window.find("navigation-panel");
+        assert!(
+            panel.bounds().bottom() <= viewport.height,
+            "the sidebar panel hangs below the window: {:?} in {:?}",
+            panel.bounds(),
+            viewport
+        );
+        let footer = window.find("open-directory");
+        assert!(
+            footer.bounds().bottom() <= viewport.height,
+            "the footer that adds a directory hangs below the window: {:?} in {:?}",
+            footer.bounds(),
+            viewport
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}

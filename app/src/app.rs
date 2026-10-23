@@ -3531,34 +3531,45 @@ impl Render for TerminalWindow {
         let content = if !self.injected && self.navigation.panels_visible {
             let sidebar = self.sidebar(window, cx);
             let inspector = self.files_inspector(window, cx);
-            h_resizable("workspace-panels")
-                .with_state(&self.resize)
+            // The panels take the room the title bar leaves, and not the whole
+            // window: a group sized to the window is a group that hangs a
+            // title bar's height below the window's edge, and a panel whose
+            // tree is taller than its own box then holds that height against
+            // the group and pushes the sidebar's own footer off the screen.
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
                 .child(
-                    resizable_panel()
-                        .flex_none()
-                        .size(px(self.navigation.sidebar_width))
-                        .size_range(px(240.)..px(500.))
-                        .child(sidebar),
+                    h_resizable("workspace-panels")
+                        .with_state(&self.resize)
+                        .child(
+                            resizable_panel()
+                                .flex_none()
+                                .size(px(self.navigation.sidebar_width))
+                                .size_range(px(240.)..px(500.))
+                                .child(sidebar),
+                        )
+                        .child(resizable_panel().child(body))
+                        .child(
+                            resizable_panel()
+                                .flex_none()
+                                .size(px(self.inspector_width))
+                                .size_range(px(200.)..px(480.))
+                                .child(inspector),
+                        )
+                        .on_resize(cx.listener(|app, state: &Entity<ResizableState>, _, cx| {
+                            let sizes = state.read(cx).sizes();
+                            if let Some(width) = sizes.first() {
+                                app.navigation.sidebar_width = width.as_f32().clamp(240., 500.);
+                                app.persist();
+                            }
+                            if let Some(width) = sizes.get(2) {
+                                app.inspector_width = width.as_f32().clamp(200., 480.);
+                            }
+                            cx.notify();
+                        })),
                 )
-                .child(resizable_panel().child(body))
-                .child(
-                    resizable_panel()
-                        .flex_none()
-                        .size(px(self.inspector_width))
-                        .size_range(px(200.)..px(480.))
-                        .child(inspector),
-                )
-                .on_resize(cx.listener(|app, state: &Entity<ResizableState>, _, cx| {
-                    let sizes = state.read(cx).sizes();
-                    if let Some(width) = sizes.first() {
-                        app.navigation.sidebar_width = width.as_f32().clamp(240., 500.);
-                        app.persist();
-                    }
-                    if let Some(width) = sizes.get(2) {
-                        app.inspector_width = width.as_f32().clamp(200., 480.);
-                    }
-                    cx.notify();
-                }))
                 .into_any_element()
         } else {
             body
