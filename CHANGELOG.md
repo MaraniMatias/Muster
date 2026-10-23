@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.15
 
 - **The workdirs can be put in the order you want them in.** The panel drew
   the workdirs in the order they were opened in, and there was no way to say
