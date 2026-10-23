@@ -236,8 +236,8 @@ impl EventListener for ParkedEvents {
 enum StringScan {
     Ground,
     Escape,
+    EscapeIntermediate,
     Osc,
-    OscEscape,
     Apc,
     ApcEscape,
     Ignored,
@@ -261,6 +261,12 @@ pub struct TerminalCore {
     /// drift from the byte stream permanently.
     parser: Processor,
     string_scan: StringScan,
+    #[cfg(test)]
+    parser_scan_test: StringScan,
+    #[cfg(test)]
+    parser_osc_bytes_test: usize,
+    #[cfg(test)]
+    parser_osc_max_test: usize,
     /// The payload of the OSC sequence being scanned, across reads.
     osc: Vec<u8>,
     /// That payload outgrew [`MAX_OSC_PAYLOAD_BYTES`] and was refused, so what is
@@ -316,6 +322,12 @@ impl TerminalCore {
             events,
             parser: Processor::new(),
             string_scan: StringScan::Ground,
+            #[cfg(test)]
+            parser_scan_test: StringScan::Ground,
+            #[cfg(test)]
+            parser_osc_bytes_test: 0,
+            #[cfg(test)]
+            parser_osc_max_test: 0,
             osc: Vec::new(),
             osc_oversized: false,
             pending: Vec::new(),
@@ -379,7 +391,18 @@ impl TerminalCore {
         let mut state = self.string_scan;
         for (index, &byte) in bytes.iter().enumerate() {
             let previous = state;
-            state = match (state, byte) {
+            // After a string's ESC, vte processes the next byte as native Escape.
+            // Reuse that classification for non-ST APC and ignored-string recovery.
+            let transition = match (state, byte) {
+                (StringScan::ApcEscape | StringScan::IgnoredEscape, b'\\' | 0x18 | 0x1a) => state,
+                (StringScan::ApcEscape | StringScan::IgnoredEscape, _) => StringScan::Escape,
+                _ => state,
+            };
+            if state == StringScan::ApcEscape && byte != b'\\' {
+                self.apc_oversized = true;
+                self.graphics.abort(self.is_alt_screen());
+            }
+            state = match (transition, byte) {
                 (StringScan::Ground, 0x1b) => StringScan::Escape,
                 (StringScan::Escape, b']') => {
                     // The payload is accumulated here rather than sliced out of
@@ -396,20 +419,27 @@ impl TerminalCore {
                     StringScan::Apc
                 }
                 (StringScan::Escape, b'P' | b'^' | b'X') => StringScan::Ignored,
+                (StringScan::Escape, 0x18 | 0x1a) => StringScan::Ground,
                 (StringScan::Escape, 0x1b) => StringScan::Escape,
-                (StringScan::Escape, _) => StringScan::Ground,
-
-                (StringScan::Osc, 0x07) => StringScan::Ground,
-                (StringScan::Osc, 0x1b) => StringScan::OscEscape,
-                (StringScan::OscEscape, b'\\') => StringScan::Ground,
-                (StringScan::OscEscape, 0x1b) => StringScan::OscEscape,
-                (StringScan::OscEscape, _) => StringScan::Osc,
-                (StringScan::Osc, _) => {
-                    self.scan_osc(byte);
-                    StringScan::Osc
+                (StringScan::Escape, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff) => {
+                    StringScan::Escape
                 }
+                (StringScan::Escape, 0x20..=0x2f) => StringScan::EscapeIntermediate,
+                (StringScan::Escape, _) => StringScan::Ground,
+                (StringScan::EscapeIntermediate, 0x18 | 0x1a) => StringScan::Ground,
+                (StringScan::EscapeIntermediate, 0x1b) => StringScan::Escape,
+                (
+                    StringScan::EscapeIntermediate,
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff | 0x20..=0x2f,
+                ) => StringScan::EscapeIntermediate,
+                (StringScan::EscapeIntermediate, _) => StringScan::Ground,
+
+                (StringScan::Osc, 0x07 | 0x18 | 0x1a) => StringScan::Ground,
+                // vte dispatches OSC and leaves the string state on ESC itself.
+                // Its next byte is parsed from Escape, whether or not it is ST.
+                (StringScan::Osc, 0x1b) => StringScan::Escape,
+                (StringScan::Osc, _) => StringScan::Osc,
                 (StringScan::Apc, 0x1b) => StringScan::ApcEscape,
-                (StringScan::ApcEscape, b'\\') => StringScan::Ground,
                 (StringScan::Apc, 0x18 | 0x1a) => {
                     self.apc.clear();
                     self.graphics.abort(self.is_alt_screen());
@@ -427,32 +457,58 @@ impl TerminalCore {
                     }
                     StringScan::Apc
                 }
-                (StringScan::ApcEscape, _) => {
-                    self.apc_oversized = true;
-                    self.graphics.abort(self.is_alt_screen());
-                    if byte == 0x1b {
-                        StringScan::ApcEscape
-                    } else {
-                        StringScan::Apc
-                    }
-                }
+                (StringScan::ApcEscape, b'\\') => StringScan::Ground,
+                (StringScan::ApcEscape, _) => StringScan::Ground,
                 (StringScan::Ignored, 0x1b) => StringScan::IgnoredEscape,
                 (StringScan::IgnoredEscape, b'\\') | (StringScan::Ignored, 0x18 | 0x1a) => {
                     StringScan::Ground
                 }
-                (StringScan::IgnoredEscape, 0x1b) => StringScan::IgnoredEscape,
-                (StringScan::Ignored | StringScan::IgnoredEscape, _) => StringScan::Ignored,
+                (StringScan::IgnoredEscape, 0x18 | 0x1a) => StringScan::Ground,
+                (StringScan::IgnoredEscape, _) => StringScan::Ground,
+                (StringScan::Ignored, _) => StringScan::Ignored,
                 (StringScan::Ground, _) => StringScan::Ground,
             };
-            let terminated = (matches!(previous, StringScan::Osc) && byte == 0x07)
-                || (matches!(previous, StringScan::OscEscape) && byte == b'\\');
+            let terminated =
+                matches!(previous, StringScan::Osc) && matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b);
             let graphic_terminated = matches!(previous, StringScan::ApcEscape) && byte == b'\\';
+            if matches!(previous, StringScan::Osc) && matches!(state, StringScan::Osc) {
+                let was_oversized = self.osc_oversized;
+                self.scan_osc(byte);
+                if !was_oversized && self.osc_oversized {
+                    // The parser has already received at most the accepted prefix.
+                    // Drop its owned OSC buffer without dispatching that prefix;
+                    // subsequent bytes are discarded until the actual terminator.
+                    self.advance(&bytes[offset..index]);
+                    self.parser = Processor::new();
+                    #[cfg(test)]
+                    {
+                        self.parser_scan_test = StringScan::Ground;
+                        self.parser_osc_bytes_test = 0;
+                    }
+                    offset = index + 1;
+                }
+            }
             if terminated || graphic_terminated {
-                state = StringScan::Ground;
+                let oversized_osc_terminated =
+                    matches!(previous, StringScan::Osc) && self.osc_oversized;
+                if !matches!(previous, StringScan::Osc) {
+                    state = StringScan::Ground;
+                }
                 // The grid is read after the parser has consumed exactly up to
                 // the terminator and before anything after it, which is the
                 // position the marker was written at.
-                self.advance(&bytes[offset..=index]);
+                if oversized_osc_terminated {
+                    match (previous, byte) {
+                        (StringScan::Osc, 0x1b) => self.advance(&[0x1b]),
+                        (StringScan::Osc, 0x18 | 0x1a) => self.advance(&[byte]),
+                        _ => {}
+                    }
+                } else {
+                    self.advance(&bytes[offset..=index]);
+                }
+                if oversized_osc_terminated {
+                    self.osc_oversized = false;
+                }
                 if graphic_terminated {
                     if !self.apc_oversized {
                         if let Some(reply) = self.graphics.apply(&self.apc, &mut self.term) {
@@ -470,7 +526,7 @@ impl TerminalCore {
                 offset = index + 1;
             }
         }
-        if offset < bytes.len() {
+        if offset < bytes.len() && !(matches!(state, StringScan::Osc) && self.osc_oversized) {
             self.advance(&bytes[offset..]);
             self.handle_events_at_position();
         }
@@ -482,6 +538,8 @@ impl TerminalCore {
     /// so retire it rather than allow a click to edit unrelated content. Merely
     /// scrolling the viewport is safe and is not part of this input operation.
     fn advance(&mut self, bytes: &[u8]) {
+        #[cfg(test)]
+        self.observe_parser_osc_bytes(bytes);
         self.term.reset_damage();
         self.parser.advance(
             &mut GraphicsHandler {
@@ -502,6 +560,42 @@ impl TerminalCore {
             .prune(self.is_alt_screen(), self.history_size());
         if matches!(self.term.damage(), TermDamage::Full) || self.is_alt_screen() {
             self.prompt_anchor = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_parser_osc_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            let previous = self.parser_scan_test;
+            self.parser_scan_test = match (previous, byte) {
+                (StringScan::Ground, 0x1b) => StringScan::Escape,
+                (StringScan::Escape, b']') => {
+                    self.parser_osc_bytes_test = 0;
+                    StringScan::Osc
+                }
+                (StringScan::Escape, 0x18 | 0x1a) => StringScan::Ground,
+                (StringScan::Escape, 0x1b) => StringScan::Escape,
+                (StringScan::Escape, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff) => {
+                    StringScan::Escape
+                }
+                (StringScan::Escape, 0x20..=0x2f) => StringScan::EscapeIntermediate,
+                (StringScan::Escape, _) => StringScan::Ground,
+                (StringScan::EscapeIntermediate, 0x18 | 0x1a) => StringScan::Ground,
+                (StringScan::EscapeIntermediate, 0x1b) => StringScan::Escape,
+                (
+                    StringScan::EscapeIntermediate,
+                    0x20..=0x2f | 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff,
+                ) => StringScan::EscapeIntermediate,
+                (StringScan::EscapeIntermediate, _) => StringScan::Ground,
+                (StringScan::Osc, 0x07 | 0x18 | 0x1a) => StringScan::Ground,
+                (StringScan::Osc, 0x1b) => StringScan::Escape,
+                (StringScan::Osc, _) => StringScan::Osc,
+                (state, _) => state,
+            };
+            if previous == StringScan::Osc && self.parser_scan_test == StringScan::Osc {
+                self.parser_osc_bytes_test += 1;
+                self.parser_osc_max_test = self.parser_osc_max_test.max(self.parser_osc_bytes_test);
+            }
         }
     }
 
@@ -1654,6 +1748,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parser_byte_observer_tracks_osc_after_escape_termination() {
+        let mut core = core();
+        core.feed(b"\x1b]x\x1b]12345\x07");
+        assert_eq!(core.parser_osc_max_test, 5);
+    }
+
+    #[test]
+    fn osc_scanning_recovers_after_cancel_and_escape_at_every_input_split() {
+        for ending in [0x18, 0x1a, 0x1b] {
+            let mut interrupted = b"\x1b]133;D;1".to_vec();
+            interrupted.push(ending);
+            interrupted.extend_from_slice(b"\x1b]133;D;7\x07");
+            for split in 1..interrupted.len() {
+                let mut core = core();
+                core.feed(&interrupted[..split]);
+                core.feed(&interrupted[split..]);
+                assert_eq!(
+                    core.command_exit(),
+                    Some(7),
+                    "terminator {ending:#x}, split {split}"
+                );
+            }
+        }
+    }
+
     /// Somebody else's OSC is still theirs: the parser handles it, and nothing
     /// here mistakes it for a prompt.
     #[test]
@@ -1678,7 +1798,12 @@ mod tests {
             for split in 1..marker.len() {
                 let mut core = core();
                 core.feed(&marker[..split]);
-                assert_eq!(core.command_exit(), None, "nothing yet, split {split}");
+                let ended_on_escape = ending == b"\x1b\\" && split == marker.len() - 1;
+                assert_eq!(
+                    core.command_exit(),
+                    ended_on_escape.then_some(3),
+                    "vte ends OSC on ESC itself, split {split}"
+                );
                 core.feed(&marker[split..]);
                 assert_eq!(
                     core.command_exit(),
@@ -1753,8 +1878,11 @@ mod tests {
         unflooded.feed(&never_terminated);
         assert!(
             unflooded.osc.len() <= MAX_OSC_PAYLOAD_BYTES,
-            "an unterminated OSC is bounded, kept {}",
-            unflooded.osc.len()
+            "the wrapper retains no more than its OSC cap"
+        );
+        assert!(
+            unflooded.parser_osc_max_test <= MAX_OSC_PAYLOAD_BYTES,
+            "Processor::advance received at most the accepted OSC prefix"
         );
 
         let mut big = core();
@@ -1768,6 +1896,171 @@ mod tests {
             "a marker truncated by an oversized payload is not a marker"
         );
         assert!(big.osc.len() <= MAX_OSC_PAYLOAD_BYTES);
+        assert!(
+            big.parser_osc_max_test <= MAX_OSC_PAYLOAD_BYTES,
+            "the underlying parser did not retain the oversized tail"
+        );
+
+        let mut title = core();
+        let mut oversized_title = b"\x1b]0;untrusted".to_vec();
+        oversized_title.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES));
+        oversized_title.extend_from_slice(b"\x07after");
+        title.feed(&oversized_title);
+        assert_eq!(
+            title.title(),
+            None,
+            "the oversized title has no host effect"
+        );
+        assert_eq!(title.visible_rows()[0].cells[0].c, 'a');
+        assert!(title.parser_osc_max_test <= MAX_OSC_PAYLOAD_BYTES);
+
+        let mut clipboard = core();
+        let mut oversized_clipboard = b"\x1b]52;c;".to_vec();
+        oversized_clipboard.extend(std::iter::repeat_n(b'a', MAX_OSC_PAYLOAD_BYTES));
+        oversized_clipboard.push(0x07);
+        clipboard.feed(&oversized_clipboard);
+        assert!(!clipboard
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ClipboardStore(_))));
+    }
+
+    #[test]
+    fn ignored_controls_after_string_escape_recover_real_osc_host_events() {
+        let mut cases = Vec::new();
+        for introducer in b"]_P^X".iter().copied() {
+            let mut bytes = vec![0x1b, introducer];
+            if introducer == b'_' {
+                // Valid base64, but far beyond the graphics packet cap.
+                bytes.extend(std::iter::repeat_n(b"QUFB".as_slice(), 16_385).flatten());
+            } else {
+                bytes.extend_from_slice(b"payload");
+            }
+            let escape = bytes.len();
+            bytes.extend_from_slice(b"\x1b\0]52;c;QUFB\x07\x1b]0;recovered\x07\x1b]0;");
+            bytes.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES + 1));
+            bytes.extend_from_slice(b"\x07\x1b]0;last\x07");
+            cases.push((introducer, bytes, escape));
+        }
+
+        for (introducer, bytes, escape) in cases {
+            let control = escape + 1;
+            let osc = control + 1;
+            let cap = if introducer == b'_' { MAX_PACKET } else { 0 };
+            let splits = [
+                0,
+                bytes.len(),
+                escape.saturating_sub(1),
+                escape,
+                control,
+                osc,
+                (2 + cap).min(bytes.len()),
+                (2 + cap + 1).min(bytes.len()),
+            ];
+            for split in splits {
+                let mut terminal = core();
+                terminal.feed(&bytes[..split]);
+                terminal.feed(&bytes[split..]);
+                let events = terminal.take_events();
+                assert!(
+                    events.iter().any(
+                        |event| matches!(event, TerminalEvent::ClipboardStore(value) if value == "AAA")
+                    ),
+                    "introducer {introducer:#x}, split {split}: {events:?}"
+                );
+                let titles: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        TerminalEvent::TitleChanged(title) => Some(title.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    titles,
+                    ["recovered", "last"],
+                    "the oversized title is refused, and parsing recovers: introducer {introducer:#x}, split {split}"
+                );
+                assert!(
+                    terminal.parser_osc_max_test <= MAX_OSC_PAYLOAD_BYTES,
+                    "OSC buffering stays bounded: introducer {introducer:#x}, split {split}"
+                );
+            }
+
+            let mut oversized = vec![0x1b, introducer];
+            if introducer == b'_' {
+                oversized.extend(std::iter::repeat_n(b"QUFB".as_slice(), 16_385).flatten());
+            } else {
+                oversized.extend_from_slice(b"payload");
+            }
+            let escape = oversized.len();
+            oversized.extend_from_slice(b"\x1b\0]0;");
+            oversized.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES + 1));
+            oversized.push(0x07);
+            for split in [
+                escape,
+                escape + 1,
+                escape + 2,
+                escape + 3,
+                2 + MAX_PACKET,
+                escape + 5 + MAX_OSC_PAYLOAD_BYTES - 1,
+                escape + 5 + MAX_OSC_PAYLOAD_BYTES,
+                escape + 5 + MAX_OSC_PAYLOAD_BYTES + 1,
+            ] {
+                let split = split.min(oversized.len());
+                let mut terminal = core();
+                terminal.feed(&oversized[..split]);
+                terminal.feed(&oversized[split..]);
+                assert!(
+                    terminal
+                        .take_events()
+                        .iter()
+                        .all(|event| !matches!(event, TerminalEvent::TitleChanged(_))),
+                    "oversized title has no host effect: introducer {introducer:#x}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_escape_controls_cannot_reopen_an_unbounded_osc() {
+        let mut intermediate = core();
+        intermediate.feed(b"\x1b(]52;c;QUFB\x07");
+        assert!(!intermediate
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ClipboardStore(_))));
+        assert_eq!(intermediate.parser_osc_max_test, 0);
+
+        for ignored in (0x00..=0x17)
+            .chain([0x19])
+            .chain(0x1c..=0x1f)
+            .chain([0x7f, 0x80])
+        {
+            let mut bytes = vec![0x1b, ignored];
+            bytes.extend_from_slice(b"]52;c;");
+            bytes.extend(std::iter::repeat_n(b'A', MAX_OSC_PAYLOAD_BYTES + 1));
+            bytes.push(0x07);
+
+            for split in [
+                0,
+                bytes.len(),
+                MAX_OSC_PAYLOAD_BYTES + 8,
+                MAX_OSC_PAYLOAD_BYTES + 9,
+            ] {
+                let split = split.min(bytes.len());
+                let mut core = core();
+                core.feed(&bytes[..split]);
+                core.feed(&bytes[split..]);
+                assert!(
+                    !core
+                        .take_events()
+                        .iter()
+                        .any(|event| matches!(event, TerminalEvent::ClipboardStore(_))),
+                    "ignored escape byte {ignored:#x} at split {split}"
+                );
+                assert!(core.parser_osc_max_test <= MAX_OSC_PAYLOAD_BYTES);
+            }
+        }
     }
 
     /// A click inside the editable prompt moves the caret; a click on the
@@ -1867,10 +2160,8 @@ mod tests {
 
         core.feed(format!("\x1b]52;c;{encoded}\x07").as_bytes());
 
-        assert!(
-            !core.take_events().iter().any(|event| matches!(event, TerminalEvent::ClipboardStore(_))),
-            "a payload of {decoded_len} bytes is over the {MAX_CLIPBOARD_PAYLOAD_BYTES} byte limit and must be refused"
-        );
+        assert!(!core.take_events().iter().any(|event| matches!(event, TerminalEvent::ClipboardStore(_))),
+            "a payload of {decoded_len} bytes is over the {MAX_CLIPBOARD_PAYLOAD_BYTES} byte limit and must be refused");
     }
 
     #[test]

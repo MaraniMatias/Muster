@@ -131,25 +131,42 @@ fn settle(cx: &mut TestAppContext, handle: AnyWindowHandle) {
 }
 
 #[test]
-fn measured_width_cache_has_fixed_size_and_font_cardinality_limits() {
+fn measured_width_cache_admits_a_bounded_warm_working_set() {
     let mut widths = WidthCache::new();
-    widths.insert(
-        12,
-        (0..MAX_WIDTH_CACHE_ENTRIES_PER_SIZE)
-            .map(|index| (index.to_string(), index as f32))
-            .collect(),
-    );
-    bound_width_cache(&mut widths, 12);
-    assert!(
-        widths.is_empty(),
-        "a full text cache is discarded before insertion"
-    );
+    let unique_names = (0..=MAX_WIDTH_CACHE_ENTRIES_PER_SIZE)
+        .map(|index| format!("distinct-row-{index}"))
+        .collect::<Vec<_>>();
 
-    for size in 0..MAX_WIDTH_CACHE_SIZES as u32 {
-        widths.insert(size, HashMap::new());
+    for name in &unique_names {
+        if should_cache_width(&widths, 12, name) {
+            widths
+                .entry(12)
+                .or_default()
+                .insert(name.clone(), name.len() as f32);
+        }
     }
-    bound_width_cache(&mut widths, u32::MAX);
-    assert_eq!(widths.len(), 0, "new size keys cannot grow without bound");
+    assert_eq!(widths[&12].len(), MAX_WIDTH_CACHE_ENTRIES_PER_SIZE);
+    let warm_hits = unique_names
+        .iter()
+        .filter(|name| widths[&12].contains_key(name.as_str()))
+        .count();
+    assert_eq!(warm_hits, MAX_WIDTH_CACHE_ENTRIES_PER_SIZE);
+    for _ in 0..2 {
+        for name in &unique_names {
+            assert_eq!(
+                should_cache_width(&widths, 12, name),
+                widths[&12].contains_key(name.as_str()),
+                "repeated traversals retain admitted widths and reject new entries"
+            );
+        }
+    }
+
+    let mut sizes = WidthCache::new();
+    for size in 0..MAX_WIDTH_CACHE_SIZES as u32 {
+        sizes.entry(size).or_default();
+    }
+    assert!(!should_cache_width(&sizes, u32::MAX, "new-size"));
+    assert_eq!(sizes.len(), MAX_WIDTH_CACHE_SIZES);
 }
 
 /// The window manager draws the frame, everywhere but Windows.

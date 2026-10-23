@@ -135,16 +135,11 @@ pub(crate) type WidthCache = HashMap<u32, HashMap<String, f32>>;
 const MAX_WIDTH_CACHE_SIZES: usize = 4;
 const MAX_WIDTH_CACHE_ENTRIES_PER_SIZE: usize = 8192;
 
-fn bound_width_cache(widths: &mut WidthCache, size: u32) {
-    if !widths.contains_key(&size) && widths.len() >= MAX_WIDTH_CACHE_SIZES {
-        widths.clear();
-    }
-    if widths
-        .get(&size)
-        .is_some_and(|texts| texts.len() >= MAX_WIDTH_CACHE_ENTRIES_PER_SIZE)
-    {
-        widths.remove(&size);
-    }
+fn should_cache_width(widths: &WidthCache, size: u32, text: &str) -> bool {
+    (widths.contains_key(&size) || widths.len() < MAX_WIDTH_CACHE_SIZES)
+        && widths.get(&size).is_none_or(|texts| {
+            texts.contains_key(text) || texts.len() < MAX_WIDTH_CACHE_ENTRIES_PER_SIZE
+        })
 }
 
 /// The width a piece of text is at a size, remembered.
@@ -164,11 +159,12 @@ pub(crate) fn measured_width(
         return *width;
     }
     let width = sidebar_text_width(window, text, size).as_f32();
-    bound_width_cache(widths, at_size);
-    widths
-        .entry(at_size)
-        .or_default()
-        .insert(text.to_owned(), width);
+    if should_cache_width(widths, at_size, text) {
+        widths
+            .entry(at_size)
+            .or_default()
+            .insert(text.to_owned(), width);
+    }
     width
 }
 
@@ -490,6 +486,12 @@ pub(crate) enum InspectorTab {
 pub(crate) type PendingDocumentTransition =
     Box<dyn FnOnce(&mut TerminalWindow, &mut Window, &mut Context<TerminalWindow>) + 'static>;
 
+#[derive(Clone, Copy)]
+enum CloseAction {
+    Window,
+    Application,
+}
+
 /// What the centre pane is showing when it is not showing a terminal.
 ///
 /// Two things, and they are not the same thing: a file being read is a
@@ -549,6 +551,14 @@ pub struct TerminalWindow {
     pub(crate) document_view: Option<crate::document::DocumentView>,
     pub(crate) pending_document_transition: Option<PendingDocumentTransition>,
     pub(crate) document_transition_prompted: bool,
+    /// The formatter the document pane runs, when a test supplies one.
+    ///
+    /// Production asks the person's own Prettier for it, by name on PATH. A
+    /// test that needs a decided answer names its own executable here, so what
+    /// the test proves is the app's answer to a formatter and not whether the
+    /// machine running the test happens to have Prettier installed.
+    #[cfg(test)]
+    pub(crate) formatter_command: Option<PathBuf>,
     /// File-local syntax choices, kept only for this window's lifetime.
     pub(crate) document_language_overrides: HashMap<String, String>,
     pub(crate) document_grammar_open: bool,
@@ -752,6 +762,8 @@ impl TerminalWindow {
             document_view: None,
             pending_document_transition: None,
             document_transition_prompted: false,
+            #[cfg(test)]
+            formatter_command: None,
             document_language_overrides: HashMap::new(),
             document_grammar_open: false,
             document_grammar_highlight: 0,
@@ -1850,18 +1862,23 @@ impl TerminalWindow {
     }
 
     pub(crate) fn request_app_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_document_transition(Box::new(|_, _, cx| cx.quit()), window, cx);
+        self.request_close(CloseAction::Application, window, cx);
     }
 
     pub(crate) fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close(CloseAction::Window, window, cx);
+    }
+
+    fn request_close(&mut self, action: CloseAction, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_document_draft(cx);
-        if self
-            .document_view
-            .as_ref()
-            .is_some_and(crate::document::DocumentView::is_dirty)
-        {
+        if self.document_view.as_ref().is_some_and(|document| {
+            document.is_dirty()
+                || document.saving
+                || document.formatting
+                || document.durability_uncertain
+        }) {
             self.request_document_transition(
-                Box::new(|app, window, cx| app.request_window_close(window, cx)),
+                Box::new(move |app, window, cx| app.request_close(action, window, cx)),
                 window,
                 cx,
             );
@@ -1877,17 +1894,43 @@ impl TerminalWindow {
                 || matches!(status.shell, ShellState::Unknown)
         }) || !self.navigation.pending.is_empty();
         if busy {
+            const WINDOW_CLOSE_CHOICES: &[(&str, ButtonVariant)] = &[
+                ("Cancel", ButtonVariant::Default),
+                ("Stop and close", ButtonVariant::Danger),
+            ];
+            const APP_QUIT_CHOICES: &[(&str, ButtonVariant)] = &[
+                ("Cancel", ButtonVariant::Default),
+                ("Stop and quit", ButtonVariant::Danger),
+            ];
+            let (title, choices) = match action {
+                CloseAction::Window => {
+                    ("Close Muster and stop its terminals?", WINDOW_CLOSE_CHOICES)
+                }
+                CloseAction::Application => {
+                    ("Quit Muster and stop its terminals?", APP_QUIT_CHOICES)
+                }
+            };
             let view = cx.entity().downgrade();
-            crate::confirmation::ask(window, cx, "Close Muster and stop its terminals?",
+            crate::confirmation::ask(
+                window,
+                cx,
+                title,
                 "All terminals in this window will be stopped, including terminals in other directories.",
-                &[("Cancel", ButtonVariant::Default), ("Stop and close", ButtonVariant::Danger)],
+                choices,
                 move |choice, window, cx| {
                     if choice == 1 {
-                        let _ = view.update(cx, |app, cx| app.finish_window_close(window, cx));
+                        let _ = view.update(cx, |app, cx| match action {
+                            CloseAction::Window => app.finish_window_close(window, cx),
+                            CloseAction::Application => cx.quit(),
+                        });
                     }
-                });
+                },
+            );
         } else {
-            self.finish_window_close(window, cx);
+            match action {
+                CloseAction::Window => self.finish_window_close(window, cx),
+                CloseAction::Application => cx.quit(),
+            }
         }
     }
 

@@ -2067,6 +2067,28 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
             search.bounds().bottom() <= auto.bounds().origin.y,
             "the search is above the list it filters"
         );
+
+        // Walk to both ends through real key events. The Zig option is the last
+        // grammar, and its rectangle must stay inside the clipped list after the
+        // downward scroll; Auto is visible again after traversing back up.
+        window.click("document-grammar-search", cx);
+        for _ in 0..100 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+        let list = window.find("document-grammar-list").bounds();
+        let last_row = window.find("document-grammar-zig");
+        assert_eq!(last_row.selected(), Some(true));
+        assert!(last_row.bounds().origin.y >= list.origin.y);
+        assert!(last_row.bounds().bottom() <= list.bottom());
+        for _ in 0..100 {
+            window.press("up", cx);
+        }
+        window.render_frame(cx);
+        let first_row = window.find("document-grammar-auto");
+        assert_eq!(first_row.selected(), Some(true));
+        assert!(first_row.bounds().origin.y >= list.origin.y);
+        assert!(first_row.bounds().bottom() <= list.bottom());
     })
     .unwrap();
 
@@ -2094,6 +2116,152 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
             "the filtered keyboard target is the language that Enter confirms"
         );
     });
+    close(&fixture, cx);
+}
+
+/// The menu opens on the row the keyboard points at.
+///
+/// The list and the highlight are one thing: a list left scrolled away from
+/// the row the keyboard points at hides that row, and a menu that opens on
+/// the bottom of its list points at a row nobody can see.
+#[gpui_kit::test]
+async fn the_grammar_menu_opens_on_the_row_the_keyboard_points_at(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let path = "notes-without-an-extension";
+    std::fs::write(fixture.root.join(path), "name: muster\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, path.into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == path)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Walk the keyboard past the first screen, so the list is scrolled away
+    // from the row the keyboard started on.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar-search", cx);
+        for _ in 0..20 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.press("escape", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.document_grammar_open, "the menu is closed");
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let list = window.find("document-grammar-list").bounds();
+        let first = window.find("document-grammar-auto");
+        assert_eq!(
+            first.selected(),
+            Some(true),
+            "the reopened menu points at its first row"
+        );
+        assert!(
+            first.bounds().origin.y >= list.origin.y && first.bounds().bottom() <= list.bottom(),
+            "the reopened menu shows the row it points at"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// The search puts the list back at the row the keyboard points at.
+///
+/// A typed character re-filters the list, so the row the keyboard was on is
+/// no longer a row: the keyboard goes back to the first of what is left, and
+/// the list goes with it rather than staying where the old list was.
+#[gpui_kit::test]
+async fn the_grammar_menu_search_puts_the_list_back_at_the_first_row(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let path = "notes-without-an-extension";
+    std::fs::write(fixture.root.join(path), "name: muster\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, path.into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == path)
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("document-grammar-search", cx);
+        for _ in 0..20 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| window.input("t", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let list = window.find("document-grammar-list").bounds();
+        let first = window.find("document-grammar-auto").bounds();
+        let last = window.find("document-grammar-typescript").bounds();
+        // The search left more rows than the list shows, so the list can be
+        // scrolled away from its first row.
+        assert!(
+            last.bottom() - first.top() > list.size.height,
+            "the search left a list taller than the viewport"
+        );
+        assert_eq!(
+            window.find("document-grammar-auto").selected(),
+            Some(true),
+            "the search puts the keyboard back at the first row"
+        );
+        assert!(
+            first.origin.y >= list.origin.y && first.bottom() <= list.bottom(),
+            "the list shows the row the keyboard points at"
+        );
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 
@@ -3612,6 +3780,929 @@ async fn dirty_document_save_conflict_keeps_draft_and_pending_destination(cx: &m
     })
     .unwrap();
     close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn a_clean_document_with_uncertain_durability_keeps_window_close_pending(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    fixture.view.update(cx, |app, _| {
+        let document = app.document_view.as_mut().unwrap();
+        assert!(!document.is_dirty());
+        document.durability_uncertain = true;
+    });
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.pending_document_transition.is_some()),
+        "the close intent waits for durability retry instead of tearing down"
+    );
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().durability_uncertain = false;
+        app.navigation
+            .pending
+            .insert("pending-terminal".into(), "starting".into());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.closing);
+        assert!(app.open_document.is_some());
+    });
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn app_quit_asks_before_stopping_pending_terminals_and_cancel_keeps_them(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, _| {
+        app.navigation
+            .pending
+            .insert("pending-terminal".into(), "starting".into());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_app_quit(window, cx));
+    })
+    .unwrap();
+    assert!(super::confirmation_open(fixture.handle, cx));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window
+                .within("dialog")
+                .find(("confirmation-choice", 1usize))
+                .label(),
+            Some("Stop and quit"),
+            "the app-quit route keeps its requested final action"
+        );
+    })
+    .unwrap();
+    super::answer_confirmation(fixture.handle, "Cancel", cx);
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.navigation.pending.contains_key("pending-terminal"));
+        assert!(!app.closing);
+    });
+    close(&fixture, cx);
+}
+
+/// Wait, bounded, for the window's own state to say so.
+///
+/// The window is gone once the close it asked for has happened, so a wait that
+/// drew frames would be waiting for something that has already left: the
+/// entity outlives the window, and the wait is on that. The bound is real
+/// time, because the work that answers is a real save or a real formatter and
+/// a clock that ran ahead of it would say nothing.
+fn wait_for_state(
+    fixture: &GitFixture,
+    cx: &mut TestAppContext,
+    within: Duration,
+    wanted: impl Fn(&crate::app::TerminalWindow) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if fixture.view.read_with(cx, |app, _| wanted(app)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The labels the open confirmation offers, in the order it offers them.
+fn confirmation_labels(fixture: &GitFixture, cx: &mut TestAppContext) -> Vec<String> {
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        (0..3usize)
+            .filter_map(|choice| {
+                window
+                    .within("dialog")
+                    .try_find(("confirmation-choice", choice))
+                    .and_then(|button| button.label().map(str::to_owned))
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+/// The id of the next session a test opens.
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A session with a real program running in front of the shell.
+///
+/// The shell is interactive, because a shell that is not gives its jobs no
+/// process group of their own: the operating system would then name the shell
+/// itself as what is in front, and the window would have no way to know that
+/// something was working.
+fn session_with_foreground(
+    backend: &Arc<crate::pty::TerminalBackend>,
+) -> crate::terminal::TerminalSession {
+    use crate::terminal::{TerminalSession, TerminalSessionConfig};
+    let id = format!(
+        "muster-test-foreground-{}",
+        NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut config = TerminalSessionConfig::new(
+        id,
+        std::env::temp_dir(),
+        INITIAL_COLUMNS,
+        INITIAL_ROWS,
+        Some(std::path::PathBuf::from("/bin/sh")),
+    );
+    config.args = Some(vec!["-i".to_owned()]);
+    config.status_interval = Duration::from_millis(20);
+    config.drain_deadline = Duration::from_millis(500);
+    let session =
+        TerminalSession::spawn(Arc::clone(backend), config).expect("the test session spawns");
+    session
+        .resize(INITIAL_COLUMNS, INITIAL_ROWS)
+        .expect("the session takes the size it was opened at");
+    session
+        .send_text("sleep 30\n")
+        .expect("the command reaches the shell");
+    session
+}
+
+/// Wait, bounded, for the session to report a program in front of its shell.
+///
+/// The answer is the operating system's, read on the session's own cadence, so
+/// this waits for it rather than for the shell to have drawn a prompt.
+fn wait_for_foreground(session: &crate::terminal::TerminalSession) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if session.status().foreground.running {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Put a real terminal in the window, the way the app wires one.
+///
+/// The terminal is a real process behind a real PTY: what the window asks
+/// about it is the operating system's own answer, not a state a test wrote
+/// down.
+fn attach_terminal(
+    fixture: &GitFixture,
+    session: &crate::terminal::TerminalSession,
+    cx: &mut TestAppContext,
+) {
+    let checkout = fixture.checkout.clone();
+    cx.update_window(fixture.handle, |_, _window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let shell = Arc::new(crate::session_owner::OwnedShell {
+                session: session.clone(),
+                metrics: Arc::new(std::sync::Mutex::new(crate::session_owner::UNMEASURED_CELL)),
+            });
+            let view = cx.new(|cx| {
+                crate::terminal::TerminalView::new(session.clone(), Arc::clone(&shell.metrics), cx)
+            });
+            app.terminals.insert(
+                "running".to_owned(),
+                crate::app::LiveTerminal {
+                    checkout_id: checkout.clone(),
+                    view,
+                    shell,
+                    prompt: None,
+                },
+            );
+        });
+    })
+    .unwrap();
+}
+
+/// A program that is working is asked about, through both ways out.
+///
+/// The window's close and the app's Quit are two answers to one question: may
+/// the terminals be stopped? A program in front of the shell is that question,
+/// and the answer that says no leaves it working.
+#[gpui_kit::test]
+fn the_close_and_the_quit_ask_about_a_program_that_is_working(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let backend = Arc::new(crate::pty::TerminalBackend::default());
+    let session = session_with_foreground(&backend);
+    assert!(
+        wait_for_foreground(&session),
+        "the session never reported a program in front of its shell"
+    );
+    attach_terminal(&fixture, &session, cx);
+
+    // The close asks.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        confirmation_labels(&fixture, cx),
+        vec!["Cancel".to_owned(), "Stop and close".to_owned()],
+        "the close asks before it stops a program that is working"
+    );
+    answer_confirmation(fixture.handle, "Cancel", cx);
+    assert!(
+        session.status().foreground.running,
+        "the answer that says no leaves the program working"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.closing, "the window the person did not close is open");
+    });
+
+    // The quit asks the same question and keeps its own final action.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_app_quit(window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        confirmation_labels(&fixture, cx),
+        vec!["Cancel".to_owned(), "Stop and quit".to_owned()],
+        "the quit asks before it stops a program that is working"
+    );
+    answer_confirmation(fixture.handle, "Cancel", cx);
+    assert!(
+        session.status().foreground.running,
+        "the answer that says no leaves the program working"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.closing, "the app the person did not quit is running");
+    });
+    close(&fixture, cx);
+    let _ = session.close().wait();
+}
+
+/// The document is decided before anything is stopped.
+///
+/// A draft is somebody's work and a terminal is somebody else's: the question
+/// about the draft comes first, because an answer about the terminal cannot
+/// answer it.
+#[gpui_kit::test]
+async fn app_quit_asks_about_the_document_before_the_terminals(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    let backend = Arc::new(crate::pty::TerminalBackend::default());
+    let session = session_with_foreground(&backend);
+    assert!(
+        wait_for_foreground(&session),
+        "the session never reported a program in front of its shell"
+    );
+    attach_terminal(&fixture, &session, cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_app_quit(window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        confirmation_labels(&fixture, cx),
+        vec!["Cancel".to_owned(), "Save".to_owned(), "Discard".to_owned()],
+        "the document is decided before anything is stopped"
+    );
+    // The draft is discarded, and only then is the program asked about.
+    answer_confirmation(fixture.handle, "Discard", cx);
+    assert_eq!(
+        confirmation_labels(&fixture, cx),
+        vec!["Cancel".to_owned(), "Stop and quit".to_owned()],
+        "the program is asked about once the document has been decided"
+    );
+    answer_confirmation(fixture.handle, "Cancel", cx);
+    assert!(
+        session.status().foreground.running,
+        "the answer that says no leaves the program working"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.closing, "the app the person did not quit is running");
+    });
+    close(&fixture, cx);
+    let _ = session.close().wait();
+}
+
+#[gpui_kit::test]
+async fn clean_in_flight_save_and_format_keep_close_pending_until_idle(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().saving = true
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.pending_document_transition.is_some()));
+
+    fixture.view.update(cx, |app, _| {
+        let document = app.document_view.as_mut().unwrap();
+        document.saving = false;
+        document.formatting = true;
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    assert!(fixture
+        .view
+        .read_with(cx, |app, _| app.pending_document_transition.is_some()));
+
+    fixture.view.update(cx, |app, _| {
+        app.document_view.as_mut().unwrap().formatting = false;
+        app.navigation
+            .pending
+            .insert("pending-terminal".into(), "starting".into());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.continue_document_transition(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
+    close(&fixture, cx);
+}
+
+/// A queued close is carried by the answer of the work it waited for.
+///
+/// The guard that keeps a clean document from closing is half of the rule: the
+/// completion of the work in flight has to reach the queued close, or the
+/// window sits there with a close nobody has answered. This one runs the real
+/// save — off the UI thread, through the file boundary — and asks for the
+/// close while it is still on its way.
+#[gpui_kit::test]
+async fn a_durability_retry_carries_the_queued_window_close(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    // The published-but-not-durable state: the bytes are visible, the
+    // directory entry was not confirmed, and the text itself is clean.
+    fixture.view.update(cx, |app, _| {
+        let document = app.document_view.as_mut().unwrap();
+        assert!(!document.is_dirty());
+        document.durability_uncertain = true;
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_document_transition.is_some(),
+            "the close waits for the durability instead of tearing down"
+        );
+        assert!(!app.closing);
+    });
+    // The retry is the real save, and its completion is what has to carry the
+    // queued close on.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.save_document(window, cx));
+    })
+    .unwrap();
+    // The save is a real write on a real thread, so the wait is the file
+    // system's own: ten seconds, the bound the other saves use.
+    assert!(
+        wait_for_state(&fixture, cx, Duration::from_secs(10), |app| app.closing),
+        "the queued close continues once the retry has answered"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_document_transition.is_none());
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// The same rule for a save that is still on its way when the close is asked
+/// for: the close waits, and the save's own completion carries it on.
+#[gpui_kit::test]
+async fn a_save_in_flight_carries_the_queued_window_close(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture.view.update(cx, |app, cx| {
+            app.save_document(window, cx);
+            app.request_window_close(window, cx);
+        });
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_document_transition.is_some(),
+            "the close waits for the save instead of tearing down"
+        );
+        assert!(!app.closing);
+    });
+    // The save is a real write on a real thread, so the wait is the file
+    // system's own: ten seconds, the bound the other saves use.
+    assert!(
+        wait_for_state(&fixture, cx, Duration::from_secs(10), |app| app.closing),
+        "the queued close continues once the save has answered"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "original draft",
+        "the draft was written before the window went"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_document_transition.is_none());
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// The close's own Save answer still saves and then closes.
+///
+/// This is the ordinary flow: the draft is saved because the person said so,
+/// and the window they asked to close goes on once the write has answered.
+#[gpui_kit::test]
+async fn the_closes_save_answer_writes_the_draft_and_closes_the_window(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Save", cx);
+    // The save is a real write on a real thread, so the wait is the file
+    // system's own: ten seconds, the bound the other saves use.
+    assert!(
+        wait_for_state(&fixture, cx, Duration::from_secs(10), |app| app.closing),
+        "the window the person closed is closed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("first.txt")).unwrap(),
+        "original draft",
+        "the draft the person saved is on disk"
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.pending_document_transition.is_none());
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// The close asks before it stops a terminal, and the approval closes it.
+///
+/// The last link of the close: the work is done, the terminals are still
+/// running, so the close is asked about rather than taken, and the answer
+/// that says yes is what ends the window.
+#[gpui_kit::test]
+async fn the_close_asks_before_stopping_a_terminal_and_the_approval_closes_it(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::component::WindowExt;
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    fixture.view.update(cx, |app, _| {
+        app.navigation
+            .pending
+            .insert("pending-terminal".into(), "starting".into());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Save", cx);
+    // The save that answers the draft is a real write on a real thread, and the
+    // question about the terminal comes after it: ten seconds is the bound the
+    // other saves use.
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |window, cx| {
+        window.has_active_dialog(cx)
+    })
+    .await;
+    assert!(
+        confirmation_open(fixture.handle, cx),
+        "the close asks about the terminal it would stop"
+    );
+    fixture.view.read_with(cx, |app, _| assert!(!app.closing));
+    answer_confirmation(fixture.handle, "Stop and close", cx);
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.closing, "the approved close ends the window");
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// A save that is refused keeps the draft and keeps the queued close.
+///
+/// The failure is not the end of the close: the draft is still the person's
+/// work and the close is still what they asked for, so the window waits for
+/// another answer rather than throwing either of them away.
+#[gpui_kit::test]
+async fn a_refused_save_keeps_the_draft_and_the_queued_close(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("first.txt"), "original").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.txt".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.txt")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input(" draft", cx);
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    // The file changes under the save, so the write is refused before it
+    // publishes anything.
+    std::fs::write(fixture.root.join("first.txt"), "external edit").unwrap();
+    answer_confirmation(fixture.handle, "Save", cx);
+    cx.run_until_parked();
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.toasts.latest_error().map(str::to_owned)),
+        Some("file changed on disk; reload it before saving".to_owned())
+    );
+    fixture.view.read_with(cx, |app, _| {
+        assert!(!app.closing, "a refused save does not close the window");
+        assert!(
+            app.pending_document_transition.is_some(),
+            "the queued close survives the refusal"
+        );
+        assert!(app.document_view.as_ref().unwrap().is_dirty());
+    });
+    cx.update_window(fixture.handle, |_, _, cx| {
+        assert_eq!(editor_text(&fixture, cx), "original draft");
+    })
+    .unwrap();
+    // The close is still answerable: asking again raises the same question,
+    // and the answer is what ends the window.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture
+            .view
+            .update(cx, |app, cx| app.request_window_close(window, cx));
+    })
+    .unwrap();
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Discard", cx);
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.closing, "the close is not deadlocked by the refusal");
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// A formatter of the test's own, and the text it writes.
+///
+/// The formatter the app runs is the person's own Prettier, found by name on
+/// PATH: a test that used it would prove what the machine running the test
+/// happens to have installed rather than what the app does with an answer.
+/// This one is a script the test writes, so the answer is the same everywhere.
+fn fixture_formatter() -> (tempfile::TempDir, std::path::PathBuf, &'static str) {
+    use std::os::unix::fs::PermissionsExt;
+    const FORMATTED: &str = "const formatted = true;\n";
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("prettier");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf 'const formatted = true;\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (directory, executable, FORMATTED)
+}
+
+/// A format that finishes reaches the queued close as well.
+///
+/// The format is not leaving the document, so its completion asks the same
+/// question a pending destination would; a close waiting behind it is that
+/// question's answer, and it is asked rather than dropped.
+#[gpui_kit::test]
+async fn a_finished_format_carries_the_queued_window_close(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // The formatter is the test's own, so what the format answers is the same
+    // answer everywhere and not the machine's answer to "is Prettier installed".
+    let (_directory, formatter, formatted) = fixture_formatter();
+    fixture
+        .view
+        .update(cx, |app, _| app.formatter_command = Some(formatter));
+    std::fs::write(fixture.root.join("first.ts"), "const a = 1;\n").unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.ts".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.ts")
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        click_editor(&fixture, window, cx);
+        window.input("const b = 2;", cx);
+        fixture.view.update(cx, |app, cx| {
+            app.format_document(window, cx);
+            app.request_window_close(window, cx);
+        });
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_document_transition.is_some(),
+            "the close waits for the format instead of tearing down"
+        );
+        assert!(!app.closing);
+    });
+    // The formatter's own deadline is twenty seconds, so the wait is longer
+    // than the work it waits for.
+    assert!(
+        wait_for_state(&fixture, cx, Duration::from_secs(30), |app| !app
+            .document_view
+            .as_ref()
+            .expect("a document is open")
+            .formatting),
+        "the format answered"
+    );
+    // The format answered rather than refused: the editor holds what the
+    // formatter wrote, and nothing was said against it.
+    fixture.view.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.document_view
+                .as_ref()
+                .expect("a document is open")
+                .state
+                .read(cx)
+                .text(),
+            formatted,
+            "the formatter wrote its answer into the editor"
+        );
+        assert_eq!(
+            app.toasts.latest_error().map(str::to_owned),
+            None,
+            "the format succeeded rather than refusing"
+        );
+    });
+    assert!(
+        confirmation_open(fixture.handle, cx),
+        "the format's completion asks the question the close is waiting for"
+    );
+    answer_confirmation(fixture.handle, "Discard", cx);
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(app.closing, "the close the format asked about is answered");
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// A format of a document nobody has edited carries the queued close too.
+///
+/// There is nothing for that format to ask about, so the close that was
+/// waiting behind it is the answer, and the window goes on by itself.
+#[gpui_kit::test]
+async fn a_clean_format_carries_the_queued_window_close(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // The test's own formatter, and a document already in the form it writes,
+    // so the format leaves the text as it is and there is nothing to decide.
+    let (_directory, formatter, formatted) = fixture_formatter();
+    fixture
+        .view
+        .update(cx, |app, _| app.formatter_command = Some(formatter));
+    std::fs::write(fixture.root.join("first.ts"), formatted).unwrap();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "first.ts".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, file)| file.path == "first.ts")
+    })
+    .await;
+    fixture.view.update(cx, |app, _| {
+        assert!(!app.document_view.as_ref().unwrap().is_dirty());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.format_document(window, cx);
+            app.request_window_close(window, cx);
+        });
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert!(
+            app.pending_document_transition.is_some(),
+            "the close waits for the format instead of tearing down"
+        );
+        assert!(!app.closing);
+    });
+    // The formatter's own deadline is twenty seconds, so the wait is longer
+    // than the work it waits for.
+    assert!(
+        wait_for_state(&fixture, cx, Duration::from_secs(30), |app| app.closing),
+        "the queued close continues once the format has answered"
+    );
+    // The window is gone by now — the close it asked for is what removed it —
+    // so what the format answered is read from the window's own state.
+    fixture.view.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.document_view
+                .as_ref()
+                .expect("a document is open")
+                .state
+                .read(cx)
+                .text(),
+            formatted,
+            "the formatter answered, and its answer is what the editor holds"
+        );
+        assert_eq!(
+            app.toasts.latest_error().map(str::to_owned),
+            None,
+            "the format succeeded rather than refusing"
+        );
+        assert!(app.pending_document_transition.is_none());
+    });
+    fixture.view.update(cx, |app, _| app.owner.stop());
 }
 
 #[gpui_kit::test]
