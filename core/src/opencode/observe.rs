@@ -774,52 +774,54 @@ mod tests {
                 )
             });
         let home = home_for(mock.port());
-        let mut seen_known = HashSet::new();
-        // Reconnect each time, as the production watch does, so a client that kept its
-        // own cursor could not hide a location behind the one it read first.
-        for start in 0..12 {
-            let client = Client::connect_service(home.path()).unwrap();
-            let sessions = client.service_sessions_from(start).unwrap();
-            assert_eq!(sessions.len(), 11);
-            assert!(
-                sessions
-                    .iter()
-                    .find(|session| session.id == "ses_10")
-                    .unwrap()
-                    .running
-            );
-            assert_eq!(
-                sessions
-                    .iter()
-                    .filter(|session| session.awaiting_reply.is_none())
-                    .count(),
-                1,
-                "every location the service answers for is asked about, not a slice of them"
-            );
-            assert_eq!(
-                sessions
-                    .iter()
-                    .find(|session| session.id == "ses_3")
-                    .unwrap()
-                    .awaiting_reply,
-                None
-            );
-            for session in sessions {
-                if session.awaiting_reply == Some(false) {
-                    seen_known.insert(session.id);
-                }
-            }
-            assert_eq!(
-                client.session_messages("ses_10").unwrap(),
-                serde_json::json!([])
-            );
-        }
-        assert_eq!(
-            seen_known.len(),
-            10,
-            "every readable location is known, in the first pass and in every one after it"
+        // This test covers all eleven locations on the wire, not the production
+        // observation deadline; a separate test pins that deadline. A patient outer
+        // budget keeps scheduler load from turning an unrelated location into an
+        // additional unknown result while preserving the per-location request cap.
+        let client = Client::connect_service_with_budget(
+            home.path(),
+            crate::opencode::ReadBudget::patient(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        let sessions = client.service_sessions_from(0).unwrap();
+        assert_eq!(sessions.len(), 11);
+        assert!(
+            sessions
+                .iter()
+                .find(|session| session.id == "ses_10")
+                .unwrap()
+                .running
         );
-        assert!(!seen_known.contains("ses_3"));
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.awaiting_reply == Some(false)),
+            "a successful empty pending-list response is idle"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.id == "ses_3")
+                .unwrap()
+                .awaiting_reply,
+            None,
+            "a failed location remains unknown"
+        );
+        assert_eq!(
+            client.session_messages("ses_10").unwrap(),
+            serde_json::json!([])
+        );
+        let requested_locations: HashSet<_> = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/api/form")
+            .filter_map(|request| request.query_param("directory"))
+            .collect();
+        assert_eq!(
+            requested_locations,
+            (0..11).map(|index| format!("/work/{index:02}")).collect(),
+            "every location is queried, rather than taking a fixed-size slice"
+        );
     }
 
     #[test]

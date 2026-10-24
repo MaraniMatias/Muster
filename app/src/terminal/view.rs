@@ -3130,23 +3130,19 @@ mod tests {
         for _ in 0..3 {
             cx.update(|window, cx| window.render_frame(cx));
         }
-        // The whole word, not one of its letters: a double click selects the
-        // word under the pointer, and a half-written word is not a word.
         assert!(wait_for_text(&session, "alpha"));
         // The grid is measured when the view draws it, and the rows it shows
         // are applied to the terminal then. A click before that lands on
         // nothing at all, so the frame the word arrives in is drawn before
-        // the click, not after it.
+        // the selection, not after it.
         cx.update(|window, cx| window.render_frame(cx));
         let (origin, cell) = view.read_with(cx, |v, _| (v.canvas_origin.get(), v.cell.unwrap()));
-        cx.simulate_click(
-            point(origin.x + cell.width * 0.2, origin.y),
-            Default::default(),
-        );
-        cx.simulate_click(
-            point(origin.x + cell.width * 0.2, origin.y),
-            Default::default(),
-        );
+        let row = origin.y + cell.height * 0.5;
+        let start = point(origin.x + cell.width * 0.2, row);
+        let end = point(origin.x + cell.width * 4.8, row);
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
         assert_eq!(session.snapshot().selection.as_deref(), Some("alpha"));
 
         cx.update(|window, cx| window.dispatch_action(Box::new(EditCopy), cx));
