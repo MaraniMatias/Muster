@@ -63,6 +63,15 @@ pub use worktrees::{
     WorktreeDefaults, WorktreeRemovalConfirmation, WorktreeRemovalInfo,
 };
 
+/// Whether a path is the filesystem root, which is not a workdir.
+///
+/// A workdir is a directory somebody works in. The root holds every other
+/// directory rather than being one of them, and it is where an application
+/// opened from the desktop starts, so it would be offered on every launch.
+pub fn is_filesystem_root(path: &Path) -> bool {
+    path.is_absolute() && path.parent().is_none()
+}
+
 /// Match a cwd to the deepest unique available checkout, by path segments.
 /// Missing/ambiguous checkouts never become automatic-movement destinations.
 pub fn checkout_for_directory(repos: &[Repo], path: &Path) -> Option<String> {

@@ -34,6 +34,11 @@ pub fn open_directory_with_budget(
     if !requested.is_dir() {
         return Err("selected path is not a folder".into());
     }
+    // The filesystem root is not a workdir: it holds every other directory
+    // rather than being one of them, and it names no work at all.
+    if is_filesystem_root(&requested) {
+        return Err("the filesystem root is not a directory you can work in".into());
+    }
     path_text(&requested)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

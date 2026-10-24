@@ -6,6 +6,16 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The filesystem root is not a workdir.** The panel showed a workdir named
+  `/`. An application opened from the desktop starts in the root of the
+  filesystem, and that directory was offered as a workdir and kept in the
+  workspace file, so it came back on every launch and came back after it had
+  been removed. The root holds every other directory rather than being one of
+  them, so it is not opened, not restored and not written to the file. Opening
+  it by hand is refused, and says why.
+
 ## 1.0.0-rc.15
 
 - **The workdirs can be put in the order you want them in.** The panel drew

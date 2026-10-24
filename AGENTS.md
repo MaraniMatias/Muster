@@ -311,6 +311,16 @@ above that workdir and the lower half is the place below it. The line is
 drawn at the top of the heading that will be under the carried workdir, and
 the carried workdir stays where it is, dimmed, until it is put down.
 
+**The filesystem root is not a workdir.** It holds every other directory
+rather than being one of them, and it is where an application opened from the
+desktop starts, so it was offered as a workdir on every launch and kept in the
+workspace file: it came back after it was removed, because the file still
+named it. It is not opened now -- `core::navigation::open_directory` refuses
+it, `restore_roots` leaves it out of the panel, and the next save drops it
+from the file. Two tests pin it: `the_filesystem_root_is_not_a_workdir` in
+`core/src/navigation/tests.rs` and
+`the_filesystem_root_is_not_restored_as_a_workdir` in `app/src/app_tests.rs`.
+
 **The home workdir is where the panel starts.** It does not move, and nothing
 is put above it, so the workdir directly below it cannot move up either. That
 is the same rule Legacy drew as *Home is always the first workdir*, and it is

@@ -3787,8 +3787,50 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
             Err(error) => errors.push(error),
         }
     }
-    for root in &state.roots {
+    restore_roots(&mut nav, &state.roots, &mut errors);
+    // Launching a directory selects it by default; a persisted available checkout
+    // overrides that fallback after all registered roots have been discovered.
+    // The filesystem root is not a workdir: an application opened from the
+    // desktop starts in it, so it is not opened and nothing is said about it.
+    let launch = if navigation::is_filesystem_root(cwd) {
+        None
+    } else {
+        Some(navigation::open_directory(cwd))
+    };
+    let mut launched = false;
+    match launch {
+        Some(Ok(opened)) => {
+            nav.merge(opened, true);
+            launched = true;
+        }
+        Some(Err(error)) => errors.push(error),
+        None => (),
+    }
+    if !launched {
+        if let Some(home) = nav.home.clone() {
+            nav.select_checkout(&home);
+        }
+    }
+    nav.restore_active_checkout(active_checkout_id.as_deref());
+    RestoredNavigation {
+        navigation: nav,
+        state_path,
+        errors,
+    }
+}
+
+/// Add the directories the workspace file keeps, in the order it keeps them.
+///
+/// The filesystem root is not among them: it holds every other directory
+/// rather than being one of them, and it is where an application opened from
+/// the desktop starts, so an earlier build offered it and kept it in the file.
+/// It is left out here, and the next save drops it.
+fn restore_roots(nav: &mut Navigation, roots: &[String], errors: &mut Vec<String>) {
+    for root in roots {
         if nav.repos.iter().any(|repo| &repo.root == root) {
+            continue;
+        }
+        if navigation::is_filesystem_root(Path::new(root)) {
             continue;
         }
         match navigation::open_directory(Path::new(root)) {
@@ -3826,23 +3868,6 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
                 });
             }
         }
-    }
-    // Launching a directory selects it by default; a persisted available checkout
-    // overrides that fallback after all registered roots have been discovered.
-    match navigation::open_directory(cwd) {
-        Ok(opened) => nav.merge(opened, true),
-        Err(error) => {
-            errors.push(error);
-            if let Some(home) = nav.home.clone() {
-                nav.select_checkout(&home);
-            }
-        }
-    }
-    nav.restore_active_checkout(active_checkout_id.as_deref());
-    RestoredNavigation {
-        navigation: nav,
-        state_path,
-        errors,
     }
 }
 

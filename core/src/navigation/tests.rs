@@ -116,6 +116,23 @@ fn plain_directory_has_canonical_identity_and_no_sessions() {
 }
 
 #[test]
+fn the_filesystem_root_is_not_a_workdir() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
+    assert!(
+        is_filesystem_root(&root),
+        "the root of the filesystem is {root:?}"
+    );
+    assert!(!is_filesystem_root(&root.join("somewhere")));
+    let error = open_directory(&root).unwrap_err();
+    assert!(error.contains("filesystem root"), "{error}");
+}
+
+#[test]
 fn linked_worktree_subdirectory_opens_shared_repo_and_correct_checkout() {
     let temp = tempdir().unwrap();
     let root = repository(temp.path());

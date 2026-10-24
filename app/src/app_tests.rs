@@ -644,6 +644,29 @@ fn no_argument_at_all_leaves_the_directory_undecided() {
     );
 }
 
+#[test]
+fn the_filesystem_root_is_not_restored_as_a_workdir() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
+    let mut nav = Navigation::new();
+    let mut errors = Vec::new();
+    restore_roots(
+        &mut nav,
+        &[root.to_string_lossy().into_owned()],
+        &mut errors,
+    );
+    assert!(
+        nav.repos.is_empty(),
+        "the filesystem root was restored as a workdir: {:?}",
+        nav.repos
+    );
+    assert!(errors.is_empty(), "the root is not a failure: {errors:?}");
+}
+
 /// Finishing a selection copies its text automatically, as in Legacy.
 ///
 /// Through the real window, not the view alone: the application opens windows
