@@ -16,8 +16,6 @@ here still gets its generated notes.
   them, so it is not opened, not restored and not written to the file. Opening
   it by hand is refused, and says why.
 
-## Unreleased
-
 - **The workdir's menu no longer moves the workdir.** **Move up** and **Move
   down** are gone from it, so the menu holds only what the workdir can be asked
   for: a new worktree, an archived worktree to restore, and its removal from
