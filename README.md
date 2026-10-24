@@ -8,7 +8,7 @@ Muster is a desktop workspace for people working with coding agents in Git workt
 - **Native release targets:** macOS (Apple Silicon) · Ubuntu 24.04 (x86_64)
 - **License:** MIT
 
-![Muster screan]()
+![Muster screenshot](./docs/screanshot/screenshot_home_v2.png)
 
 ## Why
 
@@ -128,11 +128,11 @@ Workspace data, review rounds and preferences are stored locally under `~/.muste
 
 ## Layout
 
-| Path | What it is |
-| --- | --- |
-| [`core/`](core) | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI. |
-| [`app/`](app) | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. Its source is `app/src/`, and its icon and fonts are `app/assets/`. |
-| [`docs/release-safety.md`](docs/release-safety.md) | The release checklist, and what the native release path promises. |
+| Path                                               | What it is                                                                                                                               |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| [`core/`](core)                                    | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI.  |
+| [`app/`](app)                                      | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. Its source is `app/src/`, and its icon and fonts are `app/assets/`. |
+| [`docs/release-safety.md`](docs/release-safety.md) | The release checklist, and what the native release path promises.                                                                        |
 
 `core/` is a real dependency, not a shared folder: the app and the parked Tauri
 tree both compile the same PTY implementation, so process lifetime, bounded
@@ -166,20 +166,20 @@ would be discarded, so the app installs one before anything that can log.
 
 Every script in `scripts/` belongs to this app's release path.
 
-| Script | What it does | When you run it |
-| --- | --- | --- |
-| `release.sh` | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle; `candidate <version>` cuts and publishes a release candidate, `publish <version>` publishes a prepared one | The entry point for every local build. `release` is macOS-only, `candidate` and `publish` need `gh` and publish |
-| `bundle-macos.sh` | Assembles `dist/Muster.app` with the icon, name and version | Called by `release.sh release` and by CI |
-| `package-linux-deb.sh` | Builds `dist/muster_<version>_<arch>.deb` for amd64 and arm64, deriving runtime dependencies from the ELF | On Ubuntu, after `release.sh build` |
-| `debian-version.sh` | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`) | Internal to packaging |
-| `linux-package-smoke.sh` | Installs the `.deb` in a clean Ubuntu container and launches it under Xvfb | Internal to CI; run it directly to reproduce the CI check |
-| `linux-window-smoke.sh` | The window and liveness half of that check | Internal to `linux-package-smoke.sh` |
-| `finalize-native-release.mjs` | Checks the built macOS and Linux payloads of every target together before publication | Internal to the release workflow |
-| `audit-rust.mjs` | RustSec audit of the locked graph over OSV, refusing unpinned path packages | `release.sh check` and CI |
-| `perf-native.sh` | Runs the ignored terminal hot-path benchmarks | Development only |
-| `generate-native-file-icons.mjs` | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module | Only when a file icon changes; never hand-edit the output |
-| `patched-alacritty.mjs`, `patched-gitignore.mjs`, `patched-gherkin.mjs` | Hash-pin the vendored crates so the audit can trust them | Internal to `audit-rust.mjs` |
-| `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs` | Tests for the audit, the release commands and the packaging/publish gate | Run by `release.sh check` and CI |
+| Script                                                                  | What it does                                                                                                                                                                                                               | When you run it                                                                                                 |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `release.sh`                                                            | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle; `candidate <version>` cuts and publishes a release candidate, `publish <version>` publishes a prepared one | The entry point for every local build. `release` is macOS-only, `candidate` and `publish` need `gh` and publish |
+| `bundle-macos.sh`                                                       | Assembles `dist/Muster.app` with the icon, name and version                                                                                                                                                                | Called by `release.sh release` and by CI                                                                        |
+| `package-linux-deb.sh`                                                  | Builds `dist/muster_<version>_<arch>.deb` for amd64 and arm64, deriving runtime dependencies from the ELF                                                                                                                  | On Ubuntu, after `release.sh build`                                                                             |
+| `debian-version.sh`                                                     | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`)                                                                                                                                            | Internal to packaging                                                                                           |
+| `linux-package-smoke.sh`                                                | Installs the `.deb` in a clean Ubuntu container and launches it under Xvfb                                                                                                                                                 | Internal to CI; run it directly to reproduce the CI check                                                       |
+| `linux-window-smoke.sh`                                                 | The window and liveness half of that check                                                                                                                                                                                 | Internal to `linux-package-smoke.sh`                                                                            |
+| `finalize-native-release.mjs`                                           | Checks the built macOS and Linux payloads of every target together before publication                                                                                                                                      | Internal to the release workflow                                                                                |
+| `audit-rust.mjs`                                                        | RustSec audit of the locked graph over OSV, refusing unpinned path packages                                                                                                                                                | `release.sh check` and CI                                                                                       |
+| `perf-native.sh`                                                        | Runs the ignored terminal hot-path benchmarks                                                                                                                                                                              | Development only                                                                                                |
+| `generate-native-file-icons.mjs`                                        | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module                                                                                                                                                    | Only when a file icon changes; never hand-edit the output                                                       |
+| `patched-alacritty.mjs`, `patched-gitignore.mjs`, `patched-gherkin.mjs` | Hash-pin the vendored crates so the audit can trust them                                                                                                                                                                   | Internal to `audit-rust.mjs`                                                                                    |
+| `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs`     | Tests for the audit, the release commands and the packaging/publish gate                                                                                                                                                   | Run by `release.sh check` and CI                                                                                |
 
 The full release procedure is in [release safety](docs/release-safety.md).
 
