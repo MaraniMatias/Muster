@@ -3049,9 +3049,10 @@ fn a_workdir_row_is_dragged_to_another_place_in_the_panel(cx: &mut TestAppContex
     dispose(&fixture, cx);
 }
 
-/// A workdir is moved up and down the panel from its own menu.
+/// The workdir's menu does not move the workdir: the panel's order is the
+/// drag's.
 #[gpui_kit::test]
-fn a_workdir_is_moved_one_place_by_its_menu(cx: &mut TestAppContext) {
+fn the_workdir_menu_does_not_move_the_workdir(cx: &mut TestAppContext) {
     let fixture = open(cx);
     let directory = tempfile::tempdir().unwrap();
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -3078,35 +3079,26 @@ fn a_workdir_is_moved_one_place_by_its_menu(cx: &mut TestAppContext) {
     });
     assert_eq!(ids.len(), 3);
     cx.update_window(fixture.handle, |_, window, cx| {
-        // The menu of the middle workdir, chosen with the keyboard: the
-        // pointer is taken off the menu first, so the row the arrow reaches
-        // is the one the arrow lands on.
+        // The menu of the middle workdir, which has a place to move to in the
+        // panel: the menu does not offer it.
         window.hover(format!("fold-repo-{}", ids[1]), cx);
         window.click(format!("actions-{}", ids[1]), cx);
-        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
-        window.press("down", cx);
-        window.press("enter", cx);
     })
     .unwrap();
-    fixture.view.read_with(cx, |app, _| {
-        let order = app
-            .navigation
-            .repos
-            .iter()
-            .map(|repo| repo.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(order, vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]);
-    });
     cx.update_window(fixture.handle, |_, window, cx| {
-        // And down again: the workdir goes back to the place it was.
-        window.hover(format!("fold-repo-{}", ids[1]), cx);
-        window.click(format!("actions-{}", ids[1]), cx);
-        pointer_move(window, gpui_kit::point(px(800.), px(500.)), None, cx);
-        window.press("down", cx);
-        window.press("down", cx);
-        window.press("enter", cx);
+        window.render_frame(cx);
+        // The one thing the menu holds is the workdir's own removal, at index
+        // 0. Nothing is drawn after it.
+        assert!(
+            window.within("items").try_find(1usize).is_none(),
+            "the workdir's menu does not move the workdir"
+        );
+        window.within("items").click(0usize, cx);
     })
     .unwrap();
+    // And what the menu does offer asks before the workdir leaves the panel.
+    assert!(confirmation_open(fixture.handle, cx));
+    answer_confirmation(fixture.handle, "Cancel", cx);
     fixture.view.read_with(cx, |app, _| {
         let order = app
             .navigation

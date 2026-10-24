@@ -319,17 +319,16 @@ place that is not a choice.
 
 A move is **one gesture and one state**: the drag carries either a terminal or
 a workdir (`SidebarDragKind`), and the drop says where it lands
-(`SidebarDropTarget`). The same move is in the workdir's menu, as **Move up**
-and **Move down**, so it is reached with the keyboard as well as with the
-pointer; `Navigation::step_slot` is what decides whether there is a place to go.
+(`SidebarDropTarget`). The workdir's menu does not move it: the panel's order
+is the drag's, and the menu holds what the workdir can be asked for.
 
-Four rules the rows depend on, each pinned by a test:
+Three rules the rows depend on, each pinned by a test:
 
 - **A workdir moves to the place it is dropped on.**
   `a_workdir_row_is_dragged_to_another_place_in_the_panel` in
   `app/src/sidebar_tests.rs`.
-- **The menu moves it too.**
-  `a_workdir_is_moved_one_place_by_its_menu` in `app/src/sidebar_tests.rs`.
+- **The workdir's menu does not move it.**
+  `the_workdir_menu_does_not_move_the_workdir` in `app/src/sidebar_tests.rs`.
 - **The home workdir stays where the panel starts.**
   `the_home_workdir_stays_where_the_panel_starts` in
   `app/src/sidebar_tests.rs`, and `the_home_workdir_is_where_the_panel_starts`

@@ -584,13 +584,7 @@ impl TerminalWindow {
             .checkouts
             .iter()
             .any(|checkout| self.navigation.home.as_deref() == Some(&checkout.id));
-        // Where the workdir sits in the panel's own order, so it can be moved
-        // there. The home workdir is where the panel starts, so the workdir
-        // directly below it has no place to move up to.
-        let up = self.navigation.step_slot(&id, true);
-        let down = self.navigation.step_slot(&id, false);
-        move |menu, _, cx| {
-            let roles = Roles::of(cx);
+        move |menu, _, _cx| {
             let mut menu = menu.min_w(px(224.));
             // A separator is a line between two groups of rows, so it is only
             // drawn between two groups that are both there.
@@ -620,47 +614,6 @@ impl TerminalWindow {
                                 view.update(cx, |app, cx| app.restore_archived(&id, window, cx));
                         }),
                 );
-                grouped = true;
-            }
-            if up.is_some() || down.is_some() {
-                let id = id.clone();
-                let view = view.clone();
-                if grouped {
-                    menu = menu.separator();
-                }
-                for (label, slot, available) in [
-                    ("Move up", up, up.is_some()),
-                    ("Move down", down, down.is_some()),
-                ] {
-                    let id = id.clone();
-                    let view = view.clone();
-                    // The toolkit keeps the secondary foreground on a row it
-                    // draws as disabled, so the two rows that are out of range
-                    // are drawn here instead of asked of the toolkit.
-                    let ink = if available {
-                        roles.text
-                    } else {
-                        roles.text_disabled
-                    };
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
-                            div()
-                                .flex_1()
-                                .text_color(ink)
-                                .when(!available, |row| {
-                                    row.cursor(gpui_kit::CursorStyle::OperationNotAllowed)
-                                })
-                                .child(label)
-                        })
-                        .disabled(!available)
-                        .on_click(move |_, _window, cx| {
-                            let Some(slot) = slot else {
-                                return;
-                            };
-                            let _ = view.update(cx, |app, cx| app.move_workdir(&id, slot, cx));
-                        }),
-                    );
-                }
                 grouped = true;
             }
             if can_close {
