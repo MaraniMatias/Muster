@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.17
 
 - **An SVG file is read as a drawing, and its markup is one click away.** A
   drawing opened in the document pane was source and nothing else, because the
