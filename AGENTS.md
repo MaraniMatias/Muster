@@ -439,6 +439,16 @@ Three rules it depends on, each pinned by a test:
   editor's rope against the loaded text, so an undo back to what the file holds
   ends the draft instead of leaving a state a draft can be stuck in.
 
+**A file is read as a document and edited as its source.** A Markdown file opens
+as its reading, the toolkit's own text view, and an SVG file opens as the
+drawing it is; both are one toggle away from the source they were read from,
+and the toggle is the header's. The reading is built from the text the file
+holds, so the two views are one document and not two reads of it, and a save
+rebuilds it from the text that was saved. A drawing has no caret, so the
+keyboard goes with the region that holds it rather than with the editor behind
+it. `an_svg_file_opens_as_its_drawing_and_reads_as_source_on_request` in
+`app/src/inspector_tests.rs` pins it.
+
 **The header's icon copies the file's path.** The name in the header is a name
 inside the checkout, and the path a person pastes into a terminal or a message is
 the file's own path on the disk, so that is what the icon beside the name puts on

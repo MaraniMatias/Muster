@@ -8,6 +8,14 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **An SVG file is read as a drawing, and its markup is one click away.** A
+  drawing opened in the document pane was source and nothing else, because the
+  app had no reading for it. An SVG file now opens as the drawing it is — the
+  markup the file holds, drawn by the toolkit — and the header offers the source
+  beside it, the way a Markdown file offers its rendered reading. The two are
+  one document rather than two reads of the file, and the source is the same
+  text with the file's own markup highlighted.
+
 - **An SVG file is read with its markup.** A drawing opened in the document pane
   was plain text, because the toolkit ships no SVG grammar and nothing else in
   the app could read one. SVG is XML, so the pinned upstream XML grammar reads it

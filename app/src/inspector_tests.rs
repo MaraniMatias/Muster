@@ -17,7 +17,11 @@ fn reading(fixture: &GitFixture, cx: &mut TestAppContext) -> String {
     fixture.view.read_with(cx, |app, cx| {
         app.document_view
             .as_ref()
-            .and_then(|view| view.preview.clone())
+            .and_then(|view| view.reading.clone())
+            .and_then(|reading| match reading {
+                crate::document::Reading::Markdown(preview) => Some(preview),
+                crate::document::Reading::Picture { .. } => None,
+            })
             .map(|preview| {
                 preview.read_with(cx, |preview, _| preview.rendered_text().as_str().to_owned())
             })
@@ -2745,6 +2749,121 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
     close(&fixture, cx);
 }
 
+/// An SVG file opens as its drawing, and its markup is one click away.
+///
+/// The two readings are one document's two views, the way a Markdown file's
+/// are: the drawing is what the file is, and the markup is what it says. The
+/// drawing is drawn from the markup that was read, so the source beside it is
+/// the same text and the markup is what a person edits.
+#[gpui_kit::test]
+async fn an_svg_file_opens_as_its_drawing_and_reads_as_source_on_request(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\"/></svg>";
+    std::fs::write(fixture.root.join("drawing.svg"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "drawing.svg".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path == "drawing.svg")
+    })
+    .await;
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("document-picture").is_some(),
+            "an SVG file is read as the drawing it is"
+        );
+        assert!(
+            window.try_find("document-grammar").is_none(),
+            "the drawing has no source grammar selector"
+        );
+        assert_eq!(
+            window.find("document-toggle-reading").label(),
+            Some("Read this document as its source"),
+            "and the header offers the source it is not on"
+        );
+        // The source is still there, whole, for the other reading.
+        let state = fixture
+            .view
+            .read(cx)
+            .document_view
+            .as_ref()
+            .expect("a view")
+            .state
+            .clone();
+        assert_eq!(state.read(cx).text().to_string(), source);
+    })
+    .unwrap();
+
+    // The drawing holds the keyboard: a drawing has no caret, so the region
+    // that holds it is what the keyboard talks to.
+    let focus = fixture.view.read_with(cx, |app, _| {
+        match app
+            .document_view
+            .as_ref()
+            .expect("a view")
+            .reading
+            .clone()
+            .expect("a reading")
+        {
+            crate::document::Reading::Picture { focus, .. } => focus,
+            crate::document::Reading::Markdown(_) => unreachable!("a drawing"),
+        }
+    });
+    cx.update_window(fixture.handle, |_, window, _cx| {
+        assert!(
+            focus.is_focused(window),
+            "the drawing is on screen and the keyboard is somewhere else"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-toggle-reading", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("document-picture").is_none(),
+            "the source reading is the editor"
+        );
+        assert!(
+            window.try_find("document-grammar").is_some(),
+            "the source reading offers a grammar selector"
+        );
+        assert_eq!(
+            window.find("document-toggle-reading").label(),
+            Some("Read this document as its preview"),
+            "and the header offers the drawing it is not on"
+        );
+    })
+    .unwrap();
+
+    // And back again: the two readings are one document, not a re-read.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("document-toggle-reading", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("document-picture").is_some());
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// The keyboard belongs to the reading that is on screen.
 ///
 /// The defect this pins is the direction, not the missing feature. A Markdown
@@ -2787,7 +2906,11 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
     .await;
     let (state, preview) = fixture.view.read_with(cx, |app, _| {
         let view = app.document_view.as_ref().expect("a view");
-        (view.state.clone(), view.preview.clone().expect("a reading"))
+        let preview = match view.reading.clone().expect("a reading") {
+            crate::document::Reading::Markdown(preview) => preview,
+            crate::document::Reading::Picture { .. } => unreachable!("a Markdown reading"),
+        };
+        (view.state.clone(), preview)
     });
     let editor_id = state.entity_id();
     let reading_id = preview.entity_id();
@@ -2926,8 +3049,8 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
     let plain = fixture.view.read_with(cx, |app, _| {
         let view = app.document_view.as_ref().expect("a view");
         assert!(
-            view.preview.is_none(),
-            "a file that is not Markdown grew a second reading"
+            view.reading.is_none(),
+            "a file that is neither Markdown nor a drawing grew a second reading"
         );
         view.state.clone()
     });

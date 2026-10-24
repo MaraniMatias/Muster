@@ -10,9 +10,10 @@ use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextView,
 use gpui_kit::component::{Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, point, px, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Role, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, TestSupportExt, Window,
+    div, img, point, px, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
+    Image, ImageFormat, ImageSource, InteractiveElement, IntoElement, ObjectFit, ParentElement,
+    Role, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    TestSupportExt, Window,
 };
 use muster_core::workspace::{Checkout, Repo};
 use std::ffi::{OsStr, OsString};
@@ -26,6 +27,25 @@ use std::time::{Duration, Instant};
 
 mod media;
 
+/// The reading of a document that is not its source.
+///
+/// A Markdown file is read as a document and an SVG file as a drawing, and each
+/// is beside its source rather than instead of it. A file that is neither has
+/// no second reading: the pane draws its source and nothing else.
+#[derive(Clone)]
+pub(crate) enum Reading {
+    /// A Markdown file's reading, parsed by the toolkit's own text view.
+    Markdown(Entity<TextViewState>),
+    /// An SVG file's drawing, rasterized from the markup the file holds.
+    ///
+    /// The keyboard goes with it: a drawing has no caret, so the region that
+    /// holds it is what the keyboard talks to.
+    Picture {
+        image: Arc<Image>,
+        focus: FocusHandle,
+    },
+}
+
 /// The document's editor, kept between renders.
 ///
 /// The state is one entity created when the document is opened and read from
@@ -34,14 +54,14 @@ mod media;
 /// is written back, and only when somebody says so.
 pub(crate) struct DocumentView {
     pub(crate) state: Entity<EditorState>,
-    /// The reading view of a Markdown file, built when the document is opened and
-    /// kept beside the editor so the two views are one toggle rather than a second
-    /// read of the file.
-    pub(crate) preview: Option<Entity<TextViewState>>,
+    /// The reading of this document, when it has one: built when the document is
+    /// opened and kept beside the editor so the two views are one toggle rather
+    /// than a second read of the file.
+    pub(crate) reading: Option<Reading>,
     /// The replacement was published, but its directory entry was not confirmed durable.
     pub(crate) durability_uncertain: bool,
     /// Whether this document is being read as a document or as its source. True
-    /// for a Markdown file that opens rendered, false for everything else.
+    /// for a file that opens as its reading, false for everything else.
     rendered: bool,
     /// The document this state was built for. A different path replaces it: a
     /// selection or an offset carried over from another file would describe a
@@ -90,13 +110,13 @@ impl DocumentView {
                 .soft_wrap(false)
                 .default_value(text)
         });
-        let markdown = is_markdown(path);
-        let preview = markdown.then(|| cx.new(|cx| TextViewState::markdown(text, cx)));
+        let reading = build_reading(path, text, cx);
+        let rendered = reading.is_some();
         Self {
             state,
-            preview,
+            reading,
             durability_uncertain: false,
-            rendered: markdown,
+            rendered,
             path: identity.to_owned(),
             loaded: text.to_owned(),
             dirty: false,
@@ -116,7 +136,7 @@ impl DocumentView {
     }
 
     fn is_rendered(&self) -> bool {
-        self.rendered && self.preview.is_some()
+        self.rendered && self.reading.is_some()
     }
 
     /// The reading that is on screen, and the keyboard that goes with it.
@@ -154,9 +174,11 @@ impl DocumentView {
     /// The handle of the reading that is on screen.
     fn visible_handle(&self, cx: &App) -> Option<FocusHandle> {
         if self.is_rendered() {
-            self.preview
-                .as_ref()
-                .map(|preview| preview.read(cx).focus_handle().clone())
+            match self.reading.as_ref() {
+                Some(Reading::Markdown(preview)) => Some(preview.read(cx).focus_handle().clone()),
+                Some(Reading::Picture { focus, .. }) => Some(focus.clone()),
+                None => None,
+            }
         } else {
             Some(self.state.read(cx).focus_handle(cx))
         }
@@ -206,6 +228,39 @@ pub(crate) fn is_markdown(path: &str) -> bool {
             "md" | "markdown" | "mdown" | "mkd"
         )
     })
+}
+
+/// Whether a path names an SVG file.
+///
+/// The one file this window draws as a picture and also reads as its source: a
+/// drawing is a document whose markup is the document.
+pub(crate) fn is_svg(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("svg"))
+}
+
+/// The reading of a file, when it has one, built from the text it holds.
+///
+/// A Markdown file is read as a document and an SVG file as a drawing, and both
+/// are a parse of the text as it was read: a file that is neither is its source
+/// and only its source.
+fn build_reading(path: &str, text: &str, cx: &mut App) -> Option<Reading> {
+    if is_markdown(path) {
+        Some(Reading::Markdown(
+            cx.new(|cx| TextViewState::markdown(text, cx)),
+        ))
+    } else if is_svg(path) {
+        Some(Reading::Picture {
+            image: Arc::new(Image::from_bytes(
+                ImageFormat::Svg,
+                text.as_bytes().to_vec(),
+            )),
+            focus: cx.focus_handle(),
+        })
+    } else {
+        None
+    }
 }
 
 /// The toolkit language name a path asks for.
@@ -1038,15 +1093,15 @@ fn scroll_grammar_row_into_view(scroll: &ScrollHandle, row: usize) {
 /// same way whichever of the two is on screen.
 fn document_body(
     state: &Entity<EditorState>,
-    rendered: Option<Entity<TextViewState>>,
+    reading: Option<Reading>,
     media: Option<media::DocumentMedia>,
     link_handler: impl Fn(&gpui_kit::SharedString, &gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)
         + Send
         + Sync
         + 'static,
 ) -> AnyElement {
-    let reading = match rendered {
-        Some(preview) => {
+    let body = match reading {
+        Some(Reading::Markdown(preview)) => {
             let mut extensions = MarkdownExtensions::default()
                 .frontmatter()
                 .plugin(FrontmatterPlugin::new());
@@ -1076,6 +1131,22 @@ fn document_body(
                 )
                 .into_any_element()
         }
+        // A drawing is drawn where it stands, at the size it was written at: the
+        // toolkit rasterizes an SVG once, at the size the file declares, so a
+        // drawing blown up is a blurred one.
+        Some(Reading::Picture { image, focus }) => div()
+            .id("document-picture")
+            .test_support()
+            .size_full()
+            .track_focus(&focus)
+            .child(
+                img(ImageSource::Image(image))
+                    // The drawing keeps its own size inside the pane, and is only
+                    // smaller when the pane is smaller than it is.
+                    .object_fit(ObjectFit::ScaleDown)
+                    .size_full(),
+            )
+            .into_any_element(),
         None => Editor::new(state)
             .readonly(false)
             .bordered(false)
@@ -1095,7 +1166,7 @@ fn document_body(
         .min_h_0()
         .px_6()
         .py_5()
-        .child(reading)
+        .child(body)
         .into_any_element()
 }
 
@@ -1269,10 +1340,7 @@ impl TerminalWindow {
                         });
                         // The reading is a parse of the text as saved, and the
                         // saved text is the only one it can be right about.
-                        if is_markdown(&path) {
-                            document.preview =
-                                Some(cx.new(|cx| TextViewState::markdown(&content, cx)));
-                        }
+                        document.reading = build_reading(&path, &content, cx);
                         // What was loaded is what the pane draws, so a document
                         // reopened from here is the one that was saved.
                         if let Some(preview) = app
@@ -1303,10 +1371,7 @@ impl TerminalWindow {
                         document.loaded = content.clone();
                         document.durability_uncertain = true;
                         document.dirty = *document.state.read(cx).text() != content.as_str();
-                        if is_markdown(&path) {
-                            document.preview =
-                                Some(cx.new(|cx| TextViewState::markdown(&content, cx)));
-                        }
+                        document.reading = build_reading(&path, &content, cx);
                         if let Some(preview) = app
                             .open_document
                             .as_mut()
@@ -1789,32 +1854,39 @@ impl TerminalWindow {
                     .expect("just installed")
                     .focus_visible_after_this_frame(window, cx);
             }
-            // A Markdown file is read as a document and can be read as its source;
-            // everything else is its source and only its source.
-            let rendered = self
+            // A Markdown file is read as a document and an SVG file as a
+            // drawing; both can be read as their source, and everything else is
+            // its source and only its source.
+            let reading = self
                 .document_view
                 .as_ref()
                 .filter(|view| view.is_rendered())
-                .and_then(|view| view.preview.clone());
+                .and_then(|view| view.reading.clone());
             // The pictures a rendered document names are reached through the same
             // checkout the document itself was read from, so a `../` that would
             // leave it is refused where every other path out of it is refused.
-            let media = rendered.as_ref().and_then(|_| {
-                let (repo, checkout) = self.document_source(&checkout_id)?;
-                Some(media::DocumentMedia::new(
-                    repo,
-                    checkout,
-                    &path,
-                    Arc::downgrade(&self.document_view.as_ref()?.media),
-                ))
-            });
+            // Only a Markdown reading names pictures: a drawing is its own.
+            let media = match reading.as_ref() {
+                Some(Reading::Markdown(_)) => {
+                    self.document_source(&checkout_id)
+                        .and_then(|(repo, checkout)| {
+                            Some(media::DocumentMedia::new(
+                                repo,
+                                checkout,
+                                &path,
+                                Arc::downgrade(&self.document_view.as_ref()?.media),
+                            ))
+                        })
+                }
+                _ => None,
+            };
             if let Some(media) = media.as_ref() {
                 // This frame says what the document already holds and starts the
                 // reads its last parse asked for; the bytes arrive later, off the
                 // UI thread, and ask for a frame of their own when they do.
                 media.prepare(cx.entity().downgrade(), cx);
             }
-            document_body(&state, rendered, media, link_handler)
+            document_body(&state, reading, media, link_handler)
         } else if let Some(error) = self.document_errors.get(&key) {
             let retry_path = path.clone();
             let retry_checkout = checkout_id.clone();
@@ -1888,16 +1960,42 @@ impl TerminalWindow {
         // A Markdown document is rendered by the toolkit's own text view and not
         // by the editor: the toolkit's view draws headings, lists, tables and
         // fences the way Legacy's preview did, and its fences are coloured by the
-        // `muster-content` theme this window already installed. The header says
-        // which reading is on the screen and offers the other one.
-        let markdown = self
+        // `muster-content` theme this window already installed. An SVG file is
+        // drawn as the drawing it is. The header says which reading is on the
+        // screen and offers the other one.
+        let reading = self
             .document_view
             .as_ref()
-            .is_some_and(|view| view.preview.is_some());
+            .and_then(|view| view.reading.as_ref());
         let rendered = self
             .document_view
             .as_ref()
             .is_some_and(DocumentView::is_rendered);
+        // What the header offers: the reading this document is not on. A
+        // Markdown file's other reading is its rendered document, and an SVG
+        // file's is its preview.
+        let other_reading = reading.map(|reading| match reading {
+            Reading::Markdown(_) if rendered => (
+                "Source",
+                "Read this document as its source",
+                "Read the Markdown source",
+            ),
+            Reading::Markdown(_) => (
+                "Rendered",
+                "Read this document rendered",
+                "Read the rendered document",
+            ),
+            Reading::Picture { .. } if rendered => (
+                "Source",
+                "Read this document as its source",
+                "Read the SVG source",
+            ),
+            Reading::Picture { .. } => (
+                "Preview",
+                "Read this document as its preview",
+                "Read the preview",
+            ),
+        });
         // The changes this file has, in Git's own words: a file with none offers
         // nothing to see, and one whose change set has not been read is not a file
         // that can say it has none.
@@ -2100,29 +2198,21 @@ impl TerminalWindow {
                                 }),
                         )
                         .when_some(grammar_selector, |header, selector| header.child(selector))
-                        .when(markdown, |header| {
+                        .when_some(other_reading, |header, (label, accessibility, tooltip)| {
                             header.child(
                                 Button::new("document-toggle-reading")
                                     .text()
                                     .cursor_default()
                                     .small()
                                     .compact()
-                                    .label(if rendered { "Source" } else { "Rendered" })
-                                    .accessibility_label(if rendered {
-                                        "Read this document as its source"
-                                    } else {
-                                        "Read this document rendered"
-                                    })
-                                    .resting_tooltip(if rendered {
-                                        "Read the Markdown source"
-                                    } else {
-                                        "Read the rendered document"
-                                    })
+                                    .label(label)
+                                    .accessibility_label(accessibility)
+                                    .resting_tooltip(tooltip)
                                     .on_click(cx.listener(|app, _, window, cx| {
                                         let Some(view) = app.document_view.as_mut() else {
                                             return;
                                         };
-                                        if view.preview.is_some() {
+                                        if view.reading.is_some() {
                                             app.document_grammar_open = false;
                                             view.rendered = !view.rendered;
                                             // The reading that just went away takes
@@ -2372,7 +2462,7 @@ mod tests {
                 .view
                 .as_ref()
                 .filter(|view| view.is_rendered())
-                .and_then(|view| view.preview.clone());
+                .and_then(|view| view.reading.clone());
             div()
                 .size_full()
                 .flex()
@@ -2479,13 +2569,17 @@ mod tests {
         });
         settle(cx, window);
         let preview = harness.read_with(cx, |harness, _| {
-            harness
+            let reading = harness
                 .view
                 .as_ref()
                 .expect("a document is open")
-                .preview
+                .reading
                 .clone()
-                .expect("a Markdown file has a reading")
+                .expect("a Markdown file has a reading");
+            match reading {
+                Reading::Markdown(preview) => preview,
+                Reading::Picture { .. } => unreachable!("a Markdown reading"),
+            }
         });
         assert!(
             preview.read_with(cx, |preview, _| {
