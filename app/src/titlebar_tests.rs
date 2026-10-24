@@ -215,10 +215,10 @@ fn explicit_terminal_selection_closes_file_document_and_keeps_terminal(cx: &mut 
         let other = format!("other-checkout:{}", fixture.checkout);
         app.open_document = Some((
             other,
-            muster_core::files::FilePreview {
+            crate::document::DocumentPreview::Text(muster_core::files::FilePreview {
                 path: "source.rs".into(),
                 text: "fn main() {}".into(),
-            },
+            }),
         ));
         cx.notify();
     });
@@ -245,10 +245,10 @@ fn closing_a_document_restores_the_retained_terminal(cx: &mut TestAppContext) {
     fixture.view.update(cx, |app, cx| {
         app.open_document = Some((
             fixture.checkout.clone(),
-            muster_core::files::FilePreview {
+            crate::document::DocumentPreview::Text(muster_core::files::FilePreview {
                 path: "source.rs".into(),
                 text: "fn main() {}".into(),
-            },
+            }),
         ));
         cx.notify();
     });
@@ -275,10 +275,10 @@ fn checkout_change_hides_another_checkouts_document(cx: &mut TestAppContext) {
         app.navigation.merge(opened, false);
         app.open_document = Some((
             other_checkout,
-            muster_core::files::FilePreview {
+            crate::document::DocumentPreview::Text(muster_core::files::FilePreview {
                 path: "elsewhere.rs".into(),
                 text: "wrong checkout".into(),
-            },
+            }),
         ));
         cx.notify();
     });

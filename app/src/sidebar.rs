@@ -253,7 +253,7 @@ impl OpenItem {
             .or_else(|| {
                 app.open_document
                     .as_ref()
-                    .map(|(checkout, preview)| (checkout, preview.path.as_str()))
+                    .map(|(checkout, preview)| (checkout, preview.path()))
             });
         let active = app.navigation.active_checkout.as_deref() == Some(&self.checkout_id);
         match self.kind {
@@ -297,7 +297,7 @@ impl TerminalWindow {
             .or_else(|| {
                 self.open_document
                     .as_ref()
-                    .map(|(id, preview)| (id, preview.path.as_str()))
+                    .map(|(id, preview)| (id, preview.path()))
             });
         if active
             && self

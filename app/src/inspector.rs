@@ -19,6 +19,7 @@ use crate::{
     app::{
         measured_width, ButtonA11y, InspectorTab, TerminalWindow, ViewKind, ViewPin, WidthCache,
     },
+    document::{raster_image_from_bytes, DocumentPreview},
     file_icons,
     theme::Roles,
     tooltip::RestingTooltip,
@@ -28,6 +29,29 @@ use crate::{
 const ROW_TEXT_PX: f32 = 13.;
 /// The size a Git status letter is drawn at, which is its own column's size.
 const STATUS_TEXT_PX: f32 = 10.;
+
+fn read_document(repo: &Repo, checkout: &Checkout, path: &str) -> Result<DocumentPreview, String> {
+    match muster_core::files::read_preview(repo, checkout, path) {
+        Ok(preview) => {
+            if let Some(image) = raster_image_from_bytes(path, preview.text.as_bytes().to_vec()) {
+                return Ok(DocumentPreview::Image {
+                    path: preview.path,
+                    image,
+                });
+            }
+            Ok(DocumentPreview::Text(preview))
+        }
+        Err(preview_error) => match muster_core::files::read_resource(repo, checkout, path) {
+            Ok(bytes) => raster_image_from_bytes(path, bytes)
+                .map(|image| DocumentPreview::Image {
+                    path: path.to_owned(),
+                    image,
+                })
+                .ok_or(preview_error),
+            Err(_) => Err(preview_error),
+        },
+    }
+}
 
 /// The letter a Git status answers with, out of both porcelain columns.
 ///
@@ -996,7 +1020,7 @@ impl TerminalWindow {
         self.file_loading.insert(key.clone());
         let worker = cx
             .background_executor()
-            .spawn(async move { muster_core::files::read_preview(&repo, &checkout, &path) });
+            .spawn(async move { read_document(&repo, &checkout, &path) });
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update_in(cx, |app, _, cx| {

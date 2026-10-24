@@ -846,7 +846,7 @@ async fn only_the_files_being_edited_are_unfinished_work_rows(cx: &mut TestAppCo
                 .read(cx)
                 .open_document
                 .as_ref()
-                .is_some_and(|(id, preview)| id == &checkout && preview.path == path)
+                .is_some_and(|(id, preview)| id == &checkout && preview.path() == path)
         })
         .await;
         cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
@@ -1074,7 +1074,7 @@ async fn reading_through_files_leaves_one_row(cx: &mut TestAppContext) {
                 .read(cx)
                 .open_document
                 .as_ref()
-                .is_some_and(|(id, preview)| id == &checkout && preview.path == path)
+                .is_some_and(|(id, preview)| id == &checkout && preview.path() == path)
         })
         .await;
     }
@@ -2746,9 +2746,11 @@ async fn a_new_terminal_takes_the_preview_and_a_later_preview_keeps_the_keyboard
     cx: &mut TestAppContext,
 ) {
     let fixture = open(cx);
-    let preview = |path: &str| FilePreview {
-        path: path.to_owned(),
-        text: "preview\n".into(),
+    let preview = |path: &str| {
+        DocumentPreview::Text(muster_core::files::FilePreview {
+            path: path.to_owned(),
+            text: "preview\n".into(),
+        })
     };
     cx.update_window(fixture.handle, |_, window, cx| {
         fixture.view.update(cx, |app, cx| {
@@ -2794,7 +2796,7 @@ async fn a_new_terminal_takes_the_preview_and_a_later_preview_keeps_the_keyboard
         assert_eq!(
             app.open_document
                 .as_ref()
-                .map(|(_, preview)| preview.path.as_str()),
+                .map(|(_, preview)| preview.path()),
             Some("second.txt"),
             "a terminal that finished spawning took a preview opened after it"
         );

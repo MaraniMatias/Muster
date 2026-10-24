@@ -535,11 +535,11 @@ impl TerminalWindow {
         let document_path = self
             .document_target
             .as_ref()
-            .map(|(id, path)| (id, path))
+            .map(|(id, path)| (id, path.as_str()))
             .or_else(|| {
                 self.open_document
                     .as_ref()
-                    .map(|(id, preview)| (id, &preview.path))
+                    .map(|(id, preview)| (id, preview.path()))
             });
         let document_checkout = document_path.map(|(checkout, _)| checkout.as_str());
         let diff_label = self
@@ -551,7 +551,7 @@ impl TerminalWindow {
             || document_checkout
                 .is_some_and(|id| Some(id) == self.navigation.active_checkout.as_deref());
         let item_label = if document_is_active {
-            diff_label.or_else(|| document_path.map(|(_, path)| path.clone()))
+            diff_label.or_else(|| document_path.map(|(_, path)| path.to_owned()))
         } else {
             self.terminal()
                 .and(self.navigation.active_session.as_deref())
@@ -570,7 +570,7 @@ impl TerminalWindow {
                 document_checkout
                     .filter(|id| Some(*id) == self.navigation.active_checkout.as_deref())
                     .and(document_path)
-                    .map(|(_, path)| path.as_str())
+                    .map(|(_, path)| path)
             })
             .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned());
         let item_program = if item_file.is_none() && !document_is_active {

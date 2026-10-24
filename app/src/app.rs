@@ -27,13 +27,13 @@ use gpui_kit::{
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
-use muster_core::files::FilePreview;
 use muster_core::navigation::{self, DiffTotals, GitReadBudget};
 use muster_core::settings::FollowWorktree;
 use muster_core::workspace::{
     Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
 };
 
+use crate::document::DocumentPreview;
 use crate::navigation::{session_title, Navigation};
 use crate::open_directory::OpenDirectoryDraft;
 use crate::pty::TerminalBackend;
@@ -546,7 +546,7 @@ pub struct TerminalWindow {
     /// frame it draws and a name is asked once.
     pub(crate) measured_widths: WidthCache,
     pub(crate) selected_file: HashMap<String, String>,
-    pub(crate) open_document: Option<(String, FilePreview)>,
+    pub(crate) open_document: Option<(String, DocumentPreview)>,
     pub(crate) document_target: Option<(String, String)>,
     pub(crate) document_view: Option<crate::document::DocumentView>,
     pub(crate) pending_document_transition: Option<PendingDocumentTransition>,
@@ -1326,7 +1326,7 @@ impl TerminalWindow {
                     .or_else(|| {
                         self.open_document
                             .as_ref()
-                            .map(|(id, preview)| (id, preview.path.as_str()))
+                            .map(|(id, preview)| (id, preview.path()))
                     });
                 document.is_some_and(|(id, path)| {
                     id == &pin.checkout_id && Some(path) == pin.path.as_deref()

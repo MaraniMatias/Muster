@@ -15,6 +15,7 @@ use gpui_kit::{
     Role, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledImage,
     TestSupportExt, Window,
 };
+use muster_core::files::FilePreview;
 use muster_core::workspace::{Checkout, Repo};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -44,6 +45,37 @@ pub(crate) enum Reading {
         image: Arc<Image>,
         focus: FocusHandle,
     },
+}
+
+/// A file opened in the inspector, as text or as a directly-rendered image.
+#[derive(Clone)]
+pub(crate) enum DocumentPreview {
+    Text(FilePreview),
+    Image { path: String, image: Arc<Image> },
+}
+
+impl DocumentPreview {
+    pub(crate) fn path(&self) -> &str {
+        match self {
+            Self::Text(preview) => &preview.path,
+            Self::Image { path, .. } => path,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(preview) => Some(&preview.text),
+            Self::Image { .. } => None,
+        }
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Text(preview) => Some(&mut preview.text),
+            Self::Image { .. } => None,
+        }
+    }
 }
 
 /// The document's editor, kept between renders.
@@ -261,6 +293,11 @@ fn build_reading(path: &str, text: &str, cx: &mut App) -> Option<Reading> {
     } else {
         None
     }
+}
+
+/// Decode a raster image from bytes already read through the checkout boundary.
+pub(crate) fn raster_image_from_bytes(path: &str, bytes: Vec<u8>) -> Option<Arc<Image>> {
+    media::raster_picture(path, bytes)
 }
 
 /// The toolkit language name a path asks for.
@@ -1091,6 +1128,19 @@ fn scroll_grammar_row_into_view(scroll: &ScrollHandle, row: usize) {
 ///
 /// The margin is the pane's, not either reading's, so a document is read the
 /// same way whichever of the two is on screen.
+fn image_preview_body(image: Arc<Image>) -> AnyElement {
+    div()
+        .id("document-picture")
+        .test_support()
+        .size_full()
+        .child(
+            img(ImageSource::Image(image))
+                .object_fit(ObjectFit::Contain)
+                .size_full(),
+        )
+        .into_any_element()
+}
+
 fn document_body(
     state: &Entity<EditorState>,
     reading: Option<Reading>,
@@ -1346,10 +1396,10 @@ impl TerminalWindow {
                         if let Some(preview) = app
                             .open_document
                             .as_mut()
-                            .filter(|(id, preview)| *id == checkout_id && preview.path == path)
-                            .map(|(_, preview)| preview)
+                            .filter(|(id, preview)| *id == checkout_id && preview.path() == path)
+                            .and_then(|(_, preview)| preview.text_mut())
                         {
-                            preview.text = content;
+                            *preview = content;
                         }
                         // The file is not what it was: what the Changes view will
                         // show about it has to be asked again.
@@ -1375,10 +1425,10 @@ impl TerminalWindow {
                         if let Some(preview) = app
                             .open_document
                             .as_mut()
-                            .filter(|(id, preview)| *id == checkout_id && preview.path == path)
-                            .map(|(_, preview)| preview)
+                            .filter(|(id, preview)| *id == checkout_id && preview.path() == path)
+                            .and_then(|(_, preview)| preview.text_mut())
                         {
-                            preview.text = content.clone();
+                            *preview = content.clone();
                         }
                         app.git_diff.remove(&(checkout_id.clone(), path.clone()));
                         app.git_diff_request
@@ -1784,7 +1834,7 @@ impl TerminalWindow {
         let target = self.document_target.clone().or_else(|| {
             self.open_document
                 .as_ref()
-                .map(|(id, preview)| (id.clone(), preview.path.clone()))
+                .map(|(id, preview)| (id.clone(), preview.path().to_owned()))
         });
         let Some((checkout_id, path)) = target else {
             self.document_view = None;
@@ -1808,10 +1858,16 @@ impl TerminalWindow {
         // Opened where it was clicked: the handler carries this window weakly
         // into the toolkit's text view and dispatches from the click itself.
         let link_handler = link_handler(cx.entity().downgrade());
-        let body = if let Some((_, preview)) = self
+        let body = if let Some((_, DocumentPreview::Image { image, .. })) = self
             .open_document
             .as_ref()
-            .filter(|(id, preview)| id == &checkout_id && preview.path == path)
+            .filter(|(id, preview)| id == &checkout_id && preview.path() == path)
+        {
+            image_preview_body(image.clone())
+        } else if let Some((_, DocumentPreview::Text(preview))) = self
+            .open_document
+            .as_ref()
+            .filter(|(id, preview)| id == &checkout_id && preview.path() == path)
         {
             let identity = format!("{checkout_id}\0{path}\0{}", self.document_request);
             let new_view = self

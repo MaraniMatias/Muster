@@ -351,6 +351,16 @@ fn picture_format(name: &str, bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// Decode a direct raster preview from bytes already read through the checkout.
+/// SVG stays on the text-backed path so its source remains editable.
+pub(super) fn raster_picture(name: &str, bytes: Vec<u8>) -> Option<Arc<Image>> {
+    let format = picture_format(name, &bytes)?;
+    if matches!(format, ImageFormat::Svg) {
+        return None;
+    }
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
 /// What a parse leaves in a node: the name the picture has inside the checkout,
 /// and where its bytes arrive.
 ///

@@ -1635,7 +1635,7 @@ async fn retry_after_a_failed_read_reads_the_file_again(cx: &mut TestAppContext)
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.text == "here now\n")
+            .is_some_and(|(_, preview)| preview.text() == Some("here now\n"))
     })
     .await;
     fixture.view.read_with(cx, |app, _| {
@@ -2027,7 +2027,7 @@ async fn the_grammar_menu_is_a_search_over_one_list(cx: &mut TestAppContext) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == path)
+            .is_some_and(|(_, preview)| preview.path() == path)
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2147,7 +2147,7 @@ async fn the_grammar_menu_opens_on_the_row_the_keyboard_points_at(cx: &mut TestA
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == path)
+            .is_some_and(|(_, preview)| preview.path() == path)
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2223,7 +2223,7 @@ async fn the_grammar_menu_search_puts_the_list_back_at_the_first_row(cx: &mut Te
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == path)
+            .is_some_and(|(_, preview)| preview.path() == path)
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2289,7 +2289,7 @@ async fn a_reader_can_force_the_grammar_a_file_wears(cx: &mut TestAppContext) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == path)
+            .is_some_and(|(_, preview)| preview.path() == path)
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -2380,7 +2380,7 @@ async fn a_reader_can_force_the_grammar_a_file_wears(cx: &mut TestAppContext) {
                 .read(cx)
                 .open_document
                 .as_ref()
-                .is_some_and(|(_, preview)| preview.path == selected_path)
+                .is_some_and(|(_, preview)| preview.path() == selected_path)
         })
         .await;
     }
@@ -2683,7 +2683,7 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
 
@@ -2749,6 +2749,42 @@ async fn a_markdown_document_opens_rendered_and_reads_as_source_on_request(
     close(&fixture, cx);
 }
 
+/// A raster file is drawn directly without creating an editable text document.
+#[gpui_kit::test]
+async fn a_png_file_opens_as_a_direct_image_preview(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.data"), ONE_PIXEL_PNG).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout = app.navigation.checkout(&fixture.checkout).unwrap().clone();
+            app.request_document(repo, checkout, "diagram.data".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture.view.read(cx).open_document.as_ref().is_some_and(|(_, preview)| {
+            matches!(preview, crate::document::DocumentPreview::Image { path, .. } if path == "diagram.data")
+        })
+    })
+    .await;
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("document-picture").is_some());
+        assert!(window.try_find("document-toggle-reading").is_none());
+        assert!(window.try_find("document-grammar").is_none());
+        assert!(window.try_find("format-document").is_none());
+        assert!(fixture.view.read(cx).document_view.is_none());
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// An SVG file opens as its drawing, and its markup is one click away.
 ///
 /// The two readings are one document's two views, the way a Markdown file's
@@ -2777,7 +2813,7 @@ async fn an_svg_file_opens_as_its_drawing_and_reads_as_source_on_request(cx: &mu
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "drawing.svg")
+            .is_some_and(|(_, preview)| preview.path() == "drawing.svg")
     })
     .await;
 
@@ -2901,7 +2937,7 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
     let (state, preview) = fixture.view.read_with(cx, |app, _| {
@@ -3043,7 +3079,7 @@ async fn the_keyboard_follows_the_reading_that_is_on_screen(cx: &mut TestAppCont
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "note.txt")
+            .is_some_and(|(_, preview)| preview.path() == "note.txt")
     })
     .await;
     let plain = fixture.view.read_with(cx, |app, _| {
@@ -3218,7 +3254,7 @@ async fn a_rendered_document_draws_its_picture_and_says_what_it_cannot(cx: &mut 
         fixture.view.read_with(cx, |app, _| app
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")),
+            .is_some_and(|(_, preview)| preview.path() == "README.md")),
         "the document was not read"
     );
 
@@ -3367,7 +3403,7 @@ async fn a_picture_the_checkout_will_not_hand_over_is_said_in_words(cx: &mut Tes
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
     // Every worker runs, so this is what the document looks like after the reads
@@ -3628,7 +3664,7 @@ async fn a_files_changes_offer_the_source_of_a_file_that_is_on_disk(cx: &mut Tes
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "notes.md")
+            .is_some_and(|(_, preview)| preview.path() == "notes.md")
     })
     .await;
     assert!(
@@ -3662,7 +3698,7 @@ async fn open(cx: &mut TestAppContext, fixture: &GitFixture, path: &str) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == path)
+            .is_some_and(|(_, preview)| preview.path() == path)
     })
     .await;
 }
@@ -3689,7 +3725,7 @@ async fn dirty_document_navigation_waits_for_cancel_or_discard(cx: &mut TestAppC
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -3728,7 +3764,7 @@ async fn dirty_document_navigation_waits_for_cancel_or_discard(cx: &mut TestAppC
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "second.txt")
+            .is_some_and(|(_, file)| file.path() == "second.txt")
     })
     .await;
     assert_eq!(
@@ -3756,7 +3792,7 @@ async fn app_quit_waits_for_dirty_document_decisions(cx: &mut TestAppContext) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -3794,7 +3830,7 @@ async fn dirty_document_window_close_can_be_cancelled(cx: &mut TestAppContext) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -3844,7 +3880,7 @@ async fn dirty_document_save_conflict_keeps_draft_and_pending_destination(cx: &m
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -3925,7 +3961,7 @@ async fn a_clean_document_with_uncertain_durability_keeps_window_close_pending(
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     fixture.view.update(cx, |app, _| {
@@ -4226,7 +4262,7 @@ async fn app_quit_asks_about_the_document_before_the_terminals(cx: &mut TestAppC
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4279,7 +4315,7 @@ async fn clean_in_flight_save_and_format_keep_close_pending_until_idle(cx: &mut 
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     fixture.view.update(cx, |app, _| {
@@ -4352,7 +4388,7 @@ async fn a_durability_retry_carries_the_queued_window_close(cx: &mut TestAppCont
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     // The published-but-not-durable state: the bytes are visible, the
@@ -4415,7 +4451,7 @@ async fn a_save_in_flight_carries_the_queued_window_close(cx: &mut TestAppContex
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4473,7 +4509,7 @@ async fn the_closes_save_answer_writes_the_draft_and_closes_the_window(cx: &mut 
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4529,7 +4565,7 @@ async fn the_close_asks_before_stopping_a_terminal_and_the_approval_closes_it(
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     fixture.view.update(cx, |app, _| {
@@ -4590,7 +4626,7 @@ async fn a_refused_save_keeps_the_draft_and_the_queued_close(cx: &mut TestAppCon
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4691,7 +4727,7 @@ async fn a_finished_format_carries_the_queued_window_close(cx: &mut TestAppConte
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.ts")
+            .is_some_and(|(_, file)| file.path() == "first.ts")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4779,7 +4815,7 @@ async fn a_clean_format_carries_the_queued_window_close(cx: &mut TestAppContext)
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.ts")
+            .is_some_and(|(_, file)| file.path() == "first.ts")
     })
     .await;
     fixture.view.update(cx, |app, _| {
@@ -4850,7 +4886,7 @@ async fn uncertain_publication_blocks_navigation_until_durability_retry(cx: &mut
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     fixture.view.update(cx, |app, _| {
@@ -4875,7 +4911,7 @@ async fn uncertain_publication_blocks_navigation_until_durability_retry(cx: &mut
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "second.txt")
+            .is_some_and(|(_, file)| file.path() == "second.txt")
     })
     .await;
     assert_eq!(
@@ -4907,7 +4943,7 @@ async fn dirty_document_navigation_applies_only_after_successful_save(cx: &mut T
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -4924,7 +4960,7 @@ async fn dirty_document_navigation_applies_only_after_successful_save(cx: &mut T
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "second.txt")
+            .is_some_and(|(_, file)| file.path() == "second.txt")
     })
     .await;
     assert_eq!(
@@ -4955,7 +4991,7 @@ async fn navigation_requested_while_saving_keeps_newer_edits_until_decided(
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -5011,7 +5047,7 @@ async fn navigation_requested_during_formatting_is_deferred_until_idle(cx: &mut 
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -5076,7 +5112,7 @@ async fn a_document_transition_with_no_destination_asks_nothing(cx: &mut TestApp
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.txt")
+            .is_some_and(|(_, file)| file.path() == "first.txt")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -5134,7 +5170,7 @@ async fn a_finished_format_with_no_destination_asks_nothing(cx: &mut TestAppCont
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, file)| file.path == "first.ts")
+            .is_some_and(|(_, file)| file.path() == "first.ts")
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
@@ -5222,7 +5258,7 @@ async fn a_picture_read_after_its_document_is_closed_is_dropped(cx: &mut TestApp
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
     let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());
@@ -5288,7 +5324,7 @@ async fn a_picture_read_after_its_document_is_closed_is_dropped(cx: &mut TestApp
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
     assert!(
@@ -5340,7 +5376,7 @@ async fn a_picture_that_does_not_decode_is_said_in_words(cx: &mut TestAppContext
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "README.md")
+            .is_some_and(|(_, preview)| preview.path() == "README.md")
     })
     .await;
     let id = |said: &str| {
@@ -5414,7 +5450,7 @@ async fn a_picture_drawn_is_the_bytes_that_were_read(cx: &mut TestAppContext) {
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(_, preview)| preview.path == "docs/guide/README.md")
+            .is_some_and(|(_, preview)| preview.path() == "docs/guide/README.md")
     })
     .await;
     let picture = format!("document-media-{}", source.find("![The diagram]").unwrap());

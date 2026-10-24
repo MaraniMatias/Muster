@@ -397,7 +397,7 @@ async fn a_path_the_terminal_printed_opens_the_file_in_the_preview(cx: &mut Test
             .read(cx)
             .open_document
             .as_ref()
-            .is_some_and(|(id, preview)| id == &checkout && preview.path == "code.rs")
+            .is_some_and(|(id, preview)| id == &checkout && preview.path() == "code.rs")
     })
     .await;
 
@@ -423,7 +423,7 @@ async fn a_path_the_terminal_printed_opens_the_file_in_the_preview(cx: &mut Test
     let shown = fixture.view.read_with(cx, |app, _| {
         app.open_document
             .as_ref()
-            .map(|(_, preview)| preview.path.clone())
+            .map(|(_, preview)| preview.path().to_owned())
     });
     assert_eq!(
         shown.as_deref(),
