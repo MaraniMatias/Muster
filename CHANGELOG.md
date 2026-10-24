@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.16
 
 - **The filesystem root is not a workdir.** The panel showed a workdir named
   `/`. An application opened from the desktop starts in the root of the

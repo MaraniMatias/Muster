@@ -31,11 +31,11 @@ You can use any CLI agent, or work without one. OpenCode has native session and 
 
 ## Install
 
-The current candidate is **v1.0.0-rc.15**:
-[`Muster_1.0.0-rc.15_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.15/Muster_1.0.0-rc.15_arm64.zip) for macOS on Apple Silicon,
-[`Muster_1.0.0-rc.15_x86_64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.15/Muster_1.0.0-rc.15_x86_64.zip) for macOS on Intel,
-[`muster_1.0.0-rc.15_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.15/muster_1.0.0-rc.15_amd64.deb) for Ubuntu on x86_64,
-[`muster_1.0.0-rc.15_arm64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.15/muster_1.0.0-rc.15_arm64.deb) for Ubuntu on arm64.
+The current candidate is **v1.0.0-rc.16**:
+[`Muster_1.0.0-rc.16_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.16/Muster_1.0.0-rc.16_arm64.zip) for macOS on Apple Silicon,
+[`Muster_1.0.0-rc.16_x86_64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.16/Muster_1.0.0-rc.16_x86_64.zip) for macOS on Intel,
+[`muster_1.0.0-rc.16_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.16/muster_1.0.0-rc.16_amd64.deb) for Ubuntu on x86_64,
+[`muster_1.0.0-rc.16_arm64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.16/muster_1.0.0-rc.16_arm64.deb) for Ubuntu on arm64.
 
 It is a pre-release, so GitHub's `Latest` badge still selects the frozen Legacy
 release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Muster/releases)
