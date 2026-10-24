@@ -25,6 +25,7 @@ mod input;
 mod keys;
 mod links;
 mod modes;
+mod opencode_status;
 mod paste;
 mod pi_status;
 mod session;
@@ -41,6 +42,7 @@ pub use self::input::{FocusState, Input, MouseReport};
 pub use self::keys::{encode_key, Key, KeyPress};
 pub use self::links::LinkTarget;
 pub use self::modes::TerminalModes;
+pub use self::opencode_status::{OpenCodeReport, OpenCodeState};
 pub use self::paste::{encode_paste, PasteError, MAX_PASTE_BYTES};
 pub use self::pi_status::{pi_task_note, PiTaskState};
 pub use self::session::{

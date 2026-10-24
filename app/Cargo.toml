@@ -87,6 +87,9 @@ tree-sitter-gitignore = { package = "konomanoasa-tree-sitter-gitignore", path = 
 # one a `.feature` file is read with; its tree hash is checked by the RustSec audit.
 tree-sitter-gherkin = { path = "../vendor/tree-sitter-gherkin-ceeb7c8" }
 tree-sitter-ini = "1.4.0"
+# The toolkit has no SVG parser. SVG is XML, so this pinned upstream XML grammar
+# reads it; the app registers it under SVG's own name in `theme::install`.
+tree-sitter-xml = "0.7.0"
 # Already in the graph through the toolkit. Needed because a toolkit
 # `ThemeStyle`'s colour field is private, so a highlight theme is installed by
 # deserializing the theme literal rather than by assigning fields.

@@ -6,6 +6,36 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **An SVG file is read with its markup.** A drawing opened in the document pane
+  was plain text, because the toolkit ships no SVG grammar and nothing else in
+  the app could read one. SVG is XML, so the pinned upstream XML grammar reads it
+  and is registered under SVG's own name: the picker says **SVG**, and the
+  file's elements, attributes, values and comments wear the colours they mean.
+
+- **An OpenCode row says what its own terminal is doing.** The TUI reports
+  through OSC 7501, the same escape sequence Pi uses, and the report says what
+  *this* terminal is doing and which session it is showing -- the one thing the
+  service cannot say, because the service has no way to know which of its
+  sessions a terminal is showing. The row draws that now: the spinner while a
+  turn runs and the question while it waits are the terminal's own claim, and a
+  terminal at OpenCode's home screen says so instead of borrowing the state of
+  a session that belongs to another terminal. The agent's name and its colour
+  still come from the service, for the session the report names.
+
+- **An OpenCode row wears the colour of its own agent.** The panel read the
+  service's pending lists for eight of the locations the service named and
+  rotated through the rest, so a session in a checkout with more than a handful
+  of worktrees around it was *unknown* most of the time: the row said its state
+  was unavailable and wore the warning ink instead of the colour the agent
+  paints itself with. Every location is asked about now, bounded by the
+  observation's deadline rather than by a count of locations, so the row says
+  what its session is doing — idle, working, waiting for an answer — and wears
+  the agent's colour while it says it. The row's name and its tooltip carry the
+  agent's name and the time since the service last touched the session, so
+  what the row shows is what it announces.
+
 ## 1.0.0-rc.16
 
 - **The filesystem root is not a workdir.** The panel showed a workdir named

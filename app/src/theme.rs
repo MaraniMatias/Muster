@@ -381,6 +381,21 @@ pub fn install(cx: &mut App) {
                 "",
             ),
         );
+        // SVG is XML, so the XML grammar reads it. The toolkit has no SVG
+        // grammar and none of this app's own, so the pinned upstream one is
+        // registered here under the name the file carries: the picker says SVG
+        // and the file is read as one.
+        registry.register(
+            "svg",
+            &LanguageConfig::new(
+                "svg",
+                tree_sitter_xml::LANGUAGE_XML.into(),
+                Vec::new(),
+                tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+                "",
+                "",
+            ),
+        );
         // Gherkin is the language a `.feature` file is written in. The toolkit
         // has no grammar for it, so the vendored one is registered here with
         // the query above, and `syntax_language` reaches it by the name it
@@ -657,6 +672,18 @@ const CAPTURE_ALIASES: &[(&str, &str)] = &[
     // `click` in `@click` — as the directive's own name, and it is an
     // attribute the file gives a thing, which is Legacy's `string-expression`.
     ("props", "attribute"),
+    // XML names the text of a document `markup`, which is prose rather than a
+    // token of its own, and the markers around a CDATA section the same: the
+    // text is left plain, the markers are punctuation, and what they hold is a
+    // string.
+    ("markup", "primary"),
+    ("markup.heading", "punctuation.delimiter"),
+    ("markup.raw", "string"),
+    // A URI in a document is a link, wherever the grammar calls it one.
+    ("markup.link", "link_uri"),
+    // A parse that failed is text Legacy left plain, so it wears the
+    // foreground rather than a token of its own.
+    ("error", "primary"),
 ];
 
 /// The name [`CAPTURE_ALIASES`] answers `name` with, if it answers it at all.
@@ -1838,6 +1865,47 @@ mod tests {
                 Some(keyword),
                 "the text of a step is not a keyword"
             );
+        });
+    }
+
+    /// An SVG file is read with the XML grammar, and its markup wears the
+    /// colours it means.
+    ///
+    /// A drawing is markup, so the file is read as one: the name of an element
+    /// is a tag, the value of an attribute is a string, and a comment is a
+    /// comment. Compared here is what a document actually paints, not a capture
+    /// name, because a capture can be answered by the wrong token.
+    #[gpui_kit::test]
+    fn an_svg_file_is_painted_with_its_own_markup(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::Rope;
+
+        let source = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\">\n  <!-- a comment -->\n  <path d=\"M0 0 L10 10\"/>\n</svg>\n";
+        dark(cx);
+        cx.update(|cx| {
+            let mut highlighter = gpui_kit::component::highlighter::SyntaxHighlighter::new("svg");
+            assert!(
+                highlighter.update(None, &Rope::from(source), None),
+                "the XML grammar accepted an SVG file"
+            );
+            let theme = gpui_kit::component::Theme::global(cx);
+            let styles = highlighter.styles(&(0..source.len()), theme.highlight_theme.as_ref());
+            let painted = |needle: &str| {
+                let at = source.find(needle).expect("the source has the needle");
+                styles
+                    .iter()
+                    .find(|(range, _)| range.start <= at && at < range.end)
+                    .and_then(|(_, style)| style.color)
+            };
+            let tag = legacy("syntax-token-string-expression");
+            let string = legacy("syntax-token-string");
+            let comment = legacy("syntax-token-comment");
+            assert_eq!(painted("svg"), Some(tag), "the element's name");
+            assert_eq!(painted("0 0 24 24"), Some(string), "an attribute's value");
+            assert_eq!(painted("<!-- a comment -->"), Some(comment), "a comment");
+            // The markup is not one colour: a tag, a value and a comment are
+            // three things and are read as three.
+            assert_ne!(tag, string);
+            assert_ne!(string, comment);
         });
     }
 

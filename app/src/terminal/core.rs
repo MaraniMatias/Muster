@@ -17,6 +17,7 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor,
 use super::graphics::{GraphicSnapshot, Graphics, MAX_PACKET};
 use super::graphics_handler::GraphicsHandler;
 use super::modes::TerminalModes;
+use super::opencode_status::{self, OpenCodeReport};
 use super::pi_status::{self, PiProgramStatus, PiTaskState};
 use super::sync_updates::{SyncUpdates, MAX_SYNC_BYTES};
 
@@ -181,6 +182,12 @@ pub enum TerminalEvent {
     PiStatusQuery,
     /// Pi reported the state of the task in front of it.
     PiTaskState(PiTaskState),
+    /// OpenCode reported the state of the task in front of it.
+    ///
+    /// The same escape sequence Pi uses, and a different contract: the report
+    /// also names the session it is about, which is what says which of the
+    /// service's sessions this terminal is showing.
+    OpenCodeReport(OpenCodeReport),
     /// Pi's progress indicator: something is running, or is not.
     PiProgress(bool),
     /// A command started in the shell.
@@ -207,6 +214,7 @@ impl std::fmt::Debug for TerminalEvent {
             TerminalEvent::TextAreaSizeRequested { .. } => write!(f, "TextAreaSizeRequested"),
             TerminalEvent::PiStatusQuery => write!(f, "PiStatusQuery"),
             TerminalEvent::PiTaskState(state) => write!(f, "PiTaskState({state:?})"),
+            TerminalEvent::OpenCodeReport(report) => write!(f, "OpenCodeReport({report:?})"),
             TerminalEvent::PiProgress(working) => write!(f, "PiProgress({working})"),
             TerminalEvent::CommandStarted => write!(f, "CommandStarted"),
             TerminalEvent::CommandFinished => write!(f, "CommandFinished"),
@@ -680,7 +688,13 @@ impl TerminalCore {
             Some(PiProgramStatus::State(state)) => {
                 self.pending.push(TerminalEvent::PiTaskState(state))
             }
-            None => {}
+            // Pi's shape and OpenCode's are two contracts over one escape
+            // sequence, and a payload that is not Pi's may still be OpenCode's.
+            None => {
+                if let Some(report) = opencode_status::parse_opencode_status(text) {
+                    self.pending.push(TerminalEvent::OpenCodeReport(report));
+                }
+            }
         }
     }
 
@@ -1406,6 +1420,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_opencode_report_names_its_state_and_its_session() {
+        let mut terminal = TerminalCore::new(80, 24, 20);
+        terminal
+            .feed(b"\x1b]7501;state=working:id=ses_e912b168dffeXW3oWEfvXIw4U0:app=opencode\x07");
+        let report = terminal
+            .take_events()
+            .into_iter()
+            .find_map(|event| match event {
+                TerminalEvent::OpenCodeReport(report) => Some(report),
+                _ => None,
+            })
+            .expect("the report is read");
+        assert_eq!(report.state, opencode_status::OpenCodeState::Working);
+        assert_eq!(
+            report.session.as_deref(),
+            Some("ses_e912b168dffeXW3oWEfvXIw4U0")
+        );
+    }
+
+    /// The bytes OpenCode's TUI actually writes, captured from a live run.
+    #[test]
+    fn a_real_opencode_report_is_read() {
+        let mut terminal = TerminalCore::new(80, 24, 20);
+        terminal.feed(b"\x1b]7501;state=idle:app=opencode\x07");
+        terminal.feed(b"\x1b]7501;state=working:app=opencode:title=TmV3IHNlc3Npb24gLSAyMDI2LTEwLTI0VDE2OjUzOjI5LjU4N1o=\x07");
+        terminal.feed(b"\x1b]7501;state=working:id=ses_e912b168dffeXW3oWEfvXIw4U0:app=opencode:title=TmV3IHNlc3Npb24gLSAyMDI2LTEwLTI0VDE2OjUzOjI5LjU4N1o=\x07");
+        terminal.feed(b"\x1b]7501;state=clear:id=ses_e912b168dffeXW3oWEfvXIw4U0\x07");
+        let reports = terminal
+            .take_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TerminalEvent::OpenCodeReport(report) => Some(report),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 4, "every report is read");
+        assert_eq!(reports[0].state, opencode_status::OpenCodeState::Idle);
+        assert_eq!(reports[0].session, None);
+        assert_eq!(reports[2].state, opencode_status::OpenCodeState::Working);
+        assert_eq!(
+            reports[2].session.as_deref(),
+            Some("ses_e912b168dffeXW3oWEfvXIw4U0")
+        );
+        assert_eq!(reports[3].state, opencode_status::OpenCodeState::Clear);
     }
 
     #[test]

@@ -162,7 +162,7 @@ fn an_opencode_row_says_what_its_session_is_doing(cx: &mut TestAppContext) {
         );
     });
     fixture.view.read_with(cx, |app, _| {
-        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"));
+        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"), None);
         assert!(
             state.working,
             "a turn that is running is the state that moves"
@@ -188,12 +188,171 @@ fn an_opencode_row_says_what_its_session_is_doing(cx: &mut TestAppContext) {
             });
     });
     fixture.view.read_with(cx, |app, _| {
-        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"));
+        let state = app.opencode_row_state(&fixture.checkout, Some("OC | work"), None);
         assert!(state.unavailable);
         assert_eq!(state.note, "several sessions with this name");
         assert!(!state.working);
     });
     close(&fixture, cx);
+}
+
+/// A terminal says what its own session is doing, and the report is the one that counts.
+///
+/// The terminal knows which of the service's sessions it is showing and what that
+/// session is doing, and the service does not: a session earns its title by running,
+/// so the turn a person wants to watch is often one whose session cannot be named
+/// from the title. The report is about this terminal, so it is what the row draws.
+#[gpui_kit::test]
+fn an_opencode_row_draws_what_its_terminal_reported(cx: &mut TestAppContext) {
+    use crate::terminal::{OpenCodeReport, OpenCodeState};
+    use muster_core::opencode::observe::{AgentAgent, AgentSession};
+    let fixture = open_git(cx);
+    add_terminal(&fixture, cx);
+    fixture.view.update(cx, |app, _| {
+        // The checkouts the watch asked about, so the catalog is read for this one.
+        app.agent
+            .request(vec![(fixture.checkout.clone(), fixture.root.clone())]);
+        app.agent.sessions = vec![AgentSession {
+            id: "ses_a".into(),
+            title: String::new(),
+            agent: Some("build".into()),
+            running: true,
+            awaiting_reply: Some(false),
+            updated_at: 1_000,
+            directory: Some(fixture.root.clone()),
+            ..Default::default()
+        }];
+        app.agent.catalogs.insert(
+            fixture.checkout.clone(),
+            vec![AgentAgent {
+                id: "build".into(),
+                name: "Build".into(),
+                mode: "primary".into(),
+                color: Some("#5c7cfa".into()),
+                hidden: false,
+            }],
+        );
+    });
+    fixture.view.read_with(cx, |app, _| {
+        // The TUI's own title is the program, because the session has no title
+        // yet, and the report names the session it is showing.
+        let report = OpenCodeReport {
+            state: OpenCodeState::Working,
+            session: Some("ses_a".into()),
+        };
+        let state = app.opencode_row_state(&fixture.checkout, Some("OpenCode"), Some(&report));
+        assert!(state.working, "the row is the one state that moves");
+        assert_eq!(state.note, "working");
+        assert_eq!(state.label.as_deref(), Some("Build"));
+        assert_eq!(state.tint.as_deref(), Some("#5c7cfa"));
+    });
+    close(&fixture, cx);
+}
+
+/// A terminal at OpenCode's home screen is not waiting for an answer.
+///
+/// The service says a session in this checkout is waiting, and it is: it is
+/// another terminal's session. The row is about this terminal, and this terminal
+/// said it is doing nothing.
+#[gpui_kit::test]
+fn an_opencode_row_does_not_borrow_another_terminal_s_state(cx: &mut TestAppContext) {
+    use crate::terminal::{OpenCodeReport, OpenCodeState};
+    use muster_core::opencode::observe::AgentSession;
+    let fixture = open_git(cx);
+    add_terminal(&fixture, cx);
+    fixture.view.update(cx, |app, _| {
+        app.agent.sessions = vec![AgentSession {
+            id: "ses_a".into(),
+            title: String::new(),
+            agent: Some("build".into()),
+            running: false,
+            awaiting_reply: Some(true),
+            updated_at: 1_000,
+            directory: Some(fixture.root.clone()),
+            ..Default::default()
+        }];
+    });
+    fixture.view.read_with(cx, |app, _| {
+        // The report of a terminal that is at the home screen: a state, and no
+        // session at all.
+        let report = OpenCodeReport {
+            state: OpenCodeState::Idle,
+            session: None,
+        };
+        let state = app.opencode_row_state(&fixture.checkout, Some("OpenCode"), Some(&report));
+        assert!(
+            !state.asking,
+            "this terminal is not the one that is waiting"
+        );
+        assert!(!state.working);
+        assert_eq!(state.note, "idle");
+    });
+    close(&fixture, cx);
+}
+
+/// An OpenCode row wears the colour of its own agent.
+///
+/// The colour belongs to the agent: a question is the agent at work, so the question
+/// wears the agent's colour too, and the warning ink is left for a state nobody could
+/// read. A failed turn keeps the error ink, because that one is the row's own news.
+#[gpui_kit::test]
+fn an_opencode_row_wears_the_colour_of_its_agent(cx: &mut TestAppContext) {
+    use crate::agent_watch::AgentRowState;
+    use crate::sidebar::agent_row_ink;
+    use crate::theme::{service_tint, Roles};
+    let fixture = open_git(cx);
+    let roles = fixture.view.read_with(cx, |_, cx| Roles::of(cx));
+    let tint = "#5c7cfa";
+    let state = |working, asking, failed, unavailable| AgentRowState {
+        note: String::new(),
+        label: Some("Build".into()),
+        tint: Some(tint.into()),
+        working,
+        failed,
+        asking,
+        unavailable,
+        elapsed: None,
+    };
+    let agent_ink = service_tint(tint).unwrap();
+    for (working, asking) in [(false, false), (true, false), (false, true)] {
+        assert_eq!(
+            agent_row_ink(&roles, Some(&state(working, asking, false, false))),
+            agent_ink,
+            "the agent's colour wears while it is idle, working and waiting"
+        );
+    }
+    assert_eq!(
+        agent_row_ink(&roles, Some(&state(false, false, true, false))),
+        roles.status.danger_text
+    );
+    assert_eq!(
+        agent_row_ink(&roles, Some(&state(false, false, false, true))),
+        roles.status.warning
+    );
+    // A session nobody could name is not the agent's colour either.
+    assert_eq!(agent_row_ink(&roles, None), roles.text_muted);
+    close(&fixture, cx);
+}
+
+/// The row announces what it shows: the name, the agent and the state in words.
+///
+/// The state is drawn as a colour on a glyph, and a colour is not something a
+/// screen reader reads, so the words beside the name are the ones that carry it.
+#[test]
+fn a_terminal_row_announces_the_agent_and_the_state_it_draws() {
+    use crate::sidebar::session_row_label;
+    assert_eq!(
+        session_row_label("work", None, "working"),
+        "Terminal session: work, working"
+    );
+    assert_eq!(
+        session_row_label("work", Some("Build · 2m"), "working"),
+        "Terminal session: work, Build · 2m, working"
+    );
+    assert_eq!(
+        session_row_label("work", Some(""), "idle"),
+        "Terminal session: work, idle"
+    );
 }
 
 /// A terminal running OpenCode says what its session is doing, and who is doing it.

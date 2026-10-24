@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use super::core::{CursorSnapshot, PromptAnchor, RowSnapshot, TerminalCore, TerminalEvent};
 use super::keys::{encode_key, KeyPress};
 use super::modes::TerminalModes;
+use super::opencode_status::{OpenCodeReport, OpenCodeTracker};
 use super::paste::{encode_paste, encode_paste_confirmed, PasteError};
 use super::pi_status::{self, PiTaskState, PiTracker};
 use super::write_queue::{EnqueueError, WriteQueue};
@@ -418,6 +419,19 @@ fn foreground_is_pi(foreground: &Foreground) -> bool {
             .is_some_and(muster_core::pi::is_pi)
 }
 
+/// Whether what is in front of the shell is OpenCode.
+///
+/// The operating system's own answer, and the only one that counts: a terminal
+/// may print anything at all, and what says a report came from OpenCode is that
+/// the OS names OpenCode as the process in front of the shell.
+fn foreground_is_opencode(foreground: &Foreground) -> bool {
+    foreground.running
+        && foreground
+            .app
+            .as_deref()
+            .is_some_and(|app| app.eq_ignore_ascii_case("opencode"))
+}
+
 /// How the output stream ended, if it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {
@@ -465,6 +479,13 @@ pub struct SessionStatus {
     /// Pi. The panel draws a row the same either way, and the difference is
     /// only in what may be believed.
     pub pi_task: Option<PiTaskState>,
+    /// What OpenCode says about the task in front of it, if OpenCode is what is
+    /// in front.
+    ///
+    /// `None` means two things that are deliberately the same: nothing is
+    /// running, and what is running is not OpenCode. The panel draws a row the
+    /// same either way, and the difference is only in what may be believed.
+    pub opencode: Option<OpenCodeReport>,
     /// Where the shell is, as the operating system records it.
     ///
     /// The shell's own directory and not the foreground program's: a program in
@@ -749,6 +770,11 @@ struct Shared {
     /// Written by the reader thread and read by the view, so it is behind a
     /// lock like the rest of the state two threads share.
     pi: Mutex<PiTracker>,
+    /// What OpenCode has said about the task in front of it.
+    ///
+    /// Written by the reader thread and read by the view, so it is behind a
+    /// lock like the rest of the state two threads share.
+    opencode: Mutex<OpenCodeTracker>,
     /// How many program-status replies this session has handed to its child.
     pi_replies: AtomicU64,
 }
@@ -768,6 +794,7 @@ impl Shared {
             applied: Mutex::new((cols, rows)),
             chunks: AtomicU64::new(0),
             pi: Mutex::new(PiTracker::default()),
+            opencode: Mutex::new(OpenCodeTracker::default()),
             pi_replies: AtomicU64::new(0),
             child_started: AtomicBool::new(false),
         }
@@ -1139,6 +1166,7 @@ impl Inner {
         // command start raised is answered, and a report that named a process
         // which is no longer there is forgotten.
         let pi_is_foreground = foreground_is_pi(&polled.foreground);
+        let opencode_is_foreground = foreground_is_opencode(&polled.foreground);
         let changed = {
             let mut stored = self
                 .side
@@ -1156,6 +1184,12 @@ impl Inner {
             .lock()
             .expect("terminal pi state poisoned")
             .confirmed(pi_is_foreground);
+        self.side
+            .shared
+            .opencode
+            .lock()
+            .expect("terminal opencode state poisoned")
+            .confirmed(opencode_is_foreground);
         if changed {
             // Only when the answer actually changed. A poll that wakes a view
             // every 250 ms is a view that repaints for nothing four times a
@@ -1200,6 +1234,14 @@ impl Inner {
             .lock()
             .expect("terminal pi state poisoned")
             .task(foreground_is_pi(&polled.foreground));
+        let opencode = self
+            .side
+            .shared
+            .opencode
+            .lock()
+            .expect("terminal opencode state poisoned")
+            .report(foreground_is_opencode(&polled.foreground))
+            .cloned();
         SessionStatus {
             generation: polled.generation,
             shell: polled.shell,
@@ -1207,6 +1249,7 @@ impl Inner {
             stream,
             poll_error: side_protocol_error(&self.side).or(polled.poll_error),
             pi_task,
+            opencode,
             working_directory: polled.working_directory,
         }
     }
@@ -1430,6 +1473,13 @@ fn handle_events(side: &ReaderSide, events: Vec<TerminalEvent>) -> Result<(), St
                     .expect("terminal pi state poisoned")
                     .progress(working);
             }
+            TerminalEvent::OpenCodeReport(report) => {
+                side.shared
+                    .opencode
+                    .lock()
+                    .expect("terminal opencode state poisoned")
+                    .reported(report);
+            }
             // The shell's own boundaries: what a program said before them was
             // said about the command that was running then.
             TerminalEvent::CommandStarted => {
@@ -1438,12 +1488,22 @@ fn handle_events(side: &ReaderSide, events: Vec<TerminalEvent>) -> Result<(), St
                     .lock()
                     .expect("terminal pi state poisoned")
                     .command_started();
+                side.shared
+                    .opencode
+                    .lock()
+                    .expect("terminal opencode state poisoned")
+                    .command_started();
             }
             TerminalEvent::CommandFinished => {
                 side.shared
                     .pi
                     .lock()
                     .expect("terminal pi state poisoned")
+                    .command_finished();
+                side.shared
+                    .opencode
+                    .lock()
+                    .expect("terminal opencode state poisoned")
                     .command_finished();
             }
             TerminalEvent::Bell => {
@@ -3176,6 +3236,13 @@ mod tests {
         pi
     }
 
+    /// A program the operating system names OpenCode, for the belief rule.
+    fn fake_opencode(dir: &Path) -> PathBuf {
+        let opencode = dir.join("opencode");
+        std::os::unix::fs::symlink("/bin/sh", &opencode).expect("the shell is linked");
+        opencode
+    }
+
     /// The shell is told the size of the grid it draws into, before it draws.
     ///
     /// A shell that is asked for another size redraws its prompt from the
@@ -3247,6 +3314,35 @@ mod tests {
         // there any more, and the row must not still be claiming a task.
         wait_for("the status to be forgotten when Pi is gone", || {
             session.status().pi_task.is_none()
+        });
+
+        session.close().wait().expect("the session closes");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_opencode_report_is_believed_while_opencode_is_in_front_and_forgotten_when_it_is_not() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let opencode = fake_opencode(dir.path());
+        let (_backend, session, _wake) = start(interactive_config(dir.path()));
+        session
+            .send_text(&format!(
+                "{} -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do printf \"\\033]7501;state=working:id=ses_a\\007\"; sleep 0.1; done'\n",
+                opencode.display()
+            ))
+            .expect("the command is sent");
+
+        wait_for("the report to be believed", || {
+            session
+                .status()
+                .opencode
+                .as_ref()
+                .is_some_and(|report| report.session.as_deref() == Some("ses_a"))
+        });
+        // The process is gone, so what it said is about a process that is not
+        // there any more, and the row must not still be claiming a turn.
+        wait_for("the report to be forgotten when OpenCode is gone", || {
+            session.status().opencode.is_none()
         });
 
         session.close().wait().expect("the session closes");

@@ -30,6 +30,7 @@ use gpui_kit::{
 };
 use muster_core::workspace::RepoKind;
 
+use crate::agent_watch::AgentRowState;
 use crate::app::{
     baseline_from_bottom, sidebar_faint_ink, sidebar_name, sidebar_repo_path, sidebar_row_focus,
     sidebar_text_width, toggle, ButtonA11y, TerminalWindow, ViewKind, UI_FONT_FAMILY,
@@ -109,6 +110,48 @@ fn session_glyph(
         },
         |program| foreground_program_icon(program, size, color),
     )
+}
+
+/// The ink an OpenCode row's glyph wears.
+///
+/// The agent's own colour on every state that is the agent's: idle, working and
+/// waiting. A question is the agent at work, so the question wears the agent's
+/// colour too rather than the panel's warning: the glyph says what happened and
+/// the colour says who. A failed turn keeps the error ink, because that one is
+/// the row's own news, and a state nobody could read keeps the warning one.
+pub(crate) fn agent_row_ink(roles: &Roles, state: Option<&AgentRowState>) -> Hsla {
+    match state {
+        Some(state) if state.failed => roles.status.danger_text,
+        Some(state) if state.unavailable => roles.status.warning,
+        Some(state) => state
+            .tint
+            .as_deref()
+            .and_then(crate::theme::service_tint)
+            .unwrap_or(roles.text_muted),
+        None => roles.text_muted,
+    }
+}
+
+/// What a terminal row announces.
+///
+/// The name, the agent's name and how long ago the service last touched the
+/// session, and the state in words: the state is drawn as a colour on a glyph,
+/// and a colour is not something a screen reader reads, so it is spelled out
+/// here. The words are the ones the row shows, so the row and the name it
+/// announces cannot disagree about what the session is doing.
+pub(crate) fn session_row_label(
+    title: &str,
+    agent_suffix: Option<&str>,
+    state_note: &str,
+) -> String {
+    let mut said = format!("Terminal session: {title}");
+    if let Some(suffix) = agent_suffix.filter(|suffix| !suffix.is_empty()) {
+        said.push_str(", ");
+        said.push_str(suffix);
+    }
+    said.push_str(", ");
+    said.push_str(state_note);
+    said
 }
 
 /// What a terminal row wearing Pi's glyph says about the task in front of it.
@@ -1458,14 +1501,16 @@ impl TerminalWindow {
                     let program =
                         crate::navigation::foreground_program(status.foreground.app.as_deref());
                     let agent = program == Some(ForegroundProgram::OpenCode);
-                    // What the service says about the session this terminal is showing.
-                    // The title is the only thing that says which session that is, and
-                    // it is matched conservatively: a title that names several
-                    // sessions names none of them.
+                    // What the terminal itself reported about the session it is
+                    // showing, and what the service says about that session.
+                    // The report comes first: it is about this terminal, and it
+                    // names the session, which the title alone can only guess.
+                    let reported = status.opencode.as_ref();
                     let agent_state = agent.then(|| {
                         self.opencode_row_state(
                             &session.checkout_id,
                             terminal.shell.session.title().as_deref(),
+                            reported,
                         )
                     });
                     // The agent's name and how long ago the service last touched the
@@ -1530,7 +1575,8 @@ impl TerminalWindow {
                     } else {
                         "idle"
                     };
-                    let state_label = format!("Terminal session: {title}, {state_note}");
+                    let state_label =
+                        session_row_label(&title, agent_suffix.as_deref(), state_note);
                     let closing = self.closing_sessions.contains(&id);
                     let renaming = self.editing.as_ref().is_some_and(|edit| edit.id == id);
                     let row_clickable = !closing && !renaming;
@@ -1590,22 +1636,7 @@ impl TerminalWindow {
                                         roles.text_muted
                                     }
                                 } else if agent {
-                                    // The colour the service gives its agent is
-                                    // the agent's own, and it wears while the
-                                    // session is idle, working or waiting. A
-                                    // turn that failed keeps the error ink, and a
-                                    // state that could not be read keeps the
-                                    // warning one.
-                                    match agent_state.as_ref() {
-                                        Some(state) if state.failed => roles.status.danger_text,
-                                        Some(state) if state.unavailable => roles.status.warning,
-                                        Some(state) => state
-                                            .tint
-                                            .as_deref()
-                                            .and_then(crate::theme::service_tint)
-                                            .unwrap_or(roles.text_muted),
-                                        None => roles.text_muted,
-                                    }
+                                    agent_row_ink(&roles, agent_state.as_ref())
                                 } else if failed {
                                     roles.status.danger_text
                                 } else if busy {

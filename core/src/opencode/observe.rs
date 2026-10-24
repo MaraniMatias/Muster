@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -25,11 +26,11 @@ use super::{ApiModel, ApiSession, Client, DispatchError};
 /// widen the window.
 const SESSION_LIST_LIMIT: &str = "200";
 
-/// How many locations the pending lists are read for in one pass.
+/// The longest one location's pending lists may take.
 ///
-/// Every location is two more requests. A rotating starting point gives even a location
-/// beyond this slice a turn on later polls. Omitted and unreadable locations are unknown.
-const MAX_PENDING_DIRECTORIES: usize = 8;
+/// Both pending routes share this slice, so one slow location cannot spend the whole
+/// read before another gets a turn.
+const PENDING_LOCATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One entry of `GET /api/session/active`, keyed by session id.
 ///
@@ -357,21 +358,30 @@ impl Client {
                 directories.push(directory);
             }
         }
-        // Advance by one, not by the slice length: even when a slow first location
-        // spends the deadline, every location eventually becomes the first one read.
+        // Every location the list names is asked about, in a rotating order so that one
+        // the budget never reached gets its turn on a later pass. The bound is the time
+        // this read is given rather than a count of locations: a location this app never
+        // asked about is a different finding from one the service could not answer for,
+        // and only the second of them is worth a warning.
         directories.sort();
         if !directories.is_empty() {
             let count = directories.len();
             directories.rotate_left(start % count);
         }
-        directories.truncate(MAX_PENDING_DIRECTORIES);
+        // Half of what is left, so the catalog read that follows still has the other half:
+        // a row that knows the name of its agent is worth more than a pending list that
+        // would have said the session was idle.
+        let share = budget
+            .remaining()
+            .map_or(Duration::ZERO, |remaining| remaining / 2);
+        let pending_budget = budget.slice(share);
         let mut awaiting: HashMap<PathBuf, HashSet<String>> = HashMap::new();
         for directory in &directories {
-            // A slow location cannot spend the whole snapshot before another gets a
-            // turn. Both pending routes share this slice and the outer deadline.
+            // A slow location cannot spend the whole read before another gets a turn.
+            // Both pending routes share this slice and the outer deadline.
             let pending_client = client
                 .clone()
-                .with_read_budget(budget.slice(std::time::Duration::from_millis(250)));
+                .with_read_budget(pending_budget.slice(PENDING_LOCATION_TIMEOUT));
             if let Ok(sessions) = pending_client.pending_sessions(directory) {
                 awaiting.insert(directory.clone(), sessions);
             }
@@ -719,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn unscoped_located_envelopes_and_pending_slices_are_read_on_the_real_wire() {
+    fn unscoped_located_envelopes_and_pending_lists_are_read_on_the_real_wire() {
         use crate::opencode::mock::{self, Mock};
         let mock =
             Mock::start(|request| {
@@ -765,8 +775,8 @@ mod tests {
             });
         let home = home_for(mock.port());
         let mut seen_known = HashSet::new();
-        // Reconnect each time, as the production watch does. A cursor kept only on the
-        // Client would restart at the first eight directories and fail this check.
+        // Reconnect each time, as the production watch does, so a client that kept its
+        // own cursor could not hide a location behind the one it read first.
         for start in 0..12 {
             let client = Client::connect_service(home.path()).unwrap();
             let sessions = client.service_sessions_from(start).unwrap();
@@ -778,12 +788,13 @@ mod tests {
                     .unwrap()
                     .running
             );
-            assert!(
+            assert_eq!(
                 sessions
                     .iter()
                     .filter(|session| session.awaiting_reply.is_none())
-                    .count()
-                    >= 3
+                    .count(),
+                1,
+                "every location the service answers for is asked about, not a slice of them"
             );
             assert_eq!(
                 sessions
@@ -806,7 +817,7 @@ mod tests {
         assert_eq!(
             seen_known.len(),
             10,
-            "every readable location gets a turn, including those beyond eight"
+            "every readable location is known, in the first pass and in every one after it"
         );
         assert!(!seen_known.contains("ses_3"));
     }

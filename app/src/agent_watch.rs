@@ -25,10 +25,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui_kit::Context;
-use muster_core::opencode::observe::{AgentAgent, AgentSession};
+use muster_core::opencode::observe::{AgentAgent, AgentSession, Attention};
 use muster_core::opencode::{Client, ReadBudget, ReviewRound, RoundStore, OBSERVATION_TIMEOUT};
 
 use crate::app::TerminalWindow;
+use crate::terminal::{OpenCodeReport, OpenCodeState};
 
 /// How often the service is asked about again while something is running.
 ///
@@ -488,16 +489,98 @@ impl Default for AgentRowState {
     }
 }
 
+/// What a row says about the session it is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowState {
+    /// The words the row says beside its name.
+    note: &'static str,
+    /// Whether a turn is running, which is the one state that moves.
+    working: bool,
+    /// Whether the session is waiting for a question or a permission.
+    asking: bool,
+    /// Whether the last turn failed.
+    failed: bool,
+}
+
+/// The state a row wears, given what the terminal reported and what the service said.
+///
+/// The terminal's own report wins: it is about this terminal, and the service
+/// has no way to say which of its sessions a terminal is showing. The service
+/// is asked about the rest -- how the last turn ended, which no report names.
+fn reported_state(reported: Option<OpenCodeState>, attention: Option<Attention>) -> RowState {
+    match reported {
+        Some(OpenCodeState::Working) => RowState {
+            note: "working",
+            working: true,
+            asking: false,
+            failed: false,
+        },
+        Some(OpenCodeState::Blocked) => RowState {
+            note: "waiting for an answer",
+            working: false,
+            asking: true,
+            failed: false,
+        },
+        Some(OpenCodeState::Idle) | Some(OpenCodeState::Clear) => {
+            let failed = attention == Some(Attention::Failed);
+            RowState {
+                note: if failed { "last turn failed" } else { "idle" },
+                working: false,
+                asking: false,
+                failed,
+            }
+        }
+        None => match attention {
+            Some(Attention::Asking) => RowState {
+                note: "waiting for an answer",
+                working: false,
+                asking: true,
+                failed: false,
+            },
+            Some(Attention::Busy) => RowState {
+                note: "working",
+                working: true,
+                asking: false,
+                failed: false,
+            },
+            Some(Attention::Failed) => RowState {
+                note: "last turn failed",
+                working: false,
+                asking: false,
+                failed: true,
+            },
+            Some(Attention::Idle) => RowState {
+                note: "idle",
+                working: false,
+                asking: false,
+                failed: false,
+            },
+            _ => RowState {
+                note: "state unavailable",
+                working: false,
+                asking: false,
+                failed: false,
+            },
+        },
+    }
+}
+
 /// The row a terminal wears, given what the service said.
 ///
 /// Nothing is invented here: a session that could not be named produces a row that says
 /// so, a pending state that could not be read produces a row that says its state is
 /// unavailable, and a session that is doing nothing produces a row that says nothing is
 /// happening.
+///
+/// The state the terminal reported about itself wins over the service's answer,
+/// because it is about this terminal: the service cannot say which of its
+/// sessions a terminal is showing, and a row that drew another session's state
+/// would be claiming a turn nobody is running here.
 pub(crate) fn agent_row_state(
     session: &TerminalSession,
     agents: &[AgentAgent],
     now_millis: i64,
+    reported: Option<OpenCodeState>,
 ) -> AgentRowState {
     match session {
         TerminalSession::Unavailable => AgentRowState {
@@ -510,16 +593,32 @@ pub(crate) fn agent_row_state(
             unavailable: true,
             ..AgentRowState::default()
         },
-        TerminalSession::Unknown => AgentRowState {
-            note: "session not identified".into(),
-            ..AgentRowState::default()
-        },
+        TerminalSession::Unknown => {
+            let Some(reported) = reported else {
+                // Nothing named the session, and that is what the row says.
+                return AgentRowState {
+                    note: "session not identified".into(),
+                    ..AgentRowState::default()
+                };
+            };
+            // The session could not be named, but the terminal said what it is
+            // doing, and that report is about this terminal.
+            let state = reported_state(Some(reported), None);
+            AgentRowState {
+                note: state.note.into(),
+                working: state.working,
+                asking: state.asking,
+                ..AgentRowState::default()
+            }
+        }
         TerminalSession::Identified(session) => {
             let label = muster_core::opencode::agent_label(agents, session.agent.as_deref());
             let tint = muster_core::opencode::agent_color(agents, session.agent.as_deref());
+            let attention = session.attention();
             // A pending state that could not be read is not an answer, and the row says
-            // its state is unavailable rather than claiming the session is idle.
-            if session.awaiting_reply.is_none() && !session.running {
+            // its state is unavailable rather than claiming the session is idle. A
+            // terminal that reported about itself has already answered, though.
+            if reported.is_none() && session.awaiting_reply.is_none() && !session.running {
                 return AgentRowState {
                     note: "state unavailable".into(),
                     label,
@@ -529,22 +628,15 @@ pub(crate) fn agent_row_state(
                     ..AgentRowState::default()
                 };
             }
-            let attention = session.attention();
+            let state = reported_state(reported, Some(attention));
             AgentRowState {
-                note: match attention {
-                    muster_core::opencode::observe::Attention::Asking => "waiting for an answer",
-                    muster_core::opencode::observe::Attention::Busy => "working",
-                    muster_core::opencode::observe::Attention::Failed => "last turn failed",
-                    muster_core::opencode::observe::Attention::Idle => "idle",
-                    muster_core::opencode::observe::Attention::Unknown => "state unavailable",
-                }
-                .into(),
+                note: state.note.into(),
                 label,
                 tint,
-                working: attention.is_busy(),
-                failed: attention == muster_core::opencode::observe::Attention::Failed,
-                asking: attention == muster_core::opencode::observe::Attention::Asking,
-                unavailable: session.awaiting_reply.is_none(),
+                working: state.working,
+                failed: state.failed,
+                asking: state.asking,
+                unavailable: reported.is_none() && session.awaiting_reply.is_none(),
                 elapsed: elapsed_of(session, now_millis),
             }
         }
@@ -810,16 +902,29 @@ impl TerminalWindow {
 
     /// What a terminal row says about the OpenCode session it is showing.
     ///
-    /// The title is the only thing that says which session a terminal has open, so it
-    /// is matched conservatively: a title that names several sessions names none of
-    /// them, and a service that could not be read names none either.
+    /// The title is what says which session a terminal has open, and it is
+    /// matched conservatively: a title that names several sessions names none
+    /// of them, and a service that could not be read names none either.
+    ///
+    /// What the terminal itself reported comes first: it names the session it
+    /// is showing, and it says what that session is doing, which is the one
+    /// thing the service cannot say.
     pub(crate) fn opencode_row_state(
         &self,
         checkout_id: &str,
         title: Option<&str>,
+        reported: Option<&OpenCodeReport>,
     ) -> AgentRowState {
         let available = self.agent.error.is_none();
-        let matched = match_terminal(&self.agent.sessions, title.unwrap_or_default(), available);
+        // The session the terminal named, and the title's own match when it
+        // named none or named one the service does not know yet.
+        let matched = match reported.and_then(|report| report.session.as_deref()) {
+            Some(id) => match self.agent.session(id) {
+                Some(session) => TerminalSession::Identified(Box::new(session.clone())),
+                None => match_terminal(&self.agent.sessions, title.unwrap_or_default(), available),
+            },
+            None => match_terminal(&self.agent.sessions, title.unwrap_or_default(), available),
+        };
         let catalog = match matched
             .identified()
             .and_then(|session| session.directory.as_deref())
@@ -827,7 +932,12 @@ impl TerminalWindow {
             Some(directory) => self.agent.catalog_for_directory(directory),
             None => self.agent.catalog(checkout_id),
         };
-        agent_row_state(&matched, catalog, muster_core::opencode::now_millis())
+        agent_row_state(
+            &matched,
+            catalog,
+            muster_core::opencode::now_millis(),
+            reported.map(|report| report.state),
+        )
     }
 
     /// The sessions a review of this checkout can go to, newest first.
@@ -890,149 +1000,6 @@ mod tests {
         assert_eq!(
             match_terminal(&sessions, "OC | same", true),
             TerminalSession::Ambiguous
-        );
-    }
-
-    #[test]
-    fn a_service_that_cannot_be_read_names_nothing_and_says_so() {
-        assert_eq!(
-            match_terminal(&[], "OC | anything", false),
-            TerminalSession::Unavailable
-        );
-        let state = agent_row_state(&TerminalSession::Unavailable, &[], 0);
-        assert!(state.unavailable);
-        assert_eq!(state.note, "state unavailable");
-    }
-
-    #[test]
-    fn a_working_session_is_the_one_state_that_moves() {
-        let mut working = session("ses_a", "one");
-        working.running = true;
-        working.awaiting_reply = Some(false);
-        working.updated_at = 1_000;
-        let matched = TerminalSession::Identified(Box::new(working));
-        let state = agent_row_state(&matched, &[], 61_000);
-        assert!(state.working);
-        assert!(!state.failed);
-        assert_eq!(state.note, "working");
-        assert_eq!(state.elapsed, Some(60));
-    }
-
-    #[test]
-    fn a_failed_turn_says_so_and_an_asking_one_asks() {
-        let mut failed = session("ses_a", "one");
-        failed.outcome = Some("failed".into());
-        failed.awaiting_reply = Some(false);
-        let state = agent_row_state(&TerminalSession::Identified(Box::new(failed)), &[], 0);
-        assert!(state.failed);
-        assert_eq!(state.note, "last turn failed");
-
-        let mut asking = session("ses_a", "one");
-        asking.awaiting_reply = Some(true);
-        let state = agent_row_state(&TerminalSession::Identified(Box::new(asking)), &[], 0);
-        assert!(state.asking);
-        assert_eq!(state.note, "waiting for an answer");
-    }
-
-    #[test]
-    fn a_pending_state_that_could_not_be_read_is_unavailable_rather_than_idle() {
-        let mut unknown = session("ses_a", "one");
-        unknown.awaiting_reply = None;
-        let state = agent_row_state(&TerminalSession::Identified(Box::new(unknown)), &[], 0);
-        assert!(state.unavailable);
-        assert_eq!(state.note, "state unavailable");
-    }
-
-    #[test]
-    fn the_agent_is_named_and_tinted_with_what_the_service_gave() {
-        let agents = vec![AgentAgent {
-            id: "build".into(),
-            name: "Build".into(),
-            mode: "primary".into(),
-            color: Some("#5c7cfa".into()),
-            hidden: false,
-        }];
-        let mut named = session("ses_a", "one");
-        named.agent = Some("build".into());
-        named.awaiting_reply = Some(false);
-        let state = agent_row_state(&TerminalSession::Identified(Box::new(named)), &agents, 0);
-        assert_eq!(state.label.as_deref(), Some("Build"));
-        assert_eq!(state.tint.as_deref(), Some("#5c7cfa"));
-    }
-
-    #[test]
-    fn a_duration_is_written_the_way_a_person_would_say_it() {
-        assert_eq!(elapsed_label(Some(12)), "12s");
-        assert_eq!(elapsed_label(Some(120)), "2m");
-        assert_eq!(elapsed_label(Some(7_200)), "2h");
-        assert_eq!(elapsed_label(None), "");
-    }
-
-    #[test]
-    fn the_newest_session_is_the_first_one_offered() {
-        let sessions = vec![
-            AgentSession {
-                id: "ses_a".into(),
-                title: "older".into(),
-                updated_at: 10,
-                ..AgentSession::default()
-            },
-            AgentSession {
-                id: "ses_b".into(),
-                title: "newer".into(),
-                updated_at: 20,
-                ..AgentSession::default()
-            },
-        ];
-        let ordered = sessions_newest_first(sessions);
-        assert_eq!(ordered[0].id, "ses_b");
-        assert_eq!(ordered[1].id, "ses_a");
-    }
-
-    #[test]
-    fn a_search_narrows_the_list_by_title_and_ignores_its_case() {
-        let sessions = vec![
-            AgentSession {
-                id: "ses_a".into(),
-                title: "Fix the parser".into(),
-                ..AgentSession::default()
-            },
-            AgentSession {
-                id: "ses_b".into(),
-                title: "Write the docs".into(),
-                ..AgentSession::default()
-            },
-        ];
-        let found = sessions_matching(&sessions, "PARSER");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, "ses_a");
-        assert_eq!(sessions_matching(&sessions, "").len(), 2);
-    }
-
-    #[test]
-    fn unreadable_activity_always_refuses_and_absence_preserves_prior_evidence() {
-        assert_eq!(
-            activity_verdict(Ok(Some(true)), false),
-            ActivityVerdict::Busy,
-            "something is working there"
-        );
-        assert_eq!(
-            activity_verdict(Ok(Some(false)), true),
-            ActivityVerdict::Clear
-        );
-        assert_eq!(
-            activity_verdict(Ok(None), true),
-            ActivityVerdict::Unreadable,
-            "a stale idle is not what the service says now"
-        );
-        assert_eq!(
-            activity_verdict(Ok(None), false),
-            ActivityVerdict::Clear,
-            "a service that is not running is not evidence of anything"
-        );
-        assert_eq!(
-            activity_verdict(Err("timeout".into()), false),
-            ActivityVerdict::Unreadable
         );
     }
 
@@ -1129,14 +1096,19 @@ mod tests {
         let mut working = session("ses_a", "work");
         working.running = true;
         working.awaiting_reply = None;
-        let row = agent_row_state(&TerminalSession::Identified(Box::new(working)), &[], 0);
+        let row = agent_row_state(
+            &TerminalSession::Identified(Box::new(working)),
+            &[],
+            0,
+            None,
+        );
         assert!(row.working);
         assert!(row.unavailable);
         assert_eq!(row.note, "working");
     }
 
     #[test]
-    fn native_http_polls_rotate_pending_and_catalogs_beyond_eight_locations() {
+    fn native_http_polls_read_every_location_and_rotate_catalogs_beyond_eight() {
         use serde_json::json;
         let mock = mock::Mock::start(|request| {
             let data = match request.path.as_str() {
@@ -1175,7 +1147,8 @@ mod tests {
                     .iter()
                     .filter(|session| session.awaiting_reply.is_none())
                     .count(),
-                2
+                0,
+                "every location is asked about, so a row knows whether its session is idle"
             );
             known.extend(
                 snapshot
@@ -1446,7 +1419,13 @@ mod tests {
             .sessions
             .iter()
             .any(|session| session.awaiting_reply.is_none()));
-        assert!(snapshot.catalogs.is_empty());
+        // The pending read is given half of what is left, so the catalogs get the other
+        // half: a row that knows the name of its agent is worth more than a pending list
+        // that would have said the session was idle.
+        assert!(
+            snapshot.catalogs.len() < 8,
+            "the deadline cuts the catalogs off too"
+        );
         // The work would be thirty-five reads: three unscoped, twenty-four pending and
         // eight catalogs. The deadline stops it long before that.
         let reads = mock.requests().len();

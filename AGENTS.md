@@ -166,6 +166,12 @@ written there against the node names that grammar declares. Its tree is
 hash-pinned by `scripts/patched-gherkin.mjs`, like every other vendored crate
 the audit is asked to trust.
 
+The toolkit ships no SVG grammar either, and SVG is XML: the pinned upstream XML
+grammar reads it and `theme::install` registers it under SVG's own name, so the
+picker says SVG and the file is read as one. The query is the XML one, so the
+names it emits that this theme holds no key for -- `markup` and its family, and
+`error` -- are answered by `CAPTURE_ALIASES`.
+
 ### File icons: their own palette, and their own generator
 
 `theme::Ink` is the second contract that is not the app's chrome. A file icon is
@@ -641,16 +647,38 @@ for a question or a permission. Three things make it safe to draw.
   location, so each location is asked about on its own.
 - A pending list that **cannot be read** leaves its sessions *unknown* rather than
   idle: a question this app could not see is not a question that was not asked.
+  Every location the service names is asked about, bounded by the observation's
+  deadline rather than by a count of locations: a location this app never asked
+  about is a different finding from one the service could not answer for, and
+  only the second of them is worth a warning. The pending read is given half of
+  what is left of the deadline, so the catalog that names the agents still has
+  the other half.
 - A colour the service gave is checked for being a colour before it is painted
   (`theme::service_tint`), and the theme's own ink is what a row wears instead.
 
 **What a row says.** `app/src/agent_watch.rs` turns that reading into what a
 terminal row wears: a spinner while a turn runs, a question while it waits, the
 error ink after a failed turn, the agent's own name and colour, and how long ago the
-service last touched the session. The title the TUI wrote is the only thing that says
-which session a terminal has open, and it is matched conservatively: a title that
-names several sessions names none of them, and a service that could not be read names
-none either.
+service last touched the session.
+
+**What the terminal says about itself.** The TUI reports through OSC 7501, the same
+escape sequence Pi uses and a different contract: `app/src/terminal/opencode_status.rs`
+reads the state it names and the session it is about. The report is written into the
+terminal that produced it, so it says what *this* terminal is doing -- the one thing
+the service cannot say, because the service has no way to know which of its sessions
+a terminal is showing. So the report is what the row draws, and the session it names
+is the session the row is about; the service is asked about the rest, which is how the
+last turn ended. A report is believed only while the operating system says OpenCode
+is what is in front of the shell, and it is forgotten the moment that stops being
+true, or the moment the shell runs something else.
+
+**A session that has no title yet.** The TUI writes the program's own name while the
+session it shows has no title, and a session earns its title by running: the turn a
+person wants to watch is often the one whose session cannot be named by the title.
+The report is what names it, and a session the service has not heard of yet is named
+by nothing, so the row draws the state without the agent's name and colour. This is
+more than Legacy did: Legacy named a session by its title only, so the first turn of
+a fresh session drew no state at all.
 
 **Where the reading happens.** The poll is on the background executor and comes back
 as a value, so a service that takes its time costs a tick of the panel and nothing

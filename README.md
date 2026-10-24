@@ -8,6 +8,7 @@ Muster is a desktop workspace for people working with coding agents in Git workt
 - **Native release targets:** macOS (Apple Silicon) · Ubuntu 24.04 (x86_64)
 - **License:** MIT
 
+![Muster screan]()
 
 ## Why
 

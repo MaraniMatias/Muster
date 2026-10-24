@@ -4298,6 +4298,7 @@ dependencies = [
  "tree-sitter-ini",
  "tree-sitter-swift",
  "tree-sitter-vue-updated",
+ "tree-sitter-xml",
  "ttf-parser",
  "unicode-width",
 ]
@@ -7647,6 +7648,16 @@ checksum = "78cced828e25f82c788b240454a9def2a29f58f8f78214c20f51032a2b840dde"
 dependencies = [
  "cc",
  "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-xml"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e670041f591d994f54d597ddcd8f4ebc930e282c4c76a42268743b71f0c8b6b3"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

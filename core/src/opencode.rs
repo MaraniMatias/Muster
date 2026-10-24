@@ -144,7 +144,11 @@ impl ReadBudget {
         }
     }
 
-    fn remaining(&self) -> Result<Duration, DispatchError> {
+    /// The time left before this read's deadline.
+    ///
+    /// A read that is given a share of what is left keeps the rest for the work that
+    /// comes after it, rather than spending the whole deadline on itself.
+    pub fn remaining(&self) -> Result<Duration, DispatchError> {
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(DispatchError::Unavailable(
                 "the OpenCode observation was cancelled".into(),
