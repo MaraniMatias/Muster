@@ -1009,11 +1009,12 @@ fn scroll_grammar_row_into_view(scroll: &ScrollHandle, row: usize) {
     let offset = scroll.offset();
     let top = px(GRAMMAR_ROW_PX * row as f32);
     let bottom = top + px(GRAMMAR_ROW_PX);
-    let visible = offset.y..offset.y + scroll.bounds().size.height;
+    let content_top = -offset.y;
+    let visible = content_top..content_top + scroll.bounds().size.height;
     let wanted = if top < visible.start {
-        top
+        -top
     } else if bottom > visible.end {
-        bottom - scroll.bounds().size.height
+        -(bottom - scroll.bounds().size.height)
     } else {
         offset.y
     };
@@ -1384,7 +1385,23 @@ impl TerminalWindow {
         let language_for_check = language.clone();
         let source_for_format = source.clone();
         let source_for_check = source.clone();
+        #[cfg(test)]
+        let formatter = self.formatter_command.clone();
         let worker = cx.background_executor().spawn(async move {
+            #[cfg(test)]
+            {
+                // The test's own formatter: the same call the person's Prettier
+                // gets, with the executable the test wrote down.
+                if let Some(executable) = formatter {
+                    return run_prettier_with(
+                        &executable,
+                        OsStr::new(""),
+                        &path_for_format,
+                        parser,
+                        &source_for_format,
+                    );
+                }
+            }
             run_prettier(&checkout_root, &path_for_format, parser, &source_for_format)
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -1495,36 +1512,50 @@ impl TerminalWindow {
         cx.notify();
     }
 
+    /// Put the keyboard back on the list's first row, and the list with it.
+    ///
+    /// The highlight and the scroll are one thing: a list left scrolled away
+    /// from the row the keyboard points at hides that row, and the first row
+    /// is at the top of the content, so the list goes back to the top with it.
+    fn highlight_first_grammar(&mut self, scroll: &ScrollHandle) {
+        self.document_grammar_highlight = 0;
+        scroll.set_offset(point(px(0.), px(0.)));
+    }
+
     /// Watch the grammar menu's search field for as long as the menu is open.
     ///
     /// A typed character re-filters the list, so the row the keyboard was on
-    /// is no longer a row: the highlight goes back to the top of what is left.
+    /// is no longer a row: the highlight goes back to the top of what is left,
+    /// and the list goes back to the top with it.
     /// Return is not answered here: the window's keystroke interceptor takes it
     /// before the field and the popover both see it, because both of those
     /// close the menu rather than choose a row.
     pub(crate) fn watch_document_grammar_query(
         &mut self,
         query: &Entity<InputState>,
+        scroll: &ScrollHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.document_grammar_query = Some(query.clone());
         self.document_grammar_query_seen = query.read(cx).value().to_string();
-        self.document_grammar_query_watch =
-            Some(
-                cx.subscribe_in(query, window, |app, _, event, window, cx| match event {
-                    InputEvent::Change => {
-                        app.document_grammar_highlight = 0;
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter {
-                        secondary: false, ..
-                    } => {
-                        app.confirm_document_grammar(window, cx);
-                    }
-                    _ => {}
-                }),
-            );
+        let scroll = scroll.clone();
+        self.document_grammar_query_watch = Some(cx.subscribe_in(
+            query,
+            window,
+            move |app, _, event, window, cx| match event {
+                InputEvent::Change => {
+                    app.highlight_first_grammar(&scroll);
+                    cx.notify();
+                }
+                InputEvent::PressEnter {
+                    secondary: false, ..
+                } => {
+                    app.confirm_document_grammar(window, cx);
+                }
+                _ => {}
+            },
+        ));
     }
 
     /// Wear the grammar the keyboard is on, and close the menu.
@@ -1933,13 +1964,16 @@ impl TerminalWindow {
                         let view = view.clone();
                         let query = query.clone();
                         let focus = focus.clone();
+                        let scroll = scroll.read(cx).clone();
                         move |open, window, cx| {
                             let _ = view.update(cx, |app, cx| {
                                 app.document_grammar_open = *open;
-                                app.document_grammar_highlight = 0;
+                                // The menu opens on the row the keyboard points
+                                // at, and that row is the first one.
+                                app.highlight_first_grammar(&scroll);
                                 if *open {
                                     query.update(cx, |query, cx| query.set_value("", window, cx));
-                                    app.watch_document_grammar_query(&query, window, cx);
+                                    app.watch_document_grammar_query(&query, &scroll, window, cx);
                                 }
                                 cx.notify();
                             });

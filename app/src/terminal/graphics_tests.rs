@@ -79,6 +79,121 @@ fn pi_png_chunks_are_placed_once_without_moving_the_cursor() {
 }
 
 #[test]
+fn a_canceled_or_escaped_apc_does_not_swallow_the_next_graphics_packet() {
+    for ending in [0x18, 0x1a, 0x1b] {
+        let mut interrupted = b"\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;partial".to_vec();
+        interrupted.push(ending);
+        for split in 0..=interrupted.len() {
+            let mut core = core();
+            core.feed(&interrupted[..split]);
+            core.feed(&interrupted[split..]);
+            red(&mut core, "c=1,r=1");
+            assert_eq!(
+                core.graphic_snapshots().len(),
+                1,
+                "terminator {ending:#x}, split {split}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_osc_bel_preserves_following_text_and_graphics_in_same_or_split_chunks() {
+    const OSC_CAP: usize = 64 * 1024;
+    let mut bytes = b"AB\x1b]0;".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', OSC_CAP + 1));
+    bytes.extend_from_slice(b"\x07C\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\D\x1b]2;after\x07");
+
+    for split in [
+        0,
+        bytes.len(),
+        2 + 5 + OSC_CAP,
+        2 + 5 + OSC_CAP + 1,
+        2 + 5 + OSC_CAP + 2,
+        2 + 5 + OSC_CAP + 3,
+        2 + 5 + OSC_CAP + 4,
+    ] {
+        let split = split.min(bytes.len());
+        let mut core = core();
+        core.feed(&bytes[..split]);
+        core.feed(&bytes[split..]);
+        let graphics = core.graphic_snapshots();
+        assert_eq!(graphics.len(), 1, "split {split}");
+        assert_eq!(graphics[0].column, 3, "APC anchors after preceding ABC");
+        assert_eq!(
+            core.visible_rows()[0].cells[..4]
+                .iter()
+                .map(|c| c.c)
+                .collect::<String>(),
+            "ABCD"
+        );
+        assert_eq!(
+            core.cursor().col,
+            4,
+            "graphic placement does not move cursor"
+        );
+        assert_eq!(core.title(), Some("after"));
+    }
+}
+
+#[test]
+fn oversized_osc_terminators_recover_into_following_vt_sequences() {
+    const OSC_CAP: usize = 64 * 1024;
+    let ordinary = b"C\x1b[2C\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\D\x1b]2;recovered\x07";
+    let immediate_csi = b"[2C\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\D\x1b]2;recovered\x07";
+    let immediate_apc = b"_Ga=T,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\C\x1b[2C D\x1b]2;recovered\x07";
+    let immediate_osc = b"]2;recovered\x07C\x1b[2C\x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;/wAA/w==\x1b\\D";
+    let cases: &[(&[u8], &[u8], u32)] = &[
+        (b"\x07", ordinary, 5),
+        (b"\x18", ordinary, 5),
+        (b"\x1a", ordinary, 5),
+        (b"\x1b\\", ordinary, 5),
+        (b"\x1b", immediate_csi, 4),
+        (b"\x1b", immediate_apc, 2),
+        (b"\x1b", immediate_osc, 5),
+    ];
+
+    for (ending, following, graphic_column) in cases {
+        let mut bytes = b"AB\x1b]0;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', OSC_CAP + 1));
+        let boundary = bytes.len();
+        bytes.extend_from_slice(ending);
+        bytes.extend_from_slice(following);
+        let after_terminator = boundary + ending.len();
+        let mut splits = vec![0, bytes.len(), boundary - 1, boundary, boundary + 1];
+        for split in [
+            after_terminator.saturating_sub(1),
+            after_terminator,
+            after_terminator + 1,
+        ] {
+            splits.push(split.min(bytes.len()));
+        }
+
+        for split in splits {
+            let mut core = core();
+            core.feed(&bytes[..split]);
+            core.feed(&bytes[split..]);
+            assert_eq!(
+                core.title(),
+                Some("recovered"),
+                "ending {ending:?}, split {split}"
+            );
+            let graphics = core.graphic_snapshots();
+            assert_eq!(
+                graphics.len(),
+                1,
+                "ending {ending:?}, following {following:?}, split {split}"
+            );
+            assert_eq!(graphics[0].column, *graphic_column, "split {split}");
+            assert!(core.visible_rows()[0]
+                .cells
+                .iter()
+                .any(|cell| cell.c == 'D'));
+        }
+    }
+}
+
+#[test]
 fn every_pty_chunk_boundary_preserves_the_graphics_command_and_following_text() {
     let message = format!(
         "A\x1b_Ga=T,f=100,q=2,C=1,c=2,r=1,i=7;{}\x1b\\B",

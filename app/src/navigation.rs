@@ -243,20 +243,6 @@ impl Navigation {
         }
     }
 
-    /// The slot a workdir takes when it is moved one place up or down.
-    ///
-    /// The slot is the index the workdir takes in the panel's order after the
-    /// move. `None` is a move that is not there: the workdir is already at
-    /// the end of the panel, or the home workdir is in the way.
-    pub fn step_slot(&self, id: &str, up: bool) -> Option<usize> {
-        let from = self.repos.iter().position(|repo| repo.id == id)?;
-        let slot = if up { from.checked_sub(1)? } else { from + 1 };
-        if slot >= self.repos.len() {
-            return None;
-        }
-        self.allowed_slot(from, slot).then_some(slot)
-    }
-
     /// The slot a workdir takes when it is put down at a boundary.
     ///
     /// The boundary is a place between two workdirs in the panel's order: `0`
@@ -595,34 +581,6 @@ mod tests {
         // And nothing is put above it.
         assert!(nav.move_repo(&second, 0).is_err());
         assert_eq!(panel_order(&nav), vec![first.clone(), second.clone()]);
-
-        // The workdir below the home one cannot move up either.
-        assert_eq!(nav.step_slot(&second, true), None);
-        assert_eq!(nav.step_slot(&first, true), None);
-        // And it is the last one, so there is no place below it.
-        assert_eq!(nav.step_slot(&second, false), None);
-    }
-
-    #[test]
-    fn a_workdir_steps_one_place_up_or_down_the_panel() {
-        let (_dir, mut nav, home) = fixture();
-        nav.home = Some(home.clone());
-        let first = nav.repos[0].id.clone();
-        let second = extra_workdir(&mut nav);
-        let third = extra_workdir(&mut nav);
-
-        assert_eq!(nav.step_slot(&third, true), Some(1));
-        assert_eq!(nav.step_slot(&third, false), None);
-        assert_eq!(nav.step_slot(&second, true), None);
-        assert_eq!(nav.step_slot(&second, false), Some(2));
-
-        nav.move_repo(&third, nav.step_slot(&third, true).unwrap())
-            .unwrap();
-        assert_eq!(
-            panel_order(&nav),
-            vec![first.clone(), third.clone(), second.clone()]
-        );
-        assert_eq!(nav.step_slot(&third, false), Some(2));
     }
 
     #[test]

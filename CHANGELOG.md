@@ -16,6 +16,13 @@ here still gets its generated notes.
   them, so it is not opened, not restored and not written to the file. Opening
   it by hand is refused, and says why.
 
+## Unreleased
+
+- **The workdir's menu no longer moves the workdir.** **Move up** and **Move
+  down** are gone from it, so the menu holds only what the workdir can be asked
+  for: a new worktree, an archived worktree to restore, and its removal from
+  the panel. The panel's order is still the drag's.
+
 ## 1.0.0-rc.15
 
 - **The workdirs can be put in the order you want them in.** The panel drew
