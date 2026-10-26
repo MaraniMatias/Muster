@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0-rc.18
 
 - **The Files and Changes panel can be moved under the sidebar.** The window
   had two panels beside each other — the workdirs and their terminals on the
