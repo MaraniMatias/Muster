@@ -190,7 +190,9 @@ repositories and worktrees in a sidebar, live terminals grouped under them,
 line counts counted against Git, a searchable worktree picker in the title bar,
 worktree creation and archive-or-delete dialogs, drag to reorder or move a
 terminal between worktrees, drag to reorder the workdirs themselves, and a
-window state file.
+window state file. The Files and Changes panel sits beside the body, or under
+the sidebar in the sidebar's own column: a button in that panel's header moves
+it, and the workspace file keeps the shape the window was left in.
 
 The native app includes review notes and agent delivery/export, editable
 preferences, file activation and terminal search.

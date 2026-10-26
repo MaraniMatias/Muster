@@ -323,6 +323,25 @@ fn state_roundtrips_without_sessions_and_replaces_atomically() {
 }
 
 #[test]
+fn the_workspace_file_keeps_where_the_files_panel_sits() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("native-workspace.json");
+    assert_eq!(load(&path).unwrap().panel_layout, PanelLayout::Side);
+    let state = NavigationState {
+        panel_layout: PanelLayout::Below,
+        ..NavigationState::default()
+    };
+    save(&path, &state).unwrap();
+    assert_eq!(load(&path).unwrap().panel_layout, PanelLayout::Below);
+    // The file's own shape is the whole contract: a file without the field is
+    // not this build's file, and it is refused rather than read through.
+    let mut json = serde_json::to_value(&state).unwrap();
+    json.as_object_mut().unwrap().remove("panelLayout");
+    fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(load(&path).is_err());
+}
+
+#[test]
 fn invalid_state_cannot_overwrite_last_good_file() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("native-workspace.json");

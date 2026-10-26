@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::path::Path;
 
-use muster_core::navigation::{NavigationState, OpenedDirectory};
+use muster_core::navigation::{NavigationState, OpenedDirectory, PanelLayout};
 use muster_core::review::ReviewStorage;
 use muster_core::workspace::{Checkout, Repo, RepoKind, Session};
 
@@ -24,6 +24,9 @@ pub(crate) struct Navigation {
     pub sidebar_width: f32,
     pub review_storage: ReviewStorage,
     pub panels_visible: bool,
+    /// Where the Files and Changes panel sits: its own column, or under the
+    /// sidebar in the sidebar's own column.
+    pub panel_layout: PanelLayout,
 }
 
 impl Navigation {
@@ -31,6 +34,7 @@ impl Navigation {
         Self {
             sidebar_width: 240.,
             panels_visible: true,
+            panel_layout: PanelLayout::default(),
             ..Self::default()
         }
     }
@@ -420,6 +424,7 @@ impl Navigation {
             active_checkout_id: self.active_checkout.clone(),
             sidebar_width: self.sidebar_width,
             review_storage: self.review_storage,
+            panel_layout: self.panel_layout,
         }
     }
 }

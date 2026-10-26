@@ -14,6 +14,22 @@ pub struct NavigationState {
     pub active_checkout_id: Option<String>,
     pub sidebar_width: f32,
     pub review_storage: ReviewStorage,
+    pub panel_layout: PanelLayout,
+}
+
+/// Where the Files and Changes panel sits.
+///
+/// Two shapes, and the file keeps which one the window was left in: the panel
+/// is a column of its own at the right of the window, or it sits under the
+/// sidebar in the sidebar's own column.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PanelLayout {
+    /// The panel is a column of its own, at the right of the window.
+    #[default]
+    Side,
+    /// The panel sits under the sidebar, in one column with it.
+    Below,
 }
 
 // An absent field is not the current schema's explicit null selection.
@@ -31,6 +47,7 @@ impl Default for NavigationState {
             active_checkout_id: None,
             sidebar_width: 240.0,
             review_storage: ReviewStorage::Workdir,
+            panel_layout: PanelLayout::default(),
         }
     }
 }

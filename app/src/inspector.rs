@@ -13,6 +13,7 @@ use gpui_kit::{
     div, point, px, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, TestSupportExt,
 };
+use muster_core::navigation::PanelLayout;
 use muster_core::workspace::{Checkout, Repo, RepoKind};
 
 use crate::{
@@ -1383,13 +1384,19 @@ impl TerminalWindow {
             .flex()
             .flex_col()
             .bg(roles.surface)
-            .text_size(px(ROW_TEXT_PX))
-            .border_l_1()
-            .border_color(roles.border);
+            .text_size(px(ROW_TEXT_PX));
+        // The panel's own edge is drawn only where the panel is beside the
+        // body: under the sidebar the divider between them is the group's
+        // own handle, and a border here would draw a second line beside it.
+        let layout = self.navigation.panel_layout;
+        if layout == PanelLayout::Side {
+            panel = panel.border_l_1().border_color(roles.border);
+        }
         let files_tab = self.inspector_tab == InspectorTab::Files || repo.kind != RepoKind::Git;
         let mut tabs = div()
             .flex()
             .flex_none()
+            .items_center()
             .border_b_1()
             .border_color(roles.border);
         tabs = tabs.child(inspector_tab(
@@ -1419,6 +1426,30 @@ impl TerminalWindow {
                 }),
             ));
         }
+        // The room between the tabs and the button is the strip's own, and the
+        // button is the way from one layout to the other: the glyph it wears
+        // is the place the panel would go, not the place it is in.
+        let (glyph, label) = match layout {
+            PanelLayout::Side => (
+                IconName::PanelBottom,
+                "Move Files and Changes below the sidebar",
+            ),
+            PanelLayout::Below => (
+                IconName::PanelRight,
+                "Move Files and Changes to its own panel",
+            ),
+        };
+        tabs = tabs.child(div().flex_1().min_w(px(8.)));
+        tabs = tabs.child(
+            Button::new("inspector-layout")
+                .ghost()
+                .small()
+                .compact()
+                .icon(glyph)
+                .accessibility_label(label)
+                .resting_tooltip(label)
+                .on_click(cx.listener(|app, _, _, cx| app.toggle_panel_layout(cx))),
+        );
         panel = panel.child(tabs);
         if !files_tab {
             if repo.kind != RepoKind::Git {

@@ -238,6 +238,43 @@ what makes the build enforce it. The two are one decision: if the floor moves,
 both move, and if a build fails with an unavailable API then that API is the real
 floor rather than the number that was written down.
 
+## Where the Files panel sits
+
+The window has two shapes, and the Files and Changes panel is in one of them.
+Beside the body, it is a column of its own at the right of the window; under
+the sidebar, it is the lower half of the sidebar's own column, and the workdirs
+and their terminals are the upper half.
+
+**The button is in the panel's own header.** It sits at the right of the strip
+that carries the Files and Changes tabs, and the glyph it wears is the place the
+panel would go: `PanelBottom` while the panel is beside the body, `PanelRight`
+while it is under the sidebar. It is not a preference and it is not in the
+settings panel: it is the way between two shapes of the same window.
+
+**The panel's own edge follows the shape.** The border that separates it from
+the body is drawn only while it is beside the body; under the sidebar the
+divider between them is the group's own handle, and a border there would draw a
+second line beside it.
+
+**The column divides in a share, and the divider is draggable.** The sidebar
+keeps the larger part of the column and the Files panel the smaller one, and
+the split is a share of the column's height rather than a fixed height each, so
+the column divides the way it was drawn whatever the window's height is.
+
+**The file keeps the shape the window was left in.**
+`~/.muster/native-workspace.json` holds it as `panelLayout`, and it is one of
+the reasons that file's shape changed: a file written before the field existed
+is not this build's file, and it is refused by name rather than read through.
+See **Stored shapes** below.
+
+Two rules it depends on, each pinned by a test:
+
+- **The button moves the panel, and the file keeps the move.**
+  `the_files_panel_can_be_moved_under_the_sidebar` in `app/src/app_tests.rs`.
+- **The file keeps the shape.**
+  `the_workspace_file_keeps_where_the_files_panel_sits` in
+  `core/src/navigation/tests.rs`.
+
 ## The unfinished work in the sidebar
 
 A file being edited and a diff holding notes become rows of the workdir they

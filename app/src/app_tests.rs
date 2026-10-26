@@ -1114,6 +1114,59 @@ fn the_workspace_panels_reach_both_edges_of_every_window_size(cx: &mut TestAppCo
     close(&fixture, cx);
 }
 
+/// The Files and Changes panel can be moved under the sidebar.
+///
+/// The window has two shapes: the sidebar and the Files panel side by side, or
+/// one column with the Files panel under the sidebar. The button in the Files
+/// panel's own header is the way between them, and the workspace file keeps
+/// the shape the window was left in.
+#[gpui_kit::test]
+fn the_files_panel_can_be_moved_under_the_sidebar(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(size(px(1280.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        assert!(
+            inspector.origin.x >= sidebar.right(),
+            "the panel starts beside the sidebar: {inspector:?} against {sidebar:?}"
+        );
+        let button = window.find("inspector-layout").bounds();
+        assert!(
+            button.right() > inspector.center().x && button.right() <= inspector.right(),
+            "the button is at the right of the panel's own header: {button:?} against {inspector:?}"
+        );
+        window.click("inspector-layout", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        assert!(
+            inspector.origin.y >= sidebar.bottom() && inspector.right() <= sidebar.right() + px(1.),
+            "the panel is under the sidebar now: {inspector:?} against {sidebar:?}"
+        );
+        let column = sidebar.size.height.as_f32() + inspector.size.height.as_f32();
+        let share = sidebar.size.height.as_f32() / column;
+        assert!(
+            (share - 0.6).abs() < 0.02,
+            "the sidebar keeps the larger share of the column: {share} of {column}"
+        );
+        fixture.view.read_with(cx, |app, _| {
+            assert_eq!(app.navigation.panel_layout, PanelLayout::Below);
+            assert_eq!(
+                app.navigation.persistent_state().panel_layout,
+                PanelLayout::Below,
+                "the file keeps the shape the window was left in"
+            );
+        });
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
 /// The empty state belongs to the middle of the panel it is drawn in.
 ///
 /// A checkout with no terminal open leaves the middle panel holding one

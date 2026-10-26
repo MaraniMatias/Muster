@@ -6,6 +6,17 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The Files and Changes panel can be moved under the sidebar.** The window
+  had two panels beside each other — the workdirs and their terminals on the
+  left, Files and Changes on the right — and the panel on the right took room
+  the body could have used. A button in that panel's own header now moves it
+  under the sidebar, so the window has one column: the workdirs and their
+  terminals above, the file tree and the change set below it, with a divider
+  between the two that can be dragged. The same button brings the panel back to
+  its own column, and the workspace file keeps the shape the window was left in.
+
 ## 1.0.0-rc.17
 
 - **An SVG file is read as a drawing, and its markup is one click away.** A

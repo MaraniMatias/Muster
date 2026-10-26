@@ -17,7 +17,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     button::{Button, ButtonVariant},
     input::{InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, ResizableState},
+    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
     Disableable, TitleBar,
 };
 use gpui_kit::{
@@ -27,7 +27,7 @@ use gpui_kit::{
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
-use muster_core::navigation::{self, DiffTotals, GitReadBudget};
+use muster_core::navigation::{self, DiffTotals, GitReadBudget, PanelLayout};
 use muster_core::settings::FollowWorktree;
 use muster_core::workspace::{
     Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
@@ -669,6 +669,15 @@ pub struct TerminalWindow {
     pub(crate) sidebar_drag: Option<SidebarDrag>,
     pub(crate) suppress_sidebar_click: bool,
     pub(crate) resize: Entity<ResizableState>,
+    /// The horizontal group of the one-column layout: the column that holds
+    /// the sidebar and the Files panel, and the body beside it.
+    ///
+    /// Its own state, apart from the two-panel layout's, so each layout keeps
+    /// the widths it was left at.
+    pub(crate) merged_resize: Entity<ResizableState>,
+    /// The vertical group inside that column: the sidebar above, the Files
+    /// panel below it.
+    pub(crate) column_resize: Entity<ResizableState>,
     pub(crate) scroll: ScrollHandle,
     /// The window's tooltips: what a trigger waited for, and what it wears.
     pub(crate) tooltips: Entity<Tooltips>,
@@ -818,6 +827,8 @@ impl TerminalWindow {
             sidebar_drag: None,
             suppress_sidebar_click: false,
             resize: cx.new(|_| ResizableState::default()),
+            merged_resize: cx.new(|_| ResizableState::default()),
+            column_resize: cx.new(|_| ResizableState::default()),
             scroll: ScrollHandle::new(),
             tooltips: cx.new(Tooltips::new),
             files_scroll: ScrollHandle::new(),
@@ -1086,6 +1097,19 @@ impl TerminalWindow {
 
     pub(crate) fn persist(&self) {
         self.owner.persist(self.navigation.persistent_state());
+    }
+
+    /// Move the Files and Changes panel between its own column and the sidebar's.
+    ///
+    /// One gesture, one state: the panel is either beside the body or under the
+    /// sidebar, and the workspace file keeps which one the window was left in.
+    pub(crate) fn toggle_panel_layout(&mut self, cx: &mut Context<Self>) {
+        self.navigation.panel_layout = match self.navigation.panel_layout {
+            PanelLayout::Side => PanelLayout::Below,
+            PanelLayout::Below => PanelLayout::Side,
+        };
+        self.persist();
+        cx.notify();
     }
 
     pub(crate) fn request_terminal(
@@ -3603,6 +3627,19 @@ impl TerminalWindow {
     }
 }
 
+/// The share of the column the sidebar takes in the one-column layout, and the
+/// share the Files panel takes under it.
+///
+/// The split is a share of the column's height rather than a fixed height
+/// each, so the column divides the way it was drawn whatever the window's
+/// height is. The share is taken of the height the window has now, because the
+/// first frame of a column that has not been drawn yet has to divide it
+/// without a gap: a panel that does not fill its share leaves the room empty
+/// under it until the group measures it.
+const COLUMN_SIDEBAR_SHARE: f32 = 0.6;
+/// The height the title bar leaves to the panels.
+const TITLE_BAR_PX: f32 = 32.;
+
 impl Render for TerminalWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let roles = Roles::of(cx);
@@ -3678,41 +3715,100 @@ impl Render for TerminalWindow {
             // title bar's height below the window's edge, and a panel whose
             // tree is taller than its own box then holds that height against
             // the group and pushes the sidebar's own footer off the screen.
-            div()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .child(
-                    h_resizable("workspace-panels")
-                        .with_state(&self.resize)
+            match self.navigation.panel_layout {
+                // Two panels: the sidebar on the left, the Files panel on the
+                // right, and the body between them.
+                PanelLayout::Side => div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(
+                        h_resizable("workspace-panels")
+                            .with_state(&self.resize)
+                            .child(
+                                resizable_panel()
+                                    .flex_none()
+                                    .size(px(self.navigation.sidebar_width))
+                                    .size_range(px(240.)..px(500.))
+                                    .child(sidebar),
+                            )
+                            .child(resizable_panel().child(body))
+                            .child(
+                                resizable_panel()
+                                    .flex_none()
+                                    .size(px(self.inspector_width))
+                                    .size_range(px(200.)..px(480.))
+                                    .child(inspector),
+                            )
+                            .on_resize(cx.listener(
+                                |app, state: &Entity<ResizableState>, _, cx| {
+                                    let sizes = state.read(cx).sizes();
+                                    if let Some(width) = sizes.first() {
+                                        app.navigation.sidebar_width =
+                                            width.as_f32().clamp(240., 500.);
+                                        app.persist();
+                                    }
+                                    if let Some(width) = sizes.get(2) {
+                                        app.inspector_width = width.as_f32().clamp(200., 480.);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .into_any_element(),
+                // One panel: the sidebar above, the Files panel under it, and
+                // the body beside the column they share.
+                PanelLayout::Below => {
+                    // The column's height is the window's height less the title
+                    // bar's, and the split is a share of it.
+                    let column = window.viewport_size().height - px(TITLE_BAR_PX);
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
                         .child(
-                            resizable_panel()
-                                .flex_none()
-                                .size(px(self.navigation.sidebar_width))
-                                .size_range(px(240.)..px(500.))
-                                .child(sidebar),
+                            h_resizable("workspace-panels-below")
+                                .with_state(&self.merged_resize)
+                                .child(
+                                    resizable_panel()
+                                        .flex_none()
+                                        .size(px(self.navigation.sidebar_width))
+                                        .size_range(px(240.)..px(500.))
+                                        .child(
+                                            v_resizable("workspace-column")
+                                                .with_state(&self.column_resize)
+                                                .child(
+                                                    resizable_panel()
+                                                        .flex_none()
+                                                        .size(column * COLUMN_SIDEBAR_SHARE)
+                                                        .size_range(px(120.)..px(2000.))
+                                                        .child(sidebar),
+                                                )
+                                                .child(
+                                                    resizable_panel()
+                                                        .flex_none()
+                                                        .size(column * (1. - COLUMN_SIDEBAR_SHARE))
+                                                        .size_range(px(120.)..px(2000.))
+                                                        .child(inspector),
+                                                ),
+                                        ),
+                                )
+                                .child(resizable_panel().child(body))
+                                .on_resize(cx.listener(
+                                    |app, state: &Entity<ResizableState>, _, cx| {
+                                        let sizes = state.read(cx).sizes();
+                                        if let Some(width) = sizes.first() {
+                                            app.navigation.sidebar_width =
+                                                width.as_f32().clamp(240., 500.);
+                                            app.persist();
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
                         )
-                        .child(resizable_panel().child(body))
-                        .child(
-                            resizable_panel()
-                                .flex_none()
-                                .size(px(self.inspector_width))
-                                .size_range(px(200.)..px(480.))
-                                .child(inspector),
-                        )
-                        .on_resize(cx.listener(|app, state: &Entity<ResizableState>, _, cx| {
-                            let sizes = state.read(cx).sizes();
-                            if let Some(width) = sizes.first() {
-                                app.navigation.sidebar_width = width.as_f32().clamp(240., 500.);
-                                app.persist();
-                            }
-                            if let Some(width) = sizes.get(2) {
-                                app.inspector_width = width.as_f32().clamp(200., 480.);
-                            }
-                            cx.notify();
-                        })),
-                )
-                .into_any_element()
+                        .into_any_element()
+                }
+            }
         } else {
             body
         };
@@ -3819,6 +3915,7 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
     let active_checkout_id = state.active_checkout_id.clone();
     nav.sidebar_width = state.sidebar_width;
     nav.review_storage = state.review_storage;
+    nav.panel_layout = state.panel_layout;
     nav.archived = state.archived_checkout_ids.into_iter().collect();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         match Repo::plain(&home, "startup") {

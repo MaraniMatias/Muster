@@ -57,7 +57,7 @@ pub use diffs::{diff_totals, diff_totals_for_checkout, DiffTotals};
 pub use discovery::{open_directory, open_directory_with_budget, OpenedDirectory};
 pub use git::GitReadBudget;
 pub use instance::NativeInstanceLock;
-pub use persistence::{load, save, state_path, NavigationState};
+pub use persistence::{load, save, state_path, NavigationState, PanelLayout};
 pub use worktrees::{
     create_worktree, remove_worktree, worktree_defaults, worktree_removal_info, RemovedWorktree,
     WorktreeDefaults, WorktreeRemovalConfirmation, WorktreeRemovalInfo,
