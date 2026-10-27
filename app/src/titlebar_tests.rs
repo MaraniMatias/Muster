@@ -55,10 +55,11 @@ fn the_crumbs_say_what_the_sidebar_says(cx: &mut TestAppContext) {
         .read_with(cx, |app, _| app.navigation.repos[0].name.clone());
     cx.update_window(plain.handle, |_, window, _| {
         assert_eq!(window.find("repo-crumb").label(), Some(repo_name.as_str()));
-        assert!(matches!(
-            window.find("item-crumb").label(),
-            Some("sh" | "cat")
-        ));
+        assert!(
+            matches!(window.find("item-crumb").label(), Some("sh" | "cat")),
+            "the crumb names the terminal that is presented: {:?}",
+            window.find("item-crumb").label()
+        );
     })
     .unwrap();
     dispose(&plain, cx);
