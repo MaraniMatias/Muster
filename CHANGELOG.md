@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.1.0
 
 - **Exporting a review finishes it.** Saving a comment leaves a pending note
   in the diff: a note that has been written but not yet sent anywhere. Only a
