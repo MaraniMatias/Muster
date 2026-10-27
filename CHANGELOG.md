@@ -6,6 +6,30 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **Exporting a review finishes it.** Saving a comment leaves a pending note
+  in the diff: a note that has been written but not yet sent anywhere. Only a
+  successful Markdown export or a positively delivered OpenCode round finishes
+  the notes it captured -- their cards, their sidebar rows, the count and the
+  mark over their lines disappear. Notes added or edited while that operation
+  ran, notes excluded as outdated and an open composer all remain. A failed
+  export, a failed send, a queued round and a delivery that could not be
+  confirmed keep their notes, so a review is never dropped on a doubt.
+
+- **Suggest changes fills the comment from the note's own lines.** The diff
+  header's button takes the code the note's line range covers and puts it in
+  the composer as editable text, so the comment starts from what it is about.
+  A note that already has text is never overwritten, and the comment is
+  exported exactly as it was written.
+
+- **Pi is no longer a review destination.** The review menu offers Markdown
+  and OpenCode only. Pi is still watched in the terminals and still keeps a
+  worktree it is working in from being archived or removed, but a review is
+  not sent to it any more. The round store no longer admits the `pi`
+  destination: a store holding that removed shape is refused by name, and it
+  is never read through or overwritten.
+
 ## 1.0.1
 
 - **The terminal's history is the shell's own history again.** Muster starts the

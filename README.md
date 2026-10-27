@@ -2,7 +2,7 @@
 
 Muster brings your repositories, worktrees, terminals, and code reviews together in one desktop window. Work with coding agents in separate worktrees, try their changes, and leave feedback on the lines that need attention.
 
-You can send review notes to an existing OpenCode session, start a new Pi session with them, or export them as Markdown. You can also use Muster without an agent. Muster does not run AI models itself.
+You can send review notes to an existing OpenCode session, or export them as Markdown. You can also use Muster without an agent. Muster does not run AI models itself.
 
 ![Muster screenshot](./docs/screanshot/screenshot_home_v2.png)
 
@@ -37,7 +37,7 @@ Replace the filename with the one you downloaded. Packages for other Linux distr
 2. Select the repository or one of its worktrees, or create a worktree in Muster.
 3. Open a terminal and start your usual tools or coding agent. Open another terminal if you want to run the project alongside it.
 4. Select **Changes** to inspect the diff. Add notes to individual lines or ranges as you review.
-5. Send your notes to OpenCode or Pi, or export them as Markdown.
+5. Send your notes to OpenCode, or export them as Markdown.
 
 A worktree is a separate directory connected to a Git repository. It lets you work on another branch without changing the files in your main checkout.
 
@@ -58,7 +58,7 @@ The sidebar shows files with unsaved edits and files with review notes, so you c
 ### Work with agents
 
 - **OpenCode:** Install and run [OpenCode](https://opencode.ai). Muster can show session activity and send review notes to an existing session. If the session is busy, you can send now, queue the review, or cancel.
-- **Pi:** Install [Pi](https://github.com/earendil-works/pi) v1.1.0. Muster can show its activity and send notes by opening a new interactive Pi terminal for each review.
+- **Pi:** Install [Pi](https://github.com/earendil-works/pi) v1.1.0. Muster shows its activity in the terminal's row and keeps a worktree it is working in from being removed.
 - **Other CLI agents:** Run them in Muster's terminals and export your review notes as Markdown to share with them.
 
 Muster is a workspace and review companion, not a full IDE or a GitHub or GitLab review client.
