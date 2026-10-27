@@ -8,12 +8,12 @@ You can send review notes to an existing OpenCode session, start a new Pi sessio
 
 ## Install
 
-The current release is **v1.0.0**:
+The current release is **v1.0.1**:
 
-- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/Muster_1.0.0_arm64.zip)
-- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/Muster_1.0.0_x86_64.zip)
-- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/muster_1.0.0_amd64.deb)
-- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/muster_1.0.0_arm64.deb)
+- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.0.1/Muster_1.0.1_arm64.zip)
+- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.0.1/Muster_1.0.1_x86_64.zip)
+- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.1/muster_1.0.1_amd64.deb)
+- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.1/muster_1.0.1_arm64.deb)
 
 This is a stable release. Earlier candidates are on the [Releases page](https://github.com/MaraniMatias/Muster/releases).
 

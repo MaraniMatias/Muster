@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.1
 
 - **The terminal's history is the shell's own history again.** Muster starts the
   shell in a directory of its own so it can read the person's startup files, and
