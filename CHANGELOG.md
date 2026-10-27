@@ -27,6 +27,14 @@ here still gets its generated notes.
   work no longer throws away where a shell is sitting, and a title that
   changed in the meantime does not either.
 
+- **The worktree's warning says which commits are not merged.** Deleting a
+  worktree warns about the commits its branch holds that the default branch
+  does not, and the warning called them "unmerged commits" -- a word for the
+  state of a merge rather than for the commits themselves -- and the second
+  place it appeared did not say which branch they were not merged into. It now
+  says how many commits are not merged into the default branch, and names that
+  branch.
+
 ## 1.0.0
 
 - **Muster 1.0.0 is the first stable release.** The native build is the whole
