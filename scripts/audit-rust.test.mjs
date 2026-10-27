@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  acceptedAdvisory,
   auditPackages,
   AUDITED_MANIFESTS,
+  blockingAdvisories,
   cargoMetadataArgs,
   isBlocking,
   loadLockedPackages,
@@ -420,6 +422,24 @@ test("moderate advisories block the audit", async () => {
   });
   assert.equal(advisories[0].severity, "MODERATE");
   assert.equal(isBlocking(advisories[0]), true);
+});
+
+test("an accepted advisory is named and does not block the release", () => {
+  const advisory = {
+    identifiers: ["GHSA-qwgh-2vcv-g2f7"],
+    packages: ["block-buffer@0.10.4"],
+    severity: "MODERATE",
+  };
+  // The advisory is a blocking one, and it is accepted rather than fixed.
+  assert.equal(isBlocking(advisory), true);
+  assert.equal(acceptedAdvisory(advisory)?.id, "GHSA-qwgh-2vcv-g2f7");
+  assert.equal(blockingAdvisories([advisory]).length, 0);
+  // The claim is the package as well as the advisory: the same advisory on
+  // another package is not the one that was accepted.
+  assert.equal(acceptedAdvisory({ ...advisory, packages: ["block-buffer@0.12.0"] }), null);
+  assert.equal(blockingAdvisories([{ ...advisory, packages: ["block-buffer@0.12.0"] }]).length, 1);
+  // Another advisory on the accepted package is not accepted either.
+  assert.equal(acceptedAdvisory({ ...advisory, identifiers: ["GHSA-0000-0000-0000"] }), null);
 });
 
 test("OSV identifiers and aliases deduplicate across affected packages", async () => {

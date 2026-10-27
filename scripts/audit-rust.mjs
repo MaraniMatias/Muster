@@ -126,6 +126,48 @@ export function isBlocking(advisory) {
   return advisory.severity === "UNKNOWN" || severityRank[advisory.severity] >= severityRank.MODERATE;
 }
 
+// An advisory this tree accepts rather than fixes, with the reason it cannot
+// be reached here. The packages are part of the claim: an advisory that
+// reaches a different package is not the one that was accepted.
+//
+// An accepted advisory is reported on every run, with its reason, and it does
+// not block the release. It is never silently dropped, and an entry that no
+// longer applies to the locked tree says so, so the list cannot outlive the
+// advisory it names.
+export const ACCEPTED_ADVISORIES = [
+  {
+    id: "GHSA-qwgh-2vcv-g2f7",
+    packages: ["block-buffer@0.10.4"],
+    reason:
+      "The locked block-buffer keeps its cursor in its own field, so a caught panic in a hash " +
+      "callback cannot leave it out of range: the defect needs the versions that keep the cursor " +
+      "inside the buffer, which begin at 0.11.0, and 0.12.1 is the first fixed release. The locked " +
+      "tree cannot reach it, because the toolkit pins gpui-pre-linux, which pins oo7, which pins " +
+      "digest 0.10, which pins block-buffer 0.10.",
+  },
+];
+
+// The accepted entry that covers an advisory, if there is one. It matches the
+// advisory by any of its identifiers and covers exactly the packages the
+// entry names.
+export function acceptedAdvisory(advisory) {
+  if (!advisory || !Array.isArray(advisory.identifiers) || !Array.isArray(advisory.packages)) return null;
+  const identifiers = new Set(advisory.identifiers.map((id) => String(id).toUpperCase()));
+  return (
+    ACCEPTED_ADVISORIES.find(
+      (entry) =>
+        identifiers.has(entry.id.toUpperCase()) &&
+        entry.packages.length === advisory.packages.length &&
+        entry.packages.every((pkg) => advisory.packages.includes(pkg)),
+    ) ?? null
+  );
+}
+
+// The advisories that still block a release: the ones that are not accepted.
+export function blockingAdvisories(advisories) {
+  return advisories.filter((advisory) => isBlocking(advisory) && !acceptedAdvisory(advisory));
+}
+
 function mergeAdvisories(records) {
   const groups = [];
   const byIdentifier = new Map();
@@ -293,25 +335,40 @@ function safe(value) {
 
 function report(packages, advisories) {
   console.log(`Rust audit: queried ${packages.length} locked Cargo package versions against OSV.`);
+  const accepted = new Map();
+  for (const advisory of advisories) {
+    const exception = acceptedAdvisory(advisory);
+    if (exception) accepted.set(advisory, exception);
+  }
   for (const advisory of advisories) {
     const ids = advisory.identifiers;
     const primary = ids.find((id) => id.startsWith("RUSTSEC-")) ?? ids[0];
     const aliases = ids.filter((id) => id !== primary);
     const label = `${safe(primary)}${aliases.length ? ` (${aliases.map(safe).join(", ")})` : ""}`;
+    const exception = accepted.get(advisory);
+    if (exception) {
+      console.warn(`ACCEPTED ${label}: ${exception.reason}`);
+      continue;
+    }
     const line = `${advisory.severity} ${label}: ${advisory.packages.map(safe).join(", ")}`;
     if (isBlocking(advisory)) console.error(`BLOCK ${line}`);
     else console.warn(`WARN ${line}`);
   }
+  for (const entry of ACCEPTED_ADVISORIES) {
+    if (![...accepted.values()].some((exception) => exception.id === entry.id)) {
+      console.warn(`ACCEPTED ${entry.id} no longer applies to this tree: remove it from the accepted list.`);
+    }
+  }
 
-  const blocking = advisories.filter(isBlocking).length;
-  const informational = advisories.length - blocking;
+  const blocking = blockingAdvisories(advisories).length;
+  const informational = advisories.length - blocking - accepted.size;
   if (blocking) {
     console.error(`Rust audit blocked: ${blocking} security advisory/advisories require resolution.`);
     return false;
   }
-  if (informational) {
+  if (informational || accepted.size) {
     console.log(
-      `Rust audit completed with ${informational} informational/low advisory/advisories; none were silently suppressed.`,
+      `Rust audit completed with ${informational} informational/low advisory/advisories and ${accepted.size} accepted advisory/advisories; none were silently suppressed.`,
     );
   } else {
     console.log("Rust audit completed: no advisories found.");
