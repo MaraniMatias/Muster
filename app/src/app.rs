@@ -419,19 +419,11 @@ pub(crate) struct LiveTerminal {
     pub(crate) checkout_id: String,
     pub(crate) view: Entity<TerminalView>,
     pub(crate) shell: Arc<OwnedShell>,
-    /// The prompt the program in this terminal is about to read.
-    ///
-    /// It is owned here until the shell has started, because a shell that
-    /// never starts is a prompt nobody will read: the file is removed with it.
-    pub(crate) prompt: Option<muster_core::pi::PromptFile>,
 }
 
 /// A terminal that is about to be opened.
 ///
-/// The request is built before the terminal starts, because a program may have
-/// to be handed something to read first: Pi reads a review from a file before
-/// it says anything, and a terminal that opened with nothing to read would be
-/// a terminal that opened wrong.
+/// The request carries the program, arguments and checkout until its shell starts.
 pub(crate) struct TerminalRequest {
     /// The session's id.
     pub(crate) id: String,
@@ -452,12 +444,6 @@ pub(crate) struct TerminalRequest {
     /// handed to the process as arguments and are never a string a shell
     /// reads, so nothing in them can become a command.
     pub(crate) args: Option<Vec<String>>,
-    /// The prompt the program is about to read, if it is reading one.
-    ///
-    /// It is owned here, because the program may never read it: a terminal
-    /// that does not start leaves the prompt to be removed rather than
-    /// leaving somebody's review in a file nobody will look at.
-    pub(crate) prompt: Option<muster_core::pi::PromptFile>,
     /// What kind of session this is.
     pub(crate) session_type: SessionType,
     /// The navigation revision the request was made under.
@@ -922,7 +908,6 @@ impl TerminalWindow {
                 checkout_id: String::new(),
                 view,
                 shell: shell.clone(),
-                prompt: None,
             },
         );
         app.navigation.active_session = Some(id);
@@ -971,28 +956,6 @@ impl TerminalWindow {
                 if let Some(id) = id {
                     app.terminals.remove(&id);
                     app.navigation.remove_session(&id);
-                }
-                cx.notify();
-            },
-        )
-        .detach();
-        // The prompt is handed over when the shell has started: a program that
-        // is about to read it reads the file, and a prompt nobody reads is
-        // removed with the terminal that never ran it.
-        cx.subscribe(
-            view,
-            move |app, _, _: &crate::terminal::ShellStarted, cx| {
-                let id = app
-                    .terminals
-                    .iter()
-                    .find(|(_, terminal)| terminal.view.entity_id() == view_id)
-                    .map(|(id, _)| id.clone());
-                if let Some(id) = id {
-                    if let Some(terminal) = app.terminals.get_mut(&id) {
-                        if let Some(prompt) = terminal.prompt.take() {
-                            prompt.hand_over();
-                        }
-                    }
                 }
                 cx.notify();
             },
@@ -1195,7 +1158,6 @@ impl TerminalWindow {
             cwd,
             program: None,
             args: None,
-            prompt: None,
             session_type: SessionType::Shell,
             revision,
         })
@@ -1219,7 +1181,6 @@ impl TerminalWindow {
             cwd,
             program,
             args,
-            prompt,
             session_type,
             revision,
         } = request;
@@ -1287,7 +1248,6 @@ impl TerminalWindow {
                                     checkout_id: terminal_checkout_id,
                                     view: terminal,
                                     shell,
-                                    prompt,
                                 },
                             );
                             // Only while the terminal is still what is being

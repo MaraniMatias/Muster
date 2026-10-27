@@ -33,5 +33,5 @@ pub mod review;
 /// make sending a review to it safe to retry.
 pub mod opencode;
 
-/// Where Pi is, and the private file a review is written to before Pi reads it.
+/// Pi process identity and the worktrees its live work protects.
 pub mod pi;

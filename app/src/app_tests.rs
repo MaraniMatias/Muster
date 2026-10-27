@@ -381,7 +381,6 @@ async fn a_path_the_terminal_printed_opens_the_file_in_the_preview(cx: &mut Test
                     checkout_id: checkout.clone(),
                     view: terminal.clone(),
                     shell,
-                    prompt: None,
                 },
             );
             app.attach_links(&terminal, &checkout, window, cx);

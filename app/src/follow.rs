@@ -1381,7 +1381,6 @@ mod tests {
                 checkout_id: live.checkout_id.clone(),
                 view: live.view.clone(),
                 shell: live.shell.clone(),
-                prompt: None,
             };
             app.terminals.insert("second-row".into(), second);
         });

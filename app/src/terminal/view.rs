@@ -637,11 +637,6 @@ pub struct ShellFailed(pub String);
 
 impl gpui_kit::EventEmitter<ShellFailed> for TerminalView {}
 
-/// A shell that started, and is about to read what it was handed.
-pub struct ShellStarted;
-
-impl gpui_kit::EventEmitter<ShellStarted> for TerminalView {}
-
 // What the line under the pointer offers, and that the person asked for it.
 //
 // The terminal knows what the text says and the window knows what the checkout
@@ -694,8 +689,6 @@ pub struct TerminalView {
     /// The start happens where the size is measured, which is the paint pass
     /// and not the render: the failure is reported from the frame that follows.
     start_error: Rc<Cell<Option<String>>>,
-    /// Whether the shell has started, so the window is told once.
-    started: Rc<Cell<bool>>,
     /// Only images used by the last frame are retained in the GPU atlas.
     graphic_images: Vec<Arc<gpui_kit::RenderImage>>,
 
@@ -834,7 +827,6 @@ impl TerminalView {
             dragged: false,
             canvas_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             start_error: Rc::new(Cell::new(None)),
-            started: Rc::new(Cell::new(false)),
             graphic_images: Vec::new(),
         }
     }
@@ -2137,13 +2129,9 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.repaint.borrow_mut().rendered();
         self.measure(window);
-        // A shell that could not be started is said out loud, once, and a shell
-        // that started is announced so the window can hand over what it was
-        // given to read.
+        // A shell that could not be started is said out loud, once.
         if let Some(error) = self.start_error.take() {
             cx.emit(ShellFailed(error));
-        } else if self.started.replace(false) {
-            cx.emit(ShellStarted);
         }
 
         // The cursor is drawn differently when the window is not the one being
@@ -2338,7 +2326,6 @@ impl Render for TerminalView {
                         let applied = Rc::clone(&applied);
                         let view = Arc::clone(&self.session);
                         let start_error = Rc::clone(&self.start_error);
-                        let started = Rc::clone(&self.started);
                         move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
                             canvas_origin.set(bounds.origin);
                             let cell = cell?;
@@ -2360,8 +2347,6 @@ impl Render for TerminalView {
                                 // screen.
                                 if let Err(error) = view.start_at(size.0, size.1) {
                                     start_error.set(Some(error.to_string()));
-                                } else {
-                                    started.set(true);
                                 }
                             }
                             Some((cell, size))

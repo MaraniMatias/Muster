@@ -716,6 +716,15 @@ impl TerminalWindow {
         let composer_picker = composer.map(|composer| composer.start_picker.clone());
         let composer_can_save =
             composer.is_some_and(|composer| !composer.input.read(cx).value().trim().is_empty());
+        let suggest_disabled =
+            composer.is_none_or(|composer| !composer.input.read(cx).value().is_empty());
+        let suggest_help = if composer.is_none() {
+            "Open a note with + to suggest changes to its line range."
+        } else if suggest_disabled {
+            "Clear the note first to fill it with the highlighted code."
+        } else {
+            "Insert the note's highlighted code as editable comment text."
+        };
         let composer_start = composer.map(|composer| composer.line_start).unwrap_or(1);
         let composer_side = composer
             .map(|composer| composer.side.as_str())
@@ -762,11 +771,7 @@ impl TerminalWindow {
                     | muster_core::opencode::Destination::OpencodeNew
             )
         );
-        // Pi is a destination too, and it is not a round: it opens a terminal
-        // rather than delivering a message, so nothing about it is recorded.
-        let pi_selected = self.review.destination == Some(muster_core::opencode::Destination::Pi);
-        let agent_selected = opencode_selected || pi_selected;
-        let destination_error = agent_selected
+        let destination_error = opencode_selected
             .then(|| self.review.destination_error.clone())
             .flatten();
         let opencode_rounds = self.review.opencode_rounds.clone();
@@ -1247,13 +1252,10 @@ impl TerminalWindow {
                                 // theme's own control radius.
                                 .child({
                                     let send_action = weak.clone();
-                                    let pi_action = weak.clone();
                                     let export_action = weak.clone();
                                     let choose = weak.clone();
                                     let busy = exporting_review || destination_busy || opencode_loading;
-                                    let label = if pi_selected {
-                                        "Send to Pi"
-                                    } else if opencode_selected {
+                                    let label = if opencode_selected {
                                         "Send to OpenCode"
                                     } else {
                                         "Save"
@@ -1273,8 +1275,7 @@ impl TerminalWindow {
                                                 .accessibility_label(label)
                                                 .disabled(note_count == 0 || busy || (opencode_selected && has_pending_opencode))
                                                 .when(opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = send_action.update(cx, |app, cx| app.send_review_to_opencode(window, cx)); }))
-                                                .when(pi_selected, |button| button.on_click(move |_, window, cx| { let _ = pi_action.update(cx, |app, cx| app.send_review_to_pi(window, cx)); }))
-                                                .when(!agent_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
+                                                .when(!opencode_selected, |button| button.on_click(move |_, window, cx| { let _ = export_action.update(cx, |app, cx| app.export_review(window, cx)); }))
                                         )
                                         .child(
                                             Button::new("review-destination")
@@ -1287,18 +1288,27 @@ impl TerminalWindow {
                                                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                                                     let markdown = choose.clone();
                                                     let opencode = choose.clone();
-                                                    let pi = choose.clone();
                                                     menu.item(PopupMenuItem::new("Markdown").on_click(move |_, _, cx| {
                                                         let _ = markdown.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Markdown, cx));
                                                     })).item(PopupMenuItem::new("OpenCode").on_click(move |_, _, cx| {
                                                         let _ = opencode.update(cx, |app, cx| {
                                                             app.choose_opencode_destination(cx);
                                                         });
-                                                    })).item(PopupMenuItem::new("Pi").on_click(move |_, _, cx| {
-                                                        let _ = pi.update(cx, |app, cx| app.set_destination(muster_core::opencode::Destination::Pi, cx));
                                                     }))
                                                 })
                                         )
+                                })
+                                .child({
+                                    let suggest = weak.clone();
+                                    Button::new("suggest-review-changes")
+                                        .text().cursor_default().small().compact()
+                                        .label("Suggest changes")
+                                        .accessibility_label("Suggest changes")
+                                        .disabled(suggest_disabled)
+                                        .resting_tooltip(suggest_help)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = suggest.update(cx, |app, cx| app.suggest_review_changes(window, cx));
+                                        })
                                 })
                                 .when_some(source, |header, (repo, source_checkout, path)| {
                                     let weak = weak.clone();

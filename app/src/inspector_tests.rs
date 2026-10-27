@@ -4163,7 +4163,6 @@ fn attach_terminal(
                     checkout_id: checkout.clone(),
                     view,
                     shell,
-                    prompt: None,
                 },
             );
         });
@@ -6105,303 +6104,239 @@ async fn an_unknown_review_can_be_checked_again_without_authorizing_a_duplicate(
     close(&fixture, cx);
 }
 
-/// A review sent to Pi opens a terminal in the checkout the review is about,
-/// with the review written to a private file Pi reads as its first prompt.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Suggestion text is the comment's own range, not a clipboard selection.
+/// Saving the comment keeps it pending; only the final export finishes it.
 #[gpui_kit::test]
-async fn a_review_sent_to_pi_opens_a_terminal_in_the_checkout_it_is_about(cx: &mut TestAppContext) {
+async fn review_suggestion_and_export_finish_the_note_and_its_range(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use muster_core::review::{review_note_key, ReviewContext, ReviewSide, ReviewStorage};
+
     let fixture = open_git(cx);
-    let app_dir = tempfile::tempdir().unwrap();
-    let program_dir = tempfile::tempdir().unwrap();
-    // A link called `pi`, so the program is one the operating system calls Pi.
-    let program = program_dir.path().join("pi");
-    std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
-    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
     fixture.view.update(cx, |app, cx| {
-        app.review.notes.insert(
-            fixture.checkout.clone(),
-            vec![muster_core::review::ReviewNote {
-                id: "pi-note".into(),
-                checkout_id: fixture.checkout.clone(),
-                path: "change.txt".into(),
-                side: muster_core::review::ReviewSide::New,
-                line_start: 1,
-                line_end: None,
-                content: "This line could be clearer".into(),
-                code: "one".into(),
-                code_hash: muster_core::review::review_anchor_hash("one"),
-                outdated: false,
-            }],
-        );
-        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx);
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
     });
-
-    // The destination and the rounds are read before a send may use them.
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        !fixture.view.read(cx).review.opencode_loading
-    })
-    .await;
-    cx.update_window(fixture.handle, |_, window, cx| {
-        fixture.view.update(cx, |app, cx| {
-            app.send_review_to_pi_with(program.clone(), app_dir.path().to_owned(), window, cx);
-        });
-    })
-    .unwrap();
-
     cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
         fixture
             .view
             .read(cx)
-            .terminals
-            .values()
-            .any(|terminal| terminal.checkout_id == fixture.checkout)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
     })
     .await;
-    fixture.view.read_with(cx, |app, _| {
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        // No draft: the header's button cannot invent a range.
+        window.click("suggest-review-changes", cx);
+        assert!(fixture.view.read(cx).review.composer.is_none());
+        fixture.view.update(cx, |app, cx| {
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            );
+            app.set_review_note_start(ReviewSide::New, 2, window, cx);
+        });
+        window.render_frame(cx);
+        window.click("suggest-review-changes", cx);
+        let input = fixture
+            .view
+            .read(cx)
+            .review
+            .composer
+            .as_ref()
+            .unwrap()
+            .input
+            .clone();
+        assert_eq!(input.read(cx).value().as_str(), "two\nthree");
+        input.update(cx, |input, cx| input.set_value("two\nTHREE", window, cx));
+        window.render_frame(cx);
+        window.click("suggest-review-changes", cx);
         assert_eq!(
-            app.terminals.len(),
+            input.read(cx).value().as_str(),
+            "two\nTHREE",
+            "a suggestion never replaces existing writing"
+        );
+        window.click("save-review-note", cx);
+    })
+    .unwrap();
+    let (notes, repo, checkout) = fixture.view.read_with(cx, |app, _| {
+        assert!(app.review.composer.is_none());
+        assert_eq!(
+            app.review.notes_for(&fixture.checkout, None),
             1,
-            "one send opens one terminal, and no more"
+            "the composer's Save is not an export"
         );
-        assert!(app.review.destination_error.is_none());
+        (
+            app.review.notes[&fixture.checkout].clone(),
+            app.navigation
+                .repos
+                .iter()
+                .find(|repo| repo.id == fixture.repo_id)
+                .unwrap()
+                .clone(),
+            app.navigation.checkout(&fixture.checkout).unwrap().clone(),
+        )
     });
-
-    // The prompt is a private file under the app's own folder, and it holds
-    // the review: it is what Pi reads before it says anything.
-    let prompts = app_dir.path().join("pi/prompts");
-    let written = std::fs::read_dir(&prompts)
-        .expect("the prompts folder")
-        .map(|entry| entry.expect("an entry").path())
-        .collect::<Vec<_>>();
-    assert_eq!(written.len(), 1, "one send writes one prompt");
-    let prompt = std::fs::read_to_string(&written[0]).expect("the prompt reads");
+    let completed = notes.iter().map(review_note_key).collect();
+    let markdown = muster_core::review::build_review_markdown(&notes, &ReviewContext::default());
     assert!(
-        prompt.contains("This line could be clearer"),
-        "the prompt is the review: {prompt}"
+        markdown.contains("two\nthree"),
+        "the anchor still contains the original code"
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&written[0]).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "the prompt is readable by its owner only"
+    assert!(
+        markdown.contains("> two\n> THREE"),
+        "the proposal uses the ordinary comment export"
+    );
+
+    fixture.view.update(cx, |app, cx| {
+        app.finish_review_export(
+            &fixture.checkout,
+            &completed,
+            Err("export failed".into()),
+            cx,
         );
-        assert_eq!(
-            std::fs::metadata(&prompts).unwrap().permissions().mode() & 0o777,
-            0o700,
-            "the folder is reachable by its owner only"
-        );
-    }
+        assert_eq!(app.review.notes_for(&fixture.checkout, None), 1);
+        assert!(app
+            .diff_view
+            .as_ref()
+            .unwrap()
+            .state
+            .read(cx)
+            .selected_lines()
+            .is_some());
+    });
+    let path = muster_core::files::export_review_markdown(
+        &repo,
+        &checkout,
+        ReviewStorage::Workdir,
+        "2026-03-14-1532",
+        &markdown,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), markdown);
+    fixture.view.update(cx, |app, cx| {
+        app.finish_review_export(&fixture.checkout, &completed, Ok(path), cx);
+        assert_eq!(app.review.notes_for(&fixture.checkout, None), 0);
+        assert!(app
+            .diff_view
+            .as_ref()
+            .unwrap()
+            .state
+            .read(cx)
+            .selected_lines()
+            .is_none());
+        assert!(app.review.marked.is_none());
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .try_find(format!("review-card-{}", notes[0].id))
+            .is_none());
+        assert!(window.try_find("review-exported-path").is_some());
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 
-/// A send to Pi that cannot write the prompt opens no terminal and says why.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[gpui_kit::test]
-async fn a_review_sent_to_pi_without_a_writable_prompt_folder_opens_no_terminal(
+async fn review_delivery_keeps_an_open_edit_and_never_finishes_uncertain_notes(
     cx: &mut TestAppContext,
 ) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use muster_core::opencode::{ReviewRound, RoundStatus};
     let fixture = open_git(cx);
-    let app_dir = tempfile::tempdir().unwrap();
-    let program_dir = tempfile::tempdir().unwrap();
-    let program = program_dir.path().join("pi");
-    std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
-    // A file where the app's folder should be: the prompt cannot be written.
-    let blocked = app_dir.path().join("app");
-    std::fs::write(&blocked, "not a folder").unwrap();
-    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\nthree\n").unwrap();
     fixture.view.update(cx, |app, cx| {
-        app.review.notes.insert(
-            fixture.checkout.clone(),
-            vec![muster_core::review::ReviewNote {
-                id: "pi-note".into(),
-                checkout_id: fixture.checkout.clone(),
-                path: "change.txt".into(),
-                side: muster_core::review::ReviewSide::New,
-                line_start: 1,
-                line_end: None,
-                content: "This line could be clearer".into(),
-                code: "one".into(),
-                code_hash: muster_core::review::review_anchor_hash("one"),
-                outdated: false,
-            }],
-        );
-        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx);
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
     });
-
-    // The destination and the rounds are read before a send may use them.
     cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        !fixture.view.read(cx).review.opencode_loading
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
     })
     .await;
     cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
         fixture.view.update(cx, |app, cx| {
-            app.send_review_to_pi_with(program.clone(), blocked, window, cx);
+            app.begin_review_note(
+                &DiffLineRange::new("change.txt", DiffSide::Modified, 3, 3),
+                window,
+                cx,
+            );
+            let input = app.review.composer.as_ref().unwrap().input.clone();
+            input.update(cx, |input, cx| input.set_value("sent comment", window, cx));
+            app.save_review_note(cx);
+            let original = app.review.notes[&fixture.checkout][0].clone();
+            let mut round = ReviewRound {
+                id: "round-1".into(),
+                checkout_id: fixture.checkout.clone(),
+                session_id: "ses_review".into(),
+                status: RoundStatus::Queued,
+                marker: "marker".into(),
+                prompt: "review".into(),
+                note_ids: vec![original.id.clone()],
+                claim: muster_core::review::review_note_key(&original),
+                notes: vec![original.clone()],
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            };
+            for status in [
+                RoundStatus::Queued,
+                RoundStatus::Dispatching,
+                RoundStatus::Unknown,
+            ] {
+                round.status = status;
+                app.complete_delivered_review_notes(
+                    &fixture.checkout,
+                    std::slice::from_ref(&round),
+                    cx,
+                );
+                assert_eq!(app.review.notes_for(&fixture.checkout, None), 1);
+                assert!(app
+                    .diff_view
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .read(cx)
+                    .selected_lines()
+                    .is_some());
+            }
+            app.edit_review_note(&original.id, window, cx);
+            let input = app.review.composer.as_ref().unwrap().input.clone();
+            input.update(cx, |input, cx| {
+                input.set_value("new edit during send", window, cx)
+            });
+            round.status = RoundStatus::Dispatched;
+            app.complete_delivered_review_notes(
+                &fixture.checkout,
+                std::slice::from_ref(&round),
+                cx,
+            );
+            assert_eq!(app.review.notes_for(&fixture.checkout, None), 0);
+            let composer = app.review.composer.as_ref().unwrap();
+            assert!(composer.editing_id.is_none());
+            assert_eq!(
+                composer.input.read(cx).value().as_str(),
+                "new edit during send"
+            );
+            app.save_review_note(cx);
+            app.complete_delivered_review_notes(
+                &fixture.checkout,
+                std::slice::from_ref(&round),
+                cx,
+            );
+            let remaining = &app.review.notes[&fixture.checkout];
+            assert_eq!(remaining.len(), 1);
+            assert_ne!(remaining[0].id, original.id);
+            assert_eq!(remaining[0].content, "new edit during send");
+            assert_eq!(round.notes, vec![original]);
         });
     })
     .unwrap();
-
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture.view.read(cx).review.destination_error.is_some()
-    })
-    .await;
-    fixture.view.read_with(cx, |app, _| {
-        assert!(
-            app.terminals.is_empty(),
-            "a terminal that opened with nothing to read is a terminal that opened wrong"
-        );
-        assert!(
-            app.review.destination_error.is_some(),
-            "the failure is said out loud"
-        );
-    });
     close(&fixture, cx);
-}
-
-/// The prompts a send wrote, counted.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn written_prompts(prompts: &Path) -> usize {
-    std::fs::read_dir(prompts)
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-/// A review sent to Pi whose program cannot start leaves no prompt behind.
-///
-/// The program is a file that is not a program, so the PTY cannot be opened:
-/// the spawn fails rather than the program being missing from the path, which
-/// is the failure a send has to survive. The prompt was written and no Pi
-/// will read it, so it is removed rather than left holding somebody's review.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[gpui_kit::test]
-async fn a_review_sent_to_pi_removes_the_prompt_when_the_program_cannot_start(
-    cx: &mut TestAppContext,
-) {
-    let fixture = open_git(cx);
-    let app_dir = tempfile::tempdir().unwrap();
-    let program_dir = tempfile::tempdir().unwrap();
-    // A file that is not a program: the operating system will not run it.
-    let program = program_dir.path().join("pi");
-    std::fs::write(&program, "not a program").unwrap();
-    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
-    fixture.view.update(cx, |app, cx| {
-        app.review.notes.insert(
-            fixture.checkout.clone(),
-            vec![muster_core::review::ReviewNote {
-                id: "pi-note".into(),
-                checkout_id: fixture.checkout.clone(),
-                path: "change.txt".into(),
-                side: muster_core::review::ReviewSide::New,
-                line_start: 1,
-                line_end: None,
-                content: "This line could be clearer".into(),
-                code: "one".into(),
-                code_hash: muster_core::review::review_anchor_hash("one"),
-                outdated: false,
-            }],
-        );
-        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx);
-    });
-
-    // The destination and the rounds are read before a send may use them.
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        !fixture.view.read(cx).review.opencode_loading
-    })
-    .await;
-    cx.update_window(fixture.handle, |_, window, cx| {
-        fixture.view.update(cx, |app, cx| {
-            app.send_review_to_pi_with(program.clone(), app_dir.path().to_owned(), window, cx);
-        });
-    })
-    .unwrap();
-
-    // The terminal that did not open is said out loud.
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        fixture.view.read(cx).toasts.latest_error().is_some()
-    })
-    .await;
-    fixture.view.read_with(cx, |app, _| {
-        assert!(
-            app.terminals.is_empty(),
-            "a terminal that opened with nothing to read is a terminal that opened wrong"
-        );
-    });
-    let prompts = app_dir.path().join("pi/prompts");
-    assert_eq!(
-        written_prompts(&prompts),
-        0,
-        "a prompt no Pi will read is removed rather than left on disk"
-    );
-    close(&fixture, cx);
-}
-
-/// A review sent to Pi whose window goes away leaves no prompt behind.
-///
-/// The window is gone before the callback that would open the terminal runs,
-/// so there is no terminal and nothing will read the prompt: it is removed
-/// rather than left holding somebody's review.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[gpui_kit::test]
-async fn a_review_sent_to_pi_whose_window_goes_away_removes_the_prompt(cx: &mut TestAppContext) {
-    let fixture = open_git(cx);
-    let app_dir = tempfile::tempdir().unwrap();
-    let program_dir = tempfile::tempdir().unwrap();
-    let program = program_dir.path().join("pi");
-    std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
-    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
-    fixture.view.update(cx, |app, cx| {
-        app.review.notes.insert(
-            fixture.checkout.clone(),
-            vec![muster_core::review::ReviewNote {
-                id: "pi-note".into(),
-                checkout_id: fixture.checkout.clone(),
-                path: "change.txt".into(),
-                side: muster_core::review::ReviewSide::New,
-                line_start: 1,
-                line_end: None,
-                content: "This line could be clearer".into(),
-                code: "one".into(),
-                code_hash: muster_core::review::review_anchor_hash("one"),
-                outdated: false,
-            }],
-        );
-        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx);
-    });
-
-    // The destination and the rounds are read before a send may use them.
-    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
-        !fixture.view.read(cx).review.opencode_loading
-    })
-    .await;
-    cx.update_window(fixture.handle, |_, window, cx| {
-        fixture.view.update(cx, |app, cx| {
-            app.send_review_to_pi_with(program.clone(), app_dir.path().to_owned(), window, cx);
-        });
-    })
-    .unwrap();
-    // The window goes away while the prompt is on its way. The callback that
-    // would open the terminal has nowhere to run.
-    cx.update_window(fixture.handle, |_, window, _| window.remove_window())
-        .unwrap();
-
-    // The prompt is written and then removed: the write is what creates the
-    // folder, and a prompt no terminal will read does not stay in it.
-    let prompts = app_dir.path().join("pi/prompts");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut settled = false;
-    while std::time::Instant::now() < deadline {
-        cx.executor().timer(Duration::from_millis(10)).await;
-        settled = prompts.exists() && written_prompts(&prompts) == 0;
-        if settled {
-            break;
-        }
-    }
-    assert!(
-        settled,
-        "a prompt no terminal will read is removed rather than left on disk"
-    );
-    fixture.view.update(cx, |app, _| app.owner.stop());
 }
 
 #[gpui_kit::test]
@@ -6450,6 +6385,7 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
         let controls = [
             action,
             chooser,
+            window.find("suggest-review-changes").bounds(),
             window.find("diff-open-source-change.txt").bounds(),
             window.find("close-diff").bounds(),
         ];
@@ -6486,6 +6422,23 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
     })
     .unwrap();
     assert!(draw_until(&fixture, cx, "popup-menu"));
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("popup-menu").find(0usize).label(),
+            Some("Markdown")
+        );
+        assert_eq!(
+            window.within("popup-menu").find(1usize).label(),
+            Some("OpenCode")
+        );
+        assert!(
+            window.within("popup-menu").try_find(2usize).is_none(),
+            "Pi is not a review destination"
+        );
+        window.press("escape", cx);
+    })
+    .unwrap();
     fixture.view.update(cx, |app, cx| {
         app.review.destination = Some(muster_core::opencode::Destination::OpencodeNew);
         cx.notify();

@@ -553,7 +553,8 @@ Five rules it depends on, each pinned by a test:
   draft: it is visible while the note is being written, it is kept when the note
   is applied — the wash is what says which lines the comment is about — and it
   goes back to the note that was applied last when a draft is dropped. Another
-  note takes the mark over, and a note that is deleted takes its lines with it.
+  note takes the mark over, and a note that is deleted, exported or delivered
+  takes its lines with it.
   The toolkit's selection is a text selection, so anything that clears the
   window's selection takes the wash with it; the window puts it back while the
   diff has nothing selected, and a selection of the person's own is left alone.
@@ -574,6 +575,28 @@ Five rules it depends on, each pinned by a test:
   because editing a note is writing another one about the same lines; the cross
   asks first, and the answer lives in the window (`review.delete_confirmation`)
   rather than in the card, so the dialog is the thing on screen while it stands.
+
+**Saving a comment is not saving the review.** The composer's Save leaves a
+pending note in the diff. Only a successful Markdown export or a positively
+delivered OpenCode round finishes its captured snapshots: their cards, sidebar
+rows, count and line-range mark disappear. Notes added or edited while that
+operation ran, excluded outdated notes and an open composer remain. An open
+edit of a completed note becomes a new draft, so its next Save cannot write into
+a note that is gone. A failed export or send, a queue and an uncertain delivery
+keep the notes. Delivered snapshots remain in immutable OpenCode round history
+for reconciliation, but are never restored into the pending diff notes. This
+window remembers the exact snapshots it exported, too, so reopening the diff
+cannot restore them from an unresolved round. That memory is window-local, like
+the notes: a new window can still restore an unresolved round. Exporting does not
+cancel, edit or settle its queued or uncertain delivery. A completion invalidates
+an in-flight restore and starts a fresh read; an old callback cannot restore notes
+or clear the new read's loading state.
+
+**Suggest changes is a helper for writing the comment.** The diff header's
+button fills an empty composer from the code captured by the note's own line
+range. Existing text is never overwritten, and the usual comment export is
+unchanged. This range highlight is not mouse text selection or clipboard
+copying; those interactions are separate work.
 
 ## Terminal images
 
@@ -629,7 +652,7 @@ The rules it depends on, each pinned by a test:
 
 ## The Pi integration
 
-Pi is an agent this app can watch and can send a review to. It is not OpenCode
+Pi is an agent this app can watch in its terminals. It is not OpenCode
 and it does not work the same way, and the difference is worth naming.
 
 **What Pi says.** Pi reports through two escape sequences, and they are not
@@ -658,16 +681,12 @@ running, and the words `working`, `task complete` or `last task failed`. A
 blocked turn says nothing: the panel has no shape for a question this program
 asked, so the row stays neutral rather than inventing a state.
 
-**A review to Pi.** The review is written to a private file under the app's own
-folder -- `~/.muster/pi/prompts`, owner-only, swept after a day -- and handed
-to a new Pi terminal in the checkout as one argument after `--`. A long review
-is not a long command line, and nothing in the path is ever read by a shell.
-The terminal is opened only once the prompt is on disk: a terminal that opened
-with nothing to read would be a terminal that opened wrong. The prompt is
-owned from the moment it is written and is removed unless a live Pi takes it:
-a terminal that failed to start, an app that refused the session, a window
-that went away before the terminal opened -- each of them leaves no prompt
-behind, and a prompt removed before Pi reads it is a review Pi never saw.
+**Pi is not a review destination.** The review menu offers Markdown (the default)
+and OpenCode only. Pi's sidebar status and worktree protection stay independent.
+The round store no longer admits the `pi` destination spelling. A file holding
+that removed shape is refused by name and is never overwritten or deleted, like
+any other shape this build cannot read. No compatibility reader or migration is
+kept.
 
 **A worktree Pi is working in.** A live Pi process whose directory is inside a
 worktree keeps that worktree from being archived or deleted, even when the
@@ -938,6 +957,12 @@ That commit is the one that published `v1.0.0`, and the schema rule was
 already in place when it did: neither stored file carries a version, and a file
 that carries one is refused by name rather than read through. Versions from
 here are `v1.<minor>.<patch>`.
+
+Version changes, release preparation, tags and publishing require an explicit
+user request. Implementing or fixing a feature does not authorize a version bump,
+even when it changes a stored shape or public contract. Leave versions unchanged
+while the user tests the work. The rules below determine the next release's
+version only when the user requests that release.
 
 Consequences:
 

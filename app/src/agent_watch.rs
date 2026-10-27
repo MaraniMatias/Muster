@@ -666,6 +666,12 @@ pub(crate) fn elapsed_label(elapsed: Option<u64>) -> String {
 /// Cancellation follows the async owner even while blocking HTTP is on another thread.
 struct ObservationGuard(ReadBudget);
 
+struct RoundMaintenance {
+    changed: bool,
+    pending: Vec<ReviewRound>,
+    delivered: Vec<ReviewRound>,
+}
+
 impl Drop for ObservationGuard {
     fn drop(&mut self) {
         self.0.cancel();
@@ -809,9 +815,23 @@ impl TerminalWindow {
                 // One cycle owns both observation and queue maintenance; no overlapping
                 // detached flushes. Dropping the watch cancels the next blocking read.
                 if let Some(worker) = maintenance {
-                    let (changed, pending) = worker.await;
+                    let RoundMaintenance {
+                        changed,
+                        pending,
+                        delivered,
+                    } = worker.await;
                     pending_ack = pending;
                     let _ = view.update(cx, |app, cx| {
+                        let checkouts: HashSet<_> = delivered
+                            .iter()
+                            .map(|round| round.checkout_id.as_str())
+                            .collect();
+                        for checkout in checkouts {
+                            app.complete_delivered_review_notes(checkout, &delivered, cx);
+                        }
+                        if !delivered.is_empty() {
+                            cx.notify();
+                        }
                         if changed {
                             if let Some(checkout) = app.open_diff.as_ref().map(|(id, _)| id.clone())
                             {
@@ -878,7 +898,7 @@ impl TerminalWindow {
         pending: Vec<ReviewRound>,
         budget: ReadBudget,
         cx: &mut Context<Self>,
-    ) -> Option<gpui_kit::Task<(bool, Vec<ReviewRound>)>> {
+    ) -> Option<gpui_kit::Task<RoundMaintenance>> {
         let home = home_directory()?;
         let checkouts: Vec<_> = self
             .navigation
@@ -894,9 +914,26 @@ impl TerminalWindow {
             .collect();
         let cursor = self.agent.cursor;
         Some(cx.background_executor().spawn(async move {
-            maintain_rounds(
+            // These snapshots were already positively delivered before this
+            // observation; an acknowledgement may now settle them in the store.
+            let mut delivered = eligible.clone();
+            let (changed, pending) = maintain_rounds(
                 &home, &sessions, &eligible, &checkouts, cursor, budget, pending,
-            )
+            );
+            // One store read catches newly flushed deliveries in every checkout,
+            // not only the diff on screen. History remains in the round store.
+            if changed {
+                if let Ok(rounds) =
+                    RoundStore::open(&home).and_then(|store| store.eligible_dispatched())
+                {
+                    delivered.extend(rounds);
+                }
+            }
+            RoundMaintenance {
+                changed,
+                pending,
+                delivered,
+            }
         }))
     }
 

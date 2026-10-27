@@ -30,6 +30,28 @@ use crate::{
 const SESSION: &str = "ses_review";
 const ELSEWHERE: &str = "checkout:/somewhere/else";
 
+#[test]
+fn a_removed_pi_destination_is_refused_without_overwriting_any_rounds() {
+    let home = tempfile::tempdir().unwrap();
+    let store = RoundStore::open(home.path()).unwrap();
+    let round = filler_round("checkout-1", "delivered", RoundStatus::Dispatched, 0);
+    let bytes = serde_json::to_vec(&json!({
+        "rounds": [round],
+        "destinations": {"another-checkout": "pi"},
+    }))
+    .unwrap();
+    fs::write(store.path(), &bytes).unwrap();
+
+    let reopened = RoundStore::open(home.path()).unwrap();
+    let error = reopened.rounds("checkout-1").unwrap_err().to_string();
+    assert!(error.contains(store.path().to_str().unwrap()), "{error}");
+    assert!(error.contains("pi"), "{error}");
+    assert!(reopened
+        .set_destination("checkout-1", Destination::Markdown)
+        .is_err());
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+}
+
 /// A round as heavy as the app allows one to be: a note at both of its byte limits and a
 /// prompt at the message limit. This is what months of real reviews add up to, and it is
 /// why the store has to have somewhere to give bytes back.

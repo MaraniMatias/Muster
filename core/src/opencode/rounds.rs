@@ -107,13 +107,6 @@ pub enum Destination {
     /// OpenCode is selected, but the app has not created a session yet.
     /// Creating one is deferred until the person presses Send.
     OpencodeNew,
-    /// A new interactive Pi terminal, opened in the checkout with the review as
-    /// its first prompt.
-    ///
-    /// No session and no queue: every send opens its own terminal, and nothing
-    /// is recorded of it, because nothing was delivered to a service that could
-    /// be asked whether it arrived.
-    Pi,
 }
 
 /// Where a round is in its life. The names are the contract: `dispatching` is

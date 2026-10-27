@@ -1,6 +1,6 @@
 //! The window's line-anchored review drafts and their Markdown export.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -189,6 +189,9 @@ pub(crate) fn cached_anchor_hashes(
 #[derive(Default)]
 pub(crate) struct ReviewState {
     pub(crate) notes: HashMap<String, Vec<ReviewNote>>,
+    /// Exact snapshots finished in this window. Pending round history must not
+    /// restore them when a diff reopens; the queue itself remains unchanged.
+    completed_notes: HashMap<String, HashSet<String>>,
     pub(crate) anchor_hashes: AnchorHashCache,
     pub(crate) composer: Option<ReviewComposer>,
     /// The note whose lines are washed on the diff.
@@ -275,6 +278,93 @@ pub(crate) fn can_start_opencode_round(rounds: &[muster_core::opencode::ReviewRo
 }
 
 impl ReviewState {
+    /// Finish only the snapshots that actually left the window, not edits made
+    /// while the export or send was in flight. Returns whether their mark went too.
+    fn complete_notes(&mut self, checkout: &str, completed: &HashSet<String>) -> bool {
+        if completed.is_empty() {
+            return false;
+        }
+        self.completed_notes
+            .entry(checkout.to_owned())
+            .or_default()
+            .extend(completed.iter().cloned());
+        if self.opencode_loading && self.opencode_checkout.as_deref() == Some(checkout) {
+            // A read started before this completion cannot describe pending work.
+            self.opencode_generation = self.opencode_generation.wrapping_add(1);
+            self.opencode_loading = false;
+        }
+        let mut removed = HashSet::new();
+        if let Some(notes) = self.notes.get_mut(checkout) {
+            notes.retain(|note| {
+                if !completed.contains(&review::review_note_key(note)) {
+                    return true;
+                }
+                removed.insert(note.id.clone());
+                self.anchor_hashes
+                    .remove(&(checkout.to_owned(), note.path.clone()));
+                false
+            });
+        }
+        // An editor opened before delivery still holds somebody's writing. Its
+        // next Save creates a new pending note rather than editing a removed one.
+        if let Some(composer) = self.composer.as_mut().filter(|composer| {
+            composer.checkout_id == checkout
+                && composer
+                    .editing_id
+                    .as_ref()
+                    .is_some_and(|id| removed.contains(id))
+        }) {
+            composer.editing_id = None;
+        }
+        let clear_mark = self.marked.as_ref().is_some_and(|id| removed.contains(id));
+        if clear_mark {
+            self.marked = None;
+        }
+        clear_mark
+    }
+
+    /// Only unresolved rounds return to the working review. Delivered snapshots
+    /// stay in their immutable round history, never in the diff's pending notes.
+    fn restore_pending_notes(
+        &mut self,
+        checkout: &str,
+        rounds: &[muster_core::opencode::ReviewRound],
+    ) {
+        let delivered: HashSet<_> = rounds
+            .iter()
+            .filter(|round| round.status.is_settled())
+            .flat_map(|round| round.claimed_keys())
+            .collect();
+        let completed = self.completed_notes.get(checkout);
+        let notes = self.notes.entry(checkout.to_owned()).or_default();
+        for note in rounds
+            .iter()
+            .rev()
+            .filter(|round| !round.status.is_settled())
+            .flat_map(|round| &round.notes)
+        {
+            let key = review::review_note_key(note);
+            if !delivered.contains(&key)
+                && !completed.is_some_and(|completed| completed.contains(&key))
+                && !notes.iter().any(|existing| existing.id == note.id)
+            {
+                notes.push(note.clone());
+            }
+        }
+    }
+
+    /// Finish only the read that still owns the loading state. An older callback
+    /// must neither restore notes nor clear a newer read's loading flag.
+    fn finish_opencode_restore(&mut self, checkout: &str, generation: u64) -> bool {
+        if self.opencode_generation != generation
+            || self.opencode_checkout.as_deref() != Some(checkout)
+        {
+            return false;
+        }
+        self.opencode_loading = false;
+        true
+    }
+
     /// The notes `checkout` holds, and of `path` within it when one is named,
     /// counted the way the diff counts them: an outdated note is one the person
     /// has said is not part of this review.
@@ -468,6 +558,68 @@ fn review_save_keys(
 }
 
 impl TerminalWindow {
+    fn complete_review_notes(
+        &mut self,
+        checkout: &str,
+        completed: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let was_loading = self.review.opencode_loading
+            && self.review.opencode_checkout.as_deref() == Some(checkout);
+        if self.review.complete_notes(checkout, completed)
+            && self
+                .open_diff
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == checkout)
+        {
+            self.sync_review_note_selection(cx);
+        }
+        if was_loading
+            && !self.review.opencode_loading
+            && self
+                .open_diff
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == checkout)
+        {
+            self.restore_opencode_review(checkout, cx);
+        }
+    }
+
+    pub(crate) fn complete_delivered_review_notes(
+        &mut self,
+        checkout: &str,
+        rounds: &[muster_core::opencode::ReviewRound],
+        cx: &mut Context<Self>,
+    ) {
+        let completed = rounds
+            .iter()
+            .filter(|round| round.checkout_id == checkout && round.status.is_settled())
+            .flat_map(|round| round.claimed_keys())
+            .collect();
+        self.complete_review_notes(checkout, &completed, cx);
+    }
+
+    /// Insert the note's captured range as editable comment text. This is not
+    /// clipboard selection and never changes the captured source or export format.
+    pub(crate) fn suggest_review_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = self.review.composer.as_ref().filter(|composer| {
+            self.open_diff.as_ref().is_some_and(|(checkout, path)| {
+                *checkout == composer.checkout_id
+                    && path.as_ref().is_none_or(|path| *path == composer.path)
+            })
+        }) else {
+            return;
+        };
+        if !composer.input.read(cx).value().is_empty() {
+            return;
+        }
+        let input = composer.input.clone();
+        let code = composer.code.clone();
+        input.update(cx, |input, cx| input.set_value(code, window, cx));
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn begin_review_note(
         &mut self,
         range: &DiffLineRange,
@@ -1118,19 +1270,6 @@ impl TerminalWindow {
         let Some((checkout_id, _)) = self.open_diff.as_ref() else {
             return;
         };
-        // A destination that cannot be reached is not a destination. Pi is
-        // looked for here rather than at the send, because a person who is
-        // told now can pick something else, and a person told after the send
-        // has a review that went nowhere.
-        if destination == muster_core::opencode::Destination::Pi
-            && muster_core::pi::resolve_program().is_none()
-        {
-            // The toast, not the review's error row: the destination did not
-            // change, so the row would have nothing to sit under.
-            self.push_error("Pi is not installed in a location Muster can run.", cx);
-            cx.notify();
-            return;
-        }
         let checkout_id = checkout_id.clone();
         self.review.destination_busy = true;
         self.review.destination_error = None;
@@ -1216,179 +1355,21 @@ impl TerminalWindow {
         cx.spawn(async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                if app.review.opencode_generation != generation
-                    || app.review.opencode_checkout.as_deref() != Some(checkout_id.as_str())
-                {
+                if !app.review.finish_opencode_restore(&checkout_id, generation) {
                     return;
                 }
-                app.review.opencode_loading = false;
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     return;
                 }
                 match result {
                     Ok((destination, rounds)) => {
                         app.review.destination = destination;
-                        // Restore immutable round snapshots without overwriting live edits
-                        // or colliding with a draft id created since this read began.
-                        let notes = app.review.notes.entry(checkout_id.clone()).or_default();
-                        for note in rounds.iter().rev().flat_map(|round| round.notes.iter()) {
-                            if !notes.iter().any(|existing| existing.id == note.id) {
-                                notes.push(note.clone());
-                            }
-                        }
+                        app.complete_delivered_review_notes(&checkout_id, &rounds, cx);
+                        app.review.restore_pending_notes(&checkout_id, &rounds);
                         app.review.opencode_rounds = rounds;
                     }
                     Err(error) => app.review.destination_error = Some(error.to_string()),
                 }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Opens a new interactive Pi terminal in this checkout with the review as
-    /// its first prompt.
-    ///
-    /// No queue, no session to choose and nothing marked as sent: a send opens
-    /// a terminal, and the terminal is the whole of what happened. The review
-    /// is written to a private file and handed to Pi as one argument, so a long
-    /// review is not a long command line and nothing in it is read by a shell.
-    pub(crate) fn send_review_to_pi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.destination_busy || self.review.opencode_loading || self.review.exporting {
-            return;
-        }
-        // Where Pi is, and where the prompt is written, are the machine's
-        // answers; what a send does with them is this window's.
-        let Some(program) = muster_core::pi::resolve_program() else {
-            self.review.destination_error =
-                Some("Pi is not installed in a location Muster can run.".into());
-            cx.notify();
-            return;
-        };
-        let Some(app_dir) = muster_core::pi::app_dir() else {
-            self.review.destination_error =
-                Some("HOME is unavailable for Pi review prompts.".into());
-            cx.notify();
-            return;
-        };
-        self.send_review_to_pi_with(program, app_dir, window, cx);
-    }
-
-    /// The send itself, with the machine's answers handed in.
-    pub(crate) fn send_review_to_pi_with(
-        &mut self,
-        program: std::path::PathBuf,
-        app_dir: std::path::PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.review.destination_busy || self.review.opencode_loading || self.review.exporting {
-            return;
-        }
-        let Some((checkout_id, _)) = self.open_diff.as_ref() else {
-            return;
-        };
-        let checkout_id = checkout_id.clone();
-        let Some(checkout) = self.navigation.checkout(&checkout_id).cloned() else {
-            self.review.destination_error =
-                Some("The checkout for this review is no longer available.".into());
-            cx.notify();
-            return;
-        };
-        let Some(repo) = self
-            .navigation
-            .repos
-            .iter()
-            .find(|repo| repo.id == checkout.repo_id)
-            .cloned()
-        else {
-            self.review.destination_error =
-                Some("The repository for this review is no longer available.".into());
-            cx.notify();
-            return;
-        };
-        // Every note in this review, and not only the ones on screen: a send
-        // sends the review, not the file that happens to be open in it. Nothing
-        // is marked as sent, so the same notes are here the next time.
-        let notes = self
-            .review
-            .notes
-            .get(&checkout_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-            .iter()
-            .filter(|note| self.review.include_outdated || !note.outdated)
-            .cloned()
-            .collect::<Vec<_>>();
-        if notes.is_empty() {
-            self.review.destination_error = Some("There are no review notes to send.".into());
-            cx.notify();
-            return;
-        }
-        let (date, _) = match review::local_review_timestamp() {
-            Ok(time) => time,
-            Err(error) => {
-                self.review.destination_error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        let markdown = review::build_review_markdown(
-            &notes,
-            &ReviewContext {
-                branch: checkout.branch.as_deref(),
-                default_branch: repo.default_branch.as_deref(),
-                date: &date,
-                language: crate::document::syntax_language,
-            },
-        );
-        // The instructions the review is read with, and the bound it has to
-        // fit inside: one prompt is one message.
-        let prompt = format!("{}{}", muster_core::review::AGENT_PROMPT_PREFIX, markdown);
-        if let Err(error) = muster_core::review::check_round_prompt(&prompt) {
-            self.review.destination_error = Some(error);
-            cx.notify();
-            return;
-        }
-        self.review.destination_busy = true;
-        self.review.destination_error = None;
-        cx.notify();
-        // The prompt is written on a worker, and it is owned from the moment it
-        // is written: a prompt nobody read is removed rather than left lying
-        // in a private folder holding somebody's review.
-        let worker = cx
-            .background_executor()
-            .spawn(async move { muster_core::pi::write_prompt(&app_dir, &prompt) });
-        cx.spawn_in(window, async move |view, cx| {
-            let result = worker.await;
-            let _ = view.update_in(cx, move |app, window, cx| {
-                app.review.destination_busy = false;
-                let prompt_file = match result {
-                    Ok(prompt_file) => prompt_file,
-                    Err(error) => {
-                        app.review.destination_error = Some(error);
-                        cx.notify();
-                        return;
-                    }
-                };
-                // The terminal is opened only once the prompt it will read is
-                // on disk: a terminal that opened with nothing to read would be
-                // a terminal that opened wrong.
-                let Some(mut request) = app.prepare_terminal(&checkout_id, cx) else {
-                    // No terminal will read the prompt, and it is removed with
-                    // this closure.
-                    cx.notify();
-                    return;
-                };
-                request.program = Some(program);
-                request.args = Some(muster_core::pi::arguments(prompt_file.path()));
-                request.name = "Pi".into();
-                request.session_type = muster_core::workspace::SessionType::Agent;
-                // The prompt travels with the request: the terminal that reads
-                // it is the one that takes it, and a terminal that never
-                // starts leaves it to be removed.
-                request.prompt = Some(prompt_file);
-                app.start_terminal(request, window, cx);
                 cx.notify();
             });
         })
@@ -1590,6 +1571,9 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
                 app.review.destination_busy = false;
+                if let Ok((_, rounds, _, _)) = &result {
+                    app.complete_delivered_review_notes(&checkout_id, rounds, cx);
+                }
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1840,6 +1824,9 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
                 app.review.destination_busy = false;
+                if let Ok((_, rounds)) = &result {
+                    app.complete_delivered_review_notes(&checkout_id, rounds, cx);
+                }
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1902,6 +1889,9 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
                 app.review.destination_busy = false;
+                if let Ok(rounds) = &result {
+                    app.complete_delivered_review_notes(&checkout_id, rounds, cx);
+                }
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -1959,6 +1949,9 @@ impl TerminalWindow {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
                 app.review.destination_busy = false;
+                if let Ok(rounds) = &result {
+                    app.complete_delivered_review_notes(&checkout_id, rounds, cx);
+                }
                 cx.notify();
                 if app.open_diff.as_ref().map(|(id, _)| id.as_str()) != Some(checkout_id.as_str()) {
                     if let Some((active, _)) = app.open_diff.clone() {
@@ -2159,6 +2152,33 @@ impl TerminalWindow {
         )
     }
 
+    /// Apply an export's answer to the snapshots it captured, even if the user
+    /// switched checkout or kept editing while the file was being written.
+    pub(crate) fn finish_review_export(
+        &mut self,
+        checkout_id: &str,
+        completed: &HashSet<String>,
+        result: Result<PathBuf, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.review.exporting = false;
+        match result {
+            Ok(path) => {
+                self.complete_review_notes(checkout_id, completed, cx);
+                if self.open_diff.as_ref().map(|(id, _)| id.as_str()) == Some(checkout_id) {
+                    self.review.destination = Some(muster_core::opencode::Destination::Markdown);
+                }
+                // Keep the receipt visible after the pending notes are gone.
+                self.review.exported = Some(ExportedReview {
+                    checkout_id: checkout_id.to_owned(),
+                    path,
+                });
+            }
+            Err(error) => self.push_error(error, cx),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn export_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.review.exporting || self.review.destination_busy || self.review.opencode_loading {
             return;
@@ -2205,6 +2225,7 @@ impl TerminalWindow {
         let branch = checkout.branch.clone();
         let default_branch = repo.default_branch.clone();
         let storage = self.navigation.review_storage;
+        let completed = notes.iter().map(review::review_note_key).collect();
         self.review.exporting = true;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
@@ -2232,27 +2253,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.review.exporting = false;
-                match result {
-                    Ok(path) => {
-                        if app.open_diff.as_ref().map(|(id, _)| id.as_str())
-                            == Some(checkout_id.as_str())
-                        {
-                            app.review.destination =
-                                Some(muster_core::opencode::Destination::Markdown);
-                        }
-                        // The path stays in the toolbar for as long as this
-                        // review is on screen, which is where somebody looks for
-                        // where their notes went and where they can be copied
-                        // from. A toast says it once and is gone before it is read.
-                        app.review.exported = Some(ExportedReview {
-                            checkout_id: checkout_id.clone(),
-                            path,
-                        });
-                    }
-                    Err(error) => app.push_error(error, cx),
-                }
-                cx.notify();
+                app.finish_review_export(&checkout_id, &completed, result, cx);
             });
         })
         .detach();
@@ -2470,6 +2471,157 @@ mod tests {
             created_at: "1".into(),
             updated_at: "1".into(),
         }
+    }
+
+    #[test]
+    fn a_completed_review_removes_only_the_snapshots_it_saved() {
+        let saved = note("saved", "done");
+        let before_edit = note("edited", "before");
+        let edited = note("edited", "after");
+        let new = note("new", "still pending");
+        let mut excluded = note("outdated", "not exported");
+        excluded.outdated = true;
+        let mut state = ReviewState::default();
+        state.notes.insert(
+            "checkout-1".into(),
+            vec![saved.clone(), edited.clone(), new.clone(), excluded.clone()],
+        );
+        state.notes.insert("checkout-2".into(), vec![saved.clone()]);
+        state.marked = Some(saved.id.clone());
+        let completed = [saved, before_edit]
+            .iter()
+            .map(review::review_note_key)
+            .collect();
+
+        assert!(state.complete_notes("checkout-1", &completed));
+        assert_eq!(state.notes["checkout-1"], vec![edited, new, excluded]);
+        assert_eq!(state.notes["checkout-2"].len(), 1);
+        assert!(state.marked.is_none());
+    }
+
+    #[test]
+    fn exporting_a_queued_note_does_not_restore_it_when_the_diff_reopens() {
+        use muster_core::opencode::RoundStatus;
+        // Completing Markdown is local to this window, not a cancellation or
+        // modification of any durable OpenCode payload.
+        for status in [
+            RoundStatus::Queued,
+            RoundStatus::Dispatching,
+            RoundStatus::Unknown,
+        ] {
+            let original = note("exported", "saved as Markdown");
+            let mut round = sent_round("pending", vec![original.clone()]);
+            round.status = status;
+            let history = round.clone();
+            let completed = HashSet::from([review::review_note_key(&original)]);
+            let mut state = ReviewState::default();
+            state.notes.insert("checkout-1".into(), vec![original]);
+            state.complete_notes("checkout-1", &completed);
+            state.opencode_rounds.clear();
+            state.opencode_checkout = Some("another-checkout".into());
+            state.restore_pending_notes("checkout-1", std::slice::from_ref(&round));
+            assert!(state.notes["checkout-1"].is_empty(), "{status:?}");
+            assert_eq!(round, history, "the pending send remains intact");
+
+            // A changed snapshot is pending work, even with the same note id.
+            let mut edited = round.clone();
+            edited.notes[0].content = "new writing".into();
+            state.restore_pending_notes("checkout-1", std::slice::from_ref(&edited));
+            assert_eq!(state.notes["checkout-1"], edited.notes);
+        }
+    }
+
+    #[test]
+    fn a_delivery_invalidates_an_older_restore_without_clearing_the_new_read() {
+        let original = note("delivered", "sent to OpenCode");
+        let mut queued = sent_round("pending", vec![original.clone()]);
+        queued.status = muster_core::opencode::RoundStatus::Queued;
+        let mut state = ReviewState::default();
+        state
+            .notes
+            .insert("checkout-1".into(), vec![original.clone()]);
+        state.opencode_checkout = Some("checkout-1".into());
+        state.opencode_loading = true;
+        let old_generation = state.opencode_generation;
+
+        // The watcher confirms delivery after the read captured Queued.
+        state.complete_notes(
+            "checkout-1",
+            &HashSet::from([review::review_note_key(&original)]),
+        );
+        assert!(
+            !state.opencode_loading,
+            "the cancelled read cannot block refresh"
+        );
+        let fresh_generation = state.opencode_generation;
+        state.opencode_loading = true;
+        if state.finish_opencode_restore("checkout-1", old_generation) {
+            state.restore_pending_notes("checkout-1", &[queued]);
+        }
+        assert!(state.notes["checkout-1"].is_empty());
+        assert!(
+            state.opencode_loading,
+            "a stale callback cannot finish the fresh read"
+        );
+        assert!(state.finish_opencode_restore("checkout-1", fresh_generation));
+        assert!(!state.opencode_loading);
+    }
+
+    #[test]
+    fn delivered_rounds_never_return_as_pending_notes() {
+        use muster_core::opencode::RoundStatus;
+        let mut rounds = Vec::new();
+        for (id, status) in [
+            ("queued", RoundStatus::Queued),
+            ("sending", RoundStatus::Dispatching),
+            ("unknown", RoundStatus::Unknown),
+            ("delivered", RoundStatus::Dispatched),
+            ("finished", RoundStatus::Acked),
+        ] {
+            let mut round = sent_round(id, vec![note(id, id)]);
+            round.status = status;
+            rounds.push(round);
+        }
+        let edited = note("delivered", "edited during send");
+        let mut state = ReviewState::default();
+        state.notes.insert(
+            "checkout-1".into(),
+            vec![edited.clone(), note("finished", "finished")],
+        );
+        let completed = rounds
+            .iter()
+            .filter(|round| round.status.is_settled())
+            .flat_map(|round| round.claimed_keys())
+            .collect();
+        state.complete_notes("checkout-1", &completed);
+        state.restore_pending_notes("checkout-1", &rounds);
+        state.restore_pending_notes("checkout-1", &rounds);
+        assert_eq!(state.notes["checkout-1"].len(), 4);
+        assert!(state.notes["checkout-1"].contains(&edited));
+        for id in ["queued", "sending", "unknown"] {
+            assert!(state.notes["checkout-1"].iter().any(|note| note.id == id));
+        }
+        assert!(!state.notes["checkout-1"]
+            .iter()
+            .any(|note| note.id == "finished"));
+        assert_eq!(
+            rounds[3].notes,
+            vec![note("delivered", "delivered")],
+            "delivery history remains immutable"
+        );
+    }
+
+    #[test]
+    fn a_compacted_delivery_claim_cannot_restore_an_older_queued_snapshot() {
+        let original = note("note-1", "delivered");
+        let mut queued = sent_round("queued", vec![original.clone()]);
+        queued.status = muster_core::opencode::RoundStatus::Queued;
+        let mut delivered = sent_round("delivered", vec![original.clone()]);
+        delivered.claim = review::review_note_key(&original);
+        delivered.notes.clear();
+        let mut state = ReviewState::default();
+        state.restore_pending_notes("checkout-1", &[queued, delivered]);
+        assert!(state.notes["checkout-1"].is_empty());
     }
 
     #[test]

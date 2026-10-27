@@ -1669,7 +1669,6 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
                             checkout_id: checkout.clone(),
                             view: terminal,
                             shell,
-                            prompt: None,
                         },
                     );
                     app.navigation.add_session(
@@ -2005,7 +2004,6 @@ fn add_terminal(fixture: &GitFixture, cx: &mut TestAppContext) -> String {
                 checkout_id: checkout.clone(),
                 view: terminal,
                 shell,
-                prompt: None,
             },
         );
         app.navigation.add_session(
@@ -5206,7 +5204,6 @@ async fn a_pi_terminal_row_says_what_pi_is_doing(cx: &mut TestAppContext) {
                 checkout_id: checkout.clone(),
                 view: terminal,
                 shell: shell.clone(),
-                prompt: None,
             },
         );
         app.navigation.add_session(
