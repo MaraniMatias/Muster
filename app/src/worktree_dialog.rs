@@ -453,7 +453,7 @@ impl TerminalWindow {
                     if info.unmerged_commits > 0 {
                         let warning = if info.branch.is_some() {
                             format!(
-                                "Branch {} has {} unmerged commit{} versus {}. The branch is kept unless you choose to delete it.",
+                                "Branch {} has {} commit{} not merged into {}. The branch is kept unless you choose to delete it.",
                                 info.branch.as_deref().unwrap_or_default(),
                                 info.unmerged_commits,
                                 if info.unmerged_commits == 1 { "" } else { "s" },
@@ -506,9 +506,10 @@ impl TerminalWindow {
                                     branch,
                                     if info.unmerged_commits > 0 {
                                         format!(
-                                            " and its {} unmerged commit{}",
+                                            " and its {} commit{} not merged into {}",
                                             info.unmerged_commits,
-                                            if info.unmerged_commits == 1 { "" } else { "s" }
+                                            if info.unmerged_commits == 1 { "" } else { "s" },
+                                            info.default_branch.as_deref().unwrap_or("the default branch")
                                         )
                                     } else {
                                         String::new()

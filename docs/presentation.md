@@ -40,8 +40,9 @@ directories and copying comments from a browser."
 
 **Say:** A checkout owns its files, its terminals, its diff state and its review notes. Create a
 worktree from the dialog and the name slugs into a branch; archive it later and its files survive;
-delete it and the branch goes too, with a warning listing the dirty files and the unmerged commits
-before you confirm. Worktrees you create outside Muster show up on their own.
+delete it and the branch goes too, with a warning listing the dirty files and the commits not yet
+merged into the default branch before you confirm. Worktrees you create outside Muster show up on
+their own.
 
 **Evidence:** `app/src/worktree_dialog.rs`, `core/src/navigation/worktrees.rs`.
 
