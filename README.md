@@ -1,70 +1,109 @@
 # Muster
 
-Muster is a desktop workspace for people working with coding agents in Git worktrees. It keeps each repository and worktree’s files, diffs, and terminals together. Leave notes on specific diff lines, then send them to OpenCode, start a fresh Pi review session, or export them as Markdown. Muster does not run models; other CLI agents can be started in its terminals.
+Muster brings your repositories, worktrees, terminals, and code reviews together in one desktop window. Work with coding agents in separate worktrees, try their changes, and leave feedback on the lines that need attention.
 
-> **Native app:** releases target macOS (Apple Silicon) and Ubuntu 24.04
-> (x86_64).
-
-- **Native release targets:** macOS (Apple Silicon) · Ubuntu 24.04 (x86_64)
-- **License:** MIT
+You can send review notes to an existing OpenCode session, start a new Pi session with them, or export them as Markdown. You can also use Muster without an agent. Muster does not run AI models itself.
 
 ![Muster screenshot](./docs/screanshot/screenshot_home_v2.png)
-
-## Why
-
-When several agents work in parallel, each worktree ends up with its own terminals and changes to review. Muster groups them by checkout in one window, so you can try the code, review the diff, and send feedback without switching between directories and copying comments from a browser. A checkout is the repository root or one of its worktrees.
-
-## What you can do
-
-- Browse and edit files, and inspect Git changes and diffs.
-- Open multiple terminals in each repository or worktree; worktrees created outside Muster are detected too.
-- Leave notes on diff lines or ranges and track them as draft, sent, or resolved. A note is marked outdated when the code it refers to changes.
-- Send review rounds to an existing OpenCode session, start a new Pi terminal with selected notes as its first prompt, or export notes as Markdown for any CLI agent.
-
-## What it is not
-
-- Not an IDE. The editor is for quick changes, not a replacement for your main editor.
-- Not an LLM harness. Muster does not call models or manage how agents run.
-- Not a GitHub or GitLab client. Review notes go to OpenCode, a fresh Pi terminal, or a Markdown export.
-- Not just a terminal. It also groups worktrees, shows diffs, and keeps review notes.
-
-You can use any CLI agent, or work without one. OpenCode has native session and in-session delivery integration; Pi has native session observation and receives each review in a newly opened interactive terminal.
 
 ## Install
 
 The current candidate is **v1.0.0-rc.18**:
-[`Muster_1.0.0-rc.18_arm64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_arm64.zip) for macOS on Apple Silicon,
-[`Muster_1.0.0-rc.18_x86_64.zip`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_x86_64.zip) for macOS on Intel,
-[`muster_1.0.0-rc.18_amd64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_amd64.deb) for Ubuntu on x86_64,
-[`muster_1.0.0-rc.18_arm64.deb`](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_arm64.deb) for Ubuntu on arm64.
 
-It is a pre-release, so GitHub's `Latest` badge still selects the frozen Legacy
-release. Every candidate is on the [Releases](https://github.com/MaraniMatias/Muster/releases)
-page. Candidates before v1.0.0-rc.11 may carry only a macOS archive and one
-Linux package; every candidate from v1.0.0-rc.11 on carries all four.
+- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_arm64.zip)
+- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_x86_64.zip)
+- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_amd64.deb)
+- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_arm64.deb)
 
-- **macOS 15+ (Apple Silicon):** Unzip `Muster_<version>_arm64.zip` and move `Muster.app` to Applications. The bundle is ad-hoc signed, not notarized; assess the source and build before bypassing Gatekeeper quarantine.
-- **macOS 15+ (Intel):** Unzip `Muster_<version>_x86_64.zip` and move `Muster.app` to Applications. Same bundle, same ad-hoc signature.
-- **Ubuntu 24.04 x86_64:** install the package with `sudo apt install ./muster_<version>_amd64.deb`. The download filename keeps the candidate's `-rc.<n>`; the package's internal Debian version uses `~rc.<n>` for correct upgrade ordering.
-- **Ubuntu 24.04 arm64:** the same command with `muster_<version>_arm64.deb`. AppImage is not provided by the native release path.
-- **Other Linux:** No native package is currently provided.
+This is a pre-release. GitHub's **Latest** badge still points to the older Legacy app; find other candidates on the [Releases page](https://github.com/MaraniMatias/Muster/releases).
 
-For native OpenCode integration, install and run [OpenCode](https://opencode.ai). For Pi review delivery, install [Pi](https://github.com/earendil-works/pi) v1.1.0; each send starts a new interactive terminal. Other CLI agents work in Muster’s terminals, and notes can be exported as Markdown.
+### macOS
 
-## Quick start
+Muster requires macOS 15 or later. Download the archive for your Mac, unzip it, and move `Muster.app` to Applications. The app is ad-hoc signed and not notarized by Apple. If macOS blocks it, see [the Gatekeeper instructions](#why-does-macos-say-the-app-is-damaged-or-cant-be-opened).
 
-1. Open a Git repository.
-2. Select a checkout or create a worktree.
-3. Open a terminal in that checkout and start your agent.
-4. Try the code in another terminal, then open **Changes** and add notes to the relevant diff lines.
-5. Send notes to OpenCode or Pi, or export them as Markdown, then get back to what you were working on.
+### Ubuntu
+
+Muster provides packages for Ubuntu 24.04 on x86_64 and arm64. Download the package for your computer, open a terminal in the download folder, and install it with:
+
+```sh
+sudo apt install ./muster_<version>_<architecture>.deb
+```
+
+Replace the filename with the one you downloaded. Packages for other Linux distributions and an AppImage are not currently provided.
+
+## Get started
+
+1. Open Muster and add a Git repository from the sidebar. You can also add a regular folder.
+2. Select the repository or one of its worktrees, or create a worktree in Muster.
+3. Open a terminal and start your usual tools or coding agent. Open another terminal if you want to run the project alongside it.
+4. Select **Changes** to inspect the diff. Add notes to individual lines or ranges as you review.
+5. Send your notes to OpenCode or Pi, or export them as Markdown.
+
+A worktree is a separate directory connected to a Git repository. It lets you work on another branch without changing the files in your main checkout.
+
+## What you can do
+
+### Organize your work
+
+The sidebar groups terminals under their repository or worktree. Muster detects worktrees created outside the app too. Create new ones, drag workdirs to reorder them, and move terminal rows between worktrees. You can also search for a worktree from the title bar.
+
+Open multiple terminals in each worktree, search their output, and use the CLI tools you already have installed. With the modifier held, click a supported link in terminal output to open a web page or a file in the current checkout: Command-click on macOS, Control-click on Linux.
+
+### Browse files and review changes
+
+Use **Files** to browse a checkout, preview files, and make quick edits. Markdown and SVG files open as a rendered view, with a toggle for their source. Use **Changes** to inspect Git diffs and leave notes on added or removed lines, including ranges. Notes whose referenced code has changed are marked outdated.
+
+The sidebar shows files with unsaved edits and files with review notes, so you can return to unfinished work. You can place the Files and Changes panel beside the main area or below the sidebar using the button in its header.
+
+### Work with agents
+
+- **OpenCode:** Install and run [OpenCode](https://opencode.ai). Muster can show session activity and send review notes to an existing session. If the session is busy, you can send now, queue the review, or cancel.
+- **Pi:** Install [Pi](https://github.com/earendil-works/pi) v1.1.0. Muster can show its activity and send notes by opening a new interactive Pi terminal for each review.
+- **Other CLI agents:** Run them in Muster's terminals and export your review notes as Markdown to share with them.
+
+Muster is a workspace and review companion, not a full IDE or a GitHub or GitLab review client.
+
+### Make the workspace yours
+
+Open **Settings** to adjust terminal and editor sizes, terminal behavior, and review export options. The app uses a dark appearance. Changes to terminal and editor sizes require a restart.
+
+## Your work and local data
+
+Muster keeps workspace settings, delivered OpenCode review rounds, and preferences locally under `~/.muster`. Review exports are saved to the location you choose. Muster has no telemetry.
+
+Review notes are held in the window and are not restored after you close the app. Export notes you want to keep. Queued and delivered OpenCode review rounds are stored so they can be sent or shown and settled later. Terminal processes and sessions do not survive an app restart; Muster opens a fresh shell instead. Repository files remain on disk.
+
+Muster does not import workspace or review data from the older Legacy app. If a workspace or review state file is malformed or unsupported, Muster refuses to overwrite it. Back up the named file before removing it; deleting it starts that store empty.
 
 ## FAQ
 
-### Muster won’t start
+### What is the difference between Archive and Delete?
 
-The native app logs to stderr, not Legacy's log file. Quit any running instance,
-then start the binary from a terminal to see the error:
+**Archive** removes a worktree from the sidebar while keeping its files. You can restore it from the repository row. **Delete** removes the worktree directory from disk, along with its notes, review rounds, and associated UI state. Export anything you need first.
+
+### What happens if a folder is missing or moved?
+
+A missing folder stays registered. Its notes remain available if the path returns. Muster does not automatically reconnect a moved folder: opening it at the new path creates a separate registration.
+
+Closing a missing checkout removes its registration and associated notes, rounds, and UI state, but does not delete files on disk. Removing a repository from the sidebar does the same for its checkouts.
+
+### Can the terminal display images?
+
+Yes. Muster supports Kitty graphics used by terminal applications, including OpenCode and Pi. Images are held in memory and may need to be redrawn when the terminal is resized. Sixel, iTerm2 images, animation, and tmux passthrough are not supported. Restart an existing Pi session after upgrading to use the image protocol.
+
+### Why does macOS say the app is damaged or can't be opened?
+
+The download is not notarized by Apple, so Gatekeeper may block it. Only bypass this protection if you trust the source and build. After moving the app to Applications, you can remove its quarantine attribute with:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Muster.app
+```
+
+If it still does not start, check the [startup log](#muster-wont-start).
+
+### Muster won't start
+
+Quit any running instance, then start Muster from a terminal to see its log:
 
 ```sh
 # Linux
@@ -73,134 +112,11 @@ MUSTER_LOG=debug Muster
 MUSTER_LOG=debug /Applications/Muster.app/Contents/MacOS/Muster
 ```
 
-Native workspace and review state are JSON files under `~/.muster`; preferences are in `~/.muster/settings.json`. A malformed or unsupported workspace/review file is refused rather than migrated or overwritten. Back up the named file before removing it; deleting it starts that store empty. Repository files are not affected.
+If the error names a workspace or review state file, back it up before removing it. Deleting it starts that store empty; it does not remove your repository files.
 
-### Why does macOS say the app is damaged or can’t be opened?
+## Development
 
-Gatekeeper marks a downloaded app with a quarantine attribute, so the launch is blocked before Muster can start. Clear it from the app you moved to Applications:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Muster.app
-```
-
-If Muster still does not start, read the [startup log](#muster-wont-start).
-
-### Can the terminal display images?
-
-Yes. Muster supports direct Kitty graphics transfers (PNG, RGB and RGBA, including
-zlib compression), placements and Unicode image placeholders used by terminal
-applications. OpenCode can detect it with its graphics probe. New terminals set
-`PI_IMAGE_PROTOCOL=kitty` for Pi when that variable is not already configured;
-explicit user overrides are preserved. Restart an existing Pi session after upgrading.
-
-Images stay in memory, not workspace state. Transfers are limited to 16 MiB of
-base64, decoded images to 32 MiB / 8192 pixels per edge, and each screen buffer to
-64 MiB, 64 images and 256 placements. Unsupported or oversized requests are refused.
-Unicode placeholders follow text reflow; classic placements are cleared on resize
-and the terminal application must redraw them. Sixel, iTerm2 images, file/shared-memory
-transfers, animation and tmux passthrough are not implemented.
-
-### Do terminals survive a restart?
-
-No. Muster restores your workspace and UI state, but stops terminal processes when it closes and clears their sessions on startup.
-
-### What happens when a folder is missing?
-
-Missing folders stay registered; their notes remain available if the path returns. A moved folder is not reattached automatically: opening the new path creates a separate registration, and the two histories do not merge.
-
-### What does closing a missing checkout do?
-
-It deletes that checkout’s registration and attached notes, rounds, and UI state. No file on disk is touched, and opening the folder again brings the checkout back. Removing a repository from the panel does the same for every checkout under it.
-
-### What is the difference between Archive and Delete?
-
-**Archive** takes a worktree off the panel and keeps every file, so the repository row can restore it. **Delete** removes the worktree’s directory from disk.
-
-> **Delete is the only action here that removes files.** It takes the worktree’s notes, rounds, and UI state with it, so export what you need first.
-
-## Privacy and local data
-
-Workspace data, review rounds and preferences are stored locally under `~/.muster`; review exports use the selected export location. Muster has no telemetry. Native workspace and review state are not migrated from Legacy SQLite. Back up files before manually resetting them.
-
-## Maintainers
-
-[Release safety checklist](docs/release-safety.md)
-
-## Layout
-
-| Path                                               | What it is                                                                                                                               |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| [`core/`](core)                                    | `muster-core`: the PTY backend and the workspace shapes its callers exchange. No window, no toolkit, nothing to keep in sync with a UI.  |
-| [`app/`](app)                                      | `muster`: the app. GPUI Kit window, VT grid, keyboard and lifecycle. Its source is `app/src/`, and its icon and fonts are `app/assets/`. |
-| [`docs/release-safety.md`](docs/release-safety.md) | The release checklist, and what the native release path promises.                                                                        |
-
-`core/` is a real dependency, not a shared folder: the app and the parked Tauri
-tree both compile the same PTY implementation, so process lifetime, bounded
-writes and group-safe shutdown exist once.
-
-## Build and run
-
-Requires the Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) and,
-for the security audit only, Node 22. Linux builds also require Vulkan, X11,
-xcb, XKB, freetype and fontconfig development packages; Ubuntu package names
-and the native Linux release process are documented in [release safety](docs/release-safety.md).
-
-```sh
-rustup run 1.97.1 cargo run --locked -p muster
-rustup run 1.97.1 cargo run --locked -p muster -- /some/dir
-rustup run 1.97.1 cargo build --locked --release -p muster
-
-rustup run 1.97.1 cargo test --locked --workspace
-rustup run 1.97.1 cargo clippy --locked --workspace --all-targets -- -D warnings
-rustup run 1.97.1 cargo fmt --all --check
-node scripts/audit-rust.mjs                # RustSec over the locked graph
-
-scripts/perf-native.sh                      # the terminal hot-path cost table
-```
-
-`MUSTER_LOG=debug cargo run -p muster` prints what the terminal refuses
-and what it could not do. Without a sink installed every one of those records
-would be discarded, so the app installs one before anything that can log.
-
-### Scripts
-
-Every script in `scripts/` belongs to this app's release path.
-
-| Script                                                                  | What it does                                                                                                                                                                                                               | When you run it                                                                                                 |
-| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `release.sh`                                                            | `check` / `build` / `release`: formatting, clippy, tests, audit, then the optimized build and the macOS bundle; `candidate <version>` cuts and publishes a release candidate, `publish <version>` publishes a prepared one | The entry point for every local build. `release` is macOS-only, `candidate` and `publish` need `gh` and publish |
-| `bundle-macos.sh`                                                       | Assembles `dist/Muster.app` with the icon, name and version                                                                                                                                                                | Called by `release.sh release` and by CI                                                                        |
-| `package-linux-deb.sh`                                                  | Builds `dist/muster_<version>_<arch>.deb` for amd64 and arm64, deriving runtime dependencies from the ELF                                                                                                                  | On Ubuntu, after `release.sh build`                                                                             |
-| `debian-version.sh`                                                     | Converts a Cargo version to its Debian form (`1.0.0-rc.3` becomes `1.0.0~rc.3`)                                                                                                                                            | Internal to packaging                                                                                           |
-| `linux-package-smoke.sh`                                                | Installs the `.deb` in a clean Ubuntu container and launches it under Xvfb                                                                                                                                                 | Internal to CI; run it directly to reproduce the CI check                                                       |
-| `linux-window-smoke.sh`                                                 | The window and liveness half of that check                                                                                                                                                                                 | Internal to `linux-package-smoke.sh`                                                                            |
-| `finalize-native-release.mjs`                                           | Checks the built macOS and Linux payloads of every target together before publication                                                                                                                                      | Internal to the release workflow                                                                                |
-| `audit-rust.mjs`                                                        | RustSec audit of the locked graph over OSV, refusing unpinned path packages                                                                                                                                                | `release.sh check` and CI                                                                                       |
-| `perf-native.sh`                                                        | Runs the ignored terminal hot-path benchmarks                                                                                                                                                                              | Development only                                                                                                |
-| `generate-native-file-icons.mjs`                                        | Regenerates `app/src/file_icons/data.rs` from Legacy's generated module                                                                                                                                                    | Only when a file icon changes; never hand-edit the output                                                       |
-| `patched-alacritty.mjs`, `patched-gitignore.mjs`, `patched-gherkin.mjs` | Hash-pin the vendored crates so the audit can trust them                                                                                                                                                                   | Internal to `audit-rust.mjs`                                                                                    |
-| `audit-rust.test.mjs`, `release.test.mjs`, `linux-release.test.mjs`     | Tests for the audit, the release commands and the packaging/publish gate                                                                                                                                                   | Run by `release.sh check` and CI                                                                                |
-
-The full release procedure is in [release safety](docs/release-safety.md).
-
-## State
-
-The native app is a **terminal with the workspace panel around it**:
-repositories and worktrees in a sidebar, live terminals grouped under them,
-line counts counted against Git, a searchable worktree picker in the title bar,
-worktree creation and archive-or-delete dialogs, drag to reorder or move a
-terminal between worktrees, drag to reorder the workdirs themselves, and a
-window state file. The Files and Changes panel sits beside the body, or under
-the sidebar in the sidebar's own column: a button in that panel's header moves
-it, and the workspace file keeps the shape the window was left in.
-
-The native app includes review notes and agent delivery/export, editable
-preferences, file activation and terminal search.
-
-The app uses one dark appearance. Native state lives in
-`~/.muster/native-workspace.json`, independently of the old SQLite database; a single-instance
-lock protects it and shutdown flushes the latest accepted navigation snapshot.
-Git discovery/counting stays active at a slower cadence in hidden windows.
+See [AGENTS.md](AGENTS.md) for development and verification notes and the [release safety checklist](docs/release-safety.md) for builds and releases.
 
 ## License
 

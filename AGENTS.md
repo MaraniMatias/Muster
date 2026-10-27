@@ -12,7 +12,7 @@ app/src/          the app's source, and the tests that pin its rules
 app/assets/       the icon and the fonts the app draws with
 core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
 vendor/           the vendored crates the RustSec audit hash-pins
-scripts/          release gate and packaging for both platforms, the RustSec audit and the vendored-crate hash pins (README's Scripts table lists each one)
+scripts/          release gate and packaging for both platforms, the RustSec audit and the vendored-crate hash pins
 docs/             the migration plan, and what the port has to satisfy
 ```
 

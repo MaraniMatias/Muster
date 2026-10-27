@@ -113,9 +113,6 @@ test('the candidate command writes the version where the release reads it, and p
     assert.match(readme, new RegExp(`The current candidate is \\*\\*v${escape(next)}\\*\\*:`));
     assert.match(readme, new RegExp(`releases/download/v${escape(next)}/Muster_${escape(next)}_arm64\\.zip`));
     assert.match(readme, new RegExp(`releases/download/v${escape(next)}/muster_${escape(next)}_amd64\\.deb`));
-    // The sentence about the candidates that carry all four builds is about
-    // the past, so it keeps the version it was written for.
-    assert.match(readme, /Candidates before v1\.0\.0-rc\.11 may carry only a macOS archive/);
     // A dry run publishes nothing: the commit is the one it started from, and
     // the remote has no tag.
     assert.equal(git(dir, 'rev-parse', 'HEAD').trim(), before);
