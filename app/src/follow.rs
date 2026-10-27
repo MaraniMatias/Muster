@@ -159,8 +159,50 @@ pub(crate) struct FollowOutcome {
     pub(crate) states: HashMap<String, FollowState>,
     /// The completion cursor of each session.
     pub(crate) cursors: HashMap<String, SessionFollow>,
-    /// The terminals whose row should move, and where to.
-    pub(crate) moves: Vec<(String, String)>,
+    /// The rows the shell's own directory moved.
+    pub(crate) cd_moves: Vec<(String, String)>,
+    /// The rows the work an agent session is doing moved.
+    pub(crate) agent_moves: Vec<(String, String)>,
+}
+
+impl FollowInput {
+    /// Whether the facts the shell's directory was decided from are the facts
+    /// that are true now.
+    ///
+    /// The shell's directory is decided from the terminals and from the
+    /// checkouts a directory could name. The service's sessions and the
+    /// terminals' titles are facts of the *other* question: a service that
+    /// answers differently between two polls, or a title that changed while
+    /// the pass was on its way, says nothing about where a shell is sitting.
+    pub(crate) fn same_cd_facts(&self, other: &Self) -> bool {
+        self.checkouts == other.checkouts
+            && self.terminals.len() == other.terminals.len()
+            && self
+                .terminals
+                .iter()
+                .zip(other.terminals.iter())
+                .all(|(here, there)| {
+                    here.id == there.id
+                        && here.shell_directory == there.shell_directory
+                        && here.agent == there.agent
+                        && here.foreground_running == there.foreground_running
+                })
+    }
+
+    /// Whether the facts the agent's work was decided from are the facts that
+    /// are true now.
+    pub(crate) fn same_agent_facts(&self, other: &Self) -> bool {
+        self.checkouts == other.checkouts
+            && self.sessions == other.sessions
+            && self.terminals.len() == other.terminals.len()
+            && self
+                .terminals
+                .iter()
+                .zip(other.terminals.iter())
+                .all(|(here, there)| {
+                    here.id == there.id && here.title == there.title && here.agent == there.agent
+                })
+    }
 }
 
 /// The work a session has done: when it finished, and where it happened.
@@ -178,7 +220,8 @@ pub(crate) fn run(
 ) -> FollowOutcome {
     let mut states = input.states;
     let mut cursors = input.cursors;
-    let mut moves = Vec::new();
+    let mut cd_moves = Vec::new();
+    let mut agent_moves = Vec::new();
     let roots = CheckoutRoots::new(&input.checkouts);
 
     if input.mode.follows_agent() {
@@ -238,7 +281,7 @@ pub(crate) fn run(
                 .as_ref()
                 .map(|targets| (remembered.cursor, targets.clone()));
             if let Some(checkout) = targets_checkout(&roots, remembered.origin.as_deref(), work) {
-                moves.push((terminal.clone(), checkout));
+                agent_moves.push((terminal.clone(), checkout));
             }
         }
     }
@@ -268,14 +311,15 @@ pub(crate) fn run(
             let Some(checkout) = roots.checkout_of(Path::new(directory)) else {
                 continue;
             };
-            moves.push((terminal.id.clone(), checkout.to_string()));
+            cd_moves.push((terminal.id.clone(), checkout.to_string()));
         }
     }
 
     FollowOutcome {
         states,
         cursors,
-        moves,
+        cd_moves,
+        agent_moves,
     }
 }
 
@@ -509,17 +553,27 @@ impl TerminalWindow {
                 if app.closing
                     || app.follow_revision != revision
                     || app.navigation.revision != navigation_revision
-                    || current != input
                     || checkout_identities(&current.checkouts) != identities
                 {
                     return;
                 }
-                // Maps remained authoritative while the read was pending. Replace them
-                // only after all the facts used by this result have been rechecked.
-                app.follow_states = outcome.states;
-                app.follow_cursors = outcome.cursors;
-                for (terminal, checkout) in outcome.moves {
-                    app.apply_follow_move(&terminal, &checkout, cx);
+                // The two questions are followed separately, so each answer is kept
+                // on its own facts. The agent's work is read from the service, which
+                // answers while the pass is on its way: what it says says nothing
+                // about the directory a shell is sitting in, and neither does a title
+                // that changed in the meantime. A result that arrives after the
+                // facts *it* was computed from have changed is still dropped.
+                if current.same_agent_facts(&input) {
+                    app.follow_cursors = outcome.cursors;
+                    for (terminal, checkout) in outcome.agent_moves {
+                        app.apply_follow_move(&terminal, &checkout, cx);
+                    }
+                }
+                if current.same_cd_facts(&input) {
+                    app.follow_states = outcome.states;
+                    for (terminal, checkout) in outcome.cd_moves {
+                        app.apply_follow_move(&terminal, &checkout, cx);
+                    }
                 }
             });
         });
@@ -655,7 +709,7 @@ mod tests {
             &mut |_, _, _| Some((100, vec![second.clone()])),
         );
         assert_eq!(
-            outcome.moves,
+            outcome.agent_moves,
             vec![("t1".to_string(), "checkout:second".to_string())]
         );
     }
@@ -687,7 +741,8 @@ mod tests {
             },
             &mut |_, _, _| None,
         );
-        assert!(outcome.moves.is_empty());
+        assert!(outcome.agent_moves.is_empty());
+        assert!(outcome.cd_moves.is_empty());
     }
 
     #[test]
@@ -723,7 +778,7 @@ mod tests {
             &mut |_, _, _| None,
         );
         assert!(
-            outcome.moves.is_empty(),
+            outcome.agent_moves.is_empty(),
             "the observation is older than the move"
         );
     }
@@ -746,7 +801,7 @@ mod tests {
             },
             &mut |_, _, _| None,
         );
-        assert!(outcome.moves.is_empty());
+        assert!(outcome.agent_moves.is_empty());
     }
 
     #[test]
@@ -770,8 +825,8 @@ mod tests {
             },
             &mut |_, _, _| None,
         );
-        assert_eq!(outcome.moves.len(), 1);
-        assert_eq!(outcome.moves[0].0, "t1");
+        assert_eq!(outcome.cd_moves.len(), 1);
+        assert_eq!(outcome.cd_moves[0].0, "t1");
     }
 
     #[test]
@@ -792,7 +847,8 @@ mod tests {
             },
             &mut |_, _, _| None,
         );
-        assert!(outcome.moves.is_empty());
+        assert!(outcome.agent_moves.is_empty());
+        assert!(outcome.cd_moves.is_empty());
     }
 
     #[test]
@@ -815,7 +871,10 @@ mod tests {
             assert_eq!(origin, checkouts[0].1);
             Some((100, vec![checkouts[1].1.clone()]))
         });
-        assert_eq!(first.moves, vec![("t1".into(), "checkout:second".into())]);
+        assert_eq!(
+            first.agent_moves,
+            vec![("t1".into(), "checkout:second".into())]
+        );
         input.cursors = first.cursors;
         input.states = first.states;
         let second = run(input.clone(), &mut |_, after, _| {
@@ -823,7 +882,7 @@ mod tests {
             None
         });
         assert_eq!(
-            second.moves, first.moves,
+            second.agent_moves, first.agent_moves,
             "a new poll is not a return to origin"
         );
 
@@ -831,7 +890,7 @@ mod tests {
         input.sessions[0].updated_at = 200;
         let after_manual = run(input, &mut |_, _, _| None);
         assert!(
-            after_manual.moves.is_empty(),
+            after_manual.agent_moves.is_empty(),
             "a later status timestamp is not new work"
         );
     }
@@ -860,7 +919,7 @@ mod tests {
             latest_work(&messages, after, actual_origin)
         });
         assert!(
-            outcome.moves.is_empty(),
+            outcome.agent_moves.is_empty(),
             "baseline observations are not relocations"
         );
         assert_eq!(outcome.cursors["ses_a"].cursor, 200);
@@ -873,6 +932,9 @@ mod tests {
         shell: crate::terminal::TerminalSession,
         source: String,
         target: String,
+        /// The two checkouts' own directories, so a test acts on the ones the
+        /// fixture registered rather than on a second pair of its own.
+        checkouts: Vec<PathBuf>,
     }
 
     fn open_window(cx: &mut gpui_kit::TestAppContext) -> WindowFixture {
@@ -962,6 +1024,7 @@ mod tests {
             shell,
             source,
             target,
+            checkouts: checkouts.into_iter().map(|(_, path)| path).collect(),
         }
     }
 
@@ -980,14 +1043,15 @@ mod tests {
             let input = app.follow_input();
             let states = input.states.clone();
             let cursors = input.cursors.clone();
-            let moves = vec![(fixture.shell.id().into(), fixture.target.clone())];
+            let agent_moves = vec![(fixture.shell.id().into(), fixture.target.clone())];
             let executor = cx.background_executor().clone();
             let worker = executor.clone().spawn(async move {
                 executor.timer(Duration::from_secs(1)).await;
                 FollowOutcome {
                     states,
                     cursors,
-                    moves,
+                    cd_moves: Vec::new(),
+                    agent_moves,
                 }
             });
             let identities = checkout_identities(&input.checkouts);
@@ -1008,6 +1072,195 @@ mod tests {
         cx.executor()
             .advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
+    }
+
+    /// A window with a shell that is sitting in `sitting_in` while its row is
+    /// filed under the first checkout.
+    ///
+    /// Nothing is in front of the shell, so the shell's directory is the
+    /// terminal's own and the follow can act on it.
+    fn open_idle_window(cx: &mut gpui_kit::TestAppContext, sitting_in: &Path) -> WindowFixture {
+        use crate::workspace::{Repo, Session, SessionStatus as SavedSessionStatus, SessionType};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let (directory, checkouts) = roots();
+        let first = Repo::plain(&checkouts[0].1, "first").unwrap();
+        let second = Repo::plain(&checkouts[1].1, "second").unwrap();
+        let source = first.checkouts[0].id.clone();
+        let target = second.checkouts[0].id.clone();
+        let backend = Arc::new(crate::pty::TerminalBackend::default());
+        let mut config = crate::terminal::TerminalSessionConfig::new(
+            format!("follow-idle-{}", source),
+            sitting_in.to_path_buf(),
+            80,
+            24,
+            Some(PathBuf::from("/bin/sh")),
+        );
+        // No arguments: the shell waits at its prompt with nothing in front of
+        // it, which is the state the shell's directory is read in.
+        config.args = Some(Vec::new());
+        config.status_interval = Duration::from_millis(10);
+        let shell = crate::terminal::TerminalSession::spawn(backend.clone(), config).unwrap();
+        shell.start_at(80, 24).expect("the session takes its size");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shell.status().working_directory.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the fixture's shell reports its directory"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::install(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app =
+                        TerminalWindow::with_session(shell.clone(), backend.clone(), window, cx);
+                    app.navigation.merge(
+                        muster_core::navigation::OpenedDirectory {
+                            repo: first,
+                            checkout_id: source.clone(),
+                        },
+                        true,
+                    );
+                    app.navigation.merge(
+                        muster_core::navigation::OpenedDirectory {
+                            repo: second,
+                            checkout_id: target.clone(),
+                        },
+                        false,
+                    );
+                    app.navigation.add_session(
+                        Session {
+                            id: shell.id().into(),
+                            checkout_id: source.clone(),
+                            name: "sh".into(),
+                            created_at: "test".into(),
+                            session_type: SessionType::Shell,
+                            status: SavedSessionStatus::Active,
+                        },
+                        Some(app.navigation.revision),
+                    );
+                    app.terminals.get_mut(shell.id()).unwrap().checkout_id = source.clone();
+                    app.set_follow_worktree(FollowWorktree::Both);
+                    app
+                })
+            })
+            .unwrap()
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        WindowFixture {
+            _directory: directory,
+            handle,
+            view,
+            shell,
+            source,
+            target,
+            checkouts: checkouts.into_iter().map(|(_, path)| path).collect(),
+        }
+    }
+
+    /// The same delayed pass, carrying the move the shell's directory made.
+    fn delayed_cd_move(fixture: &WindowFixture, cx: &mut gpui_kit::TestAppContext) {
+        use std::time::Duration;
+        fixture.view.update(cx, |app, cx| {
+            let input = app.follow_input();
+            let states = input.states.clone();
+            let cursors = input.cursors.clone();
+            let cd_moves = vec![(fixture.shell.id().into(), fixture.target.clone())];
+            let executor = cx.background_executor().clone();
+            let worker = executor.clone().spawn(async move {
+                executor.timer(Duration::from_secs(1)).await;
+                FollowOutcome {
+                    states,
+                    cursors,
+                    cd_moves,
+                    agent_moves: Vec::new(),
+                }
+            });
+            let identities = checkout_identities(&input.checkouts);
+            app.retain_follow_pass(
+                input,
+                app.follow_revision,
+                app.navigation.revision,
+                identities,
+                ReadBudget::new(OBSERVATION_TIMEOUT),
+                worker,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// The shell's directory is decided on its own facts.
+    ///
+    /// The agent's work is read from the service, which answers while the pass
+    /// is on its way, and what it says says nothing about where a shell is
+    /// sitting. A service that answers differently must not throw the shell's
+    /// directory away.
+    #[gpui_kit::test]
+    fn the_agents_sessions_changing_do_not_throw_the_shells_directory_away(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let (_directory, checkouts) = roots();
+        let fixture = open_idle_window(cx, &checkouts[1].1);
+        delayed_cd_move(&fixture, cx);
+        // The service answers differently while the pass is on its way.
+        fixture.view.update(cx, |app, _| {
+            app.agent.sessions = vec![session("ses_a", "work", "/tmp/elsewhere", 100)];
+        });
+        fixture.view.read_with(cx, |app, _| {
+            assert!(app.follow_task.is_some(), "the pass is still on its way");
+        });
+        finish_delay(cx);
+        fixture.view.read_with(cx, |app, _| {
+            assert_eq!(
+                app.terminals[fixture.shell.id()].checkout_id,
+                fixture.target,
+                "the shell's directory was thrown away by the service's answer"
+            );
+        });
+        close_window(fixture, cx);
+    }
+
+    /// A shell that changes directory files its row under the checkout it moved to.
+    #[gpui_kit::test]
+    fn a_shell_that_changes_directory_moves_its_row(cx: &mut gpui_kit::TestAppContext) {
+        use std::time::{Duration, Instant};
+        let (_directory, checkouts) = roots();
+        let fixture = open_idle_window(cx, &checkouts[0].1);
+        let second = fixture.checkouts[1].clone();
+        fixture
+            .shell
+            .send_text(&format!("cd {}\n", second.display()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.shell.status().working_directory.as_deref() != Some(second.to_str().unwrap())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the shell reports the directory it moved to: {:?}",
+                fixture.shell.status().working_directory
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fixture.view.update(cx, |app, cx| app.run_follow_pass(cx));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        fixture.view.read_with(cx, |app, _| {
+            assert_eq!(
+                app.terminals[fixture.shell.id()].checkout_id,
+                fixture.target
+            );
+        });
+        close_window(fixture, cx);
     }
 
     #[gpui_kit::test]

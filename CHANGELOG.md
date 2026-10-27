@@ -6,6 +6,18 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A terminal's row follows the worktree it moved to.** A terminal whose shell
+  changed directory into another worktree stayed filed under the one it was
+  opened in, so the panel said where it was started rather than where it was
+  working. The follow pass reads the agent's work from the OpenCode service,
+  which answers while the pass is on its way, and the pass threw away its
+  whole answer whenever that answer was not the one it started with. The two
+  questions are decided separately now: what the service says about an agent's
+  work no longer throws away where a shell is sitting, and a title that
+  changed in the meantime does not either.
+
 ## 1.0.0
 
 - **Muster 1.0.0 is the first stable release.** The native build is the whole
