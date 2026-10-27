@@ -8,14 +8,14 @@ You can send review notes to an existing OpenCode session, start a new Pi sessio
 
 ## Install
 
-The current candidate is **v1.0.0-rc.18**:
+The current release is **v1.0.0**:
 
-- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_arm64.zip)
-- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/Muster_1.0.0-rc.18_x86_64.zip)
-- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_amd64.deb)
-- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0-rc.18/muster_1.0.0-rc.18_arm64.deb)
+- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/Muster_1.0.0_arm64.zip)
+- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/Muster_1.0.0_x86_64.zip)
+- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/muster_1.0.0_amd64.deb)
+- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.0.0/muster_1.0.0_arm64.deb)
 
-This is a pre-release. GitHub's **Latest** badge still points to the older Legacy app; find other candidates on the [Releases page](https://github.com/MaraniMatias/Muster/releases).
+This is a stable release. Earlier candidates are on the [Releases page](https://github.com/MaraniMatias/Muster/releases).
 
 ### macOS
 

@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.0.0
 
 - **Muster 1.0.0 is the first stable release.** The native build is the whole
   application now: the workspace window with its workdirs and their terminals,
