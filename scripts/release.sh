@@ -24,7 +24,8 @@ Requires Rust/rustup 1.97.1 and Node.js. Linux build prerequisites are listed
 in .github/workflows/ci.yml. `release` creates dist/Muster.app locally; it does
 not publish, sign for distribution, notarize, or create a git tag.
 
-`candidate <version> [--dry-run]` takes 0.<minor>.<patch>, 1.0.0 or 1.0.0-rc.<n>.
+`candidate <version> [--dry-run]` takes 0.<minor>.<patch> or 1.<minor>.<patch>,
+the second with an optional -rc.<n>.
 It writes the version into the manifest and the lock file, renames the
 changelog's `Unreleased` heading, points the README at the new release,
 commits that on `main`, pushes it, and publishes it. `publish <version>` is the
@@ -160,15 +161,15 @@ publish_run() {
   exit 1
 }
 
-# A version is one of the shapes a release is published in. The final `1.0.0`
-# is one of them now: it was a deliberate act of its own, taken when the
-# schema rule was already in place, and it is published like any other
-# version.
+# A version is one of the shapes a release is published in. After the first
+# major release the shape is `1.<minor>.<patch>`, with `-rc.<n>` for the
+# release that is a candidate rather than the act itself; the `0.x` shapes
+# are the ones from before that, and they are still read.
 require_version() {
   local version="${1:-}"
-  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0(-rc\.[0-9]+)?)$ ]]; then
+  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$ ]]; then
     echo "release: unsupported version: ${version:-<none>}" >&2
-    echo 'release: a version is 0.<minor>.<patch>, 1.0.0 or 1.0.0-rc.<n>' >&2
+    echo 'release: a version is 0.<minor>.<patch> or 1.<minor>.<patch>, the second with an optional -rc.<n>' >&2
     exit 2
   fi
 }

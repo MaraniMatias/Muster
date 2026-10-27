@@ -114,11 +114,11 @@ scripts/release.sh publish 1.0.0-rc.12                # publish a prepared tree
 ```
 
 The command refuses what the workflow refuses, before it touches the tree: a
-version that is not `v0.<minor>.<patch>`, `v1.0.0` or `v1.0.0-rc.<n>`, a
-dirty tree, a branch that is not `main`, a `main` that is not the commit
-`origin/main` points at, a tag that already exists, and a version the tree
-already carries. A dry run leaves the tree as the release would leave it and
-commits nothing.
+version that is not `v0.<minor>.<patch>` or `v1.<minor>.<patch>`, the second
+with an optional `-rc.<n>`, a dirty tree, a branch that is not `main`, a `main`
+that is not the commit `origin/main` points at, a tag that already exists, and
+a version the tree already carries. A dry run leaves the tree as the release
+would leave it and commits nothing.
 
 `publish` is the last half on its own, for the retry after a build that
 failed: it publishes the version the tree already carries, so the tree is left
@@ -127,12 +127,12 @@ commit. It refuses a version the manifest and the lock file do not carry, and
 a tag that already exists.
 
 Publication must be dispatched from `main`, for a commit on `main`, and the new
-tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`,
-`v1.0.0` or `v1.0.0-rc.N`. The final `v1.0.0` was a deliberate decision of its
-own, taken when the schema rule was already in place: neither stored file
-carries a version, and a file that carries one is refused by name rather than
-read through. It is published as an ordinary release, so it is the one GitHub
-files as **Latest**.
+tag must equal the manifest/lock version. Supported policy is `v0.minor.patch`
+or `v1.minor.patch`, the second with an optional `-rc.N`. The final `v1.0.0`
+was a deliberate decision of its own, taken when the schema rule was already
+in place: neither stored file carries a version, and a file that carries one
+is refused by name rather than read through. It was published as an ordinary
+release, so GitHub filed it as **Latest**.
 
 Publish mode builds and validates every target in the same run, then downloads
 the final artifact without rebuilding it. Only this last job has write permission;

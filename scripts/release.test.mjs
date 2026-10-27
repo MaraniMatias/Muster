@@ -27,11 +27,11 @@ const escape = text => text.replace(/\./g, '\\.');
 // version the tree happens to carry: a release moves it, and the tests keep
 // holding.
 const carried = /^version = "(.+)"$/m.exec(readFileSync(path.join(root, 'app/Cargo.toml'), 'utf8'))[1];
-const next = /^1\.0\.0-rc\.(\d+)$/.test(carried)
-  ? `1.0.0-rc.${Number(/^1\.0\.0-rc\.(\d+)$/.exec(carried)[1]) + 1}`
-  : /^0\.(\d+)\.(\d+)$/.test(carried)
-    ? `0.${/^0\.(\d+)\.(\d+)$/.exec(carried)[1]}.${Number(/^0\.(\d+)\.(\d+)$/.exec(carried)[2]) + 1}`
-    : '1.0.0-rc.1';
+const release = /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/.exec(carried);
+assert.ok(release, `the tree carries a version this test cannot read: ${carried}`);
+const next = release[4]
+  ? `${release[1]}.${release[2]}.${release[3]}-rc.${Number(release[4]) + 1}`
+  : `${release[1]}.${release[2]}.${Number(release[3]) + 1}`;
 
 // A repository a candidate can be cut from: the four files the release edits,
 // on a branch called `main`, with a remote to push to. The remote is a
@@ -83,10 +83,10 @@ test('unknown commands fail before doing build work', () => {
 });
 
 test('the candidate command refuses a version it does not publish, and a missing one', () => {
-  // The final release is published now, so what this command refuses is a
-  // version outside the shapes it publishes: it is refused before the tree
-  // is touched.
-  for (const version of ['1.0.1', '2.0.0']) {
+  // The shapes a release is published in are `0.<minor>.<patch>` and
+  // `1.<minor>.<patch>`, the second with an optional `-rc.<n>`. A version
+  // outside them is refused before the tree is touched.
+  for (const version of ['2.0.0', '1.0']) {
     const refused = run('candidate', version);
     assert.equal(refused.status, 2);
     assert.match(refused.stderr, new RegExp(`unsupported version: ${escape(version)}`));

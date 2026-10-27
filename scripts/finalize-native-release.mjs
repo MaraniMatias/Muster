@@ -146,7 +146,7 @@ export const RELEASE_TARGETS = [
 ];
 
 export function finalize(base, sha, version, output) {
-  assert.match(version, /^(?:0\.\d+\.\d+|1\.0\.0(?:-rc\.\d+)?)$/, 'unsupported release version');
+  assert.match(version, /^(?:0\.\d+\.\d+|1\.\d+\.\d+(?:-rc\.\d+)?)$/, 'unsupported release version');
   const debVersion = version.replace('-', '~');
   const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   const payloads = RELEASE_TARGETS.map(target => {
