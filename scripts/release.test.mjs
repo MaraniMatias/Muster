@@ -83,11 +83,14 @@ test('unknown commands fail before doing build work', () => {
 });
 
 test('the candidate command refuses a version it does not publish, and a missing one', () => {
-  // The final release is a deliberate act of its own, so it is not a shape
-  // this command publishes: it is refused before the tree is touched.
-  const final = run('candidate', '1.0.0');
-  assert.equal(final.status, 2);
-  assert.match(final.stderr, /unsupported version: 1\.0\.0/);
+  // The final release is published now, so what this command refuses is a
+  // version outside the shapes it publishes: it is refused before the tree
+  // is touched.
+  for (const version of ['1.0.1', '2.0.0']) {
+    const refused = run('candidate', version);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, new RegExp(`unsupported version: ${escape(version)}`));
+  }
   const missing = run('candidate');
   assert.equal(missing.status, 2);
   assert.match(missing.stderr, /unsupported version: <none>/);
@@ -107,10 +110,12 @@ test('the candidate command writes the version where the release reads it, and p
     // The changelog keeps the newest work under `Unreleased` and renames that
     // heading to the version when it is tagged.
     assert.match(readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'), new RegExp(`^## ${escape(next)}$`, 'm'));
-    // The README names the candidate people download, in its links and in its
-    // one line about it.
+    // The README names the release people download, in its links and in its
+    // one line about it. The name follows the version's own shape, so a
+    // candidate is named as one and a final release as one.
     const readme = readFileSync(path.join(dir, 'README.md'), 'utf8');
-    assert.match(readme, new RegExp(`The current candidate is \\*\\*v${escape(next)}\\*\\*:`));
+    const kind = next.includes('-') ? 'candidate' : 'release';
+    assert.match(readme, new RegExp(`The current ${kind} is \\*\\*v${escape(next)}\\*\\*:`));
     assert.match(readme, new RegExp(`releases/download/v${escape(next)}/Muster_${escape(next)}_arm64\\.zip`));
     assert.match(readme, new RegExp(`releases/download/v${escape(next)}/muster_${escape(next)}_amd64\\.deb`));
     // A dry run publishes nothing: the commit is the one it started from, and

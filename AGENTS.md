@@ -891,6 +891,19 @@ workspace's virtual manifest: only the workspace root's patch table is read.
 OSV. `node --test scripts/audit-rust.test.mjs` covers it. A new path dependency
 that is not a workspace member will fail the audit closed, which is the intent.
 
+**An advisory that cannot be fixed here is accepted, and it is named.** The
+accepted list in `scripts/audit-rust.mjs` carries the advisory, the locked
+packages it covers, and the reason it cannot be reached in this tree. An
+accepted advisory is reported on every run, with its reason, and it does not
+block the release: it is never silently dropped, and an entry that no longer
+applies to the locked tree says so, so the list cannot outlive the advisory it
+names. The one entry today is `GHSA-qwgh-2vcv-g2f7` on `block-buffer@0.10.4`:
+the locked block-buffer keeps its cursor in its own field, so the defect the
+advisory describes -- a caught panic in a hash callback leaving the cursor out
+of range -- cannot happen in that version, and the tree cannot reach the fixed
+`0.12.1`, because the toolkit pins `gpui-pre-linux`, which pins `oo7`, which
+pins `digest 0.10`.
+
 ## Adding to the port
 
 - A module that no window needs belongs in `core`, even if it came out of the
@@ -910,18 +923,23 @@ that is not a workspace member will fail the audit closed, which is the intent.
   mode. Workspace state in `~/.muster` is separate and
   `app/src/state_writer.rs` owns it.
 
-## Versions are v0._._ — all of them
+## Versions are v1._._ after the first major release
 
-Every version this project ships is `v0.<minor>.<patch>`. The major is `0` and
-stays `0` until someone says otherwise in a commit that also does the migration
-work described below. A `v1.0.0` is not a version bump; it is the release where
-the schema rule below has to already be in place, so it is its own deliberate
-act, not a consequence of a `--bump`. A `v1.0.0-rc.N` tag is that act's
-candidate rather than the act: the crate carries the pre-release version the
-tag names, GitHub files the release as a pre-release, and `v1.0.0` stays
-unclaimed until the final one ships.
+Every version this project shipped until the first major release was
+`v0.<minor>.<patch>`. The major stayed `0` until someone said otherwise in a
+commit that also did the migration work described below, and a `v1.0.0` was not
+a version bump: it was the release where the schema rule below had to already
+be in place, so it was its own deliberate act, not a consequence of a
+`--bump`. A `v1.0.0-rc.N` tag was that act's candidate rather than the act: the
+crate carried the pre-release version the tag named, GitHub filed the release
+as a pre-release, and `v1.0.0` stayed unclaimed until the final one shipped.
 
-Consequences while the version is `v0.*.*`:
+That commit is the one that published `v1.0.0`, and the schema rule was
+already in place when it did: neither stored file carries a version, and a file
+that carries one is refused by name rather than read through. Versions from
+here are `v1.<minor>.<patch>`.
+
+Consequences:
 
 - A breaking change to a stored shape, an IPC contract, a preference key or a file
   format is made in place, and the version moves a minor. Nothing waits for a

@@ -24,9 +24,9 @@ Requires Rust/rustup 1.97.1 and Node.js. Linux build prerequisites are listed
 in .github/workflows/ci.yml. `release` creates dist/Muster.app locally; it does
 not publish, sign for distribution, notarize, or create a git tag.
 
-`candidate <version> [--dry-run]` takes 0.<minor>.<patch> or 1.0.0-rc.<n>. It
-writes the version into the manifest and the lock file, renames the
-changelog's `Unreleased` heading, points the README at the new candidate,
+`candidate <version> [--dry-run]` takes 0.<minor>.<patch>, 1.0.0 or 1.0.0-rc.<n>.
+It writes the version into the manifest and the lock file, renames the
+changelog's `Unreleased` heading, points the README at the new release,
 commits that on `main`, pushes it, and publishes it. `publish <version>` is the
 last half on its own: it publishes the version the tree already carries, which
 is what a retry after a failed build does. The Native release workflow is what
@@ -102,22 +102,35 @@ prepare_changelog() {
   sed "s|^## Unreleased\$|## $version|" CHANGELOG.md | rewrite CHANGELOG.md
 }
 
-# The README names the candidate people download. Only the download block is
+# The README names the release people download. Only the download block is
 # rewritten: the sentence that says which candidates carry all four builds is
-# about the past and keeps the version it was written for.
+# about the past and keeps the version it was written for. The name and the
+# line under it follow the version's own shape, so the final release is not
+# described as the next candidate.
 prepare_readme() {
-  local version="$1" previous bare escaped
-  previous="$(sed -n 's|^The current candidate is \*\*\(v[^*]*\)\*\*:$|\1|p' README.md | head -1)"
+  local version="$1" previous bare escaped kind note
+  previous="$(sed -n -e 's|^The current candidate is \*\*\(v[^*]*\)\*\*:$|\1|p' \
+                  -e 's|^The current release is \*\*\(v[^*]*\)\*\*:$|\1|p' README.md | head -1)"
   if [[ -z "$previous" ]]; then
-    echo 'release: candidate: the README names no current candidate' >&2
+    echo 'release: candidate: the README names no current release' >&2
     exit 1
   fi
   bare="${previous#v}"
   escaped="${bare//./\\.}"
+  if [[ "$version" == *-* ]]; then
+    kind=candidate
+    note="This is a pre-release. GitHub's **Latest** badge still points to the older Legacy app; find other candidates on the [Releases page](https://github.com/MaraniMatias/Muster/releases)."
+  else
+    kind=release
+    note="This is a stable release. Earlier candidates are on the [Releases page](https://github.com/MaraniMatias/Muster/releases)."
+  fi
   sed -e "s|releases/download/v${escaped}/|releases/download/v${version}/|g" \
       -e "s|Muster_${escaped}_|Muster_${version}_|g" \
       -e "s|muster_${escaped}_|muster_${version}_|g" \
-      -e "s|^The current candidate is \*\*v${escaped}\*\*:\$|The current candidate is **v${version}**:|" \
+      -e "s|^The current candidate is \*\*v${escaped}\*\*:\$|The current ${kind} is **v${version}**:|" \
+      -e "s|^The current release is \*\*v${escaped}\*\*:\$|The current ${kind} is **v${version}**:|" \
+      -e "s|^This is a pre-release\..*\$|${note}|" \
+      -e "s|^This is a stable release\..*\$|${note}|" \
       README.md | rewrite README.md
 }
 
@@ -147,13 +160,15 @@ publish_run() {
   exit 1
 }
 
-# A version is one of the two shapes a release is published in. The final
-# `1.0.0` is a deliberate act of its own and is not one of them.
+# A version is one of the shapes a release is published in. The final `1.0.0`
+# is one of them now: it was a deliberate act of its own, taken when the
+# schema rule was already in place, and it is published like any other
+# version.
 require_version() {
   local version="${1:-}"
-  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0-rc\.[0-9]+)$ ]]; then
+  if [[ ! "$version" =~ ^(0\.[0-9]+\.[0-9]+|1\.0\.0(-rc\.[0-9]+)?)$ ]]; then
     echo "release: unsupported version: ${version:-<none>}" >&2
-    echo 'release: a version is 0.<minor>.<patch> or 1.0.0-rc.<n>' >&2
+    echo 'release: a version is 0.<minor>.<patch>, 1.0.0 or 1.0.0-rc.<n>' >&2
     exit 2
   fi
 }
@@ -234,7 +249,7 @@ candidate() {
 
   git add app/Cargo.toml Cargo.lock CHANGELOG.md README.md
   git commit -q -m "release: prepare $tag" \
-    -m "The next native testing candidate. The Native release workflow builds and validates every target, and it is what creates the tag and the release."
+    -m "The Native release workflow builds and validates every target, and it is what creates the tag and the release."
   git push origin main
 
   publish "$version"

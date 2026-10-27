@@ -6,6 +6,18 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **Muster 1.0.0 is the first stable release.** The native build is the whole
+  application now: the workspace window with its workdirs and their terminals,
+  the VT terminal, the file tree and the document editor, and the review
+  composer with its notes on added and removed lines — exported as Markdown,
+  sent to an OpenCode session, or handed to a new Pi session.
+
+- **It ships for macOS and for Linux.** macOS 15 and later, on Apple Silicon
+  and on Intel, as an app inside a ZIP; Ubuntu 24.04, on x86_64 and on arm64,
+  as a package that installs the app, its icon and its desktop entry.
+
 ## 1.0.0-rc.18
 
 - **The Files and Changes panel can be moved under the sidebar.** The window
