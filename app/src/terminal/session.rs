@@ -213,6 +213,14 @@ fn shell_integration(
                     shell_quote(&script_path)
                 ));
             } else if file == ".zshrc" {
+                // zsh picks its history file from ZDOTDIR after the first
+                // startup file and before this one, so the directory this
+                // shell was started in would be the history: a file of its
+                // own, empty, and thrown away with the shell. The history is
+                // the person's own file, the one every other terminal on the
+                // machine reads, and the startup file above may still say
+                // otherwise.
+                text.push_str("if [[ $HISTFILE == $__muster_bootstrap/.zsh_history ]]; then HISTFILE=${ZDOTDIR-$HOME}/.zsh_history; fi\n");
                 text.push_str(&format!("if [[ -o login && -o rcs ]]; then export ZDOTDIR=$__muster_bootstrap; else unset __MUSTER_ZDOTDIR_SET __MUSTER_ZDOTDIR; source {}; fi\n", shell_quote(&script_path)));
             } else {
                 text.push_str("if [[ -o rcs ]]; then export ZDOTDIR=$__muster_bootstrap; else unset __MUSTER_ZDOTDIR_SET __MUSTER_ZDOTDIR __muster_bootstrap; fi\n");
@@ -2273,6 +2281,70 @@ mod tests {
         config.status_interval = Duration::from_millis(20);
         config.drain_deadline = Duration::from_millis(500);
         config
+    }
+
+    /// The shell's history is the person's own file, and it is read.
+    ///
+    /// zsh picks its history file from `ZDOTDIR` after the first startup file
+    /// and before the second, and the app starts the shell in a directory of
+    /// its own, so the history would be a file in that directory: empty, and
+    /// thrown away with the shell. The up arrow would then have nothing to
+    /// walk through, which is the one thing a terminal has to be like every
+    /// other terminal about.
+    #[cfg(unix)]
+    #[test]
+    fn the_shells_history_is_the_persons_own_file() {
+        for (shell, startup, history) in [
+            ("/bin/zsh", ".zshrc", ".zsh_history"),
+            ("/bin/bash", ".bash_profile", ".bash_history"),
+        ] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let home = TempDir::new().expect("isolated home");
+            std::fs::write(home.path().join(startup), "PS1='test> '\n").unwrap();
+            // A command the person ran in another terminal, in the file the
+            // shell is meant to read.
+            std::fs::write(
+                home.path().join(history),
+                "muster-history-from-another-terminal\n",
+            )
+            .unwrap();
+            let mut config = TerminalSessionConfig::new(
+                next_id(),
+                home.path().to_path_buf(),
+                80,
+                24,
+                Some(PathBuf::from(shell)),
+            );
+            config.env.extend([
+                (OsString::from("HOME"), home.path().as_os_str().to_owned()),
+                (
+                    OsString::from("ZDOTDIR"),
+                    home.path().as_os_str().to_owned(),
+                ),
+            ]);
+            config.status_interval = Duration::from_millis(20);
+            let (backend, session, _) = start(config);
+            wait_for("the prompt", || grid(&session).contains("test> "));
+            session.paste("printf 'HIST=%s\\n' \"$HISTFILE\"").unwrap();
+            session.send_key(&press(Key::Enter)).unwrap();
+            wait_for("the history file", || grid(&session).contains("HIST=/"));
+            let answer = grid(&session);
+            assert!(
+                answer.contains(&format!("HIST={}/{history}", home.path().display())),
+                "the shell's history is not the person's own file: {answer}"
+            );
+            // The file is not only named: it is read, so the up arrow has the
+            // person's own commands to walk through.
+            session.paste("fc -l").unwrap();
+            session.send_key(&press(Key::Enter)).unwrap();
+            wait_for("the history", || {
+                grid(&session).contains("muster-history-from-another-terminal")
+            });
+            session.close().wait().unwrap();
+            backend.shutdown();
+        }
     }
 
     #[cfg(unix)]

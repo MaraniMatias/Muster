@@ -8,6 +8,15 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **The terminal's history is the shell's own history again.** Muster starts the
+  shell in a directory of its own so it can read the person's startup files, and
+  zsh picks the file it keeps the command history in from that directory before
+  it reads a single startup file. The history was therefore a file of the app's
+  own: empty on every launch, and thrown away when the app closed, so the up
+  arrow had nothing to walk through. The shell now keeps its history where
+  every other terminal on the machine keeps it, and the up arrow walks the same
+  commands it walks in one.
+
 - **A terminal's row follows the worktree it moved to.** A terminal whose shell
   changed directory into another worktree stayed filed under the one it was
   opened in, so the panel said where it was started rather than where it was
