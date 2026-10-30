@@ -6,6 +6,33 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The diff's annotation button is out of the source text.** The square the
+  `+` is drawn in was as wide as a row and reached into the code, and its
+  mouse-down stopped the selection there, so the first characters of a line
+  could not be selected or copied while a note was marked. The button now
+  ends at the boundary of the source text, and the code beside it is
+  selectable and copyable again.
+
+- **A review's own mark is not taken away.** The wash over the lines a note
+  is about was put back on every frame, so a selection of text was
+  overwritten by it. It is put back only when the diff has nothing selected
+  and the window has no selection of text, and a pointer that is down on the
+  diff is left alone: the note's lines stay marked and the text the person
+  chose stays theirs.
+
+- **A folder that became a repository is one.** A folder added to the panel
+  was read as a plain folder forever, so a repository an agent set up inside
+  it -- and the worktrees that came with it -- were never seen. A folder that
+  carries a repository of its own is now read as one, and a folder that has
+  become part of another repository keeps the folder it was instead of
+  becoming that repository's workdir.
+
+- **Copying a path says so.** The copy button on a path in the diff and on
+  the document's header wrote the path to the clipboard and said nothing, so
+  there was no answer to whether it had worked. It answers now.
+
 ## 1.1.0
 
 - **Exporting a review finishes it.** Saving a comment leaves a pending note
