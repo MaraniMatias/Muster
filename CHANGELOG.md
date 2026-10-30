@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.1.1
 
 - **The diff's annotation button is out of the source text.** The square the
   `+` is drawn in was as wide as a row and reached into the code, and its
