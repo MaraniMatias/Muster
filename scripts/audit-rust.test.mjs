@@ -35,6 +35,13 @@ import {
   PATCHED_GITIGNORE_TREE_SHA256,
   patchedGitignoreTreeSha256,
 } from "./patched-gitignore.mjs";
+import {
+  auditedPatchedGpuiComponent,
+  PATCHED_GPUI_COMPONENT_ARCHIVE_SHA256,
+  PATCHED_GPUI_COMPONENT_DIR,
+  PATCHED_GPUI_COMPONENT_TREE_SHA256,
+  patchedGpuiComponentTreeSha256,
+} from "./patched-gpui-component.mjs";
 
 function response(results, ok = true, status = 200) {
   return { ok, status, json: async () => ({ results }) };
@@ -211,6 +218,39 @@ test("editing the vendored Gitignore grammar breaks its pinned hash", (t) => {
   const patched = join(copy, "src/scanner.c");
   writeFileSync(patched, `${readFileSync(patched, "utf8")}\n/* quiet edit */\n`);
   assert.notEqual(patchedGitignoreTreeSha256(copy), PATCHED_GITIGNORE_TREE_SHA256);
+});
+
+test("the diff component is accepted only at its pinned identity and source tree", () => {
+  assert.equal(patchedGpuiComponentTreeSha256(), PATCHED_GPUI_COMPONENT_TREE_SHA256);
+  assert.match(PATCHED_GPUI_COMPONENT_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
+  const pkg = {
+    id: "path+file:///fixture#gpui-component@0.7.3",
+    name: "gpui-component",
+    version: "0.7.3",
+    source: null,
+    manifest_path: join(PATCHED_GPUI_COMPONENT_DIR, "Cargo.toml"),
+  };
+  assert.deepEqual(parseCargoMetadata({ workspace_members: [APP_ID], packages: [pkg] }), [
+    { name: "gpui-component", version: "0.7.3", source: null },
+  ]);
+  for (const override of [
+    { version: "0.7.2" },
+    { manifest_path: "/external/gpui-component/Cargo.toml" },
+  ]) {
+    assert.equal(auditedPatchedGpuiComponent({ ...pkg, ...override }), null);
+    assert.throws(() => parseCargoMetadata({ workspace_members: [APP_ID], packages: [{ ...pkg, ...override }] }), /unsupported external path dependency/);
+  }
+});
+
+test("editing the vendored diff component breaks its pinned hash", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "muster-vendored-gpui-component-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const copy = join(directory, "gpui-component");
+  cpSync(PATCHED_GPUI_COMPONENT_DIR, copy, { recursive: true });
+  assert.equal(patchedGpuiComponentTreeSha256(copy), PATCHED_GPUI_COMPONENT_TREE_SHA256);
+  const patched = join(copy, "src/diff/mod.rs");
+  writeFileSync(patched, `${readFileSync(patched, "utf8")}\n// quiet edit\n`);
+  assert.notEqual(patchedGpuiComponentTreeSha256(copy), PATCHED_GPUI_COMPONENT_TREE_SHA256);
 });
 
 test("the Gherkin grammar is accepted only with its pinned source tree", () => {

@@ -47,6 +47,7 @@ pub(crate) struct DiffView {
     pub(crate) state: Entity<DiffState>,
     pub(crate) parse_errors: std::collections::HashMap<String, String>,
     pub(crate) ready: std::collections::HashSet<String>,
+    pointer_down: bool,
     _events: Subscription,
 }
 
@@ -555,6 +556,7 @@ impl TerminalWindow {
                     state,
                     parse_errors,
                     ready,
+                    pointer_down: false,
                     _events: events,
                 });
                 // A fresh diff state has nothing selected in it, so a note that
@@ -562,14 +564,11 @@ impl TerminalWindow {
                 self.sync_review_note_selection(cx);
             }
         }
-        // The wash belongs to a note, and the toolkit's selection is a text
-        // selection: anything that clears it takes the note's lines with it.
-        // The mark is put back while the diff has nothing selected, and a
-        // selection of the person's own is left alone.
-        if self
-            .diff_view
-            .as_ref()
-            .is_some_and(|view| view.state.read(cx).selected_lines().is_none())
+        // Restore the note's mark only when neither a gutter range nor a
+        // window text selection is active. Text gestures have no selected_lines.
+        if self.diff_view.as_ref().is_some_and(|view| {
+            !view.pointer_down && view.state.read(cx).selected_lines().is_none()
+        }) && !gpui_kit::base::TextSelection::has_selection(window, cx)
         {
             self.sync_review_note_selection(cx);
         }
@@ -1230,6 +1229,7 @@ impl TerminalWindow {
                                         // has nothing to copy.
                                         .when_some(selected.clone(), |row, path| {
                                             let copy = path.clone();
+                                            let copied = weak.clone();
                                             row.child(
                                                 Button::new("copy-diff-path")
                                                     .text().cursor_default().small().compact().h(px(20.)).flex_none()
@@ -1238,6 +1238,7 @@ impl TerminalWindow {
                                                     .resting_tooltip(format!("Copy the path of {path}"))
                                                     .on_click(move |_, _, cx| {
                                                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+                                                        let _ = copied.update(cx, |app, cx| app.push_info("Path copied to clipboard", cx));
                                                     }),
                                             )
                                         }),
@@ -1350,6 +1351,7 @@ impl TerminalWindow {
                             })
                             .when_some(exported, |row, path| {
                                 let copy = path.clone();
+                                let copied = weak.clone();
                                 row.child(div().flex().items_center().gap_1().min_w_0()
                                     .child(div().id("review-exported-path").test_support()
                                         // Bounded, and shrinkable below that bound: a home
@@ -1373,6 +1375,7 @@ impl TerminalWindow {
                                         .resting_tooltip(path.clone())
                                         .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+                                            let _ = copied.update(cx, |app, cx| app.push_info("Path copied to clipboard", cx));
                                         })))
                             })
                             .when(opencode_selected, |row| {
@@ -1483,7 +1486,21 @@ impl TerminalWindow {
                                                 })))
                                 })),
                         )
-                .child(div().flex_1().min_h_0().child(body))
+                .child(div().flex_1().min_h_0()
+                    .capture_any_mouse_down(cx.listener(|app, event: &gpui_kit::MouseDownEvent, _, _| {
+                        if event.button == gpui_kit::MouseButton::Left {
+                            if let Some(view) = app.diff_view.as_mut() { view.pointer_down = true; }
+                        }
+                    }))
+                    .on_mouse_up(gpui_kit::MouseButton::Left, cx.listener(|app, _, _, cx| {
+                        if let Some(view) = app.diff_view.as_mut() { view.pointer_down = false; }
+                        cx.notify();
+                    }))
+                    .on_mouse_up_out(gpui_kit::MouseButton::Left, cx.listener(|app, _, _, cx| {
+                        if let Some(view) = app.diff_view.as_mut() { view.pointer_down = false; }
+                        cx.notify();
+                    }))
+                    .child(body))
                 .into_any_element(),
         )
     }

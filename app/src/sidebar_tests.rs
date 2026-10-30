@@ -1492,6 +1492,135 @@ async fn the_background_sweep_finds_counts_with_only_the_pointer_over_a_row(
     close(&fixture, cx);
 }
 
+/// A worktree Git made outside the app belongs to the panel.
+///
+/// The agent that made it did not ask this app for anything: Git knows the
+/// worktree, and the panel's own refresh is what tells the person about it.
+#[gpui_kit::test]
+async fn a_worktree_git_made_outside_the_app_appears_in_the_panel(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, cx| app.start_maintenance(cx));
+
+    // Git makes the worktree, not the app: what an agent does from its own shell.
+    let path = fixture.root.parent().unwrap().join("agent-task");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "feature/agent",
+            path.to_str().unwrap(),
+        ],
+    );
+
+    // Nothing asks for this checkout: the refresh does, the way it does in
+    // the app.
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        fixture.view.read(cx).navigation.repos[0].checkouts.len() == 2
+    })
+    .await;
+
+    let branch = fixture.view.read_with(cx, |app, _| {
+        app.navigation.repos[0].checkouts[1].branch.clone()
+    });
+    assert_eq!(branch.as_deref(), Some("feature/agent"));
+    let id = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.repos[0].checkouts[1].id.clone());
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(format!("select-checkout-{id}")).is_some(),
+            "the worktree Git made is in the model but has no row in the panel"
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+/// A folder that became a repository is a workdir with worktrees.
+///
+/// An agent that sets a project up leaves a plain folder holding a repository
+/// and the worktrees it made. The panel called the folder plain when it was
+/// given, and nothing may keep it there: the worktrees belong to the panel.
+#[gpui_kit::test]
+async fn a_plain_workdir_that_became_a_repository_gains_its_worktrees(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("later");
+    std::fs::create_dir(&root).unwrap();
+    let opened = navigation::open_directory(&root).unwrap();
+    assert_eq!(opened.repo.kind, RepoKind::Plain);
+    let (handle, view) = open_over(opened, cx);
+
+    // The agent makes the folder a repository, and gives it a worktree.
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "first",
+    ]);
+    git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "feature/agent",
+        root.join("agent-task").to_str().unwrap(),
+    ]);
+
+    view.update(cx, |app, cx| app.start_maintenance(cx));
+    cx.wait_for(handle, Duration::from_secs(30), |_, cx| {
+        view.read(cx)
+            .navigation
+            .repos
+            .iter()
+            .any(|repo| repo.kind == RepoKind::Git && repo.checkouts.len() == 2)
+    })
+    .await;
+
+    let id = view.read_with(cx, |app, _| {
+        app.navigation
+            .repos
+            .iter()
+            .find(|repo| repo.kind == RepoKind::Git)
+            .and_then(|repo| repo.checkouts.get(1))
+            .map(|checkout| checkout.id.clone())
+            .expect("the worktree the agent made")
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(format!("select-checkout-{id}")).is_some(),
+            "the worktree the agent made has no row in the panel"
+        );
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    view.update(cx, |app, _| app.owner.stop());
+}
+
 #[gpui_kit::test]
 async fn hover_opens_counts_wide_enough_to_need_the_strip(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -3356,6 +3485,22 @@ pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
     let opened = navigation::open_directory(&root).unwrap();
     let repo_id = opened.repo.id.clone();
     let checkout = opened.checkout_id.clone();
+    let (handle, view) = open_over(opened, cx);
+    GitFixture {
+        _directory: directory,
+        handle,
+        view,
+        root,
+        repo_id,
+        checkout,
+    }
+}
+
+/// A window over one opened directory, with no terminals of its own.
+fn open_over(
+    opened: navigation::OpenedDirectory,
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<TerminalWindow>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         load_fonts(cx);
@@ -3381,14 +3526,7 @@ pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
     })
     .unwrap();
     cx.run_until_parked();
-    GitFixture {
-        _directory: directory,
-        handle,
-        view,
-        root,
-        repo_id,
-        checkout,
-    }
+    (handle, view)
 }
 
 pub(super) fn close(fixture: &GitFixture, cx: &mut TestAppContext) {

@@ -6500,6 +6500,9 @@ async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut Te
         );
     })
     .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.toasts.latest_info(), Some("Path copied to clipboard"))
+    });
     // The file outlives the diff it came from, so a save for another checkout is
     // not this change set's file and is not named by this toolbar.
     fixture.view.update(cx, |app, cx| {
@@ -6571,6 +6574,108 @@ async fn the_document_header_copies_the_files_path(cx: &mut TestAppContext) {
             Some(Some(expected.clone())),
             "the icon beside the name is what puts the file's path on the clipboard"
         );
+        assert_eq!(
+            fixture.view.read(cx).toasts.latest_info(),
+            Some("Path copied to clipboard")
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
+async fn diff_code_can_be_selected_and_copied_while_a_note_is_marked(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use gpui_kit::{MouseButton, VisualTestContext};
+    let fixture = open_git(cx);
+    std::fs::write(
+        fixture.root.join("change.txt"),
+        "selection_text\nanother_line\n",
+    )
+    .unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_diff
+            .contains_key(&(fixture.checkout.clone(), "change.txt".into()))
+    })
+    .await;
+    assert!(draw_until(&fixture, cx, "copy-diff-path"));
+    let start = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within(("new", 1usize)).hover("source", cx);
+            window.render_frame(cx);
+            window
+                .within(("new", 1usize))
+                .click(("add-annotation", 1usize), cx);
+            assert!(
+                fixture.view.read(cx).review.composer.is_some(),
+                "the + still opens a note"
+            );
+            window.render_frame(cx);
+            let bounds = window.within(("new", 0usize)).find("source").bounds();
+            let add = window
+                .within(("new", 0usize))
+                .find(("add-annotation", 0usize))
+                .bounds();
+            assert!(
+                add.right() <= bounds.left(),
+                "the note button must stay outside source text: {add:?} {bounds:?}"
+            );
+            point(bounds.left() + px(1.), bounds.top() + px(8.))
+        })
+        .unwrap();
+    {
+        let mut visual = VisualTestContext::from_window(fixture.handle, cx);
+        visual.simulate_mouse_move(start, None, Default::default());
+        visual.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            start + point(px(75.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            start + point(px(75.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+    }
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let state = fixture
+            .view
+            .read(cx)
+            .diff_view
+            .as_ref()
+            .unwrap()
+            .state
+            .clone();
+        let selected = state.read(cx).selected_text(cx);
+        assert!(
+            !selected.is_empty() && "selection_text".starts_with(&selected),
+            "the selection includes the first character: {selected:?}"
+        );
+        assert!(
+            !selected.contains("another_line"),
+            "the note's mark must not replace the text selection: {selected:?}"
+        );
+        window.press("secondary-c", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(selected)
+        );
+        gpui_kit::base::TextSelection::clear(window, cx);
+        window.render_frame(cx);
+        assert_eq!(
+            state.read(cx).selected_lines(),
+            Some(DiffLineRange::new("change.txt", DiffSide::Modified, 2, 2))
+        );
     })
     .unwrap();
     close(&fixture, cx);
@@ -6607,6 +6712,9 @@ async fn the_diff_title_copies_the_path_it_names(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.toasts.latest_info(), Some("Path copied to clipboard"))
+    });
     // A whole change set names no file, so there is no path to copy.
     fixture
         .view

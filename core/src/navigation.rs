@@ -72,6 +72,17 @@ pub fn is_filesystem_root(path: &Path) -> bool {
     path.is_absolute() && path.parent().is_none()
 }
 
+/// Whether a plain directory has become a repository of its own.
+///
+/// A directory that Git does not call a repository becomes one when it is
+/// given a `.git` entry: the metadata directory of a repository, or the file a
+/// clone with a separate Git directory points at. Nothing else about a plain
+/// directory can make it one, so this is the whole question such a directory
+/// has to ask, and it costs a stat rather than a Git read.
+pub fn has_repository_marker(path: &Path) -> bool {
+    fs::symlink_metadata(path.join(".git")).is_ok()
+}
+
 /// Match a cwd to the deepest unique available checkout, by path segments.
 /// Missing/ambiguous checkouts never become automatic-movement destinations.
 pub fn checkout_for_directory(repos: &[Repo], path: &Path) -> Option<String> {

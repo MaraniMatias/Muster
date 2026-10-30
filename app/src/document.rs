@@ -2243,13 +2243,14 @@ impl TerminalWindow {
                                             .resting_tooltip(format!(
                                                 "Copy the full path of {path}"
                                             ))
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(cx.listener(move |app, _, _, cx| {
                                                 cx.write_to_clipboard(
                                                     gpui_kit::ClipboardItem::new_string(
                                                         copy.clone(),
                                                     ),
                                                 );
-                                            }),
+                                                app.push_info("Path copied to clipboard", cx);
+                                            })),
                                     )
                                 }),
                         )

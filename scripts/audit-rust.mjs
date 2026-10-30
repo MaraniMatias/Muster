@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { auditedPatchedAlacritty } from "./patched-alacritty.mjs";
 import { auditedPatchedGherkin } from "./patched-gherkin.mjs";
 import { auditedPatchedGitignore } from "./patched-gitignore.mjs";
+import { auditedPatchedGpuiComponent } from "./patched-gpui-component.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // Every manifest whose locked dependency graph is audited: the shared core and
@@ -55,7 +56,7 @@ export function parseCargoMetadata(json) {
     } else if (pkg.source !== null) {
       throw new Error(`unsupported external dependency source for ${label}`);
     } else {
-      const audited = auditedPatchedAlacritty(pkg) ?? auditedPatchedGherkin(pkg) ?? auditedPatchedGitignore(pkg);
+      const audited = auditedPatchedAlacritty(pkg) ?? auditedPatchedGherkin(pkg) ?? auditedPatchedGitignore(pkg) ?? auditedPatchedGpuiComponent(pkg);
       if (audited) {
         const key = `patched\0${pkg.name}@${pkg.version}`;
         packages.set(key, audited);

@@ -1529,7 +1529,15 @@ impl TerminalWindow {
                             app.navigation
                                 .repos
                                 .iter()
-                                .filter(|repo| repo.kind == RepoKind::Git)
+                                // A Git workdir is read on every pass. A plain
+                                // one is read once it carries a repository of
+                                // its own: that is what an agent does when it
+                                // sets one up, and the worktrees it made then
+                                // belong to the panel.
+                                .filter(|repo| {
+                                    repo.kind == RepoKind::Git
+                                        || navigation::has_repository_marker(Path::new(&repo.root))
+                                })
                                 .map(|repo| (repo.id.clone(), repo.root.clone()))
                                 .collect::<Vec<_>>()
                         } else {
@@ -1592,7 +1600,15 @@ impl TerminalWindow {
                                 continue;
                             }
                             match result {
-                                Ok(opened) => app.navigation.merge(opened, false),
+                                Ok(opened) => {
+                                    // A folder that has become part of another
+                                    // repository is not that repository's
+                                    // workdir: it keeps the folder it was.
+                                    if opened.repo.id != id {
+                                        continue;
+                                    }
+                                    app.navigation.merge(opened, false)
+                                }
                                 Err(error) => {
                                     if let Some(repo) =
                                         app.navigation.repos.iter_mut().find(|repo| repo.id == id)

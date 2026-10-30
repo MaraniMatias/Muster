@@ -16,6 +16,8 @@ default-members = ["app", "core"]
 # `scripts/patched-alacritty.mjs` hash-pins the whole tree.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal-0.26.0" }
+# Keep the diff's annotation button out of its source-text selection lane.
+gpui-component = { path = "vendor/gpui-component-0.7.3" }
 
 # The VT parser and the GPUI text stack are hot enough that an unoptimized debug
 # build is not worth waiting for, and every third-party crate is worse.
