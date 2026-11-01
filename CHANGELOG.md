@@ -6,6 +6,24 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A diff is read as the whole file it is a change of.** Each hunk of a diff
+  was parsed on its own, so the parts of a file that a change depends on were
+  missing from the reading: a template's opening tags, a Markdown fence, a
+  comment that began above the hunk. The diff now parses the whole file on
+  each side -- the very text Git compared, read from the same base and the
+  same snapshot the patch was made from -- so a change is coloured with the
+  context it belongs to. A file whose whole text cannot be read -- too large,
+  or not text -- is still read hunk by hunk, and nothing is invented to fill
+  the gap.
+
+- **A saved review names only the files it covered.** The line under the Save
+  button names the file a review was written to, and it kept naming it after
+  the panel moved on to another file, so the answer on screen was about a
+  review of a change set that was no longer on screen. It names the export
+  only while the files it covered are the ones on screen.
+
 ## 1.1.1
 
 - **The diff's annotation button is out of the source text.** The square the
