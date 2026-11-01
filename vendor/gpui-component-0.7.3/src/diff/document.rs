@@ -388,6 +388,7 @@ struct DocumentInner {
 pub struct DiffFile {
     inner: Arc<DocumentInner>,
     language: Option<SharedString>,
+    syntax_sources: [Option<SharedString>; 2],
 }
 
 impl DiffFile {
@@ -451,6 +452,7 @@ impl DiffFile {
                 conflicts: Vec::new(),
             }),
             language: None,
+            syntax_sources: [None, None],
         }
     }
 
@@ -461,6 +463,18 @@ impl DiffFile {
         self
     }
     /// The syntax language: the override, or the one detected from the path.
+    /// Supplies the complete source of one side for contextual syntax parsing.
+    /// This does not add rows, change hunks, or retarget review positions. Only
+    /// lines whose text agrees with the supplied source receive its captures.
+    pub fn with_syntax_source(mut self, side: DiffSide, source: impl Into<SharedString>) -> Self {
+        self.syntax_sources[side as usize] = Some(source.into());
+        self
+    }
+
+    pub(crate) fn syntax_source(&self, side: DiffSide) -> Option<&SharedString> {
+        self.syntax_sources[side as usize].as_ref()
+    }
+
     pub fn language(&self) -> SharedString {
         self.language
             .clone()

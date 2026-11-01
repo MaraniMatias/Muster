@@ -147,8 +147,9 @@ impl FilePresentation {
     }
 }
 
-/// Parses each hunk of one side independently, so an unterminated comment or
-/// string in one hunk cannot affect the next.
+/// Parses complete source when supplied, mapping captures back to the patch's
+/// real source numbers. Without it, hunks remain independent: unavailable text
+/// must never be invented by concatenating disconnected fragments.
 fn syntax_spans(
     file: &DiffFile,
     side: DiffSide,
@@ -169,32 +170,68 @@ fn syntax_spans(
     let highlighter = highlighters
         .entry(language.clone())
         .or_insert_with(|| SyntaxHighlighter::new(&language));
-    let ranges = if file.hunks().is_empty() {
+    let full_source = file.syntax_source(side);
+    let mut offset = 0;
+    let full_lines: Vec<_> = full_source
+        .into_iter()
+        .flat_map(|source| source.split_inclusive('\n'))
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            start..offset
+        })
+        .collect();
+    let ranges = if full_source.is_some() || file.hunks().is_empty() {
         vec![0..lines.len()]
     } else {
         file.hunks().iter().map(|hunk| hunk.lines(side)).collect()
     };
-    let source = file.source(side);
     for range in ranges.into_iter().filter(|range| !range.is_empty()) {
-        let base = lines[range.start].source().start;
-        let text = &source[base..lines[range.end - 1].source().end];
-        let hunk_lines = &lines[range.clone()];
-        for (capture, name) in highlighter.capture_names(&Rope::from_str(text)) {
+        let (source, base, end) = match full_source {
+            Some(source) => (source.as_str(), 0, source.len()),
+            None => (
+                file.source(side),
+                lines[range.start].source().start,
+                lines[range.end - 1].source().end,
+            ),
+        };
+        let mapped: Vec<_> = range
+            .filter_map(|ix| {
+                let line = &lines[ix];
+                let source_range = match full_source {
+                    Some(_) => {
+                        let range = full_lines.get(line.line_number().checked_sub(1)?)?.clone();
+                        let raw = &source[range.clone()];
+                        let content = match raw.strip_suffix('\n') {
+                            Some(content) => content.strip_suffix('\r').unwrap_or(content),
+                            None => raw,
+                        };
+                        if content != line.text().as_str() {
+                            return None;
+                        }
+                        range
+                    }
+                    None => line.source(),
+                };
+                Some((ix, source_range))
+            })
+            .collect();
+        for (capture, name) in highlighter.capture_names(&Rope::from_str(&source[base..end])) {
             let capture = capture.start + base..capture.end + base;
-            let first = hunk_lines.partition_point(|line| line.source().end <= capture.start);
-            for (offset, line) in hunk_lines[first..].iter().enumerate() {
-                let line_start = line.source().start;
-                if line_start >= capture.end {
+            let first = mapped.partition_point(|(_, range)| range.end <= capture.start);
+            for (ix, range) in &mapped[first..] {
+                if range.start >= capture.end {
                     break;
                 }
-                if line.content_end() - line_start > max_line_length {
+                let len = lines[*ix].text().len();
+                if len > max_line_length {
                     continue;
                 }
-                let start = capture.start.max(line_start);
-                let end = capture.end.min(line.content_end());
+                let start = capture.start.max(range.start);
+                let end = capture.end.min(range.start + len);
                 if start < end {
-                    per_line[range.start + first + offset].push((
-                        (start - line_start) as u32..(end - line_start) as u32,
+                    per_line[*ix].push((
+                        (start - range.start) as u32..(end - range.start) as u32,
                         name_ix(&name),
                     ));
                 }

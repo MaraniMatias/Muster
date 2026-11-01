@@ -525,6 +525,28 @@ impl DiffState {
     pub(crate) fn geometry(&self) -> &Rc<RefCell<SelectionGeometry>> {
         &self.geometry
     }
+    /// Prepared syntax styles used by the painter, for integration tests.
+    /// `None` means the position is absent or background preparation is pending.
+    #[cfg(feature = "test-support")]
+    pub fn syntax_highlights_for_test(
+        &self,
+        position: &DiffLinePosition,
+        theme: &dyn gpui_base::input::HighlightStyleResolver,
+    ) -> Option<Vec<(Range<usize>, gpui::HighlightStyle)>> {
+        let file = self
+            .files
+            .iter()
+            .position(|file| file.path() == position.path())?;
+        let ix = self.files[file].line_index(position.side(), position.line())?;
+        let presentation = self.presentations.get(file)?.as_ref()?;
+        Some(presentation.syntax_highlights(
+            &self.files[file].lines(position.side())[ix],
+            position.side(),
+            ix,
+            theme,
+        ))
+    }
+
     pub(crate) fn presentations(&self) -> &[Option<Arc<FilePresentation>>] {
         &self.presentations
     }

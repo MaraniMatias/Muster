@@ -508,7 +508,17 @@ impl TerminalWindow {
                     }
                     None => placeholder(path),
                 };
-                files.push(file.with_language(crate::document::syntax_language(path)));
+                let mut file = file.with_language(crate::document::syntax_language(path));
+                if let Some(sources) = self
+                    .git_diff
+                    .get(&(checkout.clone(), path.clone()))
+                    .and_then(|diff| diff.syntax_sources.as_ref())
+                {
+                    file = file
+                        .with_syntax_source(DiffSide::Original, sources[0].clone())
+                        .with_syntax_source(DiffSide::Modified, sources[1].clone());
+                }
+                files.push(file);
             }
             if let Some(view) = self.diff_view.as_mut().filter(|view| view.owner == owner) {
                 view.state.update(cx, |state, cx| {
@@ -749,14 +759,18 @@ impl TerminalWindow {
         // the review, not the file that happens to be open in it.
         let note_count = self.review.notes_for(checkout, None);
         let exporting_review = self.review.exporting;
-        // The file the last save wrote, when it holds this checkout's notes. The
-        // toolbar names it rather than a toast saying it once: the row is where
-        // the Save button is, so it is where somebody looks for the answer.
+        // Name the last export only for its checkout and the files it covered.
+        // All changes keeps the checkout-wide receipt; file navigation only hides it.
         let exported = self
             .review
             .exported
             .as_ref()
-            .filter(|export| export.checkout_id == *checkout)
+            .filter(|export| {
+                export.checkout_id == *checkout
+                    && selected
+                        .as_ref()
+                        .is_none_or(|path| export.note_paths.contains(path))
+            })
             .map(|export| export.path.display().to_string());
         let has_pending_opencode =
             !crate::review::can_start_opencode_round(&self.review.opencode_rounds);

@@ -1139,15 +1139,13 @@ impl SyntaxHighlighter {
     /// Parses `text` without reusing a tree from unrelated text and returns
     /// every capture in precedence order: later captures override earlier ones.
     ///
-    /// Injected languages are skipped: building their layers compiles a query
-    /// on every parse, which dominates the cost of many short fragments.
+    /// Includes injected languages, as the editor does. Callers with complete
+    /// source must parse it once rather than parsing disconnected hunks.
     pub(crate) fn capture_names(&mut self, text: &Rope) -> Vec<(Range<usize>, SharedString)> {
         self.tree = None;
         self.text = Rope::new();
         self.injection_layers.clear();
-        let injections_query = self.injections_query.take();
         self.update(None, text, None);
-        self.injections_query = injections_query;
         self.match_styles(0..text.len())
             .into_iter()
             .map(|item| (item.range, item.name))

@@ -1434,6 +1434,11 @@ fn a_diff_is_the_merge_base_change_and_refuses_a_path_outside_the_checkout() {
 
     let diff = file_diff(&repo, checkout, "file.txt", GitReadBudget::default()).unwrap();
     assert!(diff.patch.contains("+two"));
+    assert_eq!(diff.syntax_sources.as_ref().unwrap()[0].as_ref(), "one\n");
+    assert_eq!(
+        diff.syntax_sources.as_ref().unwrap()[1].as_ref(),
+        "one\ntwo\n"
+    );
     assert_eq!(diff.total_lines, diff.patch.lines().count());
     assert_eq!(
         diff.hunks,
@@ -1498,6 +1503,9 @@ fn tracked_and_untracked_diffs_survive_ancestor_replacement_without_reading_outs
         .unwrap();
         assert!(diff.patch.contains("+inside"), "{}", diff.patch);
         assert!(!diff.patch.contains("OUTSIDE_SECRET"), "{}", diff.patch);
+        let sources = diff.syntax_sources.as_ref().unwrap();
+        assert_eq!(sources[0].as_ref(), if tracked { "before\n" } else { "" });
+        assert_eq!(sources[1].as_ref(), "inside\n");
         if tracked {
             assert!(diff.patch.contains("-before"));
         }
@@ -1555,6 +1563,14 @@ fn a_rename_a_mode_change_and_a_deleted_parent_survive_the_diff_snapshot() {
         diff.patch
     );
     assert!(diff.patch.contains("+THREE"), "{}", diff.patch);
+    assert_eq!(
+        diff.syntax_sources.as_ref().unwrap()[0].as_ref(),
+        "one\ntwo\nthree\n"
+    );
+    assert_eq!(
+        diff.syntax_sources.as_ref().unwrap()[1].as_ref(),
+        "one\ntwo\nTHREE\n"
+    );
     write_and_commit(root, "mode.txt", "mode\n");
     fs::set_permissions(root.join("mode.txt"), fs::Permissions::from_mode(0o755)).unwrap();
     let diff = file_diff(
@@ -1576,6 +1592,8 @@ fn a_rename_a_mode_change_and_a_deleted_parent_survive_the_diff_snapshot() {
     )
     .unwrap();
     assert!(diff.patch.contains("-gone"), "{}", diff.patch);
+    assert_eq!(diff.syntax_sources.as_ref().unwrap()[0].as_ref(), "gone\n");
+    assert!(diff.syntax_sources.as_ref().unwrap()[1].is_empty());
 }
 
 #[test]

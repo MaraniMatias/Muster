@@ -1909,6 +1909,231 @@ async fn large_json_uses_one_retained_unified_view_with_real_source_coordinates(
 }
 
 #[gpui_kit::test]
+async fn diff_full_source_spans_keep_crlf_tabs_and_unicode_coordinates(cx: &mut TestAppContext) {
+    use gpui_kit::base::input::HighlightStyleResolver;
+    use gpui_kit::component::diff::{
+        DiffFile, DiffLinePosition, DiffLineRange, DiffSide, DiffState,
+    };
+    use gpui_kit::component::Theme;
+    let fixture = open_git(cx);
+    let file = DiffFile::parse("--- a/a.rs\n+++ b/a.rs\n@@ -5 +5 @@\n-\told 🦀\r\n+\tnew 🦀\r\n")
+        .unwrap()
+        .remove(0)
+        .with_syntax_source(
+            DiffSide::Original,
+            "fn main() {\r\n/*\r\none\r\ntwo\r\n\told 🦀\r\n*/\r\n}\r\n",
+        )
+        .with_syntax_source(
+            DiffSide::Modified,
+            "fn main() {\r\n/*\r\none\r\ntwo\r\n\tnew 🦀\r\n*/\r\n}\r\n",
+        );
+    let state = cx.new(|cx| DiffState::new([], cx));
+    for (file, limit, coloured) in [
+        (file.clone(), 1000, [true, true]),
+        (
+            file.clone()
+                .with_syntax_source(DiffSide::Modified, "wrong\n"),
+            1000,
+            [true, false],
+        ),
+        (file, 5, [false, false]),
+    ] {
+        state.update(cx, |state, cx| {
+            state.set_syntax_max_line_length(limit, cx);
+            state.set_files([file], cx);
+        });
+        let position = DiffLinePosition::new("a.rs", DiffSide::Original, 5);
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            state
+                .read(cx)
+                .syntax_highlights_for_test(&position, Theme::global(cx).highlight_theme.as_ref())
+                .is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            let theme = Theme::global(cx).highlight_theme.clone();
+            for (side, text) in [
+                (DiffSide::Original, "\told 🦀\r\n"),
+                (DiffSide::Modified, "\tnew 🦀\r\n"),
+            ] {
+                let position = DiffLinePosition::new("a.rs", side, 5);
+                let styles = state
+                    .read(cx)
+                    .syntax_highlights_for_test(&position, theme.as_ref())
+                    .unwrap();
+                if coloured[side as usize] {
+                    assert_eq!(styles.len(), 1);
+                    assert_eq!(
+                        styles[0].0,
+                        0..12,
+                        "capture maps through the expanded tab, not its source byte"
+                    );
+                    assert_eq!(styles[0].1.color, theme.style("comment").unwrap().color);
+                } else {
+                    assert!(styles.is_empty());
+                }
+                let file = &state.read(cx).files()[0];
+                assert_eq!((file.additions(), file.deletions()), (1, 1));
+                state.update(cx, |state, cx| {
+                    state.set_selected_lines(Some(DiffLineRange::new("a.rs", side, 5, 5)), cx);
+                    assert_eq!(state.selected_text(cx), text);
+                });
+            }
+        });
+    }
+    close(&fixture, cx);
+}
+
+/// The opening tags are outside every hunk. Both changed and context rows
+/// must use the complete old/new parse, not injected parses of hunk fragments.
+#[gpui_kit::test]
+async fn diff_injections_use_full_sources_without_moving_review_anchors(cx: &mut TestAppContext) {
+    use gpui_kit::base::input::HighlightStyleResolver;
+    use gpui_kit::component::diff::{DiffLinePosition, DiffSide};
+    use gpui_kit::component::highlighter::SyntaxHighlighter;
+    use gpui_kit::component::{Rope, Theme};
+
+    let fixture = open_git(cx);
+    let script = format!(
+        "{}import {{ value }} from \"before\";\nconst label = \"before\";\n// context comment\n{}",
+        "// padding\n".repeat(8),
+        "// padding\n".repeat(8),
+    );
+    let vue = format!(
+        "<template>\n{}  <p class=\"before\">Label</p>\n{}</template>\n<script setup lang=\"ts\">\n{script}</script>\n<style scoped>\n.card {{\n{}  color: red;\n{}}}\n</style>\n",
+        "  <div>context</div>\n".repeat(8), "  <div>context</div>\n".repeat(8),
+        "  padding: 0;\n".repeat(8), "  padding: 0;\n".repeat(8),
+    );
+    let markdown = format!("# Embedded code\n\n```javascript\n{script}```\n");
+    for (path, old) in [("component.vue", vue), ("embedded.md", markdown)] {
+        std::fs::write(fixture.root.join(path), &old).unwrap();
+        commit_all(&fixture.root, "embedded syntax baseline");
+        // The inserted line shifts the new-side CSS coordinates independently.
+        let new = old
+            .replace("before", "after")
+            .replace("color: red", "color: blue")
+            .replace("const label", "const extra = 1;\nconst label");
+        std::fs::write(fixture.root.join(path), &new).unwrap();
+        let key = (fixture.checkout.clone(), path.to_owned());
+        fixture.view.update(cx, |app, cx| {
+            app.open_changes(&fixture.checkout, Some(path.into()), cx);
+        });
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            fixture.view.read(cx).git_diff.contains_key(&key)
+        })
+        .await;
+        cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        let state = fixture.view.read_with(cx, |app, _| {
+            let diff = &app.git_diff[&key];
+            assert!(
+                !diff.patch.contains("<script"),
+                "the hunk must not know its host block"
+            );
+            assert!(!diff.patch.contains("<style"));
+            assert!(
+                !diff.patch.contains("```"),
+                "the fence must be outside the hunk"
+            );
+            assert_eq!(diff.syntax_sources.as_ref().unwrap()[0].as_ref(), old);
+            assert_eq!(diff.syntax_sources.as_ref().unwrap()[1].as_ref(), new);
+            app.diff_view.as_ref().unwrap().state.clone()
+        });
+        let position = DiffLinePosition::new(
+            path,
+            DiffSide::Modified,
+            new.lines()
+                .position(|line| line.starts_with("import"))
+                .unwrap()
+                + 1,
+        );
+        cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+            state
+                .read(cx)
+                .syntax_highlights_for_test(&position, Theme::global(cx).highlight_theme.as_ref())
+                .is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            let theme = Theme::global(cx).highlight_theme.clone();
+            let theme = theme.as_ref();
+            for (side, source, string) in [
+                (DiffSide::Original, old.as_str(), "\"before\""),
+                (DiffSide::Modified, new.as_str(), "\"after\""),
+            ] {
+                let mut document = SyntaxHighlighter::new(crate::document::syntax_language(path));
+                document.update(None, &Rope::from_str(source), None);
+                let document_styles = document.styles(&(0..source.len()), theme);
+                let mut probes = vec![
+                    ("import", 0, "keyword"),
+                    ("const label", 0, "keyword"),
+                    (string, 1, "string"),
+                    ("// context comment", 3, "comment"),
+                ];
+                if path.ends_with("vue") {
+                    probes.extend([
+                        ("<p class", 1, "tag"),
+                        ("class=", 1, "function"),
+                        ("color:", 1, "property"),
+                    ]);
+                }
+                for (needle, inside, token) in probes {
+                    let byte = if token == "string" {
+                        source.rfind(needle)
+                    } else {
+                        source.find(needle)
+                    }
+                    .unwrap()
+                        + inside;
+                    let line = source[..byte].bytes().filter(|byte| *byte == b'\n').count() + 1;
+                    let column = source[..byte]
+                        .rfind('\n')
+                        .map_or(byte, |start| byte - start - 1);
+                    let position = DiffLinePosition::new(path, side, line);
+                    let styles = state
+                        .read(cx)
+                        .syntax_highlights_for_test(&position, theme)
+                        .unwrap();
+                    let actual = styles
+                        .iter()
+                        .rev()
+                        .find(|(range, _)| range.contains(&column))
+                        .and_then(|(_, style)| style.color);
+                    let expected = document_styles
+                        .iter()
+                        .rev()
+                        .find(|(range, _)| range.contains(&byte))
+                        .and_then(|(_, style)| style.color);
+                    assert_eq!(
+                        actual, expected,
+                        "{path} {side:?} {needle}: diff and document disagree"
+                    );
+                    assert_eq!(
+                        actual,
+                        theme.style(token).and_then(|style| style.color),
+                        "{path} {side:?} {needle} lacks {token}"
+                    );
+                    assert!(actual.is_some());
+                    state.update(cx, |state, cx| {
+                        state.set_selected_lines(
+                            Some(gpui_kit::component::diff::DiffLineRange::new(
+                                path, side, line, line,
+                            )),
+                            cx,
+                        );
+                        assert_eq!(
+                            state.selected_text(cx),
+                            source.lines().nth(line - 1).unwrap().to_owned() + "\n"
+                        );
+                    });
+                }
+            }
+        });
+    }
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
 async fn a_json_file_is_visible_in_the_actual_workspace_editor(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     let source = "{\n  \"project\": \"Muster\",\n  \"enabled\": true\n}\n";
@@ -6160,7 +6385,7 @@ async fn review_suggestion_and_export_finish_the_note_and_its_range(cx: &mut Tes
         window.click("save-review-note", cx);
     })
     .unwrap();
-    let (notes, repo, checkout) = fixture.view.read_with(cx, |app, _| {
+    let (mut notes, repo, checkout) = fixture.view.read_with(cx, |app, _| {
         assert!(app.review.composer.is_none());
         assert_eq!(
             app.review.notes_for(&fixture.checkout, None),
@@ -6178,8 +6403,23 @@ async fn review_suggestion_and_export_finish_the_note_and_its_range(cx: &mut Tes
             app.navigation.checkout(&fixture.checkout).unwrap().clone(),
         )
     });
+    let mut other = notes[0].clone();
+    other.id = "other-note".into();
+    other.path = "other.txt".into();
+    notes.push(other);
+    fixture.view.update(cx, |app, _| {
+        app.review
+            .notes
+            .insert(fixture.checkout.clone(), notes.clone());
+    });
     let completed = notes.iter().map(review_note_key).collect();
+    let note_paths = notes
+        .iter()
+        .map(|note| note.path.clone())
+        .collect::<std::collections::HashSet<_>>();
     let markdown = muster_core::review::build_review_markdown(&notes, &ReviewContext::default());
+    assert!(markdown.contains("## change.txt"));
+    assert!(markdown.contains("## other.txt"));
     assert!(
         markdown.contains("two\nthree"),
         "the anchor still contains the original code"
@@ -6193,10 +6433,12 @@ async fn review_suggestion_and_export_finish_the_note_and_its_range(cx: &mut Tes
         app.finish_review_export(
             &fixture.checkout,
             &completed,
+            note_paths.clone(),
             Err("export failed".into()),
             cx,
         );
-        assert_eq!(app.review.notes_for(&fixture.checkout, None), 1);
+        assert_eq!(app.review.notes_for(&fixture.checkout, None), 2);
+        assert!(app.review.exported.is_none());
         assert!(app
             .diff_view
             .as_ref()
@@ -6216,7 +6458,14 @@ async fn review_suggestion_and_export_finish_the_note_and_its_range(cx: &mut Tes
     .unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), markdown);
     fixture.view.update(cx, |app, cx| {
-        app.finish_review_export(&fixture.checkout, &completed, Ok(path), cx);
+        app.finish_review_export(
+            &fixture.checkout,
+            &completed,
+            note_paths.clone(),
+            Ok(path),
+            cx,
+        );
+        assert_eq!(app.review.exported.as_ref().unwrap().note_paths, note_paths);
         assert_eq!(app.review.notes_for(&fixture.checkout, None), 0);
         assert!(app
             .diff_view
@@ -6461,7 +6710,9 @@ async fn review_toolbar_separates_the_title_from_the_selected_action(cx: &mut Te
 #[gpui_kit::test]
 async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
-    std::fs::write(fixture.root.join("change.txt"), "one\ntwo\n").unwrap();
+    for path in ["change.txt", "other.txt", "unexported.txt"] {
+        std::fs::write(fixture.root.join(path), "one\ntwo\n").unwrap();
+    }
     fixture.view.update(cx, |app, cx| {
         app.open_changes(&fixture.checkout, Some("change.txt".into()), cx)
     });
@@ -6479,6 +6730,7 @@ async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut Te
         app.review.exported = Some(crate::review::ExportedReview {
             checkout_id: fixture.checkout.clone(),
             path,
+            note_paths: ["change.txt".into(), "other.txt".into()].into(),
         });
         cx.notify();
     });
@@ -6503,12 +6755,46 @@ async fn a_saved_review_names_the_file_it_wrote_and_copies_that_path(cx: &mut Te
     fixture.view.read_with(cx, |app, _| {
         assert_eq!(app.toasts.latest_info(), Some("Path copied to clipboard"))
     });
+    // File navigation hides the receipt without forgetting it; All changes still
+    // answers for the whole checkout, even with an unexported file in the diff.
+    for (selected, visible) in [
+        (Some("unexported.txt"), false),
+        (None, true),
+        (Some("change.txt"), true),
+        (Some("other.txt"), true),
+    ] {
+        fixture.view.update(cx, |app, cx| {
+            app.open_changes(&fixture.checkout, selected.map(str::to_owned), cx);
+        });
+        cx.update_window(fixture.handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.try_find("review-exported-path").is_some(),
+                visible,
+                "receipt scope for {selected:?}"
+            );
+            assert_eq!(
+                window.try_find("copy-review-export-path").is_some(),
+                visible,
+                "copy scope for {selected:?}"
+            );
+            if visible {
+                window.click("copy-review-export-path", cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(written.clone())
+                );
+            }
+        })
+        .unwrap();
+    }
     // The file outlives the diff it came from, so a save for another checkout is
     // not this change set's file and is not named by this toolbar.
     fixture.view.update(cx, |app, cx| {
         app.review.exported = Some(crate::review::ExportedReview {
             checkout_id: "checkout:/somewhere/else".into(),
             path: std::path::PathBuf::from("/elsewhere/2026-03-14-1532.md"),
+            note_paths: ["other.txt".into()].into(),
         });
         cx.notify();
     });

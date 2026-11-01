@@ -51,9 +51,13 @@ pub struct FileDiff {
     /// Complete patch under the hard caps. Binary and refused patches are empty;
     /// large text patches remain available to a virtualized reader.
     pub patch: String,
+    /// Complete old/new UTF-8 sources from this diff's base and private snapshot,
+    /// only for syntax highlighting. Unavailable or oversized sources stay absent.
+    pub syntax_sources: Option<[std::sync::Arc<str>; 2]>,
     /// Hash of every line Git printed, including the ones a limit threw away. Two large
     /// diffs both answer with an empty patch, and a reader that compares patches alone
-    /// would keep serving the first one's lines for the second.
+    /// would keep serving the first one's lines for the second. Includes complete
+    /// syntax sources when available, so hidden parse context invalidates highlighting.
     pub revision: String,
     pub hunks: Vec<DiffHunk>,
     pub total_lines: usize,
@@ -236,6 +240,7 @@ pub(super) fn file_diff_before_git(
             return Ok(FileDiff {
                 path: path.to_owned(),
                 patch: String::new(),
+                syntax_sources: None,
                 revision: digest(target.as_bytes()),
                 hunks: Vec::new(),
                 total_lines: 0,
@@ -278,7 +283,7 @@ pub(super) fn file_diff_before_git(
     if untracked {
         args.extend(["--no-index", "--", "/dev/null", path].map(str::to_owned));
     } else {
-        args.push(base);
+        args.push(base.clone());
         args.push("--".into());
         if let Some(old) = &changed.old_path {
             args.push(literal_pathspec(old));
@@ -302,6 +307,42 @@ pub(super) fn file_diff_before_git(
     }
     let mut diff = scan(path.to_owned(), &output.stdout)?;
     diff.image = image_format(header.as_deref(), path);
+    if !diff.is_binary && !diff.too_large && !diff.patch.is_empty() {
+        // Highlighting must read exactly the inputs Git compared, never reopen
+        // the mutable checkout or resolve the merge base a second time.
+        let sources = (|| {
+            let old = if untracked || diff.patch.lines().any(|line| line == "--- /dev/null") {
+                Vec::new()
+            } else {
+                let old_path = changed.old_path.as_deref().unwrap_or(path);
+                git_success(&root, &["show", &format!("{base}:{old_path}")], within)
+                    .ok()?
+                    .stdout
+            };
+            let new = if header.is_some() {
+                fs::read(snapshot.path().join(&relative)).ok()?
+            } else {
+                Vec::new()
+            };
+            let source = |bytes: Vec<u8>| {
+                if bytes.len() > MAX_DIFF_BYTES
+                    || bytes.iter().filter(|byte| **byte == b'\n').count() > MAX_DIFF_LINES
+                {
+                    return None;
+                }
+                String::from_utf8(bytes)
+                    .ok()
+                    .map(std::sync::Arc::<str>::from)
+            };
+            Some([source(old)?, source(new)?])
+        })();
+        if let Some(sources) = &sources {
+            // A change outside the displayed hunks can change their parse context.
+            diff.revision.push_str(&digest(sources[0].as_bytes()));
+            diff.revision.push_str(&digest(sources[1].as_bytes()));
+        }
+        diff.syntax_sources = sources;
+    }
     Ok(diff)
 }
 
@@ -444,6 +485,7 @@ fn too_large(path: &str) -> FileDiff {
     FileDiff {
         path: path.to_owned(),
         patch: String::new(),
+        syntax_sources: None,
         revision: String::new(),
         hunks: Vec::new(),
         total_lines: 0,
@@ -725,6 +767,7 @@ pub(crate) fn scan(path: String, bytes: &[u8]) -> Result<FileDiff, String> {
         return Ok(FileDiff {
             path,
             patch,
+            syntax_sources: None,
             revision: digest(bytes),
             hunks,
             total_lines: 0,
@@ -775,6 +818,7 @@ pub(crate) fn scan(path: String, bytes: &[u8]) -> Result<FileDiff, String> {
     Ok(FileDiff {
         path,
         patch,
+        syntax_sources: None,
         revision: digest(bytes),
         hunks: if is_binary || too_large {
             Vec::new()

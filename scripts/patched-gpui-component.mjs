@@ -8,7 +8,7 @@ export const PATCHED_GPUI_COMPONENT_DIR = join(ROOT, "vendor/gpui-component-0.7.
 const PATCHED_GPUI_COMPONENT_VERSION = "0.7.3";
 // Published crates.io archive; see the vendored PATCHES.md for the local change.
 export const PATCHED_GPUI_COMPONENT_ARCHIVE_SHA256 = "465a363235cd4062ef5f0953fc096fc764ed6f53dfbd9f409f669f93ea3b1ff9";
-export const PATCHED_GPUI_COMPONENT_TREE_SHA256 = "f383e311fde82a55e998dcec15cf609d5bfe22cd9002fcff77beaace9e2948d4";
+export const PATCHED_GPUI_COMPONENT_TREE_SHA256 = "2d7920ac7f151a3a6c5d8968d698d70849def506f62a731327b6546ffe44eab9";
 
 export function patchedGpuiComponentTreeSha256(root = PATCHED_GPUI_COMPONENT_DIR) {
   const rootInfo = lstatSync(root);

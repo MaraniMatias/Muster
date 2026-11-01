@@ -1322,9 +1322,16 @@ impl TerminalWindow {
                     if app.git_diff_request.get(&key) == Some(&token) {
                         app.git_diff_request.remove(&key);
                         match result {
-                            Ok(diff) => {
-                                let retained: usize = app.git_diff.iter().filter(|(cached, _)| *cached != &key).map(|(_, diff)| diff.patch.len()).sum();
-                                if retained.saturating_add(diff.patch.len()) > crate::diff::MAX_RETAINED_PATCH_BYTES {
+                            Ok(mut diff) => {
+                                let bytes = |diff: &muster_core::navigation::FileDiff| {
+                                    diff.patch.len() + diff.syntax_sources.as_ref().map_or(0, |sources| sources.iter().map(|source| source.len()).sum::<usize>())
+                                };
+                                let retained: usize = app.git_diff.iter().filter(|(cached, _)| *cached != &key).map(|(_, diff)| bytes(diff)).sum();
+                                if retained.saturating_add(bytes(&diff)) > crate::diff::MAX_RETAINED_PATCH_BYTES {
+                                    // Optional parse context must not evict a reviewable patch.
+                                    diff.syntax_sources = None;
+                                }
+                                if retained.saturating_add(bytes(&diff)) > crate::diff::MAX_RETAINED_PATCH_BYTES {
                                     app.git_diff_errors.insert(key.clone(), "Too many expanded diffs. Collapse another file or open this change individually.".into());
                                     app.pump_diff_reads(cx);
                                     cx.notify();

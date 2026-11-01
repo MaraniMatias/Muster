@@ -235,7 +235,7 @@ pub(crate) struct ReviewState {
     opencode_generation: u64,
 }
 
-/// The file a save wrote, with the checkout whose notes went into it.
+/// The file a save wrote, with the checkout and note paths that went into it.
 ///
 /// The checkout is part of it because the file outlives the diff: a review saved
 /// for one checkout is still on disk after another checkout's change set is opened,
@@ -243,6 +243,7 @@ pub(crate) struct ReviewState {
 pub(crate) struct ExportedReview {
     pub(crate) checkout_id: String,
     pub(crate) path: PathBuf,
+    pub(crate) note_paths: HashSet<String>,
 }
 
 /// A review that is ready to go, and the choice a busy target raises.
@@ -2158,6 +2159,7 @@ impl TerminalWindow {
         &mut self,
         checkout_id: &str,
         completed: &HashSet<String>,
+        note_paths: HashSet<String>,
         result: Result<PathBuf, String>,
         cx: &mut Context<Self>,
     ) {
@@ -2172,6 +2174,7 @@ impl TerminalWindow {
                 self.review.exported = Some(ExportedReview {
                     checkout_id: checkout_id.to_owned(),
                     path,
+                    note_paths,
                 });
             }
             Err(error) => self.push_error(error, cx),
@@ -2226,6 +2229,7 @@ impl TerminalWindow {
         let default_branch = repo.default_branch.clone();
         let storage = self.navigation.review_storage;
         let completed = notes.iter().map(review::review_note_key).collect();
+        let note_paths = notes.iter().map(|note| note.path.clone()).collect();
         self.review.exporting = true;
         cx.notify();
         let worker = cx.background_executor().spawn(async move {
@@ -2253,7 +2257,7 @@ impl TerminalWindow {
         cx.spawn_in(window, async move |view, cx| {
             let result = worker.await;
             let _ = view.update(cx, |app, cx| {
-                app.finish_review_export(&checkout_id, &completed, result, cx);
+                app.finish_review_export(&checkout_id, &completed, note_paths, result, cx);
             });
         })
         .detach();
