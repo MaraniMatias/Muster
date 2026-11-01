@@ -916,12 +916,7 @@ packages it covers, and the reason it cannot be reached in this tree. An
 accepted advisory is reported on every run, with its reason, and it does not
 block the release: it is never silently dropped, and an entry that no longer
 applies to the locked tree says so, so the list cannot outlive the advisory it
-names. The one entry today is `GHSA-qwgh-2vcv-g2f7` on `block-buffer@0.10.4`:
-the locked block-buffer keeps its cursor in its own field, so the defect the
-advisory describes -- a caught panic in a hash callback leaving the cursor out
-of range -- cannot happen in that version, and the tree cannot reach the fixed
-`0.12.1`, because the toolkit pins `gpui-pre-linux`, which pins `oo7`, which
-pins `digest 0.10`.
+names. The accepted list is currently empty.
 
 ## Adding to the port
 

@@ -135,18 +135,7 @@ export function isBlocking(advisory) {
 // not block the release. It is never silently dropped, and an entry that no
 // longer applies to the locked tree says so, so the list cannot outlive the
 // advisory it names.
-export const ACCEPTED_ADVISORIES = [
-  {
-    id: "GHSA-qwgh-2vcv-g2f7",
-    packages: ["block-buffer@0.10.4"],
-    reason:
-      "The locked block-buffer keeps its cursor in its own field, so a caught panic in a hash " +
-      "callback cannot leave it out of range: the defect needs the versions that keep the cursor " +
-      "inside the buffer, which begin at 0.11.0, and 0.12.1 is the first fixed release. The locked " +
-      "tree cannot reach it, because the toolkit pins gpui-pre-linux, which pins oo7, which pins " +
-      "digest 0.10, which pins block-buffer 0.10.",
-  },
-];
+export const ACCEPTED_ADVISORIES = [];
 
 // The accepted entry that covers an advisory, if there is one. It matches the
 // advisory by any of its identifiers and covers exactly the packages the
