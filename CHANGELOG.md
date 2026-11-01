@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.2.0
 
 - **A diff is read as the whole file it is a change of.** Each hunk of a diff
   was parsed on its own, so the parts of a file that a change depends on were
