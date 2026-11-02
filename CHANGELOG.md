@@ -6,6 +6,15 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **macOS downloads include a disk image.** Apple Silicon and Intel builds ship
+  in clearly named DMGs alongside the ZIPs. Each image includes Muster, an
+  Applications shortcut, and an optional installer that asks for trust before
+  copying the app and removing quarantine from that copy. It never overwrites
+  an existing installation or disables Gatekeeper globally. Local packaging
+  and the release workflow verify the mounted image and publish its checksum.
+
 ## 1.2.0
 
 - **A diff is read as the whole file it is a change of.** Each hunk of a diff

@@ -116,7 +116,7 @@ test('the candidate command writes the version where the release reads it, and p
     const readme = readFileSync(path.join(dir, 'README.md'), 'utf8');
     const kind = next.includes('-') ? 'candidate' : 'release';
     assert.match(readme, new RegExp(`The current ${kind} is \\*\\*v${escape(next)}\\*\\*:`));
-    assert.match(readme, new RegExp(`releases/download/v${escape(next)}/Muster_${escape(next)}_arm64\\.zip`));
+    assert.match(readme, new RegExp(`releases/download/v${escape(next)}/Muster_${escape(next)}_macOS_arm64\\.dmg`));
     assert.match(readme, new RegExp(`releases/download/v${escape(next)}/muster_${escape(next)}_amd64\\.deb`));
     // A dry run publishes nothing: the commit is the one it started from, and
     // the remote has no tag.
@@ -168,4 +168,42 @@ test('the macOS floor is one decision in the config, the bundle and the release 
   assert.ok(sameVersion(parseVersionText(enforced[1]), MACOS_MINIMUM_VERSION));
   const bundle = readFileSync(path.join(root, 'scripts/bundle-macos.sh'), 'utf8');
   assert.ok(sameVersion(plistMinimumSystemVersion(bundle), MACOS_MINIMUM_VERSION));
+});
+
+test('macOS packages a mountable DMG and its installer confirms, copies and refuses replacement', { skip: process.platform !== 'darwin' }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'muster-dmg-'));
+  try {
+    const execute = (command, args, options = {}) => {
+      const result = spawnSync(command, args, { encoding: 'utf8', timeout: 120000, ...options });
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      return result;
+    };
+    // A real signed bundle and disk image, without rebuilding the Rust app.
+    const binary = path.join(dir, 'fixture');
+    execute('cc', ['-x', 'c', '-o', binary, '-'], { input: 'int main(void) { return 0; }\n' });
+    execute('bash', [path.join(root, 'scripts/bundle-macos.sh'), binary, dir]);
+    execute('bash', [path.join(root, 'scripts/package-macos-dmg.sh'), path.join(dir, 'Muster.app'), dir]);
+    const arch = execute('lipo', ['-archs', path.join(dir, 'Muster.app/Contents/MacOS/Muster')]).stdout.trim();
+    assert.ok(readFileSync(path.join(dir, `Muster_${carried}_macOS_${arch}.dmg`)).length > 512);
+
+    // Exercise the shipped installer against an isolated Applications directory.
+    const applications = path.join(dir, 'Applications');
+    mkdirSync(applications);
+    const installer = path.join(dir, 'Install Muster.command');
+    writeFileSync(installer, readFileSync(path.join(root, 'scripts/install-macos.command'), 'utf8').replaceAll('/Applications', applications));
+    const destination = path.join(applications, 'Muster.app');
+    execute('bash', [installer], { input: 'n\n' });
+    assert.throws(() => readFileSync(path.join(destination, 'Contents/Info.plist')), /ENOENT/);
+    execute('xattr', ['-w', 'com.apple.quarantine', '0083;00000000;MusterTest;', path.join(dir, 'Muster.app')]);
+    execute('bash', [installer], { input: 'y\n' });
+    assert.doesNotMatch(execute('xattr', ['-lr', destination]).stdout, /com.apple.quarantine/);
+    execute('codesign', ['--verify', '--strict', destination]);
+    const original = readFileSync(path.join(destination, 'Contents/Info.plist'), 'utf8');
+    const refused = spawnSync('bash', [installer], { encoding: 'utf8', input: 'y\n' });
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /existing .*Muster.app/);
+    assert.equal(readFileSync(path.join(destination, 'Contents/Info.plist'), 'utf8'), original);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

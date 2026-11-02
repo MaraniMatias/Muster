@@ -19,7 +19,11 @@ This is a stable release. Earlier candidates are on the [Releases page](https://
 
 ### macOS
 
-Muster requires macOS 15 or later. Download the archive for your Mac, unzip it, and move `Muster.app` to Applications. The app is ad-hoc signed and not notarized by Apple. If macOS blocks it, see [the Gatekeeper instructions](#why-does-macos-say-the-app-is-damaged-or-cant-be-opened).
+Muster requires macOS 15 or later. For ZIP downloads (including v1.2.0), unzip yours and move `Muster.app` to Applications.
+
+macOS downloads include a clearly named `Muster_<version>_macOS_<architecture>.dmg`. Open it and drag `Muster.app` to Applications, or run **Install Muster.command** inside the image. The script asks you to confirm that you trust the download, copies the app to `/Applications`, and removes quarantine from that copy only. Quit Muster and move any existing copy to the Trash before using the script; your data in `~/.muster` is untouched. ZIPs remain available as an alternative.
+
+The app and installer are not notarized by Apple. If macOS blocks the installer, open Terminal and run `/bin/bash "/Volumes/Muster/Install Muster.command"` (adjust the volume name if Finder changed it). Only do this if you trust the source. For manual installation, see [the Gatekeeper instructions](#why-does-macos-say-the-app-is-damaged-or-cant-be-opened).
 
 ### Ubuntu
 

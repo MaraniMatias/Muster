@@ -164,13 +164,14 @@ jobs:
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Muster.app/Contents/Info.plist)" == "$VERSION" ]]
           cd dist
           ditto -c -k --sequesterRsrc --keepParent Muster.app "Muster_${VERSION}_${ARCH}.zip"
-          shasum -a 256 "Muster_${VERSION}_${ARCH}.zip" > SHA256SUMS
+          shasum -a 256 "Muster_${VERSION}_${ARCH}.zip" "Muster_${VERSION}_macOS_${ARCH}.dmg" > SHA256SUMS
           printf '%s\n' "$SHA" > SOURCE_SHA
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-${{ matrix.arch }}-${{ inputs.sha }}
           path: |
             dist/*.zip
+            dist/*.dmg
             dist/SHA256SUMS
             dist/SOURCE_SHA
           if-no-files-found: error
@@ -231,9 +232,10 @@ jobs:
           sha256sum -c SHA256SUMS
           shopt -s nullglob
           version="${TAG#v}"
-          files=(*); [[ ${#files[@]} == 6 ]]
+          files=(*); [[ ${#files[@]} == 8 ]]
           [[ -s "muster_${version}_amd64.deb" && -s "muster_${version}_arm64.deb" ]]
           [[ -s "Muster_${version}_arm64.zip" && -s "Muster_${version}_x86_64.zip" ]]
+          [[ -s "Muster_${version}_macOS_arm64.dmg" && -s "Muster_${version}_macOS_x86_64.dmg" ]]
           if git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG"; then
             echo "Tag already exists: $TAG"; exit 1
           else
@@ -243,5 +245,5 @@ jobs:
           gh api "repos/$REPO/git/refs" -X POST -f ref="refs/tags/$TAG" -f sha="$object"
           flags=()
           if [[ "$TAG" == *-* ]]; then flags+=(--prerelease --latest=false); fi
-          gh release create "$TAG" ./*.deb ./*.zip SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "Native macOS arm64 and x86_64 and Ubuntu 24.04 amd64 and arm64 artifacts built and validated from $SHA." "${flags[@]}"
+          gh release create "$TAG" ./*.deb ./*.zip ./*.dmg SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "Native macOS arm64 and x86_64 and Ubuntu 24.04 amd64 and arm64 artifacts built and validated from $SHA." "${flags[@]}"
           gh release edit "$TAG" --repo "$REPO" --draft=false "${flags[@]}"

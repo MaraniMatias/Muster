@@ -124,15 +124,18 @@ export function verifyMacBundleMinimumOs(plist, executable, arch = 'arm64') {
   return binary;
 }
 
-export function verifyPayload(directory, sha, filename) {
+export function verifyPayload(directory, sha, filename, additional = []) {
   assert.match(sha, /^[0-9a-f]{40}$/);
   assert.equal(readFileSync(path.join(directory, 'SOURCE_SHA'), 'utf8').trim(), sha, 'source SHA mismatch');
-  assert.deepEqual(readdirSync(directory).sort(), ['SHA256SUMS', 'SOURCE_SHA', filename].sort(), 'unexpected artifact files');
-  const bytes = readFileSync(path.join(directory, filename));
-  assert.ok(bytes.length > 0, 'empty artifact');
-  const digest = createHash('sha256').update(bytes).digest('hex');
-  assert.equal(readFileSync(path.join(directory, 'SHA256SUMS'), 'utf8').trim(), `${digest}  ${filename}`, 'checksum mismatch');
-  return bytes;
+  const files = [filename, ...additional];
+  assert.deepEqual(readdirSync(directory).sort(), ['SHA256SUMS', 'SOURCE_SHA', ...files].sort(), 'unexpected artifact files');
+  const checksums = files.map(file => {
+    const bytes = readFileSync(path.join(directory, file));
+    assert.ok(bytes.length > 0, 'empty artifact');
+    return `${createHash('sha256').update(bytes).digest('hex')}  ${file}`;
+  });
+  assert.deepEqual(readFileSync(path.join(directory, 'SHA256SUMS'), 'utf8').trim().split('\n').sort(), checksums.sort(), 'checksum mismatch');
+  return readFileSync(path.join(directory, filename));
 }
 
 // The four targets a release carries. Each one is a directory of its own with
@@ -149,7 +152,7 @@ export function finalize(base, sha, version, output) {
   assert.match(version, /^(?:0\.\d+\.\d+|1\.\d+\.\d+(?:-rc\.\d+)?)$/, 'unsupported release version');
   const debVersion = version.replace('-', '~');
   const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  const payloads = RELEASE_TARGETS.map(target => {
+  const payloads = RELEASE_TARGETS.flatMap(target => {
     const directory = path.join(base, `${target.directory}-${sha}`);
     const file = target.format === 'deb'
       ? `muster_${debVersion}_${target.arch}.deb`
@@ -158,7 +161,8 @@ export function finalize(base, sha, version, output) {
     const published = target.format === 'deb'
       ? `muster_${version}_${target.arch}.deb`
       : file;
-    verifyPayload(directory, sha, file);
+    const dmg = `Muster_${version}_macOS_${target.arch}.dmg`;
+    verifyPayload(directory, sha, file, target.format === 'zip' ? [dmg] : []);
     const source = path.join(directory, file);
     if (target.format === 'deb') {
       for (const [field, expected] of [['Package', 'muster'], ['Version', debVersion], ['Architecture', target.arch]]) {
@@ -175,7 +179,10 @@ export function finalize(base, sha, version, output) {
       const executable = execFileSync('unzip', ['-p', source, 'Muster.app/Contents/MacOS/Muster'], { maxBuffer: 256 * 1024 * 1024 });
       verifyMacBundleMinimumOs(plist, executable, target.arch);
     }
-    return { published, source };
+    return [
+      { published, source },
+      ...(target.format === 'zip' ? [{ published: dmg, source: path.join(directory, dmg) }] : []),
+    ];
   });
   mkdirSync(output, { recursive: true });
   for (const payload of payloads) copyFileSync(payload.source, path.join(output, payload.published));

@@ -21,7 +21,7 @@ Commands:
   help       Show this help
 
 Requires Rust/rustup 1.97.1 and Node.js. Linux build prerequisites are listed
-in .github/workflows/ci.yml. `release` creates dist/Muster.app locally; it does
+in .github/workflows/ci.yml. `release` creates dist/Muster.app and a macOS DMG; it does
 not publish, sign for distribution, notarize, or create a git tag.
 
 `candidate <version> [--dry-run]` takes 0.<minor>.<patch> or 1.<minor>.<patch>,
@@ -127,6 +127,8 @@ prepare_readme() {
   fi
   sed -e "s|releases/download/v${escaped}/|releases/download/v${version}/|g" \
       -e "s|Muster_${escaped}_|Muster_${version}_|g" \
+      -e "s|Muster_${version}_arm64\.zip|Muster_${version}_macOS_arm64.dmg|g" \
+      -e "s|Muster_${version}_x86_64\.zip|Muster_${version}_macOS_x86_64.dmg|g" \
       -e "s|muster_${escaped}_|muster_${version}_|g" \
       -e "s|^The current candidate is \*\*v${escaped}\*\*:\$|The current ${kind} is **v${version}**:|" \
       -e "s|^The current release is \*\*v${escaped}\*\*:\$|The current ${kind} is **v${version}**:|" \
@@ -281,4 +283,5 @@ cargo build --locked --release -p muster
 if [[ "$command" == release ]]; then
   [[ "$(uname -s)" == Darwin ]] || { echo 'release: packaging requires macOS' >&2; exit 1; }
   scripts/bundle-macos.sh
+  scripts/package-macos-dmg.sh
 fi

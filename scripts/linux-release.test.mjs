@@ -85,6 +85,18 @@ test('finalization refuses wrong SHA, tampering, missing targets and unexpected 
   assert.throws(() => verifyPayload(dir, sha, filename), /unexpected artifact files/);
 }));
 
+test('macOS payload verification requires both ZIP and DMG checksums', () => temporary(dir => {
+  const files = ['Muster_1.2.0_arm64.zip', 'Muster_1.2.0_macOS_arm64.dmg'];
+  writeFileSync(path.join(dir, 'SOURCE_SHA'), `${sha}\n`);
+  for (const file of files) writeFileSync(path.join(dir, file), file);
+  writeFileSync(path.join(dir, 'SHA256SUMS'), files.map(file => `${createHash('sha256').update(file).digest('hex')}  ${file}\n`).join(''));
+  verifyPayload(dir, sha, files[0], [files[1]]);
+  writeFileSync(path.join(dir, files[1]), 'tampered');
+  assert.throws(() => verifyPayload(dir, sha, files[0], [files[1]]), /checksum mismatch/);
+  rmSync(path.join(dir, files[1]));
+  assert.throws(() => verifyPayload(dir, sha, files[0], [files[1]]), /unexpected artifact files/);
+}));
+
 test('the packaged binary states its minimum macOS version in its load commands', () => {
   assert.deepEqual(readMachOMinimumOs(machO('arm64', buildVersionCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
   assert.deepEqual(readMachOMinimumOs(machO('arm64', versionMinCommand('15.0'))), { major: 15, minor: 0, patch: 0 });
@@ -158,7 +170,13 @@ test('finalization validates every target and refuses wrong bundle versions', { 
   };
   const record = (directory, filename) => {
     writeFileSync(path.join(directory, 'SOURCE_SHA'), `${sha}\n`);
-    writeFileSync(path.join(directory, 'SHA256SUMS'), `${createHash('sha256').update(readFileSync(path.join(directory, filename))).digest('hex')}  ${filename}\n`);
+    const files = [filename];
+    if (filename.endsWith('.zip')) {
+      const dmg = filename.replace(/_(arm64|x86_64)\.zip$/, '_macOS_$1.dmg');
+      writeFileSync(path.join(directory, dmg), 'DMG verified by the macOS packaging job');
+      files.push(dmg);
+    }
+    writeFileSync(path.join(directory, 'SHA256SUMS'), files.map(file => `${createHash('sha256').update(readFileSync(path.join(directory, file))).digest('hex')}  ${file}\n`).join(''));
   };
   // Each target is a directory of its own carrying one payload, so a payload
   // is checked against its own checksum and its own architecture.
@@ -248,8 +266,8 @@ test('a release carries a build for every supported target', () => {
   assert.match(workflow, /arch: arm64\n {12}runner: macos-latest/);
   assert.match(workflow, /arch: x86_64\n {12}runner: macos-15-intel/);
   const publish = workflow.slice(workflow.indexOf('\n  publish:'));
-  assert.match(publish, /\[\[ \$\{#files\[@\]\} == 6 \]\]/);
-  for (const artifact of ['muster_${version}_amd64.deb', 'muster_${version}_arm64.deb', 'Muster_${version}_arm64.zip', 'Muster_${version}_x86_64.zip']) {
+  assert.match(publish, /\[\[ \$\{#files\[@\]\} == 8 \]\]/);
+  for (const artifact of ['muster_${version}_amd64.deb', 'muster_${version}_arm64.deb', 'Muster_${version}_arm64.zip', 'Muster_${version}_x86_64.zip', 'Muster_${version}_macOS_arm64.dmg', 'Muster_${version}_macOS_x86_64.dmg']) {
     assert.ok(publish.includes(artifact), `the release does not carry ${artifact}`);
   }
 });

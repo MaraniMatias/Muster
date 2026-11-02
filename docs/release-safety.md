@@ -2,8 +2,8 @@
 
 ## Supported targets
 
-- macOS 15+, Apple Silicon: ad-hoc signed `.app` in a versioned ZIP, not notarized.
-- macOS 15+, Intel: the same `.app` in a versioned ZIP, built on an Intel runner.
+- macOS 15+, Apple Silicon: ad-hoc signed `.app` in a versioned DMG and ZIP, not notarized.
+- macOS 15+, Intel: the same formats, built on an Intel runner.
 - Ubuntu 24.04, x86_64 and arm64: `.deb`. No AppImage promise yet.
 
 Every target is built on a runner of its own architecture, so the binary inside
@@ -39,7 +39,19 @@ and the crate that builds them says so with `cc`.
 
 `release.sh check` runs fmt, clippy, workspace tests, release-script tests and the
 RustSec audit. `build` adds the locked release build. On macOS, `release` also
-assembles `dist/Muster.app`; these local commands never tag or publish.
+assembles `dist/Muster.app` and `dist/Muster_<version>_macOS_<arch>.dmg`;
+these local commands never tag or publish. To package an existing bundle, run
+`scripts/package-macos-dmg.sh`. The DMG contains the app, an Applications link,
+installation instructions and `Install Muster.command`. The installer asks for
+trust before copying to `/Applications` and removing quarantine from that copy;
+it refuses to overwrite an existing app and never disables Gatekeeper globally.
+The script itself can be blocked by Gatekeeper: the included instructions also
+show how to invoke it explicitly through Bash or install manually.
+
+DMG packaging uses native `hdiutil` with HFS+ and verifies, mounts read-only,
+compares the shipped app and installer against staging, and verifies the app's
+signature before accepting the image. The macOS release-script test exercises
+real image creation/mounting and installation in an isolated temporary folder.
 
 The package derives shared-library dependencies from the ELF with
 `dpkg-shlibdeps`. Git, `xdg-utils` and the dynamically loaded Vulkan loader are
@@ -81,7 +93,10 @@ Mach-O load commands and refuses a bundle that declares a floor other than
 15.0, a binary that states no floor, a binary that states a floor other than
 15.0 -- older or newer -- and a binary whose own load commands disagree about
 it. It retains one `native-release-<sha>` artifact with the two `.deb`
-packages, the two ZIPs, `SHA256SUMS` and `SOURCE_SHA`. Validation never creates
+packages, two ZIPs, two DMGs, `SHA256SUMS` and `SOURCE_SHA`. Both macOS formats
+have their checksums and source SHA checked at finalization; bundle metadata is
+read from the ZIP, while the DMG's mounted contents were checked on its macOS
+runner. Validation never creates
 a tag or release.
 
 Before publishing, inspect that artifact and manually verify real desktop
