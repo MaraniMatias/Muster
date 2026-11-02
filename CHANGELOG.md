@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.2.1
 
 - **macOS downloads include a disk image.** Apple Silicon and Intel builds ship
   in clearly named DMGs alongside the ZIPs. Each image includes Muster, an
