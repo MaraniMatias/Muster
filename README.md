@@ -55,7 +55,7 @@ Open multiple terminals in each worktree, search their output, and use the CLI t
 
 ### Browse files and review changes
 
-Use **Files** to browse a checkout, preview files, and make quick edits. Markdown and SVG files open as a rendered view, with a toggle for their source. Use **Changes** to inspect Git diffs and leave notes on added or removed lines, including ranges. Notes whose referenced code has changed are marked outdated.
+Use **Files** to browse a checkout, preview files, and make quick edits. Markdown and SVG files open as a rendered view, with a toggle for their source. Use **Changes** to inspect Git diffs and leave notes on added or removed lines, including ranges. Notes whose referenced code has changed are marked outdated. The diff's header says what it is measured from: the commits above the merge base with the default branch, or the uncommitted changes on disk.
 
 The sidebar shows files with unsaved edits and files with review notes, so you can return to unfinished work. You can place the Files and Changes panel beside the main area or below the sidebar using the button in its header.
 

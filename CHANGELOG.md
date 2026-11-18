@@ -6,6 +6,35 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A diff says what it is measured from.** A change set has two origins and
+  the diff showed one of them without saying which: the commits above the merge
+  base with the default branch, or what `git status` reports as uncommitted. A
+  chooser in the diff's own header now names the origin -- "Since main" or
+  "Uncommitted changes" -- and the change list in the sidebar, the figures on a
+  workdir row and the diff itself are read against that same base, so they are
+  one answer rather than three answers to three questions about two change
+  sets. A note written against one origin goes stale when the origin changes,
+  and a review of the working tree says so: the exported Markdown names
+  `working tree` rather than a branch range.
+
+- **The panels are drawn at the sizes they were left at.** The workspace file
+  carried the sidebar's width and the shape the Files panel was left in, but
+  the sizes were never applied to the drawn layout: a resizable group remembers
+  the size it measured, and the file is read after the window has opened, so the
+  width the file held was ignored and the panels kept the width they were first
+  drawn at. The Files panel's own width and the column's split were not written
+  to the file at all. Both are in the file now, and a size that arrives after
+  the window is drawn is taken.
+
+- **The workspace file has a new shape, so an older one is refused.** It now
+  carries the Files panel's width and the column's split beside the sidebar's
+  width. A file written by an earlier build does not have them, so it is
+  refused by name rather than read through: the panel starts empty and says so,
+  and deleting `~/.muster/native-workspace.json` starts a fresh store. The
+  checkouts themselves are on disk and are untouched.
+
 ## 1.2.1
 
 - **macOS downloads include a disk image.** Apple Silicon and Intel builds ship
