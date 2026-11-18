@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
@@ -1457,6 +1458,41 @@ impl TerminalWindow {
             ),
         };
         tabs = tabs.child(div().flex_1().min_w(px(8.)));
+        if !files_tab {
+            let choices = self.diff_origin_choices(&checkout_id);
+            let origin = self.diff_origin;
+            let label = choices
+                .iter()
+                .find(|choice| choice.origin == origin)
+                .map(|choice| format!("Changes origin: {}", choice.label))
+                .unwrap_or_else(|| "Changes origin".to_owned());
+            let weak = cx.weak_entity();
+            tabs = tabs.child(
+                Button::new("inspector-origin")
+                    .ghost()
+                    .small()
+                    .compact()
+                    .icon(IconName::GitCompare)
+                    .accessibility_label(label.clone())
+                    .resting_tooltip(label)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for choice in &choices {
+                            let weak = weak.clone();
+                            let value = choice.origin;
+                            menu = menu.item(
+                                PopupMenuItem::new(choice.label.clone())
+                                    .checked(value == origin)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |app, cx| {
+                                            app.set_diff_origin(value, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            );
+        }
         tabs = tabs.child(
             Button::new("inspector-layout")
                 .ghost()

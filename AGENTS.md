@@ -533,7 +533,10 @@ files on disk against the last commit.
 
 The chooser sits in the diff view's own header, beside the title, and not in the
 row under it: that row is empty until a note is saved, and a row that grows is a
-row that moves the diff under the note being written.
+row that moves the diff under the note being written. The Changes panel also
+has a compact comparison menu beside its position button, available before a
+diff is opened. Its checked choice and tooltip name the same window-wide origin;
+changing it updates the diff's chooser too.
 
 The origin is the **window's**, not the pane's. The change list in the sidebar,
 the figures on a workdir row and the diff itself are one answer, so they are

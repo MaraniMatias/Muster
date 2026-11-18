@@ -6,6 +6,13 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **Choose the comparison from the Changes panel.** A compact comparison menu
+  beside the panel-position button offers "Since main" and "Uncommitted changes"
+  without opening a diff. The current origin is checked in the menu and named
+  in the tooltip; the diff header, file list and workdir totals stay in sync.
+
 ## 1.3.0
 
 - **A diff says what it is measured from.** A change set has two origins and

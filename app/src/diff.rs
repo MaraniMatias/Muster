@@ -214,7 +214,13 @@ impl TerminalWindow {
             let picker = picker.clone();
             picker.update(cx, |state, cx| state.set_items(choices, &mut *window, cx));
         }
-        picker.clone()
+        let picker = picker.clone();
+        if picker.read(cx).selected_value() != Some(&self.diff_origin) {
+            picker.update(cx, |state, cx| {
+                state.set_selected_value(&self.diff_origin, window, cx);
+            });
+        }
+        picker
     }
 
     /// Measure the change set from another origin.

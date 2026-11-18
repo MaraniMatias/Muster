@@ -1484,6 +1484,63 @@ fn branch(root: &Path, name: &str) {
 }
 
 #[gpui_kit::test]
+fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, cx| {
+        app.inspector_tab = InspectorTab::Changes;
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("diff-origin").is_none());
+        let origin = window.find("inspector-origin").bounds();
+        let layout = window.find("inspector-layout").bounds();
+        assert!(origin.right() <= layout.left());
+        assert!((origin.center().y - layout.center().y).abs() <= px(1.));
+        window.click("inspector-origin", cx);
+        window.press("down", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    fixture.view.update(cx, |app, cx| {
+        assert_eq!(app.diff_origin, DiffOrigin::WorkingTree);
+        app.open_changes(&fixture.checkout, None, cx);
+    });
+    cx.update_window(fixture.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.diff_origin_picker
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .selected_value(),
+            Some(&DiffOrigin::WorkingTree)
+        );
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("inspector-origin", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, cx| {
+        assert_eq!(app.diff_origin, DiffOrigin::Branch);
+        assert_eq!(
+            app.diff_origin_picker
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .selected_value(),
+            Some(&DiffOrigin::Branch)
+        );
+    });
+    close(&fixture, cx);
+}
+
+#[gpui_kit::test]
 async fn the_diff_origin_chooser_asks_for_another_change_set(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
     // A commit the branch holds above its base is the branch's own change, and
