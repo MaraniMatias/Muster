@@ -1298,7 +1298,7 @@ async fn a_count_sweep_answers_every_batch_and_never_turns_a_failure_into_zero(
     }
     let executor = cx.update(|cx| cx.background_executor().clone());
     executor.allow_parking();
-    let results = count_sweep(work, executor).await;
+    let results = count_sweep(work, navigation::DiffOrigin::Branch, executor).await;
     assert_eq!(results.len(), SWEEP_CONCURRENCY + 2);
     assert!(results[0].2.is_err());
     for (index, (_, path, total)) in results.into_iter().skip(1).enumerate() {
@@ -3694,6 +3694,7 @@ fn stale_diff_totals_require_the_same_revision_and_checkout_membership(cx: &mut 
         app.membership_revision += 1;
         app.apply_diff_totals(
             stale_revision,
+            navigation::DiffOrigin::Branch,
             vec![(
                 id.clone(),
                 path.clone(),
@@ -3709,6 +3710,7 @@ fn stale_diff_totals_require_the_same_revision_and_checkout_membership(cx: &mut 
         let current_revision = app.membership_revision;
         app.apply_diff_totals(
             current_revision,
+            navigation::DiffOrigin::Branch,
             vec![(
                 id.clone(),
                 path.clone(),
@@ -3726,6 +3728,7 @@ fn stale_diff_totals_require_the_same_revision_and_checkout_membership(cx: &mut 
             .retain(|checkout| checkout.id != id);
         app.apply_diff_totals(
             current_revision,
+            navigation::DiffOrigin::Branch,
             vec![(id.clone(), path, Ok(DiffTotals::default()))],
             cx,
         );

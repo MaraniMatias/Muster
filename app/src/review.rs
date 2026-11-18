@@ -17,6 +17,7 @@ use gpui_kit::{
     div, px, AnyElement, AppContext, Context, Entity, Focusable, IntoElement, ParentElement,
     SharedString, Styled, Window,
 };
+use muster_core::navigation::DiffOrigin;
 use muster_core::review::{
     self, review_anchor_hash, ReviewContext, ReviewNote, ReviewSide, ReviewStorage,
     MAX_NOTE_CODE_BYTES, MAX_NOTE_CONTENT_BYTES, MAX_REVIEW_NOTES,
@@ -1440,8 +1441,14 @@ impl TerminalWindow {
         let markdown = review::build_review_markdown(
             &notes,
             &ReviewContext {
-                branch: checkout.branch.as_deref(),
-                default_branch: repo.default_branch.as_deref(),
+                branch: match self.diff_origin {
+                    DiffOrigin::Branch => checkout.branch.as_deref(),
+                    DiffOrigin::WorkingTree => None,
+                },
+                default_branch: match self.diff_origin {
+                    DiffOrigin::Branch => repo.default_branch.as_deref(),
+                    DiffOrigin::WorkingTree => None,
+                },
                 date: &date,
                 language: crate::document::syntax_language,
             },
@@ -2227,6 +2234,13 @@ impl TerminalWindow {
         }
         let branch = checkout.branch.clone();
         let default_branch = repo.default_branch.clone();
+        // A review of the working tree is a review of the working tree, and a
+        // file that names a branch range about one is a file that names another
+        // change set.
+        let (branch, default_branch) = match self.diff_origin {
+            DiffOrigin::Branch => (branch, default_branch),
+            DiffOrigin::WorkingTree => (None, None),
+        };
         let storage = self.navigation.review_storage;
         let completed = notes.iter().map(review::review_note_key).collect();
         let note_paths = notes.iter().map(|note| note.path.clone()).collect();

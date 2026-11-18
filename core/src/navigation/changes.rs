@@ -4,6 +4,35 @@ use super::diffs::{
 use super::worktrees::porcelain_path;
 use super::*;
 
+/// What a change set is measured from.
+///
+/// Two answers, and they are two different change sets rather than two views of one: the
+/// branch's own changes since it left the default branch, and the change set `git status`
+/// reports about the files on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffOrigin {
+    /// The merge base with the default branch: every commit this checkout holds above that
+    /// base, and what is on disk on top of them.
+    Branch,
+    /// `HEAD`: the files on disk against the last commit, which is what `git status`
+    /// reports.
+    WorkingTree,
+}
+
+impl DiffOrigin {
+    /// The commit a change is measured from, for the origin that measures one.
+    ///
+    /// The branch's changes are measured from the merge base with the default branch; the
+    /// working tree's are measured from the last commit. A file that is only on disk is
+    /// still part of the second and not of the first.
+    fn base(&self, merge_base: &str) -> String {
+        match self {
+            Self::Branch => merge_base.to_owned(),
+            Self::WorkingTree => "HEAD".to_owned(),
+        }
+    }
+}
+
 /// What a checkout changed, against the merge base with its default branch.
 ///
 /// Two change sets are one answer, not two: a commit made in the worktree moves every
@@ -153,11 +182,13 @@ const MAX_DIFF_BYTES: usize = 16 * 1024 * 1024;
 pub fn status(
     repo: &Repo,
     checkout: &Checkout,
+    origin: DiffOrigin,
     within: GitReadBudget,
 ) -> Result<GitStatus, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
-    let (base, default_branch) = merge_base(repo, root.as_path(), within)?;
-    let mut files = changed_files(root.as_path(), &base, within)?;
+    let (merge_base, default_branch) = merge_base(repo, root.as_path(), within)?;
+    let base = origin.base(&merge_base);
+    let mut files = changed_files(root.as_path(), &base, origin, within)?;
     let counts = numstat_counts(root.as_path(), &base, within)?;
     let untracked = untracked_counts(&root, &files, within)?;
     for file in &mut files {
@@ -178,9 +209,12 @@ pub fn status(
         within,
     )?;
     let head = optional_ref(root.as_path(), &["rev-parse", "--short", "HEAD"], within)?;
+    // How far the branch is above the default branch is a fact about the commits and not
+    // about what the changes are measured from, so it is counted from the merge base in
+    // either origin.
     let ahead = git_success(
         root.as_path(),
-        &["rev-list", "--count", &format!("{base}..HEAD")],
+        &["rev-list", "--count", &format!("{merge_base}..HEAD")],
         within,
     )?;
     let ahead_count = output_text(&ahead)?
@@ -197,7 +231,7 @@ pub fn status(
     })
 }
 
-/// One file's change against the same merge base the status listed it under.
+/// One file's change against the base the origin measures it from.
 ///
 /// `path` is checkout-relative as the status spelled it; anything else is refused before
 /// Git is asked, because a diff is a read of one file and a path from anywhere else is a
@@ -206,9 +240,10 @@ pub fn file_diff(
     repo: &Repo,
     checkout: &Checkout,
     path: &str,
+    origin: DiffOrigin,
     within: GitReadBudget,
 ) -> Result<FileDiff, String> {
-    file_diff_before_git(repo, checkout, path, within, || {})
+    file_diff_before_git(repo, checkout, path, origin, within, || {})
 }
 
 // The callback allows tests to exchange the working directory at exactly the old
@@ -217,16 +252,23 @@ pub(super) fn file_diff_before_git(
     repo: &Repo,
     checkout: &Checkout,
     path: &str,
+    origin: DiffOrigin,
     within: GitReadBudget,
     before_git: impl FnOnce(),
 ) -> Result<FileDiff, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
     let relative = validated_relative_path(path)?;
-    let (base, _) = merge_base(repo, &root, within)?;
-    let changed = changed_files(&root, &base, within)?
+    let (merge_base, _) = merge_base(repo, &root, within)?;
+    let base = origin.base(&merge_base);
+    let changed = changed_files(&root, &base, origin, within)?
         .into_iter()
         .find(|file| file.path == path)
-        .ok_or("Git does not report this file as changed in this checkout")?;
+        .ok_or(match origin {
+            DiffOrigin::Branch => "Git does not report this file as changed in this checkout",
+            DiffOrigin::WorkingTree => {
+                "Git does not report this file as changed in the working tree"
+            }
+        })?;
     let snapshot = tempfile::Builder::new()
         .prefix("muster-diff-")
         .tempdir()
@@ -521,9 +563,14 @@ fn merge_base(repo: &Repo, root: &Path, within: GitReadBudget) -> Result<(String
 
 /// The worktree's dirty files and the commits it holds above the base, keyed by path so a
 /// commit and a dirty edit of one file are one row and keep one old path.
+///
+/// The working tree's origin is `git status` and nothing else: a file it does not mention
+/// has no uncommitted change, and the commits above the base belong to the other origin's
+/// change set rather than to this one.
 fn changed_files(
     root: &Path,
     base: &str,
+    origin: DiffOrigin,
     within: GitReadBudget,
 ) -> Result<Vec<ChangedFile>, String> {
     let status = git_success(
@@ -532,6 +579,9 @@ fn changed_files(
         within,
     )?;
     let mut files = parse_porcelain_v2(&status.stdout)?;
+    if origin == DiffOrigin::WorkingTree {
+        return Ok(files.into_values().collect());
+    }
     let committed = git_success(
         root,
         &[

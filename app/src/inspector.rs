@@ -670,6 +670,9 @@ struct DiffWork {
     path: String,
     repo: Repo,
     checkout: Checkout,
+    /// The origin the read was asked for, so a read that is on its way when the
+    /// origin changes answers about the change set it was asked about.
+    origin: muster_core::navigation::DiffOrigin,
 }
 
 /// The diff reads this window wants, and how many are running.
@@ -1076,10 +1079,15 @@ impl TerminalWindow {
             .wrapping_add(1);
         self.git_status_request.insert(id.to_owned(), token);
         let key = id.to_owned();
+        // The origin the read is asked for is the one the window is asking
+        // about now, so a read that is on its way for another one is answered
+        // by another read.
+        let origin = self.diff_origin;
         let worker = cx.background_executor().spawn(async move {
             muster_core::navigation::status(
                 &repo,
                 &checkout,
+                origin,
                 muster_core::navigation::GitReadBudget::new(Duration::from_secs(20)),
             )
         });
@@ -1283,6 +1291,7 @@ impl TerminalWindow {
             path: path.to_owned(),
             repo,
             checkout,
+            origin: self.diff_origin,
         });
         if !wanted {
             self.git_diff_errors.insert(
@@ -1312,6 +1321,7 @@ impl TerminalWindow {
                     &work.repo,
                     &work.checkout,
                     &work.path,
+                    work.origin,
                     muster_core::navigation::GitReadBudget::new(Duration::from_secs(20)),
                 )
             });
@@ -2139,6 +2149,7 @@ mod tests {
             path: format!("file-{index}"),
             repo: repo.clone(),
             checkout: checkout.clone(),
+            origin: muster_core::navigation::DiffOrigin::Branch,
         };
         let mut queue = DiffQueue::default();
         let mut wanted = HashMap::new();

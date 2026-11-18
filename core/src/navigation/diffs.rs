@@ -8,7 +8,7 @@ pub struct DiffTotals {
     pub deletions: u64,
 }
 
-pub fn diff_totals(path: &Path) -> Result<DiffTotals, String> {
+pub fn diff_totals(path: &Path, origin: DiffOrigin) -> Result<DiffTotals, String> {
     let within = GitReadBudget::default();
     let opened = open_directory_with_budget(path, within)?;
     let checkout = opened
@@ -17,7 +17,7 @@ pub fn diff_totals(path: &Path) -> Result<DiffTotals, String> {
         .iter()
         .find(|checkout| checkout.id == opened.checkout_id)
         .ok_or("opened checkout is unavailable")?;
-    diff_totals_for_checkout(&opened.repo, checkout, within)
+    diff_totals_for_checkout(&opened.repo, checkout, origin, within)
 }
 
 /// Count an already discovered checkout without listing every worktree again.
@@ -26,20 +26,29 @@ pub fn diff_totals(path: &Path) -> Result<DiffTotals, String> {
 pub fn diff_totals_for_checkout(
     repo: &Repo,
     checkout: &Checkout,
+    origin: DiffOrigin,
     within: GitReadBudget,
 ) -> Result<DiffTotals, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
-    let primary_branch = repo
-        .checkouts
-        .iter()
-        .find(|checkout| checkout.is_primary)
-        .and_then(|checkout| checkout.branch.as_deref());
-    let (_, reference) = default_ref_with_budget(
-        root.as_path(),
-        repo.default_branch.as_deref().or(primary_branch),
-        within,
-    )?;
-    let base = git_success(root.as_path(), &["merge-base", &reference, "HEAD"], within)?;
+    // The merge base is where the branch's own changes are measured from; the working
+    // tree's are measured from the last commit, so the merge base is not asked for.
+    let base = match origin {
+        DiffOrigin::Branch => {
+            let primary_branch = repo
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.is_primary)
+                .and_then(|checkout| checkout.branch.as_deref());
+            let (_, reference) = default_ref_with_budget(
+                root.as_path(),
+                repo.default_branch.as_deref().or(primary_branch),
+                within,
+            )?;
+            let base = git_success(root.as_path(), &["merge-base", &reference, "HEAD"], within)?;
+            output_text(&base)?.to_owned()
+        }
+        DiffOrigin::WorkingTree => "HEAD".to_owned(),
+    };
     let output = git_success(
         root.as_path(),
         &[
@@ -49,7 +58,7 @@ pub fn diff_totals_for_checkout(
             "--numstat",
             "-z",
             "--find-renames",
-            output_text(&base)?,
+            &base,
             "--",
         ],
         within,

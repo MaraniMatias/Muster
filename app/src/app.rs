@@ -18,6 +18,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
+    select::SelectState,
     Disableable, TitleBar,
 };
 use gpui_kit::{
@@ -357,6 +358,7 @@ type CountWork = (String, Repo, Checkout);
 /// an unfinished read from looking like an empty working tree.
 async fn count_sweep(
     work: Vec<CountWork>,
+    origin: navigation::DiffOrigin,
     executor: gpui_kit::BackgroundExecutor,
 ) -> Vec<(String, String, Result<DiffTotals, String>)> {
     let sweep = GitReadBudget::new(SWEEP_BUDGET);
@@ -377,7 +379,7 @@ async fn count_sweep(
             let within =
                 GitReadBudget::new(sweep.remaining().unwrap_or_default().min(CHECKOUT_BUDGET));
             reads.push(executor.spawn(async move {
-                let total = navigation::diff_totals_for_checkout(&item.1, &item.2, within);
+                let total = navigation::diff_totals_for_checkout(&item.1, &item.2, origin, within);
                 (item.0, item.2.path, total)
             }));
         }
@@ -576,6 +578,21 @@ pub struct TerminalWindow {
     pub(crate) file_request: HashMap<(String, String), u64>,
     pub(crate) document_request: u64,
     pub(crate) inspector_tab: InspectorTab,
+    /// What the change set on screen is measured from.
+    ///
+    /// The branch's own changes since it left the default branch, or the change
+    /// set `git status` reports about the files on disk. Every change list and
+    /// every diff in this window is read against it, so choosing another one is
+    /// a request to read them again rather than a change to what is already on
+    /// screen.
+    pub(crate) diff_origin: navigation::DiffOrigin,
+    /// The picker that chooses what the change set is measured from.
+    pub(crate) diff_origin_picker: Option<Entity<SelectState<Vec<crate::diff::DiffOriginChoice>>>>,
+    /// The subscription that reads the picker's answer.
+    pub(crate) diff_origin_picker_events: Option<Subscription>,
+    /// What the picker offers right now, so a name that arrived with the
+    /// checkout's status replaces the one the picker was made with.
+    pub(crate) diff_origin_offered: Vec<crate::diff::DiffOriginChoice>,
     pub(crate) git_status: HashMap<String, navigation::GitStatus>,
     /// Each checkout's changed files by path, for the file tree.
     ///
@@ -771,6 +788,10 @@ impl TerminalWindow {
             file_request: HashMap::new(),
             document_request: 0,
             inspector_tab: InspectorTab::Files,
+            diff_origin: navigation::DiffOrigin::Branch,
+            diff_origin_picker: None,
+            diff_origin_picker_events: None,
+            diff_origin_offered: Vec::new(),
             git_status: HashMap::new(),
             status_index: HashMap::new(),
             git_status_errors: HashMap::new(),
@@ -1697,17 +1718,21 @@ impl TerminalWindow {
             return;
         }
         let revision = self.membership_revision;
+        // The figures are counted against the origin the window is asking about,
+        // so a sweep that answers for another one is a sweep about another change
+        // set and is dropped rather than drawn.
+        let origin = self.diff_origin;
         self.diff_refresh_running = true;
         let executor = cx.background_executor().clone();
         let worker = executor.clone().spawn({
             let executor = executor.clone();
-            async move { count_sweep(work, executor).await }
+            async move { count_sweep(work, origin, executor).await }
         });
         cx.spawn(async move |view, cx| {
             let totals = worker.await;
             let _ = view.update(cx, |app, cx| {
                 app.diff_refresh_running = false;
-                app.apply_diff_totals(revision, totals, cx);
+                app.apply_diff_totals(revision, origin, totals, cx);
                 if std::mem::take(&mut app.diff_refresh_again)
                     || revision != app.membership_revision
                 {
@@ -1746,6 +1771,10 @@ impl TerminalWindow {
 
     /// Record one pass's answers.
     ///
+    /// A pass counted against another origin is about another change set, so it
+    /// is dropped whole: its figures would describe changes this window is not
+    /// showing.
+    ///
     /// A checkout that could not be counted loses its figure and draws
     /// nothing: an absent figure is "not counted", and a figure of zero is a
     /// claim about the working tree that a timed-out read is not entitled to
@@ -1755,10 +1784,11 @@ impl TerminalWindow {
     fn apply_diff_totals(
         &mut self,
         revision: u64,
+        origin: navigation::DiffOrigin,
         totals: Vec<(String, String, Result<DiffTotals, String>)>,
         cx: &mut Context<Self>,
     ) {
-        if self.closing || self.membership_revision != revision {
+        if self.closing || self.membership_revision != revision || self.diff_origin != origin {
             return;
         }
         for (id, path, total) in totals {

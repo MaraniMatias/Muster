@@ -10,8 +10,10 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
 };
-use gpui_kit::component::select::Select;
+use gpui_kit::component::searchable_list::SearchableListItem;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::Disableable;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::Theme;
 use gpui_kit::component::{
@@ -21,8 +23,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Anchor, AnyElement, AppContext, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Subscription, TestSupportExt,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    TestSupportExt,
 };
+use muster_core::navigation::DiffOrigin;
 use muster_core::review::{self, AnchorOutcome, ReviewSide};
 use muster_core::workspace::RepoKind;
 
@@ -107,6 +111,28 @@ pub(crate) struct RowChoice {
     intent: u64,
 }
 
+/// One origin a change set can be measured from, as the picker offers it.
+///
+/// The value is the origin itself and not the words that name it, so what the
+/// picker confirms is the choice rather than a string to be read back.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DiffOriginChoice {
+    pub(crate) origin: DiffOrigin,
+    pub(crate) label: SharedString,
+}
+
+impl SearchableListItem for DiffOriginChoice {
+    type Value = DiffOrigin;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &DiffOrigin {
+        &self.origin
+    }
+}
+
 impl TerminalWindow {
     /// The Git status letter for one file of one checkout, or an empty string.
     ///
@@ -118,6 +144,110 @@ impl TerminalWindow {
             .and_then(|status| status.files.iter().find(|file| file.path == path))
             .map(|file| file.status.clone())
             .unwrap_or_default()
+    }
+
+    /// The origins the change set can be measured from, in the words the picker
+    /// offers them.
+    ///
+    /// The first names the branch the changes are measured from, because "since
+    /// main" says what the diff is against and "since base" does not. That name
+    /// is what the checkout's status knows, and the status is what this window
+    /// has not read yet when the picker is made.
+    pub(crate) fn diff_origin_choices(&self, checkout: &str) -> Vec<DiffOriginChoice> {
+        let base = self
+            .git_status
+            .get(checkout)
+            .map(|status| status.default_branch.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.navigation
+                    .repos
+                    .iter()
+                    .find(|repo| repo.checkouts.iter().any(|entry| entry.id == checkout))
+                    .and_then(|repo| repo.default_branch.clone())
+            })
+            .unwrap_or_else(|| "base".to_owned());
+        vec![
+            DiffOriginChoice {
+                origin: DiffOrigin::Branch,
+                label: format!("Since {base}").into(),
+            },
+            DiffOriginChoice {
+                origin: DiffOrigin::WorkingTree,
+                label: "Uncommitted changes".into(),
+            },
+        ]
+    }
+
+    /// The picker that chooses what the change set is measured from.
+    ///
+    /// It is made when the change set is first drawn and kept for the window's
+    /// life, and the names it offers follow the checkout: a picker that offered
+    /// a branch this window has since learned differently would be a picker that
+    /// lies.
+    fn diff_origin_picker(
+        &mut self,
+        checkout: &str,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SelectState<Vec<DiffOriginChoice>>> {
+        let choices = self.diff_origin_choices(checkout);
+        let Some(picker) = &self.diff_origin_picker else {
+            let selected = choices
+                .iter()
+                .position(|choice| choice.origin == self.diff_origin)
+                .map(|row| IndexPath::default().row(row));
+            let picker = cx.new(|cx| SelectState::new(choices.clone(), selected, &mut *window, cx));
+            let events = cx.subscribe_in(&picker, window, |app, _, event, _, cx| {
+                let SelectEvent::Confirm(Some(origin)) = event else {
+                    return;
+                };
+                app.set_diff_origin(*origin, cx);
+            });
+            self.diff_origin_picker = Some(picker.clone());
+            self.diff_origin_picker_events = Some(events);
+            self.diff_origin_offered = choices;
+            return picker;
+        };
+        if self.diff_origin_offered != choices {
+            self.diff_origin_offered = choices.clone();
+            let picker = picker.clone();
+            picker.update(cx, |state, cx| state.set_items(choices, &mut *window, cx));
+        }
+        picker.clone()
+    }
+
+    /// Measure the change set from another origin.
+    ///
+    /// Every change list and every diff in this window was read against the
+    /// origin it was asked for, so choosing another one asks for them again
+    /// rather than changing what is on screen: the answers that arrive replace
+    /// the ones they were read against, and the ones on screen stay until then.
+    pub(crate) fn set_diff_origin(&mut self, origin: DiffOrigin, cx: &mut Context<Self>) {
+        if self.diff_origin == origin {
+            return;
+        }
+        self.diff_origin = origin;
+        // A read that is on its way was asked for the other origin, so its answer
+        // is about another change set and must not be drawn.
+        self.git_diff_request.clear();
+        // Every checkout's change list is read against an origin too.
+        let checkouts = self
+            .navigation
+            .repos
+            .iter()
+            .flat_map(|repo| repo.checkouts.iter())
+            .filter(|checkout| {
+                !checkout.is_missing && !self.navigation.archived.contains(&checkout.id)
+            })
+            .map(|checkout| checkout.id.clone())
+            .collect::<Vec<_>>();
+        for id in checkouts {
+            self.request_git_status(&id, cx);
+        }
+        // The figures on the workdir rows are counted against an origin as well.
+        self.refresh_diff_totals(cx);
+        cx.notify();
     }
 }
 
@@ -405,6 +535,9 @@ impl TerminalWindow {
             return None;
         }
         let roles = Roles::of(cx);
+        // The picker that chooses what the change set is measured from, made
+        // when the change set is first drawn and kept for the window's life.
+        let origin_picker = self.diff_origin_picker(checkout, window, cx);
         // The size the code in the diff is drawn at, which is the size the
         // document beside it is drawn at too.
         let mono = Theme::global(cx).mono_font_size;
@@ -459,7 +592,13 @@ impl TerminalWindow {
                         &self.git_status_status(checkout, path),
                     ))
                 } else if diff.patch.is_empty() {
-                    Some("No net text changes against the default branch.".into())
+                    Some(
+                        match self.diff_origin {
+                            DiffOrigin::Branch => "No net text changes against the default branch.",
+                            DiffOrigin::WorkingTree => "No uncommitted changes in this file.",
+                        }
+                        .into(),
+                    )
                 } else {
                     None
                 };
@@ -1256,6 +1395,22 @@ impl TerminalWindow {
                                                     }),
                                             )
                                         }),
+                                )
+                                // What the change set is measured from. It sits
+                                // with the title rather than under it because the
+                                // row under the title is empty until a note is
+                                // saved, and a row that grows is a row that moves
+                                // the diff under the note being written.
+                                .child(
+                                    div().id("diff-origin").test_support()
+                                        .w(px(140.)).flex_shrink_0()
+                                        .child(
+                                            Select::new(&origin_picker)
+                                                .id("diff-origin-select")
+                                                .xsmall()
+                                                .bg(roles.surface_base)
+                                                .accessibility_label("Diff origin"),
+                                        ),
                                 )
                                 // The action and the destination chooser are one
                                 // control: two halves of the same button, joined edge

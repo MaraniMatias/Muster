@@ -3,9 +3,11 @@ use crate::app::sidebar_tests::{
     add_worktree, close, commit_all, open_git, read_status, GitFixture,
 };
 use crate::inspector::{opens_elsewhere, sticky_ancestors, tree_window, within, Ancestor, TreeRow};
+use gpui_kit::component::select::SelectEvent;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{point, px, TestAppContext};
 use muster_core::files::FileEntry;
+use muster_core::navigation::DiffOrigin;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -1462,6 +1464,92 @@ async fn changes_open_in_the_center_and_refresh_without_replacing_the_terminal(
         assert!(app
             .expanded_diffs
             .contains(&(fixture.checkout.clone(), "change.txt".into())));
+    });
+    close(&fixture, cx);
+}
+
+/// The branch a checkout is on, so the commit it holds is the branch's own
+/// change and not the working tree's.
+fn branch(root: &Path, name: &str) {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["checkout", "--quiet", "-b", name])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[gpui_kit::test]
+async fn the_diff_origin_chooser_asks_for_another_change_set(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // A commit the branch holds above its base is the branch's own change, and
+    // `git status` says nothing about it.
+    branch(&fixture.root, "feature");
+    std::fs::write(fixture.root.join("committed.txt"), "committed\n").unwrap();
+    commit_all(&fixture.root, "committed");
+    std::fs::write(fixture.root.join("dirty.txt"), "dirty\n").unwrap();
+
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, None, cx);
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.diff_origin, DiffOrigin::Branch);
+        let files = &app.git_status[&fixture.checkout].files;
+        assert!(
+            files.iter().any(|file| file.path == "committed.txt"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.path == "dirty.txt"),
+            "{files:?}"
+        );
+    });
+
+    // The chooser is drawn with the change set, and what it confirms is the
+    // choice rather than the words that name it.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("diff-origin").is_some());
+    })
+    .unwrap();
+    let picker = fixture
+        .view
+        .read_with(cx, |app, _| app.diff_origin_picker.clone().unwrap());
+    fixture.view.read_with(cx, |_, cx| {
+        assert_eq!(
+            picker.read(cx).selected_value().copied(),
+            Some(DiffOrigin::Branch)
+        );
+    });
+    picker.update(cx, |_, cx| {
+        cx.emit(SelectEvent::Confirm(Some(DiffOrigin::WorkingTree)));
+    });
+    // The change set is read again against the origin that was chosen.
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| !status.files.iter().any(|file| file.path == "committed.txt"))
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.diff_origin, DiffOrigin::WorkingTree);
+        let files = &app.git_status[&fixture.checkout].files;
+        assert!(
+            !files.iter().any(|file| file.path == "committed.txt"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.path == "dirty.txt"),
+            "{files:?}"
+        );
     });
     close(&fixture, cx);
 }

@@ -34,17 +34,26 @@ fn discovered_checkout_totals_revalidate_identity_and_share_discovery_budget() {
     fs::write(root.join("new-file"), "one\ntwo\n").unwrap();
     let checkout = &repo.checkouts[0];
     assert_eq!(
-        diff_totals_for_checkout(&repo, checkout, GitReadBudget::default()).unwrap(),
+        diff_totals_for_checkout(
+            &repo,
+            checkout,
+            DiffOrigin::Branch,
+            GitReadBudget::default()
+        )
+        .unwrap(),
         DiffTotals {
             additions: 2,
             deletions: 0
         }
     );
-    assert!(
-        diff_totals_for_checkout(&repo, checkout, GitReadBudget::new(Duration::ZERO))
-            .unwrap_err()
-            .contains("timed out")
-    );
+    assert!(diff_totals_for_checkout(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::new(Duration::ZERO)
+    )
+    .unwrap_err()
+    .contains("timed out"));
     let other = temp.path().join("other");
     fs::create_dir(&other).unwrap();
     git(&other, &["init", "--quiet", "--initial-branch=main"]);
@@ -55,13 +64,22 @@ fn discovered_checkout_totals_revalidate_identity_and_share_discovery_budget() {
     spoofed.is_primary = false;
     let mut changed = repo.clone();
     changed.checkouts.push(spoofed.clone());
-    assert!(
-        diff_totals_for_checkout(&changed, &spoofed, GitReadBudget::default())
-            .unwrap_err()
-            .contains("repository changed")
-    );
+    assert!(diff_totals_for_checkout(
+        &changed,
+        &spoofed,
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .unwrap_err()
+    .contains("repository changed"));
     fs::rename(root.join(".git"), root.join("old-git")).unwrap();
-    assert!(diff_totals_for_checkout(&repo, checkout, GitReadBudget::default()).is_err());
+    assert!(diff_totals_for_checkout(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
 }
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -1088,7 +1106,7 @@ fn totals_count_staged_unstaged_and_untracked_once_and_skip_ignored_binary_files
     fs::write(root.join(".git/info/exclude"), "ignored\n").unwrap();
     fs::write(root.join("ignored"), "ignore\n").unwrap();
     assert_eq!(
-        diff_totals(root).unwrap(),
+        diff_totals(root, DiffOrigin::Branch).unwrap(),
         DiffTotals {
             additions: 3,
             deletions: 1
@@ -1097,8 +1115,11 @@ fn totals_count_staged_unstaged_and_untracked_once_and_skip_ignored_binary_files
     fs::remove_file(root.join("untracked\tfile\n")).unwrap();
     fs::write(root.join("tracked"), "old\nkeep\n").unwrap();
     // Staged change undone in the worktree is a net zero, not two diffs.
-    assert_eq!(diff_totals(root).unwrap(), DiffTotals::default());
-    assert!(diff_totals(temp.path()).is_err());
+    assert_eq!(
+        diff_totals(root, DiffOrigin::Branch).unwrap(),
+        DiffTotals::default()
+    );
+    assert!(diff_totals(temp.path(), DiffOrigin::Branch).is_err());
 }
 
 #[test]
@@ -1119,13 +1140,16 @@ fn totals_include_feature_commits_from_merge_base_and_renames() {
     git(&tree, &["add", "."]);
     commit(&tree, "feature changes");
     assert_eq!(
-        diff_totals(&tree).unwrap(),
+        diff_totals(&tree, DiffOrigin::Branch).unwrap(),
         DiffTotals {
             additions: 1,
             deletions: 0
         }
     );
-    assert_eq!(diff_totals(root).unwrap(), DiffTotals::default());
+    assert_eq!(
+        diff_totals(root, DiffOrigin::Branch).unwrap(),
+        DiffTotals::default()
+    );
 }
 
 #[test]
@@ -1133,11 +1157,11 @@ fn unresolved_base_and_unborn_head_are_errors_not_clean_totals() {
     let temp = tempdir().unwrap();
     let root = repository(temp.path());
     git(&root, &["checkout", "--detach", "HEAD"]);
-    assert!(diff_totals(&root).is_err());
+    assert!(diff_totals(&root, DiffOrigin::Branch).is_err());
     let unborn = temp.path().join("unborn");
     fs::create_dir(&unborn).unwrap();
     git(&unborn, &["init", "--quiet", "--initial-branch=main"]);
-    assert!(diff_totals(&unborn).is_err());
+    assert!(diff_totals(&unborn, DiffOrigin::Branch).is_err());
     assert!(worktree_defaults(&open_directory(&unborn).unwrap().repo).is_err());
 }
 
@@ -1171,7 +1195,10 @@ fn untracked_count_is_contained_bounded_and_refuses_nonregular_files() {
     let outside = temp.path().join("secret");
     fs::write(&outside, "not counted\n").unwrap();
     symlink(&outside, root.join("link")).unwrap();
-    assert_eq!(diff_totals(root).unwrap(), DiffTotals::default());
+    assert_eq!(
+        diff_totals(root, DiffOrigin::Branch).unwrap(),
+        DiffTotals::default()
+    );
     let file = root.join("text");
     fs::write(&file, "one\ntwo").unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -1236,7 +1263,13 @@ fn status_reports_local_committed_untracked_and_renamed_files_with_one_base() {
     fs::write(root.join("untracked.txt"), "new\n").unwrap();
     git(root, &["mv", "committed.txt", "renamed.txt"]);
 
-    let status = status(&repo, checkout, GitReadBudget::default()).unwrap();
+    let status = status(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert_eq!(status.default_branch, "main");
     assert_eq!(status.branch.as_deref(), Some("feature"));
     assert_eq!(status.ahead_count, 1);
@@ -1264,6 +1297,132 @@ fn status_reports_local_committed_untracked_and_renamed_files_with_one_base() {
 }
 
 #[test]
+fn the_working_tree_origin_is_what_git_status_reports_and_is_measured_from_head() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    write_and_commit(root, "committed.txt", "one\n");
+    let checkout = &repo.checkouts[0];
+
+    git(root, &["checkout", "--quiet", "-b", "feature"]);
+    write_and_commit(root, "clean.txt", "clean\n");
+    write_and_commit(root, "pushed.txt", "pushed\n");
+    fs::write(root.join("pushed.txt"), "pushed\nmore\n").unwrap();
+    fs::write(root.join("untracked.txt"), "new\n").unwrap();
+
+    // The branch's own change set holds the commits the branch carries above its
+    // base. The working tree's does not, because `git status` says nothing about
+    // a commit.
+    let branch = status(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    assert!(branch.files.iter().any(|file| file.path == "clean.txt"));
+
+    let working = status(
+        &repo,
+        checkout,
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    let names = working
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"pushed.txt"), "{names:?}");
+    assert!(names.contains(&"untracked.txt"), "{names:?}");
+    assert!(!names.contains(&"clean.txt"), "{names:?}");
+    // How far the branch is above the default branch is a fact about the commits
+    // and not about what the changes are measured from.
+    assert_eq!(working.ahead_count, 2);
+
+    // A file the working tree says nothing about is not in this change set.
+    assert!(file_diff(
+        &repo,
+        checkout,
+        "clean.txt",
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default()
+    )
+    .is_err());
+    assert!(file_diff(
+        &repo,
+        checkout,
+        "clean.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_ok());
+
+    // The diff is measured from HEAD, so the commit the branch carries is not
+    // part of it.
+    let branch_diff = file_diff(
+        &repo,
+        checkout,
+        "pushed.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    assert!(
+        branch_diff.patch.contains("+pushed"),
+        "{}",
+        branch_diff.patch
+    );
+    let working_diff = file_diff(
+        &repo,
+        checkout,
+        "pushed.txt",
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    assert!(
+        !working_diff.patch.contains("+pushed"),
+        "{}",
+        working_diff.patch
+    );
+    assert!(
+        working_diff.patch.contains("+more"),
+        "{}",
+        working_diff.patch
+    );
+
+    // The counts are counted from the base the list was read against.
+    assert_eq!(
+        diff_totals_for_checkout(
+            &repo,
+            checkout,
+            DiffOrigin::WorkingTree,
+            GitReadBudget::default()
+        )
+        .unwrap(),
+        DiffTotals {
+            additions: 2,
+            deletions: 0
+        }
+    );
+    assert_eq!(
+        diff_totals_for_checkout(
+            &repo,
+            checkout,
+            DiffOrigin::Branch,
+            GitReadBudget::default()
+        )
+        .unwrap(),
+        DiffTotals {
+            additions: 4,
+            deletions: 0
+        }
+    );
+}
+
+#[test]
 fn staged_and_unstaged_edits_of_one_file_are_counted_together_as_git_counts_them() {
     let temp = tempdir().unwrap();
     let repo = main_repo(temp.path());
@@ -1274,7 +1433,13 @@ fn staged_and_unstaged_edits_of_one_file_are_counted_together_as_git_counts_them
     git(root, &["add", "file.txt"]);
     fs::write(root.join("file.txt"), "one\nTWO\nthree\nfour\n").unwrap();
 
-    let status = status(&repo, &repo.checkouts[0], GitReadBudget::default()).unwrap();
+    let status = status(
+        &repo,
+        &repo.checkouts[0],
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     let file = status
         .files
         .iter()
@@ -1284,7 +1449,13 @@ fn staged_and_unstaged_edits_of_one_file_are_counted_together_as_git_counts_them
     assert_eq!((file.additions, file.deletions), (Some(2), Some(1)));
     // The same base the sidebar's own total counts against.
     assert_eq!(
-        diff_totals_for_checkout(&repo, &repo.checkouts[0], GitReadBudget::default()).unwrap(),
+        diff_totals_for_checkout(
+            &repo,
+            &repo.checkouts[0],
+            DiffOrigin::Branch,
+            GitReadBudget::default()
+        )
+        .unwrap(),
         DiffTotals {
             additions: 2,
             deletions: 1
@@ -1302,7 +1473,13 @@ fn a_binary_change_is_listed_and_counted_by_nothing() {
     commit(root, "blob");
     fs::write(root.join("blob.bin"), [0, 9, 2]).unwrap();
 
-    let status = status(&repo, &repo.checkouts[0], GitReadBudget::default()).unwrap();
+    let status = status(
+        &repo,
+        &repo.checkouts[0],
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     let file = status
         .files
         .iter()
@@ -1314,6 +1491,7 @@ fn a_binary_change_is_listed_and_counted_by_nothing() {
         &repo,
         &repo.checkouts[0],
         "blob.bin",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1339,6 +1517,7 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
         &repo,
         &repo.checkouts[0],
         "added.png",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .expect("the new picture is diffable");
@@ -1354,6 +1533,7 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
         &repo,
         &repo.checkouts[0],
         "picture.png",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .expect("the picture is diffable whatever it is called");
@@ -1362,8 +1542,14 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
     // Nothing in the name: a file called `logo` that opens with the PNG signature is
     // the picture its bytes describe.
     fs::write(root.join("logo"), png).unwrap();
-    let extensionless = file_diff(&repo, &repo.checkouts[0], "logo", GitReadBudget::default())
-        .expect("the picture is diffable whatever it is called");
+    let extensionless = file_diff(
+        &repo,
+        &repo.checkouts[0],
+        "logo",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .expect("the picture is diffable whatever it is called");
     assert_eq!(extensionless.image, Some(ImageFormat::Png));
 
     // WebP is a RIFF container: the form sits at bytes 8-11, behind the size field,
@@ -1378,6 +1564,7 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
         &repo,
         &repo.checkouts[0],
         "screenshot",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .expect("the webp picture is diffable whatever it is called");
@@ -1393,6 +1580,7 @@ fn an_image_change_names_the_picture_rather_than_the_encoding() {
         &repo,
         &repo.checkouts[0],
         "picture.png",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .expect("the removed picture is diffable");
@@ -1410,7 +1598,15 @@ fn a_present_file_is_named_by_its_bytes_and_never_by_its_extension() {
     let temp = tempdir().unwrap();
     let repo = main_repo(temp.path());
     let root = Path::new(&repo.root);
-    let image = |name: &str| file_diff(&repo, &repo.checkouts[0], name, GitReadBudget::default());
+    let image = |name: &str| {
+        file_diff(
+            &repo,
+            &repo.checkouts[0],
+            name,
+            DiffOrigin::Branch,
+            GitReadBudget::default(),
+        )
+    };
 
     // Bytes that are not a picture, under a name that says they are.
     fs::write(
@@ -1472,7 +1668,14 @@ fn a_diff_is_the_merge_base_change_and_refuses_a_path_outside_the_checkout() {
     write_and_commit(root, "file.txt", "one\ntwo\n");
     let checkout = &repo.checkouts[0];
 
-    let diff = file_diff(&repo, checkout, "file.txt", GitReadBudget::default()).unwrap();
+    let diff = file_diff(
+        &repo,
+        checkout,
+        "file.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(diff.patch.contains("+two"));
     assert_eq!(diff.syntax_sources.as_ref().unwrap()[0].as_ref(), "one\n");
     assert_eq!(
@@ -1492,9 +1695,15 @@ fn a_diff_is_the_merge_base_change_and_refuses_a_path_outside_the_checkout() {
     // throwing away what it is showing because the file was read again.
     assert_eq!(
         diff.revision,
-        file_diff(&repo, checkout, "file.txt", GitReadBudget::default())
-            .unwrap()
-            .revision
+        file_diff(
+            &repo,
+            checkout,
+            "file.txt",
+            DiffOrigin::Branch,
+            GitReadBudget::default()
+        )
+        .unwrap()
+        .revision
     );
 
     #[cfg(unix)]
@@ -1502,14 +1711,28 @@ fn a_diff_is_the_merge_base_change_and_refuses_a_path_outside_the_checkout() {
         // A diff of a link answers with the link, not with the paths of both of its ends.
         fs::write(root.join("target.txt"), "t\n").unwrap();
         std::os::unix::fs::symlink("target.txt", root.join("link")).unwrap();
-        let link = file_diff(&repo, checkout, "link", GitReadBudget::default()).unwrap();
+        let link = file_diff(
+            &repo,
+            checkout,
+            "link",
+            DiffOrigin::Branch,
+            GitReadBudget::default(),
+        )
+        .unwrap();
         assert_eq!(link.symlink_target.as_deref(), Some("target.txt"));
         assert!(link.patch.is_empty());
     }
 
     for refused in ["../escape", "/etc/passwd", ".git/config", "missing.txt", ""] {
         assert!(
-            file_diff(&repo, checkout, refused, GitReadBudget::default()).is_err(),
+            file_diff(
+                &repo,
+                checkout,
+                refused,
+                DiffOrigin::Branch,
+                GitReadBudget::default()
+            )
+            .is_err(),
             "{refused} was not refused"
         );
     }
@@ -1534,6 +1757,7 @@ fn tracked_and_untracked_diffs_survive_ancestor_replacement_without_reading_outs
             &repo,
             &repo.checkouts[0],
             "dir/probe.txt",
+            DiffOrigin::Branch,
             GitReadBudget::default(),
             || {
                 fs::rename(root.join("dir"), root.join("saved")).unwrap();
@@ -1565,7 +1789,13 @@ fn uncountable_untracked_entries_do_not_hide_the_change_list_or_claim_zero() {
     fs::write(root.join("ordinary.txt"), "one\ntwo\n").unwrap();
     let large = File::create(root.join("large.txt")).unwrap();
     large.set_len((17 * 1024 * 1024) as u64).unwrap();
-    let reported = status(&repo, &repo.checkouts[0], GitReadBudget::default()).unwrap();
+    let reported = status(
+        &repo,
+        &repo.checkouts[0],
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     let find = |name: &str| reported.files.iter().find(|f| f.path == name).unwrap();
     assert_eq!(find("nested/").additions, None);
     assert_eq!(find("large.txt").additions, None);
@@ -1573,9 +1803,14 @@ fn uncountable_untracked_entries_do_not_hide_the_change_list_or_claim_zero() {
     // Aggregate counts no longer share the per-file diff preview cap.
     fs::remove_file(root.join("large.txt")).unwrap();
     assert_eq!(
-        diff_totals_for_checkout(&repo, &repo.checkouts[0], GitReadBudget::default())
-            .unwrap()
-            .additions,
+        diff_totals_for_checkout(
+            &repo,
+            &repo.checkouts[0],
+            DiffOrigin::Branch,
+            GitReadBudget::default()
+        )
+        .unwrap()
+        .additions,
         2
     );
 }
@@ -1594,6 +1829,7 @@ fn a_rename_a_mode_change_and_a_deleted_parent_survive_the_diff_snapshot() {
         &repo,
         &repo.checkouts[0],
         "after.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1617,6 +1853,7 @@ fn a_rename_a_mode_change_and_a_deleted_parent_survive_the_diff_snapshot() {
         &repo,
         &repo.checkouts[0],
         "mode.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1628,6 +1865,7 @@ fn a_rename_a_mode_change_and_a_deleted_parent_survive_the_diff_snapshot() {
         &repo,
         &repo.checkouts[0],
         "removed/gone.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1667,6 +1905,7 @@ fn a_linked_worktree_diff_uses_its_own_snapshot_and_stable_untracked_identity() 
         &opened.repo,
         checkout,
         "tracked.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1679,6 +1918,7 @@ fn a_linked_worktree_diff_uses_its_own_snapshot_and_stable_untracked_identity() 
         &opened.repo,
         checkout,
         "untracked.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1686,6 +1926,7 @@ fn a_linked_worktree_diff_uses_its_own_snapshot_and_stable_untracked_identity() 
         &opened.repo,
         checkout,
         "untracked.txt",
+        DiffOrigin::Branch,
         GitReadBudget::default(),
     )
     .unwrap();
@@ -1700,16 +1941,29 @@ fn a_plain_directory_and_a_missing_checkout_have_no_changes_to_report() {
     let plain = temp.path().join("plain");
     fs::create_dir(&plain).unwrap();
     let repo = Repo::plain(&plain, "now").unwrap();
-    assert!(status(&repo, &repo.checkouts[0], GitReadBudget::default()).is_err());
+    assert!(status(
+        &repo,
+        &repo.checkouts[0],
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
 
     let repo = main_repo(temp.path());
     let mut missing = repo.checkouts[0].clone();
     missing.is_missing = true;
-    assert!(status(&repo, &missing, GitReadBudget::default()).is_err());
+    assert!(status(
+        &repo,
+        &missing,
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
     // A budget with nothing left in it is not a clean change set.
     assert!(status(
         &repo,
         &repo.checkouts[0],
+        DiffOrigin::Branch,
         GitReadBudget::new(Duration::ZERO)
     )
     .unwrap_err()
@@ -1726,7 +1980,13 @@ fn an_untracked_and_a_deleted_file_are_both_diffable() {
     write_and_commit(root, "gone.txt", "x\ny\n");
     fs::remove_file(root.join("gone.txt")).unwrap();
 
-    let reported = status(&repo, checkout, GitReadBudget::default()).unwrap();
+    let reported = status(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     let untracked = reported
         .files
         .iter()
@@ -1744,13 +2004,27 @@ fn an_untracked_and_a_deleted_file_are_both_diffable() {
 
     // `git diff --no-index` answers 1 for a difference, so an exit code that is not
     // treated as that would leave every new file unreadable.
-    let fresh = file_diff(&repo, checkout, "fresh.txt", GitReadBudget::default()).unwrap();
+    let fresh = file_diff(
+        &repo,
+        checkout,
+        "fresh.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(fresh.patch.contains("+one"), "{}", fresh.patch);
     assert!(!fresh.is_binary && !fresh.too_large && fresh.symlink_target.is_none());
 
     // A deleted path has no entry to canonicalize; refusing it would leave the change Git
     // reports most often the one change that cannot be read.
-    let gone = file_diff(&repo, checkout, "gone.txt", GitReadBudget::default()).unwrap();
+    let gone = file_diff(
+        &repo,
+        checkout,
+        "gone.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(gone.patch.contains("-x"), "{}", gone.patch);
 }
 
@@ -1767,7 +2041,14 @@ fn a_changed_path_is_asked_for_by_name_and_never_as_a_pattern() {
     fs::write(root.join("a[1].txt"), "ONE\n").unwrap();
     fs::write(root.join("a1.txt"), "UNO\n").unwrap();
 
-    let diff = file_diff(&repo, checkout, "a[1].txt", GitReadBudget::default()).unwrap();
+    let diff = file_diff(
+        &repo,
+        checkout,
+        "a[1].txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(diff.patch.contains("+ONE"), "{}", diff.patch);
     assert!(
         !diff.patch.contains("UNO"),
@@ -1791,7 +2072,13 @@ fn a_link_is_the_path_git_reports_and_containment_refuses_what_is_behind_one() {
     // Git reports the link itself and never a path through it, so the panel has no row
     // that could name the file behind it, and the one row it does have is a link with no
     // added lines to count.
-    let reported = status(&repo, checkout, GitReadBudget::default()).unwrap();
+    let reported = status(
+        &repo,
+        checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(
         !reported
             .files
@@ -1827,7 +2114,14 @@ fn a_large_change_remains_complete_for_a_virtualized_reader() {
     fs::write(root.join("big.txt"), body).unwrap();
     let checkout = &repo.checkouts[0];
 
-    let diff = file_diff(&repo, checkout, "big.txt", GitReadBudget::default()).unwrap();
+    let diff = file_diff(
+        &repo,
+        checkout,
+        "big.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default(),
+    )
+    .unwrap();
     assert!(diff.large && !diff.too_large);
     assert!(diff.patch.contains("+line 0") && diff.patch.contains("+line 1199"));
 

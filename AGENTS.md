@@ -522,6 +522,48 @@ keyboard is therefore asked for at the end of the cycle, where the next frame's
 report can carry it: `focus_visible_after_this_frame`.
 `the_open_document_draws_its_caret` in `app/src/inspector_tests.rs` pins it.
 
+## What the diff is measured from
+
+A change set has two origins, and the diff view says which one it is showing.
+**Since the default branch** — the chooser names it, so "Since main" — is the
+merge base with it: every commit the checkout holds above that base, and what is
+on disk on top of them. **Uncommitted changes** is what `git status` reports: the
+files on disk against the last commit.
+
+The chooser sits in the diff view's own header, beside the title, and not in the
+row under it: that row is empty until a note is saved, and a row that grows is a
+row that moves the diff under the note being written.
+
+The origin is the **window's**, not the pane's. The change list in the sidebar,
+the figures on a workdir row and the diff itself are one answer, so they are
+read against the same base; read apart, they are three answers to three
+questions about two different change sets.
+
+Choosing another origin asks for the change set again rather than changing what
+is on screen: the answers that arrive replace the ones they were read against, and
+the ones on screen stay until then. A read that was asked for the other origin
+answers about another change set, so it is dropped rather than drawn.
+
+A note written against one origin is written against the other's lines, so it
+goes stale when the origin changes — that is what the diff's own "outdated"
+answer is for. A review of the working tree says so: the exported Markdown names
+`working tree` rather than a branch range, because a file that named a range
+about it would be naming another change set.
+
+Three rules it depends on, each pinned by a test:
+
+- **The working tree's origin is `git status` and nothing else.** A file it does
+  not mention has no uncommitted change, and the commits above the base belong to
+  the other origin's change set.
+  `the_working_tree_origin_is_what_git_status_reports_and_is_measured_from_head`
+  in `core/src/navigation/tests.rs` pins it.
+- **The chooser asks for another change set.**
+  `the_diff_origin_chooser_asks_for_another_change_set` in
+  `app/src/inspector_tests.rs` pins it.
+- **How far the branch is above the default branch is a fact about the commits.**
+  It is counted from the merge base in either origin, because it is not a
+  statement about what the changes are measured from.
+
 ## The review composer
 
 `app/src/diff.rs` draws the note being written as a row of the diff and
