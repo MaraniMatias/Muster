@@ -55,16 +55,10 @@ pub(crate) fn font_size() -> Pixels {
 
 /// A row's height, as a fraction of the font size.
 ///
-/// A 13px grid is a 15.6px cell, which is what Ghostty draws at the same size.
-/// It is not the face's own ascent and descent, which are already taller than
-/// the em they are drawn in — Fira Code's line box is 1.23 of it — and
-/// multiplying those by the ratio again gave a row a quarter taller than the
-/// glyph in it, with a gap above every row a block element filled.
-///
-/// Published so the document can be drawn at this same ratio: the grid, a file
-/// and a diff are read in one window, and code set in a taller row than the
-/// terminal beside it is the first thing anybody notices.
-pub(crate) const LINE_HEIGHT: f32 = 1.2;
+/// Fira Code's ascent plus descent is 2400 of its 1950 units per em.
+/// The document uses this compact ratio; the terminal measures its actual face
+/// so a fallback font is not squeezed into Fira Code's row height.
+pub(crate) const LINE_HEIGHT: f32 = 2400.0 / 1950.0;
 /// `--muster-cursor` from the legacy dark theme, which is also the editor's caret.
 const CURSOR_COLOR: (u8, u8, u8) = (0xc2, 0xc9, 0xf1);
 
@@ -444,7 +438,7 @@ impl CellSize {
     /// The width is the shaped advance of `M` rather than any ratio of the font
     /// size: it is the number the text system itself will use, so a face whose
     /// advance is not a round fraction still produces a grid that lines up.
-    /// The height is the face's own ascent plus descent for the same reason.
+    /// The height is the face's own line box for the same reason.
     ///
     /// `None` for metrics that came back empty. Every column count below divides
     /// by this, and a zero here is a division by zero rather than a small grid.
@@ -456,16 +450,9 @@ impl CellSize {
         let probe = text_system.shape_line("M".into(), font_size, &[style.to_run(1)], None);
         let measured = Self {
             width: probe.width(),
-            // Whole pixels, so a row is a whole row: the font's own ascent and
-            // descent may be fractional, so round only after spacing.
-            //
-            // The height is the size times the ratio rather than the face's own
-            // ascent and descent. A face's line box is already taller than its em
-            // -- Fira Code's is 1.23 of it -- so multiplying that by the ratio
-            // again made every row a quarter taller than the glyph in it, and
-            // left a gap above every row a block element filled, because the
-            // face draws a block across its whole line box.
-            height: (font_size * LINE_HEIGHT).ceil(),
+            // Fit the face's line box without multiplying it by another spacing
+            // ratio. Round up only once; descent is signed in the test backend.
+            height: (probe.ascent + px(f32::from(probe.descent).abs())).ceil(),
         };
         (measured.width > px(0.0) && measured.height > px(0.0)).then_some(measured)
     }
@@ -2841,8 +2828,8 @@ mod tests {
 
     /// The bundled face draws a block element across its whole line box.
     ///
-    /// That is what makes a row the size of the ratio filled by one: the ink of a
-    /// block reaches from the face's descent to its ascent, which is the line box
+    /// That is what makes a row the size of the line box filled by one: the ink of
+    /// a block reaches from the face's descent to its ascent, which is the line box
     /// the row is drawn in, so a bar of blocks reads as a bar. A face that drew
     /// its blocks shorter would leave a gap above every row it filled.
     #[test]
@@ -2863,25 +2850,24 @@ mod tests {
         // The line box is the box the glyph is drawn in, so the row has to be it:
         // a row much taller would leave a gap above every row a block filled.
         let line_box = (face.ascender() - face.descender()) as f32 / face.units_per_em() as f32;
-        assert!(
-            (line_box - LINE_HEIGHT).abs() < 0.05,
+        assert_eq!(
+            line_box, LINE_HEIGHT,
             "the face's line box is {line_box} of the size and a row is {LINE_HEIGHT} of it"
         );
     }
 
-    /// A row is the font size times the line-height ratio.
+    /// A row holds the face's line box.
     ///
-    /// Not the face's own ascent and descent: a face's line box is already taller
-    /// than the em it is drawn in — Fira Code's is 1.23 of it — so multiplying that
-    /// by the ratio again gave every row a quarter of empty space above the glyph
-    /// in it. A block element, which the face draws across its whole line box,
-    /// then left a gap above every row it filled, and a bar of blocks read as a
-    /// row of separate tiles rather than as a bar.
+    /// The row is the box the face's glyphs are drawn in, from its own ascent to
+    /// its own descent. A row shorter than that lets a glyph reach into the row
+    /// below it — a block element, which the face draws across its whole line
+    /// box, always does — and a row much taller would leave a gap above every
+    /// row a block filled, so a bar of blocks read as a row of separate tiles.
     ///
     /// The size is the one the preferences say, so the panel does not offer a
     /// number the grid is not drawn at.
     #[gpui_kit::test]
-    fn a_row_is_the_font_size_times_the_line_height(cx: &mut gpui_kit::TestAppContext) {
+    fn a_row_holds_the_faces_line_box(cx: &mut gpui_kit::TestAppContext) {
         let session = echo_session();
         let metrics = Arc::new(Mutex::new(CellMetrics {
             width: 8,
@@ -2901,11 +2887,24 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         cx.update(|window, cx| window.render_frame(cx));
         let cell = view.read_with(cx, |view, _| view.cell.expect("the grid measured a cell"));
+        let style = view.read_with(cx, |view, _| view.style.clone());
         let size = font_size();
-        assert_eq!(
-            cell.height,
-            (size * LINE_HEIGHT).ceil(),
-            "a row of {} for a {size} font is not the size times the ratio",
+        // The same face the grid was measured with, so the line box compared here
+        // is the one the grid's own row has to hold.
+        let line_box = cx.update(|window, _| {
+            let probe = window
+                .text_system()
+                .shape_line("M".into(), size, &[style.to_run(1)], None);
+            probe.ascent + px(f32::from(probe.descent).abs())
+        });
+        assert!(
+            cell.height >= line_box.ceil(),
+            "a row of {} does not hold the face's line box of {line_box}",
+            cell.height
+        );
+        assert!(
+            cell.height <= line_box.ceil() + px(1.),
+            "a row of {} is more than a pixel taller than the face's line box of {line_box}",
             cell.height
         );
         assert_eq!(

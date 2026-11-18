@@ -51,7 +51,7 @@ pub use self::session::{
     TerminalSessionConfig, TerminalSnapshot, TerminalWake, DEFAULT_DRAIN_DEADLINE,
     DEFAULT_SCROLLBACK_LINES, DEFAULT_STATUS_INTERVAL,
 };
-/// The grid's own row ratio, which the document is drawn at too.
+/// The face's line box, which the grid's rows are and the document's rows are too.
 pub(crate) use self::view::LINE_HEIGHT;
 pub use self::view::{
     xterm_256, CellSize, InputRefused, Palette, Placement, ShellFailed, TerminalView,

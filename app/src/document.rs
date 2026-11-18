@@ -1203,7 +1203,7 @@ fn document_body(
             // The document's rows are the grid's rows: the same ratio of the same
             // size, so a file read beside a terminal is set like the code it sits
             // next to. The toolkit draws its own rows at one and a half times the
-            // size, which is a quarter taller than the grid's.
+            // size, which is a fifth taller than the grid's.
             .line_height(gpui_kit::DefiniteLength::Fraction(
                 crate::terminal::LINE_HEIGHT,
             ))

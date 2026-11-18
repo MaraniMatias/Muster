@@ -130,17 +130,18 @@ colors separate from the UI theme; no chrome role reaches
 
 ### The code's size, and the height of its rows
 
-A row is the **font size** times 1.2, and that ratio is the grid's own
-(`app/src/terminal/view.rs`). The document's rows are drawn at it rather than at
-the toolkit's 1.5, which is a quarter taller than the grid's, so a file read
-beside a terminal is set like the code it sits next to.
+A row is the **face's line box**: the box its glyphs are drawn in, from the
+face's own ascent to its own descent. The bundled face's is 2400 of its 1950
+units — 1800 up and 600 down — so 1.2308 of the em, and that ratio
+(`app/src/terminal/view.rs`) is what the document's rows are drawn at too,
+rather than the toolkit's 1.5, so a file read beside a terminal is set like the
+code it sits next to.
 
-The height is the font size times the ratio and **not** the face's own ascent
-and descent. A face's line box is already taller than the em it is drawn in —
-Fira Code's is 1.23 of it — so multiplying that by the ratio again gave every
-row a quarter of empty space above the glyph in it. A block element, which the
-face draws across its whole line box, then left a gap above every row it
-filled, and a bar of blocks read as a row of separate tiles.
+The grid **measures** its row from the face that draws it, rounding the ascent
+plus descent up to whole pixels. The old 1.2 ratio could make the row shorter
+than the bundled face's line box. Do not multiply that measured line box by
+another spacing ratio: that adds excessive space and separates stacked block
+glyphs. Fallback fonts use their own measured line box.
 
 The sizes are preferences, and the panel's number is the number the surface is
 drawn at: the grid's is `terminal.fontSize`, and the document's and the diff's
