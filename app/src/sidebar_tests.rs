@@ -3480,12 +3480,26 @@ pub(super) struct GitFixture {
 }
 
 pub(super) fn open_git(cx: &mut TestAppContext) -> GitFixture {
+    open_git_with(cx, |_| {})
+}
+
+/// A window over one real Git repository, whose navigation is edited before
+/// the window is drawn.
+///
+/// The panels are laid out the first time they are drawn, and they take the
+/// size the navigation holds at that moment, so a test about a size the
+/// workspace file kept has to set it before the window opens rather than
+/// after.
+pub(super) fn open_git_with(
+    cx: &mut TestAppContext,
+    edit: impl FnOnce(&mut Navigation),
+) -> GitFixture {
     let directory = tempfile::tempdir().unwrap();
     let root = git_repository(directory.path());
     let opened = navigation::open_directory(&root).unwrap();
     let repo_id = opened.repo.id.clone();
     let checkout = opened.checkout_id.clone();
-    let (handle, view) = open_over(opened, cx);
+    let (handle, view) = open_over_with(opened, cx, edit);
     GitFixture {
         _directory: directory,
         handle,
@@ -3501,6 +3515,15 @@ fn open_over(
     opened: navigation::OpenedDirectory,
     cx: &mut TestAppContext,
 ) -> (AnyWindowHandle, Entity<TerminalWindow>) {
+    open_over_with(opened, cx, |_| {})
+}
+
+/// The same window, with its navigation edited before the window is drawn.
+fn open_over_with(
+    opened: navigation::OpenedDirectory,
+    cx: &mut TestAppContext,
+    edit: impl FnOnce(&mut Navigation),
+) -> (AnyWindowHandle, Entity<TerminalWindow>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         load_fonts(cx);
@@ -3514,6 +3537,7 @@ fn open_over(
             cx.new(|cx| {
                 let mut app = TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
                 app.navigation.merge(opened, true);
+                edit(&mut app.navigation);
                 app
             })
         })

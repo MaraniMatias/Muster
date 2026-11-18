@@ -617,7 +617,6 @@ pub struct TerminalWindow {
     pub(crate) service_home: Option<PathBuf>,
     /// The diff reads this window still wants, and how many are running.
     pub(crate) diff_queue: crate::inspector::DiffQueue,
-    pub(crate) inspector_width: f32,
     pub(crate) next_file_request: u64,
     pub(crate) worktree: Option<WorktreeDraft>,
     pub(crate) worktree_removal: Option<WorktreeRemovalDraft>,
@@ -792,7 +791,6 @@ impl TerminalWindow {
             follow_task: None,
             service_home: crate::agent_watch::home_directory(),
             diff_queue: Default::default(),
-            inspector_width: 280.,
             next_file_request: 0,
             worktree: None,
             worktree_removal: None,
@@ -868,6 +866,10 @@ impl TerminalWindow {
                     app.push_error(error, cx);
                 }
                 app.navigation = loaded.navigation;
+                // The panels were drawn at the default sizes while the
+                // workspace was opening, so the sizes the file holds have to
+                // be given to them again.
+                app.reset_panel_sizes(cx);
                 app.refresh_diff_totals(cx);
                 match loaded.state_path.map(StateWriter::new).transpose() {
                     Ok(writer) => app.owner.install_writer(writer),
@@ -1071,8 +1073,24 @@ impl TerminalWindow {
             PanelLayout::Side => PanelLayout::Below,
             PanelLayout::Below => PanelLayout::Side,
         };
+        // The layout that comes up is drawn at the sizes the navigation holds,
+        // not at the ones it was last drawn at.
+        self.reset_panel_sizes(cx);
         self.persist();
         cx.notify();
+    }
+
+    /// Draw the panels at the sizes the navigation holds.
+    ///
+    /// A resizable group remembers the size it measured, so a size that
+    /// arrives after the group was drawn is ignored: the one the workspace
+    /// file holds arrives once the window has opened, and the group would
+    /// keep the width it was first drawn at. A fresh group takes the size the
+    /// navigation holds instead, which is the size the file keeps.
+    fn reset_panel_sizes(&mut self, cx: &mut Context<Self>) {
+        self.resize = cx.new(|_| ResizableState::default());
+        self.merged_resize = cx.new(|_| ResizableState::default());
+        self.column_resize = cx.new(|_| ResizableState::default());
     }
 
     pub(crate) fn request_terminal(
@@ -3603,16 +3621,6 @@ impl TerminalWindow {
     }
 }
 
-/// The share of the column the sidebar takes in the one-column layout, and the
-/// share the Files panel takes under it.
-///
-/// The split is a share of the column's height rather than a fixed height
-/// each, so the column divides the way it was drawn whatever the window's
-/// height is. The share is taken of the height the window has now, because the
-/// first frame of a column that has not been drawn yet has to divide it
-/// without a gap: a panel that does not fill its share leaves the room empty
-/// under it until the group measures it.
-const COLUMN_SIDEBAR_SHARE: f32 = 0.6;
 /// The height the title bar leaves to the panels.
 const TITLE_BAR_PX: f32 = 32.;
 
@@ -3712,7 +3720,7 @@ impl Render for TerminalWindow {
                             .child(
                                 resizable_panel()
                                     .flex_none()
-                                    .size(px(self.inspector_width))
+                                    .size(px(self.navigation.panel_width))
                                     .size_range(px(200.)..px(480.))
                                     .child(inspector),
                             )
@@ -3722,11 +3730,12 @@ impl Render for TerminalWindow {
                                     if let Some(width) = sizes.first() {
                                         app.navigation.sidebar_width =
                                             width.as_f32().clamp(240., 500.);
-                                        app.persist();
                                     }
                                     if let Some(width) = sizes.get(2) {
-                                        app.inspector_width = width.as_f32().clamp(200., 480.);
+                                        app.navigation.panel_width =
+                                            width.as_f32().clamp(200., 480.);
                                     }
+                                    app.persist();
                                     cx.notify();
                                 },
                             )),
@@ -3738,6 +3747,7 @@ impl Render for TerminalWindow {
                     // The column's height is the window's height less the title
                     // bar's, and the split is a share of it.
                     let column = window.viewport_size().height - px(TITLE_BAR_PX);
+                    let sidebar_share = self.navigation.column_sidebar_share;
                     div()
                         .flex_1()
                         .min_w_0()
@@ -3756,17 +3766,39 @@ impl Render for TerminalWindow {
                                                 .child(
                                                     resizable_panel()
                                                         .flex_none()
-                                                        .size(column * COLUMN_SIDEBAR_SHARE)
+                                                        .size(column * sidebar_share)
                                                         .size_range(px(120.)..px(2000.))
                                                         .child(sidebar),
                                                 )
                                                 .child(
                                                     resizable_panel()
                                                         .flex_none()
-                                                        .size(column * (1. - COLUMN_SIDEBAR_SHARE))
+                                                        .size(column * (1. - sidebar_share))
                                                         .size_range(px(120.)..px(2000.))
                                                         .child(inspector),
-                                                ),
+                                                )
+                                                // The split is the sidebar's share of the
+                                                // column, so it is what the file keeps:
+                                                // a height would not divide the way it
+                                                // was drawn in a window of another size.
+                                                .on_resize(cx.listener(
+                                                    |app, state: &Entity<ResizableState>, _, cx| {
+                                                        let sizes = state.read(cx).sizes();
+                                                        if let (Some(top), Some(bottom)) =
+                                                            (sizes.first(), sizes.get(1))
+                                                        {
+                                                            let total =
+                                                                top.as_f32() + bottom.as_f32();
+                                                            if total > 0. {
+                                                                app.navigation
+                                                                    .column_sidebar_share =
+                                                                    (top.as_f32() / total)
+                                                                        .clamp(0.1, 0.9);
+                                                                app.persist();
+                                                            }
+                                                        }
+                                                    },
+                                                )),
                                         ),
                                 )
                                 .child(resizable_panel().child(body))
@@ -3889,10 +3921,7 @@ fn restore_navigation(cwd: &Path) -> RestoredNavigation {
         .unwrap_or_default();
     let mut nav = Navigation::new();
     let active_checkout_id = state.active_checkout_id.clone();
-    nav.sidebar_width = state.sidebar_width;
-    nav.review_storage = state.review_storage;
-    nav.panel_layout = state.panel_layout;
-    nav.archived = state.archived_checkout_ids.into_iter().collect();
+    nav.restore(&state);
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         match Repo::plain(&home, "startup") {
             Ok(mut repo) => {

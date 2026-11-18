@@ -13,6 +13,12 @@ pub struct NavigationState {
     #[serde(deserialize_with = "required_selection")]
     pub active_checkout_id: Option<String>,
     pub sidebar_width: f32,
+    /// The Files and Changes panel's own width, while the panel is a column of
+    /// its own at the right of the window.
+    pub panel_width: f32,
+    /// The share of the column's height the sidebar takes, while the Files and
+    /// Changes panel sits under it.
+    pub column_sidebar_share: f32,
     pub review_storage: ReviewStorage,
     pub panel_layout: PanelLayout,
 }
@@ -46,6 +52,8 @@ impl Default for NavigationState {
             archived_checkout_ids: Vec::new(),
             active_checkout_id: None,
             sidebar_width: 240.0,
+            panel_width: 280.0,
+            column_sidebar_share: 0.6,
             review_storage: ReviewStorage::Workdir,
             panel_layout: PanelLayout::default(),
         }
@@ -56,6 +64,14 @@ impl NavigationState {
     pub fn validate(&self) -> Result<(), String> {
         if !self.sidebar_width.is_finite() || !(240.0..=500.0).contains(&self.sidebar_width) {
             return Err("native sidebar width must be between 240 and 500".into());
+        }
+        if !self.panel_width.is_finite() || !(200.0..=480.0).contains(&self.panel_width) {
+            return Err("native panel width must be between 200 and 480".into());
+        }
+        if !self.column_sidebar_share.is_finite()
+            || !(0.1..=0.9).contains(&self.column_sidebar_share)
+        {
+            return Err("native column share must be between 0.1 and 0.9".into());
         }
         if self.roots.len() > 1024 || self.archived_checkout_ids.len() > 8192 {
             return Err("native workspace contains too many directories".into());

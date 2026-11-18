@@ -22,6 +22,16 @@ pub(crate) struct Navigation {
     pub pending: HashMap<String, String>,
     pub revision: u64,
     pub sidebar_width: f32,
+    /// The Files and Changes panel's own width, while the panel is a column of
+    /// its own at the right of the window.
+    pub panel_width: f32,
+    /// The share of the column's height the sidebar takes, while the Files and
+    /// Changes panel sits under it.
+    ///
+    /// The split is a share of the column's height rather than a fixed height
+    /// each, so the column divides the way it was drawn whatever the window's
+    /// height is.
+    pub column_sidebar_share: f32,
     pub review_storage: ReviewStorage,
     pub panels_visible: bool,
     /// Where the Files and Changes panel sits: its own column, or under the
@@ -33,10 +43,25 @@ impl Navigation {
     pub fn new() -> Self {
         Self {
             sidebar_width: 240.,
+            panel_width: 280.,
+            column_sidebar_share: 0.6,
             panels_visible: true,
             panel_layout: PanelLayout::default(),
             ..Self::default()
         }
+    }
+
+    /// Take the persisted shape into this window's navigation.
+    ///
+    /// The file keeps where the panels sit and how big they are, so a window
+    /// that is opened again draws them where they were left.
+    pub fn restore(&mut self, state: &NavigationState) {
+        self.sidebar_width = state.sidebar_width;
+        self.panel_width = state.panel_width;
+        self.column_sidebar_share = state.column_sidebar_share;
+        self.review_storage = state.review_storage;
+        self.panel_layout = state.panel_layout;
+        self.archived = state.archived_checkout_ids.iter().cloned().collect();
     }
 
     pub fn checkout(&self, id: &str) -> Option<&Checkout> {
@@ -423,6 +448,8 @@ impl Navigation {
             archived_checkout_ids,
             active_checkout_id: self.active_checkout.clone(),
             sidebar_width: self.sidebar_width,
+            panel_width: self.panel_width,
+            column_sidebar_share: self.column_sidebar_share,
             review_storage: self.review_storage,
             panel_layout: self.panel_layout,
         }
@@ -542,6 +569,26 @@ mod tests {
 
     fn panel_order(nav: &Navigation) -> Vec<String> {
         nav.repos.iter().map(|repo| repo.id.clone()).collect()
+    }
+
+    #[test]
+    fn the_persisted_shape_comes_back_to_the_window() {
+        let mut nav = Navigation::new();
+        let state = NavigationState {
+            sidebar_width: 300.,
+            panel_width: 360.,
+            column_sidebar_share: 0.35,
+            panel_layout: PanelLayout::Below,
+            ..NavigationState::default()
+        };
+        nav.restore(&state);
+        assert_eq!(nav.sidebar_width, 300.);
+        assert_eq!(nav.panel_width, 360.);
+        assert_eq!(nav.column_sidebar_share, 0.35);
+        assert_eq!(nav.panel_layout, PanelLayout::Below);
+        // And the window writes the same shape back.
+        assert_eq!(nav.persistent_state().panel_width, 360.);
+        assert_eq!(nav.persistent_state().column_sidebar_share, 0.35);
     }
 
     #[test]

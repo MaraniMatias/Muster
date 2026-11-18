@@ -39,7 +39,8 @@ docs/             the migration plan, and what the port has to satisfy
 - The native workspace lives in `~/.muster/native-workspace.json`, written by
   `core::navigation`. It is **not** the Legacy SQLite database and nothing reads
   the old one. It holds roots, archived checkout ids, the active checkout, the
-  sidebar width and the review export location. Live sessions and terminal
+  sidebar width, the Files panel's width, the column's split and the review
+  export location. Live sessions and terminal
   layouts are never written; review notes stay in window memory until exported,
   except for the notes a review sent, which are captured in
   `~/.muster/opencode-rounds.json` so a sent review can be shown and settled
@@ -267,6 +268,17 @@ the reasons that file's shape changed: a file written before the field existed
 is not this build's file, and it is refused by name rather than read through.
 See **Stored shapes** below.
 
+**The file keeps the size the panels were left at.** The sidebar's width is
+`sidebarWidth`, the Files panel's own width is `panelWidth`, and the column's
+split is `columnSidebarShare`: a share of the column's height, because a
+height would not divide the way it was drawn in a window of another size. The
+panels are drawn at the sizes the file holds, which is not the same as
+*offering* them those sizes: a resizable group remembers the size it measured,
+so a size that arrives after the group was drawn — the file is read while the
+window is opening — is ignored by the group. The window therefore hands the
+panels a fresh group when the file's sizes arrive, and the group takes the
+size the navigation holds.
+
 Two rules it depends on, each pinned by a test:
 
 - **The button moves the panel, and the file keeps the move.**
@@ -274,6 +286,13 @@ Two rules it depends on, each pinned by a test:
 - **The file keeps the shape.**
   `the_workspace_file_keeps_where_the_files_panel_sits` in
   `core/src/navigation/tests.rs`.
+- **The panels are drawn at the sizes the file keeps.**
+  `the_panels_are_drawn_at_the_sizes_the_file_keeps` and
+  `the_column_keeps_the_share_the_file_keeps` in `app/src/app_tests.rs`, and
+  `the_workspace_file_keeps_the_size_of_the_files_panel` in
+  `core/src/navigation/tests.rs`.
+- **A size that arrives late is taken.**
+  `a_size_that_arrives_late_is_taken` in `app/src/app_tests.rs`.
 
 ## The unfinished work in the sidebar
 

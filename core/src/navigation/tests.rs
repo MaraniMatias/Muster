@@ -342,6 +342,30 @@ fn the_workspace_file_keeps_where_the_files_panel_sits() {
 }
 
 #[test]
+fn the_workspace_file_keeps_the_size_of_the_files_panel() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("native-workspace.json");
+    let fresh = load(&path).unwrap();
+    assert_eq!(fresh.panel_width, 280.);
+    assert_eq!(fresh.column_sidebar_share, 0.6);
+    let state = NavigationState {
+        panel_width: 360.,
+        column_sidebar_share: 0.35,
+        ..NavigationState::default()
+    };
+    save(&path, &state).unwrap();
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.panel_width, 360.);
+    assert_eq!(loaded.column_sidebar_share, 0.35);
+    // The file's own shape is the whole contract: a file without the fields is
+    // not this build's file, and it is refused rather than read through.
+    let mut json = serde_json::to_value(&state).unwrap();
+    json.as_object_mut().unwrap().remove("panelWidth");
+    fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(load(&path).is_err());
+}
+
+#[test]
 fn invalid_state_cannot_overwrite_last_good_file() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("native-workspace.json");
@@ -350,6 +374,22 @@ fn invalid_state_cannot_overwrite_last_good_file() {
     for width in [0.0, 239.0, 501.0, f32::NAN, f32::INFINITY] {
         let invalid = NavigationState {
             sidebar_width: width,
+            ..NavigationState::default()
+        };
+        assert!(save(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    for width in [0.0, 199.0, 481.0, f32::NAN, f32::INFINITY] {
+        let invalid = NavigationState {
+            panel_width: width,
+            ..NavigationState::default()
+        };
+        assert!(save(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    for share in [0.0, 0.09, 0.91, f32::NAN, f32::INFINITY] {
+        let invalid = NavigationState {
+            column_sidebar_share: share,
             ..NavigationState::default()
         };
         assert!(save(&path, &invalid).is_err());

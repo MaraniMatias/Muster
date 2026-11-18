@@ -1166,6 +1166,112 @@ fn the_files_panel_can_be_moved_under_the_sidebar(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
+/// The panels are drawn at the sizes the workspace file keeps.
+///
+/// The Files and Changes panel is a column of its own or a share of the column
+/// under the sidebar, and the sidebar is a column of its own either way. The
+/// file keeps all three, so a window that is opened again draws the panels
+/// where they were left rather than at the widths a fresh window starts with.
+#[gpui_kit::test]
+fn the_panels_are_drawn_at_the_sizes_the_file_keeps(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git_with};
+
+    let fixture = open_git_with(cx, |navigation| {
+        navigation.sidebar_width = 300.;
+        navigation.panel_width = 360.;
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        assert!(
+            (sidebar.size.width.as_f32() - 300.).abs() < 1.,
+            "the sidebar is at the width the file kept: {sidebar:?}"
+        );
+        assert!(
+            (inspector.size.width.as_f32() - 360.).abs() < 1.,
+            "the panel is at the width the file kept: {inspector:?}"
+        );
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
+/// The column keeps the share the workspace file keeps.
+///
+/// The one-column layout divides the column between the sidebar and the Files
+/// panel, and the split is a share of the column's height, so the file keeps
+/// the share rather than a height: the column divides the way it was drawn
+/// whatever the window's height is.
+#[gpui_kit::test]
+fn the_column_keeps_the_share_the_file_keeps(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git_with};
+
+    let fixture = open_git_with(cx, |navigation| {
+        navigation.panel_layout = PanelLayout::Below;
+        navigation.column_sidebar_share = 0.35;
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        let column = sidebar.size.height.as_f32() + inspector.size.height.as_f32();
+        let share = sidebar.size.height.as_f32() / column;
+        assert!(
+            (share - 0.35).abs() < 0.02,
+            "the column divides at the share the file kept: {share} of {column}"
+        );
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
+/// A size that arrives after the panels were drawn is taken.
+///
+/// The workspace file is read while the window is opening, so the sizes it
+/// holds arrive after the panels have been drawn at the widths a fresh window
+/// starts with. The panels are given those sizes again, or the window would
+/// keep the width it was first drawn at and the file would be the only place
+/// the size existed.
+#[gpui_kit::test]
+fn a_size_that_arrives_late_is_taken(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        assert!(
+            (sidebar.size.width.as_f32() - 240.).abs() < 1.,
+            "the width a fresh window starts with: {sidebar:?}"
+        );
+        // What the file holds arrives here, once the window has opened.
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.sidebar_width = 320.;
+            app.navigation.panel_width = 380.;
+            app.reset_panel_sizes(cx);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let inspector = window.find("inspector-panel").bounds();
+        assert!(
+            (sidebar.size.width.as_f32() - 320.).abs() < 1.,
+            "the sidebar takes the size that arrived late: {sidebar:?}"
+        );
+        assert!(
+            (inspector.size.width.as_f32() - 380.).abs() < 1.,
+            "the panel takes the size that arrived late: {inspector:?}"
+        );
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
 /// The empty state belongs to the middle of the panel it is drawn in.
 ///
 /// A checkout with no terminal open leaves the middle panel holding one
