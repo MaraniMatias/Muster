@@ -6,6 +6,17 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The Changes panel names the origin it is showing.** The panel carried a
+  small icon whose menu held the two origins, so the panel said nothing about
+  what the change list was measured from until the icon was opened. The panel
+  now draws the diff's own chooser above the change list, and what it confirms
+  is the same window-wide origin: the diff header, the file list and the
+  workdir totals stay in sync. The choice is named "Uncommitted" rather than
+  "Uncommitted changes", because the panel and the diff both already say
+  "changes" and the chooser has room for the shorter name.
+
 ## 1.3.1
 
 - **Choose the comparison from the Changes panel.** A compact comparison menu

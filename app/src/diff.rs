@@ -133,6 +133,18 @@ impl SearchableListItem for DiffOriginChoice {
     }
 }
 
+/// The two places the origin is drawn from.
+///
+/// The diff header and the Changes panel are two surfaces of one window-wide
+/// origin, and each needs its own control: a `Select` draws its trigger and
+/// its menu from the state it is given, so one state drawn in two places at
+/// once would draw the same menu twice.
+#[derive(Clone, Copy)]
+pub(crate) enum OriginPickerSlot {
+    Diff,
+    Panel,
+}
+
 impl TerminalWindow {
     /// The Git status letter for one file of one checkout, or an empty string.
     ///
@@ -174,25 +186,31 @@ impl TerminalWindow {
             },
             DiffOriginChoice {
                 origin: DiffOrigin::WorkingTree,
-                label: "Uncommitted changes".into(),
+                label: "Uncommitted".into(),
             },
         ]
     }
 
     /// The picker that chooses what the change set is measured from.
     ///
-    /// It is made when the change set is first drawn and kept for the window's
+    /// It is made when its surface is first drawn and kept for the window's
     /// life, and the names it offers follow the checkout: a picker that offered
     /// a branch this window has since learned differently would be a picker that
-    /// lies.
-    fn diff_origin_picker(
+    /// lies. What it confirms is the window's origin, so both pickers are
+    /// brought back to it every time they are drawn.
+    pub(crate) fn origin_picker(
         &mut self,
+        slot: OriginPickerSlot,
         checkout: &str,
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) -> Entity<SelectState<Vec<DiffOriginChoice>>> {
         let choices = self.diff_origin_choices(checkout);
-        let Some(picker) = &self.diff_origin_picker else {
+        let existing = match slot {
+            OriginPickerSlot::Diff => self.diff_origin_picker.clone(),
+            OriginPickerSlot::Panel => self.panel_origin_picker.clone(),
+        };
+        let Some(picker) = existing else {
             let selected = choices
                 .iter()
                 .position(|choice| choice.origin == self.diff_origin)
@@ -204,17 +222,31 @@ impl TerminalWindow {
                 };
                 app.set_diff_origin(*origin, cx);
             });
-            self.diff_origin_picker = Some(picker.clone());
-            self.diff_origin_picker_events = Some(events);
-            self.diff_origin_offered = choices;
+            match slot {
+                OriginPickerSlot::Diff => {
+                    self.diff_origin_picker = Some(picker.clone());
+                    self.diff_origin_picker_events = Some(events);
+                    self.diff_origin_offered = choices;
+                }
+                OriginPickerSlot::Panel => {
+                    self.panel_origin_picker = Some(picker.clone());
+                    self.panel_origin_picker_events = Some(events);
+                    self.panel_origin_offered = choices;
+                }
+            }
             return picker;
         };
-        if self.diff_origin_offered != choices {
-            self.diff_origin_offered = choices.clone();
-            let picker = picker.clone();
+        let offered_changed = match slot {
+            OriginPickerSlot::Diff => self.diff_origin_offered != choices,
+            OriginPickerSlot::Panel => self.panel_origin_offered != choices,
+        };
+        if offered_changed {
+            match slot {
+                OriginPickerSlot::Diff => self.diff_origin_offered = choices.clone(),
+                OriginPickerSlot::Panel => self.panel_origin_offered = choices.clone(),
+            }
             picker.update(cx, |state, cx| state.set_items(choices, &mut *window, cx));
         }
-        let picker = picker.clone();
         if picker.read(cx).selected_value() != Some(&self.diff_origin) {
             picker.update(cx, |state, cx| {
                 state.set_selected_value(&self.diff_origin, window, cx);
@@ -543,7 +575,7 @@ impl TerminalWindow {
         let roles = Roles::of(cx);
         // The picker that chooses what the change set is measured from, made
         // when the change set is first drawn and kept for the window's life.
-        let origin_picker = self.diff_origin_picker(checkout, window, cx);
+        let origin_picker = self.origin_picker(OriginPickerSlot::Diff, checkout, window, cx);
         // The size the code in the diff is drawn at, which is the size the
         // document beside it is drawn at too.
         let mono = Theme::global(cx).mono_font_size;
@@ -1415,7 +1447,7 @@ impl TerminalWindow {
                                                 .id("diff-origin-select")
                                                 .xsmall()
                                                 .bg(roles.surface_base)
-                                                .accessibility_label("Diff origin"),
+                                                .accessibility_label("Changes origin"),
                                         ),
                                 )
                                 // The action and the destination chooser are one

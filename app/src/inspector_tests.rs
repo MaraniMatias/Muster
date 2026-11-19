@@ -1493,12 +1493,12 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("diff-origin").is_none());
-        let origin = window.find("inspector-origin").bounds();
-        let layout = window.find("inspector-layout").bounds();
-        assert!(origin.right() <= layout.left());
-        assert!((origin.center().y - layout.center().y).abs() <= px(1.));
-        window.click("inspector-origin", cx);
-        window.press("down", cx);
+        // The panel names the origin it is showing, above the list it changes.
+        let origin = window.find("inspector-origin-select").bounds();
+        let all = window.find("all-changes").bounds();
+        assert!(origin.bottom() <= all.top(), "{origin:?} {all:?}");
+        window.click("inspector-origin-select", cx);
+        window.render_frame(cx);
         window.press("down", cx);
         window.press("enter", cx);
     })
@@ -1520,8 +1520,9 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
         );
     });
     cx.update_window(fixture.handle, |_, window, cx| {
-        window.click("inspector-origin", cx);
-        window.press("down", cx);
+        window.click("inspector-origin-select", cx);
+        window.render_frame(cx);
+        window.press("up", cx);
         window.press("enter", cx);
         window.render_frame(cx);
     })
@@ -1530,6 +1531,15 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
         assert_eq!(app.diff_origin, DiffOrigin::Branch);
         assert_eq!(
             app.diff_origin_picker
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .selected_value(),
+            Some(&DiffOrigin::Branch)
+        );
+        // The panel's own chooser follows the window's origin.
+        assert_eq!(
+            app.panel_origin_picker
                 .as_ref()
                 .unwrap()
                 .read(cx)

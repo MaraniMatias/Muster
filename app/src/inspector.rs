@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::select::Select;
 use gpui_kit::component::Icon;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
@@ -21,6 +21,7 @@ use crate::{
     app::{
         measured_width, ButtonA11y, InspectorTab, TerminalWindow, ViewKind, ViewPin, WidthCache,
     },
+    diff::OriginPickerSlot,
     document::{raster_image_from_bytes, DocumentPreview},
     file_icons,
     theme::Roles,
@@ -1458,41 +1459,6 @@ impl TerminalWindow {
             ),
         };
         tabs = tabs.child(div().flex_1().min_w(px(8.)));
-        if !files_tab {
-            let choices = self.diff_origin_choices(&checkout_id);
-            let origin = self.diff_origin;
-            let label = choices
-                .iter()
-                .find(|choice| choice.origin == origin)
-                .map(|choice| format!("Changes origin: {}", choice.label))
-                .unwrap_or_else(|| "Changes origin".to_owned());
-            let weak = cx.weak_entity();
-            tabs = tabs.child(
-                Button::new("inspector-origin")
-                    .ghost()
-                    .small()
-                    .compact()
-                    .icon(IconName::GitCompare)
-                    .accessibility_label(label.clone())
-                    .resting_tooltip(label)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for choice in &choices {
-                            let weak = weak.clone();
-                            let value = choice.origin;
-                            menu = menu.item(
-                                PopupMenuItem::new(choice.label.clone())
-                                    .checked(value == origin)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = weak.update(cx, |app, cx| {
-                                            app.set_diff_origin(value, cx);
-                                        });
-                                    }),
-                            );
-                        }
-                        menu
-                    }),
-            );
-        }
         tabs = tabs.child(
             Button::new("inspector-layout")
                 .ghost()
@@ -1557,12 +1523,40 @@ impl TerminalWindow {
                 roles,
                 all_selected,
             );
+            // What the change set is measured from. The panel's own strip holds
+            // the tabs and the button that moves the panel, and that strip is
+            // too narrow for a named choice, so the chooser sits above the
+            // list it changes. It is the diff's own chooser, and it confirms
+            // the same window-wide origin.
+            let origin_picker =
+                self.origin_picker(OriginPickerSlot::Panel, &checkout_id, window, cx);
+            let origin = div()
+                .id("inspector-origin")
+                .test_support()
+                .flex()
+                .items_center()
+                .flex_none()
+                .px(px(8.))
+                .py(px(4.))
+                .child(
+                    // The select fills whatever the wrapper is, so the row's
+                    // own width is what makes it compact rather than a
+                    // whole-field control.
+                    div().w(px(140.)).flex_shrink_0().child(
+                        Select::new(&origin_picker)
+                            .id("inspector-origin-select")
+                            .xsmall()
+                            .bg(roles.surface_base)
+                            .accessibility_label("Changes origin"),
+                    ),
+                );
             let mut body = div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
                 .py(px(2.))
+                .child(origin)
                 .child(all_changes);
             if let Some(error) = self.git_status_errors.get(&checkout_id) {
                 let id = checkout_id.clone();

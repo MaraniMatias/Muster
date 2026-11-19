@@ -528,15 +528,20 @@ report can carry it: `focus_visible_after_this_frame`.
 A change set has two origins, and the diff view says which one it is showing.
 **Since the default branch** — the chooser names it, so "Since main" — is the
 merge base with it: every commit the checkout holds above that base, and what is
-on disk on top of them. **Uncommitted changes** is what `git status` reports: the
+on disk on top of them. **Uncommitted** — what `git status` reports — is the
 files on disk against the last commit.
 
 The chooser sits in the diff view's own header, beside the title, and not in the
 row under it: that row is empty until a note is saved, and a row that grows is a
-row that moves the diff under the note being written. The Changes panel also
-has a compact comparison menu beside its position button, available before a
-diff is opened. Its checked choice and tooltip name the same window-wide origin;
-changing it updates the diff's chooser too.
+row that moves the diff under the note being written. The Changes panel carries
+the same chooser above its change list, available before a diff is opened: the
+panel's strip holds the tabs and the button that moves the panel, and that strip
+is too narrow for a named choice. What the panel's chooser confirms is the same
+window-wide origin, and the diff's chooser follows it.
+
+The two choosers are two controls and not two views of one: a `Select` draws its
+menu from the state it is given, so one state drawn in the diff and in the panel
+at once would draw the same menu twice.
 
 The origin is the **window's**, not the pane's. The change list in the sidebar,
 the figures on a workdir row and the diff itself are one answer, so they are
@@ -554,7 +559,7 @@ answer is for. A review of the working tree says so: the exported Markdown names
 `working tree` rather than a branch range, because a file that named a range
 about it would be naming another change set.
 
-Three rules it depends on, each pinned by a test:
+Four rules it depends on, each pinned by a test:
 
 - **The working tree's origin is `git status` and nothing else.** A file it does
   not mention has no uncommitted change, and the commits above the base belong to
@@ -563,6 +568,11 @@ Three rules it depends on, each pinned by a test:
   in `core/src/navigation/tests.rs` pins it.
 - **The chooser asks for another change set.**
   `the_diff_origin_chooser_asks_for_another_change_set` in
+  `app/src/inspector_tests.rs` pins it.
+- **The panel names the origin before a diff is opened.** The Changes panel's
+  chooser sits above the change list, and what it confirms is the window's
+  origin: the diff's own chooser follows it.
+  `the_changes_panel_can_choose_the_origin_before_opening_a_diff` in
   `app/src/inspector_tests.rs` pins it.
 - **How far the branch is above the default branch is a fact about the commits.**
   It is counted from the merge base in either origin, because it is not a

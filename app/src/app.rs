@@ -593,6 +593,16 @@ pub struct TerminalWindow {
     /// What the picker offers right now, so a name that arrived with the
     /// checkout's status replaces the one the picker was made with.
     pub(crate) diff_origin_offered: Vec<crate::diff::DiffOriginChoice>,
+    /// The Changes panel's own picker for the same window-wide origin.
+    ///
+    /// It is a second control rather than a second view of the diff's: a
+    /// `Select` draws its menu from the state it is given, so one state drawn
+    /// in the diff and in the panel at once would draw the same menu twice.
+    pub(crate) panel_origin_picker: Option<Entity<SelectState<Vec<crate::diff::DiffOriginChoice>>>>,
+    /// The subscription that reads the panel picker's answer.
+    pub(crate) panel_origin_picker_events: Option<Subscription>,
+    /// What the panel's picker offers right now.
+    pub(crate) panel_origin_offered: Vec<crate::diff::DiffOriginChoice>,
     pub(crate) git_status: HashMap<String, navigation::GitStatus>,
     /// Each checkout's changed files by path, for the file tree.
     ///
@@ -792,6 +802,9 @@ impl TerminalWindow {
             diff_origin_picker: None,
             diff_origin_picker_events: None,
             diff_origin_offered: Vec::new(),
+            panel_origin_picker: None,
+            panel_origin_picker_events: None,
+            panel_origin_offered: Vec::new(),
             git_status: HashMap::new(),
             status_index: HashMap::new(),
             git_status_errors: HashMap::new(),
