@@ -6,6 +6,31 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **A document's pictures are measured before they are drawn.** The reader
+  bounded the bytes a picture holds and the pane bounded how large it is drawn,
+  but nothing bounded what the decoder allocated: a GIF that names a canvas of
+  65535 by 65535 pixels asks for seventeen gigabytes of memory for a file of a
+  few kilobytes. Every picture a document shows is now measured -- its edge,
+  its own bytes, and the bytes of all of an animation's frames -- and one that
+  costs more than the window allows is said in words instead.
+
+- **Uncommitted changes no longer need a merge base.** The change list and the
+  diff asked Git for the merge base with the default branch before choosing
+  what a change is measured from, so a branch with no common ancestor with it
+  -- an orphan branch, for instance -- could not show the uncommitted changes
+  it had. The working tree is now measured from the last commit, as it was
+  always meant to be, and the count of commits a branch is above the default
+  one is unknown there rather than a number.
+
+- **A document gives up its pictures when it goes.** The toolkit keeps a
+  picture it has decoded until the application is told otherwise, and nothing
+  told it, so every document a window ever showed left its pictures behind for
+  the rest of the application's life. A document now claims the pictures it
+  shows and gives them up when it is closed or replaced, and a picture two
+  windows are showing is retired only when the last of them lets it go.
+
 ## 1.3.3
 
 - **The Changes panel's chooser sits beside the button that moves the panel.**
