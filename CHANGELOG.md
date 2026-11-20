@@ -16,6 +16,13 @@ here still gets its generated notes.
   the same window-wide origin: the diff header, the file list and the workdir
   totals stay in sync.
 
+- **The panels keep the widths they were drawn at.** The workspace file kept
+  the widths a divider was dragged to, but a window that was resized is
+  answered by nothing: the panels' group rescales its slots, and the widths the
+  window went on to draw at were not the widths the file held. The widths are
+  read back after the frame that noticed the resize, so a window that is
+  resized and closed keeps the panels where they were left.
+
 ## 1.3.2
 
 - **The Changes panel names the origin it is showing.** The panel carried a

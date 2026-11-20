@@ -24,7 +24,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     div, prelude::FluentBuilder, px, size, AnyElement, App, AppContext, Bounds, Context, Entity,
     Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Size,
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, TitlebarOptions,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
@@ -712,6 +712,11 @@ pub struct TerminalWindow {
     pub(crate) _maintenance: Option<Task<()>>,
     /// Keeps the visibility observer registered for this window's life.
     pub(crate) _visibility: Subscription,
+    /// The window's own size, as it was the last time the panels were drawn.
+    ///
+    /// The panels' group rescales its slots when the window is resized, so a
+    /// window that changed size is the thing that has to be read back.
+    viewport: Size<Pixels>,
 }
 
 /// Ephemeral authorization for one removal attempt, never persisted.
@@ -855,6 +860,7 @@ impl TerminalWindow {
             injected: false,
             _maintenance: None,
             _visibility: Subscription::new(|| {}),
+            viewport: size(px(0.), px(0.)),
         }
     }
 
@@ -1125,6 +1131,47 @@ impl TerminalWindow {
         self.resize = cx.new(|_| ResizableState::default());
         self.merged_resize = cx.new(|_| ResizableState::default());
         self.column_resize = cx.new(|_| ResizableState::default());
+    }
+
+    /// Keep the widths the panels are drawn at in the navigation, and so in the
+    /// workspace file.
+    ///
+    /// A resizable group rescales its slots when the window is resized, so the
+    /// width a panel is drawn at is not the width the file keeps unless it is
+    /// read back: the group's own resize callback answers a drag, and nothing
+    /// answers a window that was resized.
+    fn record_panel_widths(&mut self, cx: &mut Context<Self>) {
+        let (sidebar, panel) = match self.navigation.panel_layout {
+            PanelLayout::Side => {
+                let sizes = self.resize.read(cx).sizes();
+                (sizes.first().copied(), sizes.get(2).copied())
+            }
+            PanelLayout::Below => {
+                let sizes = self.merged_resize.read(cx).sizes();
+                (sizes.first().copied(), None)
+            }
+        };
+        let mut changed = false;
+        if let Some(width) = sidebar {
+            let width = width.as_f32();
+            // A group measures a panel before it knows how big it is, and the
+            // placeholder it starts from is below every panel's own minimum,
+            // so a width the panel may not take is not a measurement.
+            if (240. ..=500.).contains(&width) && width != self.navigation.sidebar_width {
+                self.navigation.sidebar_width = width;
+                changed = true;
+            }
+        }
+        if let Some(width) = panel {
+            let width = width.as_f32();
+            if (200. ..=480.).contains(&width) && width != self.navigation.panel_width {
+                self.navigation.panel_width = width;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist();
+        }
     }
 
     pub(crate) fn request_terminal(
@@ -3863,6 +3910,19 @@ impl Render for TerminalWindow {
         } else {
             body
         };
+        // The panels' group rescales its slots when the window is resized, and
+        // the widths the window goes on to draw at are then not the widths the
+        // file keeps: the group's own resize callback answers a drag, and
+        // nothing answers a window. The reading is taken after the frame,
+        // because the group lays its slots out after the frame is built.
+        let viewport = window.viewport_size();
+        if viewport != self.viewport {
+            self.viewport = viewport;
+            let entity = cx.entity();
+            window.defer(cx, move |_, cx| {
+                entity.update(cx, |app, cx| app.record_panel_widths(cx));
+            });
+        }
         let dialog = self
             .worktree
             .as_ref()

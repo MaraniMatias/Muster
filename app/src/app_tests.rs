@@ -1272,6 +1272,176 @@ fn a_size_that_arrives_late_is_taken(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
+/// The width the workspace file keeps, once it holds the one the window has.
+///
+/// The writer is a thread of its own, so the file is a moment behind the
+/// window.
+fn saved_width(path: &Path, wanted: f32) -> Option<f32> {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if let Ok(state) = muster_core::navigation::load(path) {
+            if (state.sidebar_width - wanted).abs() < 1. {
+                return Some(state.sidebar_width);
+            }
+        }
+        std::thread::sleep(POLL);
+    }
+    None
+}
+
+/// A divider that was dragged is kept.
+///
+/// The workspace file keeps the sidebar's width, the Files panel's own width
+/// and the column's share, and a drag is what changes them.
+#[gpui_kit::test]
+fn a_dragged_divider_is_kept(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use crate::state_writer::StateWriter;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-workspace.json");
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, _| {
+        app.owner
+            .install_writer(Some(StateWriter::new(path.clone()).unwrap()));
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(size(px(1280.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let edge = sidebar.right();
+        let y = sidebar.center().y;
+        window.drag(
+            gpui_kit::point(edge, y),
+            gpui_kit::point(edge + px(60.), y),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .expect("the window lays out");
+    let width = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.sidebar_width);
+    assert!(width > 250., "the sidebar's width was not kept: {width}");
+    let saved = saved_width(&path, width).expect("the dragged width never reached the file");
+    assert!((saved - width).abs() < 1., "{saved} against {width}");
+    close(&fixture, cx);
+}
+
+/// The Files panel's own width is kept when its divider is dragged.
+#[gpui_kit::test]
+fn a_dragged_panel_divider_is_kept(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+
+    let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(size(px(1280.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let inspector = window.find("inspector-panel").bounds();
+        let edge = inspector.left();
+        let y = inspector.center().y;
+        window.drag(
+            gpui_kit::point(edge, y),
+            gpui_kit::point(edge - px(60.), y),
+            cx,
+        );
+        window.render_frame(cx);
+        let width = fixture
+            .view
+            .read_with(cx, |app, _| app.navigation.panel_width);
+        assert!(width > 300., "the panel's width was not kept: {width}");
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
+/// The column's share is kept when its divider is dragged.
+#[gpui_kit::test]
+fn a_dragged_column_divider_is_kept(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git_with};
+
+    let fixture = open_git_with(cx, |navigation| {
+        navigation.panel_layout = PanelLayout::Below;
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.resize(size(px(1280.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let sidebar = window.find("navigation-panel").bounds();
+        let edge = sidebar.bottom();
+        let x = sidebar.center().x;
+        window.drag(
+            gpui_kit::point(x, edge),
+            gpui_kit::point(x, edge + px(80.)),
+            cx,
+        );
+        window.render_frame(cx);
+        let share = fixture
+            .view
+            .read_with(cx, |app, _| app.navigation.column_sidebar_share);
+        assert!(share > 0.65, "the column's share was not kept: {share}");
+    })
+    .expect("the window lays out");
+    close(&fixture, cx);
+}
+
+/// A window that was resized keeps the panels' widths.
+///
+/// A resizable group rescales its slots when the window is resized, so the
+/// widths the window goes on to draw at are not the widths the file keeps
+/// unless they are read back. The drag is answered by the group's own resize
+/// callback; a window that was resized is answered by nothing.
+#[gpui_kit::test]
+fn a_resized_window_keeps_the_panels_widths(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git};
+    use crate::state_writer::StateWriter;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-workspace.json");
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, _| {
+        app.owner
+            .install_writer(Some(StateWriter::new(path.clone()).unwrap()));
+    });
+    let drawn = cx
+        .update_window(fixture.handle, |_, window, cx| {
+            window.resize(size(px(1280.), px(800.)));
+            window.bounds_changed(cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let before = window.find("navigation-panel").bounds().size.width;
+            // The window itself is resized: the group rescales its slots.
+            window.resize(size(px(1600.), px(800.)));
+            window.bounds_changed(cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let after = window.find("navigation-panel").bounds().size.width;
+            assert!(
+                after > before,
+                "the sidebar grew with the window: {before:?} {after:?}"
+            );
+            after
+        })
+        .expect("the window lays out");
+    // The reading is taken after the frame, because the group lays its slots
+    // out after the frame is built.
+    let width = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.sidebar_width);
+    assert!(
+        (width - drawn.as_f32()).abs() < 1.,
+        "the width the window drew at was not kept: {width} against {drawn:?}"
+    );
+    let saved = saved_width(&path, width).expect("the resized width never reached the file");
+    assert!((saved - width).abs() < 1., "{saved} against {width}");
+    close(&fixture, cx);
+}
+
 /// The empty state belongs to the middle of the panel it is drawn in.
 ///
 /// A checkout with no terminal open leaves the middle panel holding one

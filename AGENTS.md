@@ -280,7 +280,14 @@ window is opening — is ignored by the group. The window therefore hands the
 panels a fresh group when the file's sizes arrive, and the group takes the
 size the navigation holds.
 
-Two rules it depends on, each pinned by a test:
+**The file keeps the widths the window drew at.** A group rescales its slots
+when the window is resized, so the width a panel is drawn at after a resize is
+not the width the file kept: the group's own resize callback answers a drag,
+and nothing answers a window. The widths are read back after the frame that
+noticed the resize, because the group lays its slots out after the frame is
+built, and the file is written then.
+
+The rules it depends on, each pinned by a test:
 
 - **The button moves the panel, and the file keeps the move.**
   `the_files_panel_can_be_moved_under_the_sidebar` in `app/src/app_tests.rs`.
@@ -294,6 +301,10 @@ Two rules it depends on, each pinned by a test:
   `core/src/navigation/tests.rs`.
 - **A size that arrives late is taken.**
   `a_size_that_arrives_late_is_taken` in `app/src/app_tests.rs`.
+- **A dragged divider and a resized window are both kept.**
+  `a_dragged_divider_is_kept`, `a_dragged_panel_divider_is_kept`,
+  `a_dragged_column_divider_is_kept` and
+  `a_resized_window_keeps_the_panels_widths` in `app/src/app_tests.rs`.
 
 ## The unfinished work in the sidebar
 
