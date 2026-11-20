@@ -1486,6 +1486,14 @@ fn branch(root: &Path, name: &str) {
 #[gpui_kit::test]
 fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("inspector-origin-select").is_none(),
+            "the chooser belongs to the Changes tab, and the Files tab is on"
+        );
+    })
+    .unwrap();
     fixture.view.update(cx, |app, cx| {
         app.inspector_tab = InspectorTab::Changes;
         cx.notify();
@@ -1493,10 +1501,17 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
     cx.update_window(fixture.handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("diff-origin").is_none());
-        // The panel names the origin it is showing, above the list it changes.
+        // The panel names the origin it is showing beside the button that
+        // moves the panel, in the strip that carries the panel's own controls.
         let origin = window.find("inspector-origin-select").bounds();
-        let all = window.find("all-changes").bounds();
-        assert!(origin.bottom() <= all.top(), "{origin:?} {all:?}");
+        let move_panel = window.find("inspector-layout").bounds();
+        assert!(
+            origin.right() <= move_panel.left()
+                && origin.bottom() >= move_panel.top()
+                && move_panel.bottom() >= origin.top(),
+            "the chooser is beside the button that moves the panel: \
+             {origin:?} against {move_panel:?}"
+        );
         window.click("inspector-origin-select", cx);
         window.render_frame(cx);
         window.press("down", cx);
@@ -1547,6 +1562,36 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
             Some(&DiffOrigin::Branch)
         );
     });
+    close(&fixture, cx);
+}
+
+/// The panel's own width holds the chooser and the button that moves it.
+///
+/// The strip is the panel's width, and the panel may be as narrow as it may
+/// be drawn: a control that would not fit in the strip is one the panel's own
+/// edge would cut in half.
+#[gpui_kit::test]
+fn the_changes_panel_keeps_its_chooser_inside_its_own_width(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    fixture.view.update(cx, |app, cx| {
+        app.inspector_tab = InspectorTab::Changes;
+        app.navigation.panel_width = 200.;
+        app.reset_panel_sizes(cx);
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let panel = window.find("inspector-panel").bounds();
+        let chooser = window.find("inspector-origin-select").bounds();
+        let move_panel = window.find("inspector-layout").bounds();
+        assert!(
+            move_panel.right() <= panel.right() && chooser.right() <= move_panel.left(),
+            "the strip's own controls are inside the panel: {chooser:?} {move_panel:?} \
+             against {panel:?}"
+        );
+    })
+    .unwrap();
     close(&fixture, cx);
 }
 

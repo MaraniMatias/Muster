@@ -534,10 +534,11 @@ files on disk against the last commit.
 The chooser sits in the diff view's own header, beside the title, and not in the
 row under it: that row is empty until a note is saved, and a row that grows is a
 row that moves the diff under the note being written. The Changes panel carries
-the same chooser above its change list, available before a diff is opened: the
-panel's strip holds the tabs and the button that moves the panel, and that strip
-is too narrow for a named choice. What the panel's chooser confirms is the same
-window-wide origin, and the diff's chooser follows it.
+the same chooser in its own strip, beside the button that moves the panel, so a
+named choice costs the change list no row of its own: the strip is where the
+panel's controls are, and the chooser is only there while the Changes tab is
+the one on screen. What the panel's chooser confirms is the same window-wide
+origin, and the diff's chooser follows it.
 
 The two choosers are two controls and not two views of one: a `Select` draws its
 menu from the state it is given, so one state drawn in the diff and in the panel
@@ -559,7 +560,7 @@ answer is for. A review of the working tree says so: the exported Markdown names
 `working tree` rather than a branch range, because a file that named a range
 about it would be naming another change set.
 
-Four rules it depends on, each pinned by a test:
+The rules it depends on, each pinned by a test:
 
 - **The working tree's origin is `git status` and nothing else.** A file it does
   not mention has no uncommitted change, and the commits above the base belong to
@@ -570,9 +571,15 @@ Four rules it depends on, each pinned by a test:
   `the_diff_origin_chooser_asks_for_another_change_set` in
   `app/src/inspector_tests.rs` pins it.
 - **The panel names the origin before a diff is opened.** The Changes panel's
-  chooser sits above the change list, and what it confirms is the window's
-  origin: the diff's own chooser follows it.
+  chooser sits beside the button that moves the panel, in the panel's own
+  strip, and what it confirms is the window's origin: the diff's own chooser
+  follows it.
   `the_changes_panel_can_choose_the_origin_before_opening_a_diff` in
+  `app/src/inspector_tests.rs` pins it.
+- **The strip holds the panel's own controls.** The strip is the panel's width,
+  and the panel may be as narrow as it may be drawn, so the chooser gives the
+  room back rather than the panel's edge cutting it in half.
+  `the_changes_panel_keeps_its_chooser_inside_its_own_width` in
   `app/src/inspector_tests.rs` pins it.
 - **How far the branch is above the default branch is a fact about the commits.**
   It is counted from the merge base in either origin, because it is not a

@@ -1445,6 +1445,35 @@ impl TerminalWindow {
                 }),
             ));
         }
+        // What the change set is measured from. It sits in the strip, beside
+        // the button that moves the panel: the strip is where the panel's own
+        // controls are, and a row of its own for a named choice is room the
+        // change list does not get. It is the diff's own chooser, and it
+        // confirms the same window-wide origin.
+        if !files_tab {
+            let origin_picker =
+                self.origin_picker(OriginPickerSlot::Panel, &checkout_id, window, cx);
+            tabs = tabs.child(
+                div()
+                    .id("inspector-origin")
+                    .test_support()
+                    // The select fills whatever the wrapper is, so the wrapper's
+                    // own width is what makes it compact rather than a
+                    // whole-field control. It gives the room back when the
+                    // panel is too narrow for it: the strip is the panel's
+                    // width, and a control that would not fit is one the
+                    // panel's own edge would cut in half.
+                    .w(px(140.))
+                    .min_w(px(48.))
+                    .child(
+                        Select::new(&origin_picker)
+                            .id("inspector-origin-select")
+                            .xsmall()
+                            .bg(roles.surface_base)
+                            .accessibility_label("Changes origin"),
+                    ),
+            );
+        }
         // The room between the tabs and the button is the strip's own, and the
         // button is the way from one layout to the other: the glyph it wears
         // is the place the panel would go, not the place it is in.
@@ -1523,40 +1552,12 @@ impl TerminalWindow {
                 roles,
                 all_selected,
             );
-            // What the change set is measured from. The panel's own strip holds
-            // the tabs and the button that moves the panel, and that strip is
-            // too narrow for a named choice, so the chooser sits above the
-            // list it changes. It is the diff's own chooser, and it confirms
-            // the same window-wide origin.
-            let origin_picker =
-                self.origin_picker(OriginPickerSlot::Panel, &checkout_id, window, cx);
-            let origin = div()
-                .id("inspector-origin")
-                .test_support()
-                .flex()
-                .items_center()
-                .flex_none()
-                .px(px(8.))
-                .py(px(4.))
-                .child(
-                    // The select fills whatever the wrapper is, so the row's
-                    // own width is what makes it compact rather than a
-                    // whole-field control.
-                    div().w(px(140.)).flex_shrink_0().child(
-                        Select::new(&origin_picker)
-                            .id("inspector-origin-select")
-                            .xsmall()
-                            .bg(roles.surface_base)
-                            .accessibility_label("Changes origin"),
-                    ),
-                );
             let mut body = div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
                 .py(px(2.))
-                .child(origin)
                 .child(all_changes);
             if let Some(error) = self.git_status_errors.get(&checkout_id) {
                 let id = checkout_id.clone();

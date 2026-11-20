@@ -6,6 +6,16 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The Changes panel's chooser sits beside the button that moves the panel.**
+  The panel named the origin it was showing in a row of its own above the
+  change list, and that row was room the list did not get. The chooser is in
+  the panel's own strip now, beside the button that moves the panel, and it is
+  only there while the Changes tab is the one on screen. What it confirms is
+  the same window-wide origin: the diff header, the file list and the workdir
+  totals stay in sync.
+
 ## 1.3.2
 
 - **The Changes panel names the origin it is showing.** The panel carried a
