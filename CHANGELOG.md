@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.3.3
 
 - **The Changes panel's chooser sits beside the button that moves the panel.**
   The panel named the origin it was showing in a row of its own above the
