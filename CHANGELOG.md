@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.3.4
 
 - **A document's pictures are measured before they are drawn.** The reader
   bounded the bytes a picture holds and the pane bounded how large it is drawn,
