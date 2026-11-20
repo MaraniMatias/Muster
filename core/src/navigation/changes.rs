@@ -19,21 +19,7 @@ pub enum DiffOrigin {
     WorkingTree,
 }
 
-impl DiffOrigin {
-    /// The commit a change is measured from, for the origin that measures one.
-    ///
-    /// The branch's changes are measured from the merge base with the default branch; the
-    /// working tree's are measured from the last commit. A file that is only on disk is
-    /// still part of the second and not of the first.
-    fn base(&self, merge_base: &str) -> String {
-        match self {
-            Self::Branch => merge_base.to_owned(),
-            Self::WorkingTree => "HEAD".to_owned(),
-        }
-    }
-}
-
-/// What a checkout changed, against the merge base with its default branch.
+/// What a checkout changed, against the base its origin measures it from.
 ///
 /// Two change sets are one answer, not two: a commit made in the worktree moves every
 /// sibling's base, so the panel lists the worktree's own commits as well as its dirty
@@ -46,7 +32,12 @@ pub struct GitStatus {
     /// `None` only in a repository with no commit at all.
     pub head: Option<String>,
     pub default_branch: String,
-    pub ahead_count: u64,
+    /// How far the branch is above the default branch.
+    ///
+    /// `None` where there is no merge base to count from: a branch with no common
+    /// ancestor with the default branch has no answer here, which is an unknown answer
+    /// and not a zero.
+    pub ahead_count: Option<u64>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -186,8 +177,23 @@ pub fn status(
     within: GitReadBudget,
 ) -> Result<GitStatus, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
-    let (merge_base, default_branch) = merge_base(repo, root.as_path(), within)?;
-    let base = origin.base(&merge_base);
+    // The default branch is what this checkout is compared with, and it is resolved the
+    // way it always was: the row names the same branch it named before.
+    let (default_branch, reference) = default_ref(repo, root.as_path(), within)?;
+    // The branch's changes are measured from the merge base with the default branch;
+    // the working tree's are measured from the last commit, so the merge base is not
+    // asked for there and a checkout with no common ancestor with the default branch
+    // still reads its own changes.
+    let (base, merge_base) = match origin {
+        DiffOrigin::Branch => {
+            let merge_base = merge_base(root.as_path(), &reference, within)?;
+            (merge_base.clone(), Some(merge_base))
+        }
+        DiffOrigin::WorkingTree => {
+            let merge_base = optional_merge_base(root.as_path(), &reference, within)?;
+            ("HEAD".to_owned(), merge_base)
+        }
+    };
     let mut files = changed_files(root.as_path(), &base, origin, within)?;
     let counts = numstat_counts(root.as_path(), &base, within)?;
     let untracked = untracked_counts(&root, &files, within)?;
@@ -211,15 +217,12 @@ pub fn status(
     let head = optional_ref(root.as_path(), &["rev-parse", "--short", "HEAD"], within)?;
     // How far the branch is above the default branch is a fact about the commits and not
     // about what the changes are measured from, so it is counted from the merge base in
-    // either origin.
-    let ahead = git_success(
-        root.as_path(),
-        &["rev-list", "--count", &format!("{merge_base}..HEAD")],
-        within,
-    )?;
-    let ahead_count = output_text(&ahead)?
-        .parse()
-        .map_err(|error| format!("Git returned an invalid ahead count: {error}"))?;
+    // either origin. A branch with no merge base with the default branch has no count to
+    // give, which is an unknown answer and not a zero.
+    let ahead_count = match &merge_base {
+        Some(merge_base) => Some(count_ahead(root.as_path(), merge_base, within)?),
+        None => None,
+    };
     // The branch a row reads, without the `refs/` a ref carries: the ref is what Git is
     // asked with and the name is what a person is shown.
     Ok(GitStatus {
@@ -258,8 +261,17 @@ pub(super) fn file_diff_before_git(
 ) -> Result<FileDiff, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
     let relative = validated_relative_path(path)?;
-    let (merge_base, _) = merge_base(repo, &root, within)?;
-    let base = origin.base(&merge_base);
+    // The branch's file is measured from the merge base with the default branch; the
+    // working tree's from the last commit, so the merge base is not asked for there and
+    // a checkout with no common ancestor with the default branch still shows its own
+    // changes.
+    let base = match origin {
+        DiffOrigin::Branch => {
+            let (_, reference) = default_ref(repo, root.as_path(), within)?;
+            merge_base(root.as_path(), &reference, within)?
+        }
+        DiffOrigin::WorkingTree => "HEAD".to_owned(),
+    };
     let changed = changed_files(&root, &base, origin, within)?
         .into_iter()
         .find(|file| file.path == path)
@@ -552,13 +564,47 @@ fn default_ref(
     default_ref_with_budget(root, repo.default_branch.as_deref().or(primary), within)
 }
 
-/// The commit every change in this checkout is measured from, and the branch that
-/// commit belongs to. Both come from one resolution, because resolving the base twice
-/// is two answers that could disagree.
-fn merge_base(repo: &Repo, root: &Path, within: GitReadBudget) -> Result<(String, String), String> {
-    let (branch, reference) = default_ref(repo, root, within)?;
-    let output = git_success(root, &["merge-base", &reference, "HEAD"], within)?;
-    Ok((output_text(&output)?.to_owned(), branch))
+/// The commit every change in this checkout is measured from.
+///
+/// The branch's own changes start at the merge base with the default branch, and a
+/// checkout without one has no base to measure them from.
+fn merge_base(root: &Path, reference: &str, within: GitReadBudget) -> Result<String, String> {
+    let output = git_success(root, &["merge-base", reference, "HEAD"], within)?;
+    Ok(output_text(&output)?.to_owned())
+}
+
+/// The merge base with the default branch, when there is one.
+///
+/// A branch with no common ancestor with the default branch has no merge base. The
+/// working tree's changes are measured from the last commit and do not need one, and the
+/// count the merge base would give is unknown rather than zero.
+fn optional_merge_base(
+    root: &Path,
+    reference: &str,
+    within: GitReadBudget,
+) -> Result<Option<String>, String> {
+    let output = git_output(root, &["merge-base", reference, "HEAD"], within)?;
+    if output.status.success() {
+        return Ok(Some(output_text(&output)?.to_owned()));
+    }
+    // Git says "there is no merge base" by failing without printing anything; what it
+    // printed is a read that failed, and it is reported as one.
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    Err(git_error("Git read failed", &output))
+}
+
+/// How far the branch is above the default branch, counted from the merge base.
+fn count_ahead(root: &Path, merge_base: &str, within: GitReadBudget) -> Result<u64, String> {
+    let ahead = git_success(
+        root,
+        &["rev-list", "--count", &format!("{merge_base}..HEAD")],
+        within,
+    )?;
+    output_text(&ahead)?
+        .parse()
+        .map_err(|error| format!("Git returned an invalid ahead count: {error}"))
 }
 
 /// The worktree's dirty files and the commits it holds above the base, keyed by path so a

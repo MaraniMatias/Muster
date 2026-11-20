@@ -2091,7 +2091,7 @@ fn status_of(files: &[(&str, &str)]) -> navigation::GitStatus {
         branch: Some("main".into()),
         head: Some("abc1234".into()),
         default_branch: "main".into(),
-        ahead_count: 0,
+        ahead_count: Some(0),
         files: files
             .iter()
             .map(|(path, status)| navigation::ChangedFile {
@@ -2357,7 +2357,7 @@ async fn a_committed_change_ahead_of_the_merge_base_opens_the_change_set(cx: &mu
             "a worktree whose change is committed but uncounted showed its terminal"
         );
         let status = &app.git_status[&worktree];
-        assert_eq!(status.ahead_count, 1, "{status:?}");
+        assert_eq!(status.ahead_count, Some(1), "{status:?}");
         assert_eq!(
             status.files.len(),
             1,
@@ -3558,6 +3558,51 @@ pub(super) fn close(fixture: &GitFixture, cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     fixture.view.update(cx, |app, _| app.owner.stop());
+}
+
+/// A second window over the same checkout.
+///
+/// Two windows of one application share one picture cache, so a test about a
+/// picture two documents are showing needs two windows and not two documents:
+/// the pane of a window shows one thing at a time.
+///
+/// The application is already initialized by the first window, so this one
+/// only opens the window.
+pub(super) fn open_second_window(
+    fixture: &GitFixture,
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<TerminalWindow>) {
+    let opened = navigation::open_directory(&fixture.root).unwrap();
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(window_bounds(cx), cx, |_window, cx| {
+            cx.new(|cx| {
+                let mut app = TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
+                app.navigation.merge(opened, true);
+                app
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    (handle, view)
+}
+
+/// Close a window that is not the fixture's.
+pub(super) fn close_window(
+    handle: AnyWindowHandle,
+    view: &Entity<TerminalWindow>,
+    cx: &mut TestAppContext,
+) {
+    cx.update_window(handle, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    view.update(cx, |app, _| app.owner.stop());
 }
 
 pub(super) fn add_worktree(fixture: &GitFixture, cx: &mut TestAppContext) -> (String, PathBuf) {

@@ -421,7 +421,7 @@ impl TerminalWindow {
                 self.request_document_transition(
                     Box::new(|app, window, cx| {
                         app.view_pin = None;
-                        app.clear_document();
+                        app.clear_document(cx);
                         app.focus_terminal(window, cx);
                         cx.notify();
                     }),
@@ -588,7 +588,7 @@ impl TerminalWindow {
         cx: &mut Context<Self>,
     ) {
         if self.navigation.select_session(id) {
-            self.clear_document();
+            self.clear_document(cx);
             self.open_diff = None;
             self.persist();
             self.refresh_diff_totals(cx);

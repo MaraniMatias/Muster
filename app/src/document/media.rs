@@ -32,6 +32,7 @@
 //! itself is the toolkit's, which is free to run on a worker of its own.
 use std::{
     collections::HashMap,
+    io::Cursor,
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
 };
 
@@ -45,6 +46,7 @@ use gpui_kit::{
 };
 
 use crate::app::TerminalWindow;
+use image::{AnimationDecoder, ImageDecoder};
 use muster_core::workspace::{Checkout, Repo};
 
 /// The name every node this module answers carries, and the prefix of the id the
@@ -95,6 +97,44 @@ const MAX_DOCUMENT_MEDIA_BYTES: usize = 4 * muster_core::files::MAX_RESOURCE_BYT
 /// waiting on are read in the order frames come, and a name that is not there
 /// never holds up the ones behind it.
 const MAX_DOCUMENT_MEDIA_READS: usize = 4;
+
+/// What one picture may cost to be decoded, and what an animation may cost.
+///
+/// The bytes a file holds say nothing about the pixels it decodes to: a
+/// picture of a few kilobytes can declare a canvas of tens of thousands of
+/// pixels on a side, and the toolkit's decoder has no bound of its own for
+/// one. These are the bounds a picture is measured against before it is
+/// published.
+#[derive(Clone, Copy)]
+struct Budget {
+    /// The widest and the tallest edge a picture may have, in pixels.
+    edge: u32,
+    /// The most one picture may decode to, in bytes.
+    bytes: u64,
+    /// The most an animation may decode to across all of its frames, in bytes.
+    animation_bytes: u64,
+    /// The most frames an animation may hold.
+    ///
+    /// A frame of a few pixels costs a frame's worth of bookkeeping whatever
+    /// it decodes to, and the byte budget cannot see it.
+    frames: usize,
+}
+
+/// The budget a document's pictures are measured against.
+///
+/// The edge is the one the terminal's own inline graphics allow, so a picture
+/// drawn beside a terminal is no larger than one drawn in it. The byte budget
+/// is what sixteen megapixels cost, which is more than the pane ever draws and
+/// more than a photograph of a camera takes. An animation may cost twice what
+/// one picture may, because it is a picture *and* its frames, and the toolkit
+/// keeps every frame of it. A thousand frames is more than the animation in a
+/// document holds.
+const BUDGET: Budget = Budget {
+    edge: 8192,
+    bytes: 64 * 1024 * 1024,
+    animation_bytes: 128 * 1024 * 1024,
+    frames: 1000,
+};
 
 /// The pictures one document has named, and what has come back for them.
 ///
@@ -203,11 +243,16 @@ impl MediaStore {
     /// name that is not a picture, a file that is not there and a document with
     /// no room left all leave the slot free for the pictures behind them, and
     /// the one that brings bytes holds them within the document's share.
-    fn finish(&self, name: &str, result: Result<Arc<Image>, String>) {
+    ///
+    /// The picture that was kept is handed back, because it is a picture the
+    /// application decodes and keeps: the window admits it into the document's
+    /// asset lifecycle, so it is retired with the document instead of staying
+    /// in the application's cache for the rest of its life.
+    fn finish(&self, name: &str, result: Result<Arc<Image>, String>) -> Option<Arc<Image>> {
         let mut pictures = self.lock();
         pictures.in_flight = pictures.in_flight.saturating_sub(1);
         let Ok(image) = result else {
-            return;
+            return None;
         };
         if pictures.bytes + image.bytes.len() > MAX_DOCUMENT_MEDIA_BYTES {
             log::warn!(
@@ -215,12 +260,13 @@ impl MediaStore {
                 MAX_DOCUMENT_MEDIA_BYTES / (1024 * 1024)
             );
             pictures.by_name.insert(name.to_owned(), What::Asked(None));
-            return;
+            return None;
         }
         pictures.bytes += image.bytes.len();
         pictures
             .by_name
-            .insert(name.to_owned(), What::Asked(Some(image)));
+            .insert(name.to_owned(), What::Asked(Some(image.clone())));
+        Some(image)
     }
 }
 
@@ -274,6 +320,19 @@ impl DocumentMedia {
         checkout_relative(&self.directory, url)
     }
 
+    /// Name a picture this document holds, so a read is started for it.
+    ///
+    /// The parse is the toolkit's, and it is what names a picture in the
+    /// ordinary way. A test needs to start a read without one, because the
+    /// moment that matters is the one where the document is gone before the
+    /// read answers.
+    #[cfg(test)]
+    pub(crate) fn want_picture(&self, name: &str) {
+        if let Some(store) = self.store.upgrade() {
+            store.want(name);
+        }
+    }
+
     /// Start a read for every picture the last parse asked for.
     ///
     /// Drained here, from the frame that owns the reading, rather than from
@@ -305,8 +364,17 @@ impl DocumentMedia {
                 let Some(store) = store.upgrade() else {
                     return;
                 };
-                store.finish(&name, result);
-                let _ = view.update(cx, |_, cx| cx.notify());
+                let _ = view.update(cx, |app, cx| {
+                    // The picture is published into the document's store and
+                    // admitted into its asset lifecycle in one step: what the
+                    // document holds is what the document is keeping alive, and
+                    // a read that arrives after the document is gone publishes
+                    // nothing at all.
+                    if let Some(image) = store.finish(&name, result) {
+                        app.document_assets.admit(image, cx);
+                    }
+                    cx.notify();
+                });
             })
             .detach();
         }
@@ -325,6 +393,7 @@ fn picture(repo: &Repo, checkout: &Checkout, name: &str) -> Result<Arc<Image>, S
             "{name} does not hold a picture this window can draw"
         ));
     };
+    within_budget(format, &bytes, &BUDGET).map_err(|reason| format!("{name} {reason}"))?;
     Ok(Arc::new(Image::from_bytes(format, bytes)))
 }
 
@@ -351,11 +420,147 @@ fn picture_format(name: &str, bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// The codec that reads a format the toolkit draws, when it is a picture of
+/// pixels.
+///
+/// SVG is not one: markup is drawn by the toolkit's own renderer, which is not
+/// a canvas of pixels and is bounded by the bytes it holds.
+fn raster_format(format: ImageFormat) -> Option<image::ImageFormat> {
+    Some(match format {
+        ImageFormat::Png => image::ImageFormat::Png,
+        ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        ImageFormat::Gif => image::ImageFormat::Gif,
+        ImageFormat::Webp => image::ImageFormat::WebP,
+        ImageFormat::Bmp => image::ImageFormat::Bmp,
+        ImageFormat::Ico => image::ImageFormat::Ico,
+        ImageFormat::Tiff => image::ImageFormat::Tiff,
+        ImageFormat::Pnm => image::ImageFormat::Pnm,
+        ImageFormat::Svg => return None,
+    })
+}
+
+/// Refuse a picture that would cost more than the budget allows.
+///
+/// The check is on what the picture decodes to, not on what it holds: the
+/// toolkit's decoder has no bound of its own for the canvas a GIF's logical
+/// screen asks for, so a picture of a few kilobytes can name a canvas of
+/// gigabytes and be decoded into one.
+///
+/// The picture is refused whole rather than trimmed, because a trimmed picture
+/// is not the picture the document asked for. Bytes the toolkit cannot decode
+/// at all are not refused: they cost nothing to draw, and the toolkit draws
+/// them as nothing.
+fn within_budget(format: ImageFormat, bytes: &[u8], budget: &Budget) -> Result<(), String> {
+    let Some(format) = raster_format(format) else {
+        return Ok(());
+    };
+    if format == image::ImageFormat::Gif {
+        return animation_within_budget(bytes, budget);
+    }
+    let decoder = match image::ImageReader::with_format(Cursor::new(bytes), format).into_decoder() {
+        Ok(decoder) => decoder,
+        Err(error) => return decoder_refusal(error),
+    };
+    let (width, height) = decoder.dimensions();
+    check_decoded_size(width, height, budget)
+}
+
+/// The bytes one picture decodes to, or the reason it is too many.
+///
+/// Four bytes a pixel is what the toolkit holds, so this is the canvas a
+/// picture of the widest edge would need.
+fn check_decoded_size(width: u32, height: u32, budget: &Budget) -> Result<(), String> {
+    if width > budget.edge || height > budget.edge {
+        return Err(format!(
+            "is larger than the {} pixels on a side this window decodes",
+            budget.edge
+        ));
+    }
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(u64::MAX);
+    if bytes > budget.bytes {
+        return Err(format!(
+            "decodes to more than the {} MiB this window holds",
+            budget.bytes / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an animation that would cost more than the budget allows.
+///
+/// The toolkit keeps every frame of an animation, so an animation's frames are
+/// held together: they may cost what the whole animation's share is, and no
+/// more. The frames are read to know what they cost, which is why this runs
+/// on the worker that read the bytes and not on the thread that draws.
+fn animation_within_budget(bytes: &[u8], budget: &Budget) -> Result<(), String> {
+    let mut decoder = match image::codecs::gif::GifDecoder::new(Cursor::new(bytes)) {
+        Ok(decoder) => decoder,
+        // Bytes the toolkit cannot decode cost nothing to draw.
+        Err(_) => return Ok(()),
+    };
+    // The logical screen is the canvas every frame is drawn on. It is measured
+    // here, before a canvas of that size is ever allocated.
+    let (width, height) = decoder.dimensions();
+    check_decoded_size(width, height, budget)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(budget.edge);
+    limits.max_image_height = Some(budget.edge);
+    // The decoder holds the canvas, the frame it is reading and the canvas it
+    // composites them into at once, so its own ceiling is the animation's
+    // share plus one canvas.
+    limits.max_alloc = Some(budget.animation_bytes + budget.bytes);
+    if let Err(error) = decoder.set_limits(limits) {
+        return decoder_refusal(error);
+    }
+    let mut frames = 0usize;
+    let mut total = 0u64;
+    for frame in decoder.into_frames() {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => return decoder_refusal(error),
+        };
+        frames += 1;
+        if frames > budget.frames {
+            return Err(format!(
+                "has more than the {} frames this window decodes",
+                budget.frames
+            ));
+        }
+        total += frame.buffer().as_raw().len() as u64;
+        if total > budget.animation_bytes {
+            return Err(format!(
+                "decodes to more than the {} MiB its frames cost this window",
+                budget.animation_bytes / (1024 * 1024)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a decoder's refusal means.
+///
+/// A limit that was reached is a refusal: the picture costs more than the
+/// budget allows. Anything else is bytes the toolkit cannot draw either, and
+/// those cost nothing to draw.
+fn decoder_refusal(error: image::ImageError) -> Result<(), String> {
+    match error {
+        image::ImageError::Limits(_) => Err("costs more than this window decodes".to_string()),
+        _ => Ok(()),
+    }
+}
+
 /// Decode a direct raster preview from bytes already read through the checkout.
 /// SVG stays on the text-backed path so its source remains editable.
 pub(super) fn raster_picture(name: &str, bytes: Vec<u8>) -> Option<Arc<Image>> {
     let format = picture_format(name, &bytes)?;
     if matches!(format, ImageFormat::Svg) {
+        return None;
+    }
+    if let Err(reason) = within_budget(format, &bytes, &BUDGET) {
+        log::warn!("{name} {reason}, so it is not shown");
         return None;
     }
     Some(Arc::new(Image::from_bytes(format, bytes)))
@@ -901,5 +1106,131 @@ mod tests {
     /// slot, not the picture.
     fn picture_of_a_pixel() -> Arc<Image> {
         Arc::new(Image::from_bytes(ImageFormat::Png, vec![0; 1]))
+    }
+
+    /// A picture of a few kilobytes can name a canvas of gigabytes: the
+    /// logical screen of a GIF is the canvas every frame is drawn on, and the
+    /// toolkit's decoder has no bound of its own for one.
+    ///
+    /// The refusal is on the size of that screen, and it happens before a
+    /// canvas of that size is allocated, so this test never holds more than
+    /// the twenty-three bytes it builds.
+    #[test]
+    fn a_gif_whose_logical_screen_is_oversized_is_refused() {
+        let refusal =
+            within_budget(ImageFormat::Gif, &gif_with_an_oversized_screen(), &BUDGET).unwrap_err();
+        assert!(
+            refusal.contains("pixels on a side"),
+            "the size of the screen is what refuses it, not the memory of it: {refusal}"
+        );
+    }
+
+    /// An animation keeps every frame, so its frames are held together: the
+    /// budget is over all of them and not over one.
+    #[test]
+    fn an_animation_whose_frames_cost_more_than_the_budget_is_refused() {
+        let budget = Budget {
+            edge: BUDGET.edge,
+            bytes: 1024 * 1024,
+            animation_bytes: 1024 * 1024,
+            frames: BUDGET.frames,
+        };
+        // Five frames of a canvas of a quarter of a mebibyte: one picture is
+        // within the budget, and the five of them together are not.
+        let bytes = gif_of_frames(5, 256, 256);
+        let refusal = within_budget(ImageFormat::Gif, &bytes, &budget).unwrap_err();
+        assert!(
+            refusal.contains("its frames"),
+            "the frames together are what refuse it: {refusal}"
+        );
+    }
+
+    /// An ordinary picture is within the budget and is published as it was.
+    #[test]
+    fn an_ordinary_picture_is_within_the_budget() {
+        let png = png_of(2, 2);
+        assert!(
+            within_budget(ImageFormat::Png, &png, &BUDGET).is_ok(),
+            "an ordinary picture is not refused"
+        );
+        let gif = gif_of_frames(2, 8, 8);
+        assert!(
+            within_budget(ImageFormat::Gif, &gif, &BUDGET).is_ok(),
+            "an ordinary animation is not refused"
+        );
+    }
+
+    /// A picture past the budget is not published: the preview has nothing to
+    /// draw, and the document's own picture is said in words.
+    #[test]
+    fn a_picture_that_is_refused_is_not_published() {
+        assert!(
+            raster_picture("huge.gif", gif_with_an_oversized_screen()).is_none(),
+            "a picture past the budget is not a preview"
+        );
+        assert!(
+            raster_picture("small.gif", gif_of_frames(1, 8, 8)).is_some(),
+            "a picture within the budget is a preview"
+        );
+    }
+
+    /// A GIF whose logical screen is 65535 by 65535: twenty-three bytes that
+    /// name a canvas of seventeen gigabytes.
+    fn gif_with_an_oversized_screen() -> Vec<u8> {
+        vec![
+            b'G', b'I', b'F', b'8', b'9', b'a', // the header
+            0xff, 0xff, 0xff, 0xff, // a logical screen of 65535 by 65535
+            0x00, 0x00, 0x00, // no global colour table, no background
+            0x2c, // the first frame
+            0x00, 0x00, 0x00, 0x00, // at the top left of the screen
+            0x01, 0x00, // a frame of one pixel
+            0x01, 0x00, // a frame of one pixel
+            0x00, // with no local colour table
+        ]
+    }
+
+    /// A picture that is refused is said in words: the document keeps no
+    /// picture for it, so the reading draws the words the author wrote.
+    #[test]
+    fn a_refused_picture_leaves_the_document_without_one() {
+        let store = MediaStore::new();
+        store.want("huge.gif");
+        assert_eq!(store.take_wanted(), vec!["huge.gif".to_string()]);
+        let refusal =
+            within_budget(ImageFormat::Gif, &gif_with_an_oversized_screen(), &BUDGET).unwrap_err();
+        store.finish("huge.gif", Err(format!("huge.gif {refusal}")));
+        assert!(
+            store.image("huge.gif").is_none(),
+            "a picture that is refused is not a picture the document holds"
+        );
+    }
+
+    /// A PNG of one size, as the codec writes it.
+    fn png_of(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut cursor = Cursor::new(&mut bytes);
+        image::DynamicImage::new_rgba8(width, height)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("a picture the codec writes");
+        bytes
+    }
+
+    /// A GIF of a few frames of one size, as the codec writes it.
+    fn gif_of_frames(frames: usize, width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for index in 0..frames {
+                let frame = image::RgbaImage::from_pixel(
+                    width,
+                    height,
+                    image::Rgba([0, 0, 0, index as u8]),
+                );
+                encoder
+                    .encode_frame(image::Frame::new(frame))
+                    .expect("a frame the codec writes");
+            }
+        }
+        bytes
     }
 }

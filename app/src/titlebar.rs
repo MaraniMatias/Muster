@@ -495,7 +495,7 @@ impl TerminalWindow {
         if !self.navigation.select_session(target) && !self.navigation.select_checkout(target) {
             return;
         }
-        self.clear_document();
+        self.clear_document(cx);
         self.open_diff = None;
         self.persist();
         self.refresh_diff_totals(cx);

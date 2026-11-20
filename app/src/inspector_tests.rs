@@ -3210,6 +3210,304 @@ async fn a_png_file_opens_as_a_direct_image_preview(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
+/// A picture the pane drew is retired with the document that was showing it.
+///
+/// The application keeps a decoded picture until it is told otherwise, so a
+/// document that is closed has to give its picture up: otherwise every
+/// document this window ever showed would keep its picture alive for the rest
+/// of the application's life.
+#[gpui_kit::test]
+async fn a_closed_document_gives_up_the_picture_it_was_showing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.data"), ONE_PIXEL_PNG).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "diagram.data").await;
+
+    let picture = fixture.view.read_with(cx, |app, _| {
+        app.open_document
+            .as_ref()
+            .and_then(|(_, preview)| preview.image())
+            .cloned()
+            .expect("the preview holds the picture the pane draws")
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            picture.is_asset_cached(cx),
+            "a picture the pane drew is the application's to keep"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            !picture.is_asset_cached(cx),
+            "a document nobody is showing does not keep a decoded picture alive"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A picture a document named is retired with the document that named it.
+///
+/// The same rule as the picture the pane draws directly, on the other path a
+/// picture reaches a document: the one its reading names.
+#[gpui_kit::test]
+async fn a_closed_document_gives_up_the_pictures_it_named(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    std::fs::write(
+        fixture.root.join("README.md"),
+        "![The diagram](diagram.png)\n",
+    )
+    .unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "README.md").await;
+    assert!(
+        draw_until(&fixture, cx, "document-media-0"),
+        "the picture the document names is drawn"
+    );
+
+    let prepared = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.media.image("diagram.png"))
+            .expect("the worker read the picture into this document")
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        prepared
+            .clone()
+            .get_render_image(window, cx)
+            .expect("the toolkit decoded the bytes the read brought back");
+        assert!(
+            prepared.is_asset_cached(cx),
+            "a picture the document names is the application's to keep"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            !prepared.is_asset_cached(cx),
+            "a document nobody is showing does not keep a decoded picture alive"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A drawing is retired with the document that was showing it.
+///
+/// The SVG reading is the third path a picture reaches the document pane, and
+/// it is the same picture the toolkit decodes and the application keeps.
+#[gpui_kit::test]
+async fn a_closed_document_gives_up_the_drawing_it_was_showing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\"/></svg>";
+    std::fs::write(fixture.root.join("drawing.svg"), source).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "drawing.svg").await;
+
+    let drawing = fixture.view.read_with(cx, |app, _| {
+        app.document_view
+            .as_ref()
+            .and_then(|view| view.reading.as_ref())
+            .and_then(|reading| match reading {
+                crate::document::Reading::Picture { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+            .expect("the file is read as the drawing it is")
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            drawing.is_asset_cached(cx),
+            "a drawing the pane shows is the application's to keep"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            !drawing.is_asset_cached(cx),
+            "a document nobody is showing does not keep a decoded drawing alive"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A read that answers after its document is gone publishes nothing.
+///
+/// The store a document's pictures live in goes with the document, so a read
+/// that answers afterwards has nothing to publish into: it must not bring the
+/// document back, and it must not leave a claim on a picture nobody is
+/// showing behind.
+#[gpui_kit::test]
+async fn a_read_that_answers_after_its_document_is_gone_publishes_nothing(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.png"), ONE_PIXEL_PNG).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    let (repo, checkout) = fixture.view.read_with(cx, |app, _| {
+        (
+            app.navigation.repos[0].clone(),
+            app.navigation.checkout(&fixture.checkout).unwrap().clone(),
+        )
+    });
+    let view = fixture.view.downgrade();
+
+    // The read is started, and the document goes before it answers: the store
+    // its answer was for went with it.
+    cx.update(|app| {
+        let store = crate::document::media::MediaStore::new();
+        let media = crate::document::media::DocumentMedia::new(
+            repo,
+            checkout,
+            "README.md",
+            Arc::downgrade(&store),
+        );
+        media.want_picture("diagram.png");
+        media.prepare(view, app);
+        drop(store);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.document_view.is_none()),
+        "a read that arrives after its document is gone does not bring it back"
+    );
+    assert_eq!(
+        fixture
+            .view
+            .read_with(cx, |app, _| app.document_assets.claims()),
+        0,
+        "and it leaves no claim on a picture nobody is showing"
+    );
+    cx.update(|cx| {
+        let picture = Arc::new(gpui_kit::Image::from_bytes(
+            gpui_kit::ImageFormat::Png,
+            ONE_PIXEL_PNG.to_vec(),
+        ));
+        assert!(
+            !picture.is_asset_cached(cx),
+            "and no decoded picture behind either"
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A picture another window is showing is not retired with the first one.
+///
+/// Two pictures with the same bytes are one entry in the application's cache,
+/// so a document that is closed must not take the picture away from a
+/// document that is still showing it.
+#[gpui_kit::test]
+async fn a_picture_another_window_is_showing_is_not_retired_with_the_first(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("diagram.data"), ONE_PIXEL_PNG).unwrap();
+    fixture.view.update(cx, |app, _| {
+        app.navigation.active_checkout = Some(fixture.checkout.clone());
+    });
+    open(cx, &fixture, "diagram.data").await;
+
+    // A second window over the same checkout, showing the same picture.
+    let (other_handle, other_view) = open_second_window(&fixture, cx);
+    cx.update_window(other_handle, |_, window, cx| {
+        other_view.update(cx, |app, cx| {
+            let repo = app.navigation.repos[0].clone();
+            let checkout_id = app
+                .navigation
+                .active_checkout
+                .clone()
+                .expect("the second window opened a checkout of its own");
+            let checkout = app
+                .navigation
+                .checkout(&checkout_id)
+                .cloned()
+                .expect("and the checkout is there");
+            app.request_document(repo, checkout, "diagram.data".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(other_handle, Duration::from_secs(20), |_, cx| {
+        other_view
+            .read(cx)
+            .open_document
+            .as_ref()
+            .is_some_and(|(_, preview)| preview.path() == "diagram.data")
+    })
+    .await;
+
+    let picture = fixture.view.read_with(cx, |app, _| {
+        app.open_document
+            .as_ref()
+            .and_then(|(_, preview)| preview.image())
+            .cloned()
+            .expect("the preview holds the picture the pane draws")
+    });
+    for handle in [fixture.handle, other_handle] {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.update(|cx| {
+        assert!(
+            picture.is_asset_cached(cx),
+            "the picture two windows are showing is the application's to keep"
+        );
+    });
+
+    // The first window gives its document up.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            picture.is_asset_cached(cx),
+            "the second window is still showing it, so it is still the application's to keep"
+        );
+    });
+
+    // And the second one does too.
+    cx.update_window(other_handle, |_, window, cx| {
+        window.click("close-document", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            !picture.is_asset_cached(cx),
+            "and once nobody is showing it, it is retired"
+        );
+    });
+    close_window(other_handle, &other_view, cx);
+    close(&fixture, cx);
+}
+
 /// An SVG file opens as its drawing, and its markup is one click away.
 ///
 /// The two readings are one document's two views, the way a Markdown file's

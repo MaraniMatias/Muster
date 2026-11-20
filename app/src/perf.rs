@@ -260,7 +260,7 @@ fn tree_fixture(folders: usize, per_folder: usize) -> TreeFixture {
         branch: Some("main".to_owned()),
         head: Some("0f1e2d3".to_owned()),
         default_branch: "main".to_owned(),
-        ahead_count: 0,
+        ahead_count: Some(0),
         files,
     };
     let statuses = status_index(&status);

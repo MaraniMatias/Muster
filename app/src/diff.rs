@@ -444,7 +444,7 @@ impl TerminalWindow {
         if !self.navigation.select_checkout(checkout) {
             return;
         }
-        self.clear_document();
+        self.clear_document(cx);
         self.open_diff = None;
         self.persist();
         self.refresh_diff_totals(cx);
@@ -493,7 +493,7 @@ impl TerminalWindow {
         path: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.clear_document();
+        self.clear_document(cx);
         self.open_diff = Some((checkout.to_owned(), path.clone()));
         // The pane is on a change from here on, and the row that says so is
         // named after it.

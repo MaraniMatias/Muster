@@ -537,6 +537,13 @@ pub struct TerminalWindow {
     pub(crate) open_document: Option<(String, DocumentPreview)>,
     pub(crate) document_target: Option<(String, String)>,
     pub(crate) document_view: Option<crate::document::DocumentView>,
+    /// The pictures the document pane has admitted, and this window's claims
+    /// on them.
+    ///
+    /// The application keeps a decoded picture until it is told otherwise, so
+    /// a document that is replaced or closed has to give up the pictures it
+    /// was showing. See `document::assets`.
+    pub(crate) document_assets: crate::document::assets::DocumentAssets,
     pub(crate) pending_document_transition: Option<PendingDocumentTransition>,
     pub(crate) document_transition_prompted: bool,
     /// The formatter the document pane runs, when a test supplies one.
@@ -786,6 +793,7 @@ impl TerminalWindow {
             open_document: None,
             document_target: None,
             document_view: None,
+            document_assets: crate::document::assets::DocumentAssets::new(),
             pending_document_transition: None,
             document_transition_prompted: false,
             #[cfg(test)]
@@ -1234,7 +1242,7 @@ impl TerminalWindow {
         // view is open now is what the person chose to replace. The token moves
         // here rather than when the shell lands: a preview whose read is still
         // running must not come back after the terminal has taken its place.
-        self.clear_document();
+        self.clear_document(cx);
         self.open_diff = None;
         let id = format!(
             "native-{}-{}",
@@ -2048,6 +2056,10 @@ impl TerminalWindow {
         }
         self.closing = true;
         self.persist();
+        // The pictures this window was showing go with it: the application
+        // keeps a decoded picture until it is told otherwise, and a window that
+        // is gone is not showing anything.
+        self.document_assets.release_all(cx);
         let owner = self.owner.clone();
         let worker = cx.background_executor().spawn(async move {
             owner.stop();

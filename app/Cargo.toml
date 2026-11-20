@@ -100,10 +100,22 @@ libc = "0.2"
 log = "0.4"
 alacritty_terminal = "0.26.0"
 unicode-width = "0.2"
-# Already in the locked graph. Decode bounded inline graphics off the UI thread.
+# Already in the locked graph. Decode bounded inline graphics off the UI thread,
+# and measure a document's own pictures before the toolkit decodes them: the
+# codecs below are the ones this window draws, and the toolkit compiles them in
+# already.
 base64 = "0.22"
 flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "tiff",
+    "webp",
+] }
 # The shell-integration scripts are written to a private directory that has to
 # outlive the spawn and disappear with the session; nothing else owns that.
 tempfile = "3"

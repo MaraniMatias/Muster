@@ -1272,7 +1272,7 @@ fn status_reports_local_committed_untracked_and_renamed_files_with_one_base() {
     .unwrap();
     assert_eq!(status.default_branch, "main");
     assert_eq!(status.branch.as_deref(), Some("feature"));
-    assert_eq!(status.ahead_count, 1);
+    assert_eq!(status.ahead_count, Some(1));
     assert!(status.head.is_some());
 
     let file = |name: &str| {
@@ -1339,7 +1339,7 @@ fn the_working_tree_origin_is_what_git_status_reports_and_is_measured_from_head(
     assert!(!names.contains(&"clean.txt"), "{names:?}");
     // How far the branch is above the default branch is a fact about the commits
     // and not about what the changes are measured from.
-    assert_eq!(working.ahead_count, 2);
+    assert_eq!(working.ahead_count, Some(2));
 
     // A file the working tree says nothing about is not in this change set.
     assert!(file_diff(
@@ -1420,6 +1420,168 @@ fn the_working_tree_origin_is_what_git_status_reports_and_is_measured_from_head(
             deletions: 0
         }
     );
+}
+
+/// A linked worktree, and the checkout it is read as, in the repository that holds
+/// both worktrees.
+fn linked_worktree_checkout(tree: &Path) -> (Repo, Checkout) {
+    let opened = open_directory(tree).unwrap();
+    let checkout = opened
+        .repo
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == opened.checkout_id)
+        .unwrap()
+        .clone();
+    (opened.repo, checkout)
+}
+
+#[test]
+fn a_linked_worktree_measures_its_working_tree_from_head() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    write_and_commit(root, "committed.txt", "one\n");
+    let tree = temp.path().join("feature");
+    git(
+        root,
+        &["worktree", "add", "-b", "feature", tree.to_str().unwrap()],
+    );
+    // The change on disk is what the working tree's change set is.
+    fs::write(tree.join("dirty.txt"), "one\ntwo\n").unwrap();
+
+    let (repo, checkout) = linked_worktree_checkout(&tree);
+    let working = status(
+        &repo,
+        &checkout,
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    let names = working
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["dirty.txt"], "{names:?}");
+    assert_eq!(working.files[0].status, "??");
+    assert_eq!(working.files[0].additions, Some(2));
+    assert_eq!(working.files[0].deletions, None);
+    // This branch has a merge base with the default branch, so the count is a number.
+    assert_eq!(working.ahead_count, Some(0));
+
+    assert_eq!(
+        diff_totals_for_checkout(
+            &repo,
+            &checkout,
+            DiffOrigin::WorkingTree,
+            GitReadBudget::default()
+        )
+        .unwrap(),
+        DiffTotals {
+            additions: 2,
+            deletions: 0
+        }
+    );
+
+    let diff = file_diff(
+        &repo,
+        &checkout,
+        "dirty.txt",
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    assert!(diff.patch.contains("+two"), "{}", diff.patch);
+}
+
+#[test]
+fn a_worktree_with_no_common_ancestor_still_measures_its_working_tree() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    write_and_commit(root, "committed.txt", "one\n");
+    let tree = temp.path().join("lonely");
+    git(
+        root,
+        &["worktree", "add", "-b", "lonely", tree.to_str().unwrap()],
+    );
+    // A history of its own: nothing in common with the default branch.
+    git(&tree, &["checkout", "--quiet", "--orphan", "start"]);
+    write_and_commit(&tree, "start.txt", "one\n");
+    fs::write(tree.join("dirty.txt"), "one\ntwo\n").unwrap();
+
+    let (repo, checkout) = linked_worktree_checkout(&tree);
+
+    // The working tree's changes are measured from HEAD, which this checkout has.
+    let working = status(
+        &repo,
+        &checkout,
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    let names = working
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["dirty.txt"], "{names:?}");
+    assert_eq!(working.files[0].status, "??");
+    assert_eq!(working.files[0].additions, Some(2));
+    assert_eq!(working.files[0].deletions, None);
+    // There is no merge base to count the ahead count from, so the count is unknown
+    // rather than a number.
+    assert_eq!(working.ahead_count, None);
+
+    assert_eq!(
+        diff_totals_for_checkout(
+            &repo,
+            &checkout,
+            DiffOrigin::WorkingTree,
+            GitReadBudget::default()
+        )
+        .unwrap(),
+        DiffTotals {
+            additions: 2,
+            deletions: 0
+        }
+    );
+
+    let diff = file_diff(
+        &repo,
+        &checkout,
+        "dirty.txt",
+        DiffOrigin::WorkingTree,
+        GitReadBudget::default(),
+    )
+    .unwrap();
+    assert!(diff.patch.contains("+two"), "{}", diff.patch);
+
+    // The branch's own changes cannot be measured without a merge base, and the
+    // answer says so rather than measuring from a base that is not there.
+    assert!(status(
+        &repo,
+        &checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
+    assert!(diff_totals_for_checkout(
+        &repo,
+        &checkout,
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
+    assert!(file_diff(
+        &repo,
+        &checkout,
+        "dirty.txt",
+        DiffOrigin::Branch,
+        GitReadBudget::default()
+    )
+    .is_err());
 }
 
 #[test]

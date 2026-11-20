@@ -534,6 +534,29 @@ keyboard is therefore asked for at the end of the cycle, where the next frame's
 report can carry it: `focus_visible_after_this_frame`.
 `the_open_document_draws_its_caret` in `app/src/inspector_tests.rs` pins it.
 
+**A document gives up its pictures when it goes.** The toolkit decodes a
+picture through the application's asset system, and that system keeps what it
+decoded until something retires it, so a document that is replaced or closed
+has to give up the pictures it was showing: the raster preview the pane draws
+directly, the SVG drawing it reads as, and the pictures its reading names.
+Two pictures with the same bytes are one entry, so the retirement is a claim
+and not an eviction: the entry goes when the last document holding those
+bytes lets go, and not before, so a document never takes a picture away from
+another one that is still showing it. `app/src/document/assets.rs` owns the
+claims, and `clear_document` is where they are given up.
+
+The rules it depends on, each pinned by a test in
+`app/src/inspector_tests.rs`:
+
+- **A closed document gives up the picture it was showing.**
+  `a_closed_document_gives_up_the_picture_it_was_showing`,
+  `a_closed_document_gives_up_the_drawing_it_was_showing` and
+  `a_closed_document_gives_up_the_pictures_it_named`.
+- **A read that answers after its document is gone publishes nothing.**
+  `a_read_that_answers_after_its_document_is_gone_publishes_nothing`.
+- **A picture another window is showing is not retired with the first one.**
+  `a_picture_another_window_is_showing_is_not_retired_with_the_first`.
+
 ## What the diff is measured from
 
 A change set has two origins, and the diff view says which one it is showing.
@@ -594,7 +617,9 @@ The rules it depends on, each pinned by a test:
   `app/src/inspector_tests.rs` pins it.
 - **How far the branch is above the default branch is a fact about the commits.**
   It is counted from the merge base in either origin, because it is not a
-  statement about what the changes are measured from.
+  statement about what the changes are measured from. A branch with no common
+  ancestor with the default branch has no merge base to count from, so the
+  count is unknown there rather than a number.
 
 ## The review composer
 

@@ -26,7 +26,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod media;
+/// The pictures of a Markdown document, and how they are read.
+///
+/// The module is visible to the crate so a test can start a read for a
+/// document that is about to be gone, which is the one moment the read's
+/// late answer matters.
+pub(crate) mod media;
+
+/// The pictures a document admits into the application's asset cache, and the
+/// claims it holds on them.
+pub(crate) mod assets;
 
 /// The reading of a document that is not its source.
 ///
@@ -59,6 +68,18 @@ impl DocumentPreview {
         match self {
             Self::Text(preview) => &preview.path,
             Self::Image { path, .. } => path,
+        }
+    }
+
+    /// The picture this preview holds, when it is one.
+    ///
+    /// A file the pane draws directly is a picture the toolkit decodes and the
+    /// application keeps, so it is admitted into the document's asset
+    /// lifecycle like every other picture the document shows.
+    pub(crate) fn image(&self) -> Option<&Arc<Image>> {
+        match self {
+            Self::Text(_) => None,
+            Self::Image { image, .. } => Some(image),
         }
     }
 
@@ -169,6 +190,16 @@ impl DocumentView {
 
     fn is_rendered(&self) -> bool {
         self.rendered && self.reading.is_some()
+    }
+
+    /// Replace the reading, and hand back the one that was replaced.
+    ///
+    /// The reading is a parse of the text as saved, and the saved text is the
+    /// only one it can be right about, so a save rebuilds it. The reading it
+    /// replaced is handed back because a drawing is a picture the application
+    /// keeps, and the claim on it goes with the drawing.
+    fn replace_reading(&mut self, path: &str, content: &str, cx: &mut App) -> Option<Reading> {
+        std::mem::replace(&mut self.reading, build_reading(path, content, cx))
     }
 
     /// The reading that is on screen, and the keyboard that goes with it.
@@ -1117,6 +1148,26 @@ fn scroll_grammar_row_into_view(scroll: &ScrollHandle, row: usize) {
     }
 }
 
+/// The claims this window holds on the pictures a reading shows.
+///
+/// A drawing is a picture the application decodes and keeps, so the reading
+/// that shows one is admitted into the document's asset lifecycle, and the
+/// reading it replaced gave its claim up: the document is still on screen, but
+/// the drawing it was showing is not.
+fn admit_reading_picture(
+    assets: &mut assets::DocumentAssets,
+    replaced: Option<&Reading>,
+    reading: Option<&Reading>,
+    cx: &mut App,
+) {
+    if let Some(Reading::Picture { image, .. }) = replaced {
+        assets.release(image.id(), cx);
+    }
+    if let Some(Reading::Picture { image, .. }) = reading {
+        assets.admit(image.clone(), cx);
+    }
+}
+
 /// The document's body: the reading, or the source.
 ///
 /// Both fill the pane and scroll themselves, because a document taller than the
@@ -1318,7 +1369,7 @@ impl TerminalWindow {
                         1 => app.save_document(window, cx),
                         2 => {
                             let transition = app.pending_document_transition.take();
-                            app.clear_document();
+                            app.clear_document(cx);
                             if let Some(transition) = transition {
                                 transition(app, window, cx);
                             }
@@ -1390,7 +1441,15 @@ impl TerminalWindow {
                         });
                         // The reading is a parse of the text as saved, and the
                         // saved text is the only one it can be right about.
-                        document.reading = build_reading(&path, &content, cx);
+                        // The drawing it replaced gave up its picture and the
+                        // one that replaces it takes its own.
+                        let replaced = document.replace_reading(&path, &content, cx);
+                        admit_reading_picture(
+                            &mut app.document_assets,
+                            replaced.as_ref(),
+                            document.reading.as_ref(),
+                            cx,
+                        );
                         // What was loaded is what the pane draws, so a document
                         // reopened from here is the one that was saved.
                         if let Some(preview) = app
@@ -1421,7 +1480,13 @@ impl TerminalWindow {
                         document.loaded = content.clone();
                         document.durability_uncertain = true;
                         document.dirty = *document.state.read(cx).text() != content.as_str();
-                        document.reading = build_reading(&path, &content, cx);
+                        let replaced = document.replace_reading(&path, &content, cx);
+                        admit_reading_picture(
+                            &mut app.document_assets,
+                            replaced.as_ref(),
+                            document.reading.as_ref(),
+                            cx,
+                        );
                         if let Some(preview) = app
                             .open_document
                             .as_mut()
@@ -1805,15 +1870,23 @@ impl TerminalWindow {
         false
     }
 
-    pub(crate) fn clear_document(&mut self) {
-        // Every gesture that replaces what this window shows comes through here
-        // first, so this is where a newer view selection is noted. A decision
-        // waiting on Git may only act while nothing newer has been asked for.
+    /// Give up the document this window is showing.
+    ///
+    /// Every gesture that replaces what this window shows comes through here
+    /// first, so this is where a newer view selection is noted. A decision
+    /// waiting on Git may only act while nothing newer has been asked for.
+    ///
+    /// The pictures the document was showing go with it: the application keeps
+    /// a decoded picture until it is told otherwise, so a document nobody is
+    /// showing must not keep one alive. The application's entry is only retired
+    /// when no other document is showing the same bytes.
+    pub(crate) fn clear_document(&mut self, cx: &mut App) {
         self.view_intent = self.view_intent.wrapping_add(1);
         if let Some(key) = self.document_target.take() {
             self.file_loading.remove(&key);
             self.document_errors.remove(&key);
         }
+        self.document_assets.release_all(cx);
         self.open_document = None;
         self.document_view = None;
         self.pending_document_transition = None;
@@ -1837,7 +1910,13 @@ impl TerminalWindow {
                 .map(|(id, preview)| (id.clone(), preview.path().to_owned()))
         });
         let Some((checkout_id, path)) = target else {
-            self.document_view = None;
+            // Nothing is on screen, so nothing may keep a picture alive. A
+            // document that was dropped outside the funnel that replaces the
+            // pane's content leaves its pictures behind, and this is where they
+            // are noticed.
+            if self.document_view.take().is_some() {
+                self.document_assets.release_all(cx);
+            }
             return None;
         };
         if self.navigation.active_checkout.as_ref() != Some(&checkout_id) {
@@ -1874,6 +1953,18 @@ impl TerminalWindow {
                 .document_view
                 .as_ref()
                 .is_none_or(|view| view.path != identity);
+            // The drawing the view being replaced held is given up here, and the
+            // one the new view holds is admitted: a drawing is a picture the
+            // application keeps, and this window's claim on it is what says it
+            // is still wanted.
+            let replaced = if new_view {
+                self.document_view
+                    .as_ref()
+                    .and_then(|view| view.reading.as_ref())
+                    .cloned()
+            } else {
+                None
+            };
             let language = self
                 .document_language_overrides
                 .get(&grammar_key)
@@ -1889,6 +1980,14 @@ impl TerminalWindow {
                 cx,
             );
             if new_view {
+                admit_reading_picture(
+                    &mut self.document_assets,
+                    replaced.as_ref(),
+                    self.document_view
+                        .as_ref()
+                        .and_then(|view| view.reading.as_ref()),
+                    cx,
+                );
                 self.document_grammar_open = false;
                 // The header asks whether this file has changes, and the answer is
                 // Git's rather than the maintenance tick's: the file this pane is
@@ -2344,7 +2443,7 @@ impl TerminalWindow {
                                 .on_click(cx.listener(|app, _, window, cx| {
                                     app.request_document_transition(
                                         Box::new(|app, window, cx| {
-                                            app.clear_document();
+                                            app.clear_document(cx);
                                             // A close is a close: the row that
                                             // named this view goes with it.
                                             app.view_pin = None;

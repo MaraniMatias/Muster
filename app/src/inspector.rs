@@ -1006,7 +1006,7 @@ impl TerminalWindow {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.clear_document();
+        self.clear_document(cx);
         let token = self.document_request;
         let checkout_id = checkout.id.clone();
         self.document_target = Some((checkout_id.clone(), path.clone()));
@@ -1036,7 +1036,16 @@ impl TerminalWindow {
                 }
                 app.file_loading.remove(&key);
                 match result {
-                    Ok(preview) => app.open_document = Some((checkout_id, preview)),
+                    Ok(preview) => {
+                        // A file the pane draws directly is a picture the
+                        // application decodes and keeps, so it is admitted into
+                        // the document's asset lifecycle here: the document that
+                        // is showing it is what keeps it alive.
+                        if let Some(image) = preview.image() {
+                            app.document_assets.admit(image.clone(), cx);
+                        }
+                        app.open_document = Some((checkout_id, preview));
+                    }
                     Err(error) => {
                         app.open_document = None;
                         app.document_errors.insert(key, error);
