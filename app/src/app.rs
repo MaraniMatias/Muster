@@ -1148,6 +1148,11 @@ impl TerminalWindow {
     /// width a panel is drawn at is not the width the file keeps unless it is
     /// read back: the group's own resize callback answers a drag, and nothing
     /// answers a window that was resized.
+    ///
+    /// What is read back is the width the panel is drawn at, and that is the
+    /// panel's own limit when the group's size is past it: a group rescales its
+    /// slots without regard for the limits the panels declare, so the size it
+    /// holds can be one the panel may not take.
     fn record_panel_widths(&mut self, cx: &mut Context<Self>) {
         let (sidebar, panel) = match self.navigation.panel_layout {
             PanelLayout::Side => {
@@ -1161,18 +1166,21 @@ impl TerminalWindow {
         };
         let mut changed = false;
         if let Some(width) = sidebar {
-            let width = width.as_f32();
-            // A group measures a panel before it knows how big it is, and the
-            // placeholder it starts from is below every panel's own minimum,
-            // so a width the panel may not take is not a measurement.
-            if (240. ..=500.).contains(&width) && width != self.navigation.sidebar_width {
+            // A group rescales its slots without regard for the panels' own
+            // limits, so the size it holds can be one the panel may not take:
+            // the panel is drawn at the limit, and the limit is what the file
+            // keeps. A size the panel may not take is not a size it was drawn
+            // at, and keeping the old one loses the width the window is drawn
+            // at.
+            let width = width.as_f32().clamp(240., 500.);
+            if width != self.navigation.sidebar_width {
                 self.navigation.sidebar_width = width;
                 changed = true;
             }
         }
         if let Some(width) = panel {
-            let width = width.as_f32();
-            if (200. ..=480.).contains(&width) && width != self.navigation.panel_width {
+            let width = width.as_f32().clamp(200., 480.);
+            if width != self.navigation.panel_width {
                 self.navigation.panel_width = width;
                 changed = true;
             }

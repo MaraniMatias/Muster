@@ -287,6 +287,13 @@ and nothing answers a window. The widths are read back after the frame that
 noticed the resize, because the group lays its slots out after the frame is
 built, and the file is written then.
 
+**A width the panel may not take is not a width it was drawn at.** A group
+rescales its slots without regard for the limits the panels declare, so the
+size it holds can be one the panel may not take — and the panel is then drawn
+at the limit. The file keeps the limit, because that is the width on screen:
+keeping the size the group held instead loses the width the window is drawn
+at, and the next window comes back at a width the window was never drawn at.
+
 The rules it depends on, each pinned by a test:
 
 - **The button moves the panel, and the file keeps the move.**
@@ -305,6 +312,9 @@ The rules it depends on, each pinned by a test:
   `a_dragged_divider_is_kept`, `a_dragged_panel_divider_is_kept`,
   `a_dragged_column_divider_is_kept` and
   `a_resized_window_keeps_the_panels_widths` in `app/src/app_tests.rs`.
+- **A resized window keeps the widths at their limits too.**
+  `a_resized_window_keeps_the_panels_widths_at_their_limits` in
+  `app/src/app_tests.rs`.
 
 ## The unfinished work in the sidebar
 

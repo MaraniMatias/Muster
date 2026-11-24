@@ -1277,11 +1277,26 @@ fn a_size_that_arrives_late_is_taken(cx: &mut TestAppContext) {
 /// The writer is a thread of its own, so the file is a moment behind the
 /// window.
 fn saved_width(path: &Path, wanted: f32) -> Option<f32> {
+    saved_field(path, wanted, |state| state.sidebar_width)
+}
+
+/// The Files panel's own width, once the file holds the one the window has.
+fn saved_panel_width(path: &Path, wanted: f32) -> Option<f32> {
+    saved_field(path, wanted, |state| state.panel_width)
+}
+
+/// Wait for the file to hold a width, and answer it.
+fn saved_field(
+    path: &Path,
+    wanted: f32,
+    read: impl Fn(&muster_core::navigation::NavigationState) -> f32,
+) -> Option<f32> {
     let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline {
         if let Ok(state) = muster_core::navigation::load(path) {
-            if (state.sidebar_width - wanted).abs() < 1. {
-                return Some(state.sidebar_width);
+            let width = read(&state);
+            if (width - wanted).abs() < 1. {
+                return Some(width);
             }
         }
         std::thread::sleep(POLL);
@@ -1438,6 +1453,56 @@ fn a_resized_window_keeps_the_panels_widths(cx: &mut TestAppContext) {
         "the width the window drew at was not kept: {width} against {drawn:?}"
     );
     let saved = saved_width(&path, width).expect("the resized width never reached the file");
+    assert!((saved - width).abs() < 1., "{saved} against {width}");
+    close(&fixture, cx);
+}
+
+/// A window that was resized keeps the panels' widths, at their limits too.
+///
+/// A group rescales its slots when the window is resized, and it rescales them
+/// without regard for the panels' own limits: the size it holds can be one the
+/// panel may not take. The panel is drawn at the limit, and the limit is what
+/// the file keeps. A size the panel may not take is not a size it was drawn
+/// at, and keeping the old one loses the width the window is drawn at.
+#[gpui_kit::test]
+fn a_resized_window_keeps_the_panels_widths_at_their_limits(cx: &mut TestAppContext) {
+    use crate::app::sidebar_tests::{close, open_git_with};
+    use crate::state_writer::StateWriter;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-workspace.json");
+    let fixture = open_git_with(cx, |navigation| {
+        navigation.sidebar_width = 300.;
+        navigation.panel_width = 360.;
+    });
+    fixture.view.update(cx, |app, _| {
+        app.owner
+            .install_writer(Some(StateWriter::new(path.clone()).unwrap()));
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The window is resized: the group rescales its slots, and the panel's
+        // share of the wider window is past the width the panel may take.
+        window.resize(size(px(1800.), px(800.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let inspector = window.find("inspector-panel").bounds();
+        assert!(
+            (inspector.size.width.as_f32() - 480.).abs() < 1.,
+            "the panel is drawn at the width it may take: {inspector:?}"
+        );
+    })
+    .expect("the window lays out");
+    let width = fixture
+        .view
+        .read_with(cx, |app, _| app.navigation.panel_width);
+    assert!(
+        (width - 480.).abs() < 1.,
+        "the width the window drew at was not kept: {width}"
+    );
+    let saved = saved_panel_width(&path, width).expect("the resized width never reached the file");
     assert!((saved - width).abs() < 1., "{saved} against {width}");
     close(&fixture, cx);
 }

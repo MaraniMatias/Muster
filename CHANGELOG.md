@@ -6,6 +6,16 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The panels keep the width they are drawn at.** A resizable group rescales
+  its slots when the window is resized, and it rescales them without regard for
+  the limits the panels declare: the size it holds can be one the panel may not
+  take, and the panel is then drawn at the limit. The workspace file kept the
+  size the group held instead of the limit, so a window that was resized past a
+  panel's limit came back at a width it was never drawn at. The file keeps the
+  limit now, which is the width on screen.
+
 ## 1.3.4
 
 - **A document's pictures are measured before they are drawn.** The reader
