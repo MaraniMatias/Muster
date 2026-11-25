@@ -8,6 +8,11 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **Two dependencies are updated for their security fixes.** The URL parser
+  overflowed its stack on a `blob:` URL nested past a few thousand prefixes,
+  and the cookie crate could repeat an encryption nonce across a fork. Both
+  are fixed upstream, and the release gate refuses to publish until they are.
+
 - **The window keeps the size it was left at.** A window that was resized, or
   maximized, came back at the default size and at its default state: nothing
   read the window's own bounds, so nothing kept them. The window's own file
