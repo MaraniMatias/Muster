@@ -61,6 +61,78 @@ impl DisplayRow {
             | Self::Code { file, .. } => *file,
         }
     }
+
+    /// What the row is inside its file, without the file itself.
+    fn identity(&self) -> RowIdentity {
+        match self {
+            Self::File(_) => RowIdentity::File,
+            Self::Notice(_) => RowIdentity::Notice,
+            Self::Hunk { hunk, .. } => RowIdentity::Hunk(*hunk),
+            Self::Fold { pairs, .. } => RowIdentity::Fold(pairs.clone()),
+            Self::Conflict { conflict, part, .. } => RowIdentity::Conflict(*conflict, *part),
+            Self::Code {
+                original,
+                modified,
+                changed,
+                ..
+            } => RowIdentity::Code {
+                original: *original,
+                modified: *modified,
+                changed: *changed,
+            },
+        }
+    }
+}
+
+/// What a row is inside its file.
+///
+/// A file's place in the list is not the file: a patch that reorders its
+/// files renumbers them, and a row that names its file by that place names
+/// another file once the patch is reordered. The identity of a row is what it
+/// is inside its own file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowIdentity {
+    /// The file's header row.
+    File,
+    /// The file's notice: the summary of a file without source rows.
+    Notice,
+    /// The heading of a hunk, by the hunk's place in the file.
+    Hunk(usize),
+    /// A disclosure, by the pairs it covers.
+    Fold(Range<usize>),
+    /// The heading of a conflict part, by the conflict's place in the file.
+    Conflict(usize, ConflictPart),
+    /// A code row, by the pairs it shows.
+    Code {
+        original: Option<usize>,
+        modified: Option<usize>,
+        changed: bool,
+    },
+}
+
+/// The reader's place in the list: the file the row belongs to, what the row
+/// is inside that file, the source line that row shows, and how far into the
+/// row the viewport is.
+struct ScrollAnchor {
+    /// The file the row belongs to, named by its path.
+    ///
+    /// A path is what survives a patch that reorders its files and one that
+    /// drops others: the place of a file in the list is not the file.
+    path: SharedString,
+    /// What the row is inside that file.
+    row: RowIdentity,
+    /// The source line that row shows, when it shows one.
+    position: Option<DiffLinePosition>,
+    /// How far into the row the viewport is.
+    offset: Pixels,
+}
+
+/// The header pinned at the top of the viewport.
+pub(crate) struct StickyHeader {
+    /// The file whose header is pinned.
+    pub file: usize,
+    /// The row of the next file's header, when one is on its way up.
+    pub next: Option<usize>,
 }
 
 /// Which part of a collapsed unchanged range a disclosure reveals.
@@ -215,6 +287,13 @@ pub struct DiffState {
     header_rows: Vec<usize>,
     rows: Rc<Vec<DisplayRow>>,
     change_rows: Vec<usize>,
+    /// The measured height of the header pinned at the top of the viewport.
+    ///
+    /// The pinned copy is lifted by the room the next header takes, and that
+    /// room is measured against the copy that is lifted: the next header's
+    /// own row carries the notices and the notes under it, which the copy
+    /// does not draw, and a copy lifted by that row leaves a gap.
+    sticky_header_height: Pixels,
     list: ListState,
     horizontal_scroll: ScrollHandle,
     focus: FocusHandle,
@@ -343,6 +422,7 @@ impl DiffState {
             header_rows: Vec::new(),
             rows: Rc::default(),
             change_rows: Vec::new(),
+            sticky_header_height: px(0.),
             list: ListState::new(0, ListAlignment::Top, px(0.)),
             horizontal_scroll: ScrollHandle::new(),
             focus,
@@ -510,6 +590,15 @@ impl DiffState {
         self.collapsed.contains(path)
     }
 
+    /// The source line at the top of the viewport, for integration tests.
+    ///
+    /// The line is the row's own coordinates: it names the file and the line
+    /// the reader is on, which is what a reader's place is.
+    #[cfg(feature = "test-support")]
+    pub fn scroll_top_position_for_test(&self) -> Option<DiffLinePosition> {
+        self.row_position(self.list.logical_scroll_top().item_ix)
+    }
+
     pub(crate) fn rows(&self) -> &Rc<Vec<DisplayRow>> {
         &self.rows
     }
@@ -573,14 +662,37 @@ impl DiffState {
         wider || resized
     }
 
-    /// Replaces the files and resets expansion, selection and viewport.
+    /// The measured height of the header pinned at the top of the viewport.
+    pub(crate) fn sticky_header_height(&self) -> Pixels {
+        self.sticky_header_height
+    }
+
+    /// Records the measured height of the header pinned at the top of the
+    /// viewport. Returns whether it changed, so the frame must be laid out
+    /// again.
+    pub(crate) fn record_sticky_header_height(&mut self, height: Pixels) -> bool {
+        if self.sticky_header_height == height {
+            return false;
+        }
+        self.sticky_header_height = height;
+        true
+    }
+
+    /// Replaces the files and resets expansion and selection.
     /// Collapsed files stay collapsed when their path is still present.
+    ///
+    /// The viewport is kept: the patch is replaced under the reader, and the
+    /// row that was at the top of it stays at the top of it.
     pub fn set_files(&mut self, files: impl IntoIterator<Item = DiffFile>, cx: &mut Context<Self>) {
         if let Some(window) = self.window
             && self.selection_is_local(cx)
         {
             TextSelection::clear_for_window(window, cx);
         }
+        // The reader's place is named before the files are replaced: the row
+        // belongs to the patch that is being replaced, and it is the one to
+        // come back to.
+        let anchor = self.scroll_anchor();
         self.files = files.into_iter().collect();
         self.file_ixs = file_ixs(&self.files);
         self.collapsed
@@ -597,10 +709,44 @@ impl DiffState {
         self.selection_cursor = None;
         self.selecting = false;
         self.geometry.borrow_mut().clear();
-        self.rebuild(true);
+        // The rows are spliced rather than reset, so the rows that did not
+        // change keep their measured heights and the row at the top of the
+        // viewport stays there.
+        self.rebuild(false);
+        self.restore_anchor(anchor.as_ref());
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
         self.ensure_presentation(cx);
         cx.notify();
+    }
+
+    /// The header pinned at the top of the viewport.
+    ///
+    /// The first answer is the file whose header is pinned: the last header at
+    /// or above the top of the viewport. The second is the row of the next
+    /// file's header, when one is on its way up: the pinned header steps aside
+    /// for it, so the next header is never masked by it and its own click is
+    /// never taken by it.
+    ///
+    /// There is no pinned header when the header in the list is already the
+    /// row at the top of the viewport: it is where it belongs.
+    pub(crate) fn sticky_header(&self) -> Option<StickyHeader> {
+        if self.files.is_empty() {
+            return None;
+        }
+        let top = self.list.logical_scroll_top();
+        // The header rows are in the order of the files, so the last one at
+        // or above the top of the viewport is the header of the file the top
+        // row belongs to, and the one after it is the next file's header.
+        let next = self.header_rows.partition_point(|row| *row <= top.item_ix);
+        let file = next.checked_sub(1)?;
+        let header = *self.header_rows.get(file)?;
+        if header == top.item_ix && top.offset_in_item == px(0.) {
+            return None;
+        }
+        Some(StickyHeader {
+            file,
+            next: self.header_rows.get(next).copied(),
+        })
     }
 
     /// Changes the display mode while preserving source-line selection and a
@@ -792,7 +938,7 @@ impl DiffState {
             self.rebuild_at_anchor();
         }
         if self.expand_line(&position).is_some() {
-            self.reveal_line(&position);
+            self.reveal_line(&position, px(0.));
             cx.notify();
         }
     }
@@ -1251,22 +1397,88 @@ impl DiffState {
         rows.get(self.line_index(position)?).copied().flatten()
     }
 
-    fn reveal_line(&self, position: &DiffLinePosition) {
+    fn reveal_line(&self, position: &DiffLinePosition, offset: Pixels) {
         if let Some(item_ix) = self.source_row(position) {
             self.list.scroll_to(ListOffset {
                 item_ix,
-                offset_in_item: px(0.),
+                offset_in_item: offset,
             });
         }
     }
 
+    /// The reader's place: the file the row belongs to, what the row is
+    /// inside that file, the source line it shows, and how far into the row
+    /// the viewport is.
+    ///
+    /// The row is the reader's place and the source line is its fallback: a
+    /// row that survives the rebuild is the same row, while a source line
+    /// survives a rebuild that changed the rows around it.
+    fn scroll_anchor(&self) -> Option<ScrollAnchor> {
+        let top = self.list.logical_scroll_top();
+        let row = self.rows.get(top.item_ix)?;
+        let path = self.files.get(row.file())?.path().clone();
+        Some(ScrollAnchor {
+            path,
+            row: row.identity(),
+            position: self.row_position(top.item_ix),
+            offset: top.offset_in_item,
+        })
+    }
+
+    /// Puts the reader back where they were.
+    ///
+    /// The row that was at the top of the viewport is the row they were on,
+    /// and the offset into it is where they were reading: a row that did not
+    /// change keeps both, so the patch that arrives under the reader does not
+    /// move them. A row that did change is gone, and the source line it
+    /// showed is the reader's place instead.
+    fn restore_anchor(&self, anchor: Option<&ScrollAnchor>) {
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let Some(item_ix) = self.anchor_row(anchor) else {
+            return;
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: anchor.offset,
+        });
+    }
+
+    /// The row the reader was on, among the rows that are there now.
+    ///
+    /// The file is found by its path, so a patch that reorders its files or
+    /// drops one of them does not point the reader at another file. A row
+    /// that shows source lines is found by the source line it shows: a code
+    /// row's own place in the file is a pair index, which a newer patch
+    /// renumbers, while the source line is the row's own coordinates. The
+    /// rest is found by its own place inside the file.
+    fn anchor_row(&self, anchor: &ScrollAnchor) -> Option<usize> {
+        let file = self.file_ix(&anchor.path)?;
+        if matches!(anchor.row, RowIdentity::Code { .. } | RowIdentity::Fold(_))
+            && let Some(item_ix) = anchor
+                .position
+                .as_ref()
+                .and_then(|position| self.source_row(position))
+        {
+            return Some(item_ix);
+        }
+        self.rows
+            .iter()
+            .position(|row| row.file() == file && row.identity() == anchor.row)
+            .or_else(|| {
+                anchor
+                    .position
+                    .as_ref()
+                    .and_then(|position| self.source_row(position))
+            })
+    }
+
     /// Rebuilds rows and restores the source line at the top of the viewport.
     fn rebuild_at_anchor(&mut self) {
-        let anchor = self.row_position(self.list.logical_scroll_top().item_ix);
+        let anchor = self.scroll_anchor();
         self.rebuild(false);
-        if let Some(anchor) = anchor {
-            self.reveal_line(&anchor);
-        }
+        self.restore_anchor(anchor.as_ref());
     }
 
     /// Projects rows. Without `reset`, only the changed middle is spliced so

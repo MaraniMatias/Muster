@@ -716,14 +716,11 @@ impl TerminalWindow {
                                 .find(|(path, _)| path == range.path().as_str())
                     });
                     state.set_files(files, cx);
+                    // The selection is the reader's own: the patch that
+                    // arrives under them does not move them, and the range a
+                    // note is written on stays marked where it is.
                     if let Some(range) = selection {
-                        let position = gpui_kit::component::diff::DiffLinePosition::new(
-                            range.path().clone(),
-                            range.side(),
-                            range.start(),
-                        );
                         state.set_selected_lines(Some(range), cx);
-                        state.scroll_to_line(position, cx);
                     }
                 });
                 view.revisions = revisions;
@@ -1027,8 +1024,98 @@ impl TerminalWindow {
                     .collect::<std::collections::HashMap<_, _>>()
             })
             .unwrap_or_default();
+        // The header row of a file: the letter, the path and the counts, and
+        // the row itself is the file's collapse control.
+        //
+        // The copy that is pinned at the top of the pane is a second element,
+        // so it is named apart from the row in the list: two elements with one
+        // id are one ambiguous target.
+        //
+        // The counts are shared by the two renderers rather than copied into
+        // them, so a frame that draws the diff does not copy the change set.
+        let stats = std::rc::Rc::new(stats);
+        let header_state = state.clone();
+        let header = move |file: &DiffFile, pinned: bool| {
+            let (status, added, removed) =
+                stats.get(file.path().as_str()).cloned().unwrap_or_default();
+            // Legacy's column order: the letter that says what Git did,
+            // then the path, then the counts.
+            let marker = crate::inspector::change_marker(&status);
+            let path = file.path().to_string();
+            // The pinned copy is named in a namespace of its own rather than
+            // with a suffix: a suffix is a name a file can have, so the copy
+            // of `a.rs` and the row of `a.rs-pinned` would be one id.
+            let copy = if pinned { "pinned-" } else { "" };
+            let toggle = ToggleDiffFile {
+                state: header_state.clone(),
+                weak: header_weak.clone(),
+                checkout: header_id.clone(),
+                path: path.clone(),
+            };
+            div()
+                .id(format!("diff-{copy}file-{path}"))
+                .test_support()
+                // The row is the file's collapse control, the way the
+                // chevron beside it is: one gesture and one meaning, on
+                // every pixel of the row rather than on sixteen of them.
+                .w_full()
+                .flex_1()
+                .flex()
+                .items_center()
+                .on_click(move |_, _, cx| toggle.apply(cx))
+                .min_w_0()
+                .gap(px(6.))
+                .when(!marker.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .id(format!("diff-{copy}status-{}", file.path()))
+                            .test_support()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(match marker.as_str() {
+                                "A" => roles.status.success,
+                                "D" => roles.status.danger_text,
+                                _ => roles.text_muted,
+                            })
+                            .child(marker),
+                    )
+                })
+                .child(
+                    div()
+                        .id(format!("diff-{copy}path-{}", file.path()))
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .child(file.path().clone()),
+                )
+                .when_some(added.filter(|n| *n != 0), |row, n| {
+                    row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(roles.status.success)
+                            .child(format!("+{n}")),
+                    )
+                })
+                .when_some(removed.filter(|n| *n != 0), |row, n| {
+                    row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(roles.status.danger_text)
+                            .child(format!("−{n}")),
+                    )
+                })
+        };
+        let pinned_header = header.clone();
         let viewer = Diff::new(&state)
             .header_visible(selected.is_none())
+            // The header of the file being read stays at the top of the pane
+            // while its rows scroll under it, so a long file keeps saying
+            // which file it is.
+            .sticky_header(true)
             // The pane is as wide as the pane, and no wider: a long line wraps
             // rather than dragging a sideways scroller under the code, so the
             // header row stays where it is — the letter, the path and the counts
@@ -1036,76 +1123,8 @@ impl TerminalWindow {
             .soft_wrap(true)
             .font_family(UI_FONT_FAMILY)
             .text_size(px(DIFF_CHROME_PX))
-            .render_header(move |file, _, _| {
-                let (status, added, removed) =
-                    stats.get(file.path().as_str()).cloned().unwrap_or_default();
-                // Legacy's column order: the letter that says what Git did,
-                // then the path, then the counts.
-                let marker = crate::inspector::change_marker(&status);
-                let path = file.path().to_string();
-                let toggle = ToggleDiffFile {
-                    state: state.clone(),
-                    weak: header_weak.clone(),
-                    checkout: header_id.clone(),
-                    path: path.clone(),
-                };
-                div()
-                    .id(format!("diff-file-{path}"))
-                    .test_support()
-                    // The row is the file's collapse control, the way the
-                    // chevron beside it is: one gesture and one meaning, on
-                    // every pixel of the row rather than on sixteen of them.
-                    .w_full()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .on_click(move |_, _, cx| toggle.apply(cx))
-                    .min_w_0()
-                    .gap(px(6.))
-                    .when(!marker.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .id(format!("diff-status-{}", file.path()))
-                                .test_support()
-                                .flex_shrink_0()
-                                .text_size(px(11.))
-                                .text_color(match marker.as_str() {
-                                    "A" => roles.status.success,
-                                    "D" => roles.status.danger_text,
-                                    _ => roles.text_muted,
-                                })
-                                .child(marker),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(format!("diff-path-{}", file.path()))
-                            .test_support()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.))
-                            .child(file.path().clone()),
-                    )
-                    .when_some(added.filter(|n| *n != 0), |row, n| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(11.))
-                                .text_color(roles.status.success)
-                                .child(format!("+{n}")),
-                        )
-                    })
-                    .when_some(removed.filter(|n| *n != 0), |row, n| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(11.))
-                                .text_color(roles.status.danger_text)
-                                .child(format!("−{n}")),
-                        )
-                    })
-            })
+            .render_header(move |file, _window, _cx| header(file, false))
+            .render_pinned_header(move |file, _window, _cx| pinned_header(file, true))
             .annotations(annotations)
             .on_add_annotation(move |range, window, cx| {
                 let _ = add_note_weak.update(cx, |app, cx| {

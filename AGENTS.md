@@ -670,6 +670,62 @@ The rules it depends on, each pinned by a test:
   ancestor with the default branch has no merge base to count from, so the
   count is unknown there rather than a number.
 
+## The diff's own header, and the reader's place
+
+A patch can be longer than the pane, and the file's header row is what says
+which file the lines under it belong to. **The header stays at the top of the
+pane** while the rows of its file scroll under it: it is pinned over them, and
+it is the same row — the same letter, the same path and the same counts. The
+pinned copy is a second element, so it is named apart from the row in the
+list: two elements with one id are one ambiguous target. **A namespace, not a
+suffix**: a suffix is a name a file can have, so the copy of `a.rs` and the
+row of `a.rs-pinned` would be one id.
+
+The pinned copy is drawn over the rows, and the pointer over it is over the
+copy: the wheel there scrolls the patch, and the row is the file's collapse
+control, as the row in the list is. The next file's header is on its way up to
+the top of the pane, and the pinned header is **lifted by the room the next one
+takes**: the next header is never masked by it, and the pinned header never
+takes the next header's click. The room is the copy's own measured height and
+not the next header's row: that row carries the notices and the notes under
+it, which the copy does not draw, and a copy lifted by that row leaves a gap.
+
+Opening a file does not move what the reader was reading. The patch of a file
+is read when the file is opened, and it lands in the list under the reader: the
+rows are spliced, and the row that was at the top of the viewport — with the
+reader's place inside it — is put back, so the diff does not go back to its
+first row and does not jump a row's height either. A patch that arrives under
+the reader does not scroll to the reviewer's selection either: the selection is
+the reader's own, and it stays where it is.
+
+**The reader's place is a file's own name and the source line it shows**, and
+not the place of either in the list: the place of a file in the list is not the
+file, and a patch that reorders its files or drops one of them renumbers the
+files that are left. A row that shows source lines is named by the source line
+it shows, and that line is asked for before the row's own place in the file: a
+code row's place is a pair index, which a newer patch of the same file
+renumbers when it supplies a different window of it.
+
+The rules it depends on, each pinned by a test:
+
+- **The header of the file being read stays at the top of the pane.**
+  `the_header_of_the_file_being_read_stays_at_the_top` in `app/src/app_tests.rs`
+  pins it.
+- **Opening a file does not move the reader.**
+  `opening_a_file_does_not_move_the_reader` in `app/src/app_tests.rs` pins it.
+- **The pinned header steps aside for the next one.**
+  `the_pinned_header_steps_aside_for_the_next_header` in `app/src/app_tests.rs`
+  pins it.
+- **The pinned header scrolls the patch and folds its file.**
+  `the_pinned_header_scrolls_the_patch_and_folds_its_file` in
+  `app/src/app_tests.rs` pins it.
+- **A patch that reorders its files keeps the reader's place.**
+  `a_patch_that_reorders_its_files_keeps_the_readers_place` in
+  `app/src/app_tests.rs` pins it.
+- **A newer patch keeps the reader on the same source line.**
+  `a_newer_patch_keeps_the_reader_on_the_same_source_line` in
+  `app/src/app_tests.rs` pins it.
+
 ## The review composer
 
 `app/src/diff.rs` draws the note being written as a row of the diff and

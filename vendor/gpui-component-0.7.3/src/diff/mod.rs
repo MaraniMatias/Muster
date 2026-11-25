@@ -171,6 +171,7 @@ impl DiffAnnotation {
     }
 }
 
+/// Renders the content of a file's header.
 type FileRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> AnyElement>;
 type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> AnyElement>;
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
@@ -180,6 +181,8 @@ type HoverHandler = Rc<dyn Fn(Option<&DiffLinePosition>, &mut Window, &mut App)>
 #[derive(Default)]
 struct HeaderSlots {
     content: Option<FileRenderer>,
+    /// The content of the header pinned at the top of the viewport.
+    pinned: Option<FileRenderer>,
     prefix: Option<FileRenderer>,
     title_suffix: Option<FileRenderer>,
     suffix: Option<FileRenderer>,
@@ -206,6 +209,7 @@ pub struct Diff {
     line_number: bool,
     syntax_highlight: bool,
     header_visible: bool,
+    sticky_header: bool,
     hover_highlight: DiffHoverHighlight,
     hunk_separator: DiffHunkSeparator,
     change_indicator: DiffChangeIndicator,
@@ -235,6 +239,7 @@ impl Diff {
             line_number: true,
             syntax_highlight: true,
             header_visible: true,
+            sticky_header: false,
             hover_highlight: DiffHoverHighlight::default(),
             hunk_separator: DiffHunkSeparator::default(),
             change_indicator: DiffChangeIndicator::default(),
@@ -261,6 +266,13 @@ impl Diff {
     /// Shows a header above each file. Default is true.
     pub fn header_visible(mut self, visible: bool) -> Self {
         self.header_visible = visible;
+        self
+    }
+    /// Pins the header of the file at the top of the viewport while the patch
+    /// scrolls under it, so a long file keeps saying which file it is.
+    /// Default is false.
+    pub fn sticky_header(mut self, value: bool) -> Self {
+        self.sticky_header = value;
         self
     }
     /// Emphasizes the line, its number, or both under the pointer. Default is none.
@@ -332,6 +344,22 @@ impl Diff {
         self.header.content = Some(file_renderer(render));
         self
     }
+    /// Renders the content of the header pinned at the top of the viewport.
+    ///
+    /// The pinned copy is a second element with the same content as the row in
+    /// the list, so an application names it apart: two elements with one id
+    /// are one ambiguous target. It is a slot of its own for that reason, and
+    /// the pinned copy falls back to [`Self::render_header`] when it is not
+    /// set.
+    pub fn render_pinned_header<F, E>(mut self, render: F) -> Self
+    where
+        F: Fn(&DiffFile, &mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        self.header.pinned = Some(file_renderer(render));
+        self
+    }
+
     /// Inserts content before the path in the default header.
     pub fn render_header_prefix<F, E>(mut self, render: F) -> Self
     where
@@ -536,6 +564,74 @@ fn render_diff(
     let scrollbar = state.list().clone();
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
+    // The file whose header is pinned over the rows that scroll under it.
+    // A patch without headers has nothing to pin.
+    let sticky = if props.sticky_header && props.header_visible {
+        state.sticky_header()
+    } else {
+        None
+    };
+    let sticky_header = sticky.map(|sticky| {
+        let path = state.files()[sticky.file].path().clone();
+        let collapsed = state.is_file_collapsed(&path);
+        // The next file's header is on its way up: the pinned header is
+        // lifted by the room it takes, so the next header is never masked by
+        // it and the pinned header never takes the next header's click.
+        //
+        // The room is the copy's own height and not the next header's row:
+        // that row carries the notices and the notes under it, which the
+        // copy does not draw, and a copy lifted by that row is lifted past
+        // the next header and leaves a gap under it.
+        let height = state.sticky_header_height();
+        let lift = sticky
+            .next
+            .and_then(|row| scrollbar.bounds_for_item(row))
+            .map(|bounds| {
+                let offset = bounds.top() - scrollbar.viewport_bounds().top();
+                (height - offset).max(px(0.))
+            })
+            .unwrap_or(px(0.));
+        div()
+            // The pinned copy is a second element with the same content as
+            // the row in the list, so it lives in a scope of its own: two
+            // elements with one id are one ambiguous target, and a scope says
+            // which copy a query means.
+            .id(format!("diff-sticky-header-{path}"))
+            .test_support()
+            .absolute()
+            .top(-lift)
+            .left_0()
+            .w_full()
+            .bg(cx.theme().background)
+            .child(render_file_header_row(
+                sticky.file,
+                &code,
+                true,
+                collapsed,
+                window,
+                cx,
+            ))
+            // The copy's own height, measured: the lift above is measured
+            // against the copy that is lifted, and its height is the one
+            // thing the list cannot say.
+            .child(
+                gpui::canvas(
+                    {
+                        let state = code.state.clone();
+                        move |bounds, _, cx| {
+                            state.update(cx, |state, cx| {
+                                if state.record_sticky_header_height(bounds.size.height) {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+    });
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
         files => t!("Diff.ViewerFiles", count = files.len()).to_string(),
@@ -543,6 +639,9 @@ fn render_diff(
     let body = div()
         .id("diff-body")
         .relative()
+        // The pinned header is lifted out of the pane as the next header
+        // arrives, and the pane is what it is lifted out of.
+        .overflow_hidden()
         .min_h_0()
         .min_w_0()
         .flex_1()
@@ -572,6 +671,10 @@ fn render_diff(
             state.selection().clone(),
             state.geometry().clone(),
         ))
+        // The header of the file at the top of the viewport, pinned over the
+        // rows that scroll under it. It is drawn before the scrollbar, so the
+        // scrollbar stays on top of it.
+        .when_some(sticky_header, |this, header| this.child(header))
         .when(has_rows && !soft_wrap, |this| {
             this.child(
                 ScrollableMask::new(Axis::Horizontal, &horizontal).id("diff-horizontal-wheel"),
@@ -1101,6 +1204,7 @@ fn conflict_tint(part: Option<ConflictPart>, cx: &App) -> Hsla {
     }
 }
 
+/// The header of a file, with the annotations that belong under it.
 fn render_file_header(
     file: usize,
     code: &CodePresentation,
@@ -1112,11 +1216,39 @@ fn render_file_header(
             .children(file_annotations(file, code, window, cx))
             .into_any_element();
     }
+    let collapsed = code
+        .state
+        .read(cx)
+        .is_file_collapsed(code.files[file].path());
+    render_file_header_row(file, code, false, collapsed, window, cx)
+        .children(file_annotations(file, code, window, cx))
+        .into_any_element()
+}
+
+/// The header row of a file on its own.
+///
+/// The copy pinned at the top of the viewport carries the row and not what the
+/// file holds: the notices and the notes under it belong to the row in the
+/// list, and drawing them twice would say them twice.
+fn render_file_header_row(
+    file: usize,
+    code: &CodePresentation,
+    pinned: bool,
+    collapsed: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Stateful<gpui::Div> {
     let document = &code.files[file];
     let foreground = cx.theme().muted_foreground;
     let border = cx.theme().border;
-    let collapsed = code.state.read(cx).is_file_collapsed(document.path());
-    let content = if let Some(render) = &code.header.content {
+    // The pinned copy is drawn by its own slot when the application gave one:
+    // it is a second element, and the application names it apart.
+    let content_renderer = if pinned {
+        code.header.pinned.as_ref().or(code.header.content.as_ref())
+    } else {
+        code.header.content.as_ref()
+    };
+    let content = if let Some(render) = content_renderer {
         render(document, window, cx)
     } else {
         let name: SharedString = match (document.original_path(), document.modified_path()) {
@@ -1210,8 +1342,6 @@ fn render_file_header(
                 )
                 .child(div().flex_1().min_w_0().child(content)),
         )
-        .children(file_annotations(file, code, window, cx))
-        .into_any_element()
 }
 
 fn file_annotations(

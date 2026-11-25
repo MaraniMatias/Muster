@@ -10,7 +10,7 @@ use gpui_kit::{
 };
 
 use super::*;
-use crate::app::sidebar_tests::{close, open_git};
+use crate::app::sidebar_tests::{close, open_git, GitFixture};
 use crate::terminal::Palette;
 
 /// How long a test waits for a child before deciding it is not coming.
@@ -986,6 +986,459 @@ fn a_diff_header_names_the_file_the_way_legacy_orders_its_columns(cx: &mut TestA
         );
     })
     .unwrap();
+    close(&fixture, cx);
+}
+
+/// A patch that arrives with its files in another order keeps the reader's
+/// place.
+///
+/// The reader's place is a file's own name and the source line it shows: the
+/// place of a file in the list is not the file, and a patch that reorders its
+/// files renumbers them.
+#[gpui_kit::test]
+fn a_patch_that_reorders_its_files_keeps_the_readers_place(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffSide, DiffState};
+
+    let first =
+        DiffFile::parse("--- a/first.txt\n+++ b/first.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+ONE\n")
+            .unwrap()
+            .remove(0);
+    let second = DiffFile::parse(
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1,2 +1,2 @@\n three\n-three\n+THREE\n",
+    )
+    .unwrap()
+    .remove(0);
+    let state = cx.new(|cx| DiffState::new([first.clone(), second.clone()], cx));
+    state.update(cx, |state, cx| {
+        // The reader is on the second file's first line.
+        state.scroll_to_line(
+            DiffLinePosition::new("second.txt", DiffSide::Modified, 1),
+            cx,
+        );
+        assert_eq!(
+            state.scroll_top_position_for_test(),
+            Some(DiffLinePosition::new("second.txt", DiffSide::Modified, 1)),
+            "the reader is on the second file's first line"
+        );
+        // The patch arrives with its files in the other order.
+        state.set_files([second.clone(), first], cx);
+        // The reader is still on the second file's first line, which is now
+        // the first file of the patch.
+        assert_eq!(
+            state.scroll_top_position_for_test(),
+            Some(DiffLinePosition::new("second.txt", DiffSide::Modified, 1)),
+            "the reader is still on the second file's first line"
+        );
+        // The other file is dropped, and the reader is still on the line they
+        // were reading.
+        state.set_files([second], cx);
+        assert_eq!(
+            state.scroll_top_position_for_test(),
+            Some(DiffLinePosition::new("second.txt", DiffSide::Modified, 1)),
+            "the reader is still on the second file's first line"
+        );
+    });
+}
+
+/// A newer patch of the same file keeps the reader on the same source line.
+///
+/// The reader's place is the source line the row shows and not the row's place
+/// in the file: a patch that supplies a different window of the same file
+/// renumbers the rows of that file and leaves the source lines where they
+/// were.
+#[gpui_kit::test]
+fn a_newer_patch_keeps_the_reader_on_the_same_source_line(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffFile, DiffLinePosition, DiffSide, DiffState};
+
+    let narrow = DiffFile::parse(
+        "--- a/review.txt\n+++ b/review.txt\n@@ -10,3 +10,3 @@\n keep\n-old\n+new\n keep\n",
+    )
+    .unwrap()
+    .remove(0);
+    let wide = DiffFile::parse(
+        "--- a/review.txt\n+++ b/review.txt\n@@ -9,5 +9,5 @@\n keep\n keep\n-old\n+new\n keep\n keep\n",
+    )
+    .unwrap()
+    .remove(0);
+    let state = cx.new(|cx| DiffState::new([narrow], cx));
+    state.update(cx, |state, cx| {
+        // The reader is on the changed line, which is the eleventh.
+        state.scroll_to_line(
+            DiffLinePosition::new("review.txt", DiffSide::Modified, 11),
+            cx,
+        );
+        assert_eq!(
+            state.scroll_top_position_for_test(),
+            Some(DiffLinePosition::new("review.txt", DiffSide::Modified, 11)),
+            "the reader is on the changed line"
+        );
+        // The newer patch supplies a wider window of the same file.
+        state.set_files([wide], cx);
+        // The reader is still on the changed line, which is the eleventh
+        // there too.
+        assert_eq!(
+            state.scroll_top_position_for_test(),
+            Some(DiffLinePosition::new("review.txt", DiffSide::Modified, 11)),
+            "the reader is still on the changed line"
+        );
+    });
+}
+
+/// A repository with changed files, each with a patch longer than a pane.
+///
+/// The patch of a file is read when the file is opened, so a test about what
+/// the diff does with one needs a patch that is longer than the window: a
+/// patch that fits is a patch nobody scrolls.
+fn changed_files(cx: &mut TestAppContext, names: &[&str]) -> GitFixture {
+    use std::process::Command;
+
+    let fixture = open_git(cx);
+    let lines = |changed: bool| {
+        (0..60)
+            .map(|i| {
+                if changed {
+                    format!("fn f{i}() {{ let x = 1; }}\n")
+                } else {
+                    format!("fn f{i}() {{}}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    for name in names {
+        std::fs::write(fixture.root.join(name), lines(false)).unwrap();
+    }
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(&fixture.root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.email=muster@example.test",
+        "-c",
+        "user.name=Muster",
+        "commit",
+        "--quiet",
+        "-m",
+        "add a file",
+    ]);
+    for name in names {
+        std::fs::write(fixture.root.join(name), lines(true)).unwrap();
+    }
+    fixture
+}
+
+/// Where a row of the diff is drawn, if it is drawn at all.
+fn diff_row(
+    cx: &mut TestAppContext,
+    fixture: &GitFixture,
+    id: &'static str,
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    cx.update_window(fixture.handle, move |_, window, _| {
+        window.try_find(id).map(|row| row.bounds())
+    })
+    .unwrap()
+}
+
+/// Scroll the diff by a wheel over it, which is what a person does.
+fn scroll_diff(cx: &mut TestAppContext, fixture: &GitFixture, pixels: f32) {
+    scroll_diff_at(cx, fixture, pixels, px(400.))
+}
+
+/// Scroll the diff by a wheel over a point of the pane.
+fn scroll_diff_at(cx: &mut TestAppContext, fixture: &GitFixture, pixels: f32, y: gpui_kit::Pixels) {
+    use gpui_kit::{point, InputEvent};
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.dispatch_event(
+            gpui_kit::ScrollWheelEvent {
+                position: point(px(500.), y),
+                delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(pixels))),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+/// Scroll the diff until the row named is on screen, and say where it is.
+///
+/// The row is looked for away from the edges of the window, so a click on it
+/// lands on it.
+fn scroll_diff_to(
+    cx: &mut TestAppContext,
+    fixture: &GitFixture,
+    id: &'static str,
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    for _ in 0..120 {
+        let bounds = diff_row(cx, fixture, id);
+        if let Some(bounds) = bounds {
+            let viewport = cx
+                .update_window(fixture.handle, |_, window, _| window.viewport_size())
+                .unwrap();
+            let center = bounds.center().y;
+            if center > viewport.height / 4. && center < viewport.height * 3. / 4. {
+                return Some(bounds);
+            }
+        }
+        scroll_diff(cx, fixture, -60.);
+    }
+    None
+}
+
+/// The header of the file being read stays at the top of the pane.
+///
+/// A patch can be longer than the pane, and the header is what says which file
+/// the lines under it belong to. It is pinned over the rows that scroll under
+/// it, and the pinned row is the same row: the same letter, the same path and
+/// the same counts.
+#[gpui_kit::test]
+fn the_header_of_the_file_being_read_stays_at_the_top(cx: &mut TestAppContext) {
+    let fixture = changed_files(cx, &["a.rs", "b.rs"]);
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // The file is opened, and its patch is read.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-a.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+    let header = diff_row(cx, &fixture, "diff-file-a.rs")
+        .expect("the file's header is drawn where the file is opened");
+
+    // The reader scrolls down the file, and the header stays at the top of the
+    // pane while the rows of the file go under it.
+    scroll_diff(cx, &fixture, -400.);
+    let pinned = diff_row(cx, &fixture, "diff-pinned-file-a.rs")
+        .expect("the header of the file being read is pinned at the top");
+    assert_eq!(
+        pinned.origin.y, header.origin.y,
+        "the pinned header is where the header was: {pinned:?} against {header:?}"
+    );
+    assert!(
+        diff_row(cx, &fixture, "diff-file-a.rs").is_none(),
+        "the header in the list has scrolled away under the pinned one"
+    );
+    close(&fixture, cx);
+}
+
+/// The pinned header steps aside for the next one.
+///
+/// The next file's header is on its way up to the top of the pane. The pinned
+/// header is lifted by the room the next one takes, so the next header is
+/// never masked by it, and the pinned header never takes the next header's
+/// click.
+#[gpui_kit::test]
+fn the_pinned_header_steps_aside_for_the_next_header(cx: &mut TestAppContext) {
+    let fixture = changed_files(cx, &["a.rs", "b.rs", "c.rs"]);
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // The second file is opened first, while every header is on screen: there
+    // are then rows under its header, and it can reach the top of the pane.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-b.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // The first file is opened, and its patch is read.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-a.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+    let top = diff_row(cx, &fixture, "diff-file-a.rs")
+        .expect("the header is at the top of the pane")
+        .origin
+        .y;
+
+    // The reader scrolls to the next header, and the pinned header gives it
+    // the room it takes.
+    for _ in 0..2000 {
+        scroll_diff(cx, &fixture, -5.);
+        let Some(next) = diff_row(cx, &fixture, "diff-file-b.rs") else {
+            continue;
+        };
+        if let Some(pinned) = diff_row(cx, &fixture, "diff-pinned-file-a.rs") {
+            assert!(
+                pinned.bottom() <= next.origin.y,
+                "the pinned header does not cover the next one: {pinned:?} against {next:?}"
+            );
+        }
+        if next.origin.y <= top {
+            break;
+        }
+    }
+    assert!(
+        diff_row(cx, &fixture, "diff-pinned-file-b.rs").is_some(),
+        "the next header took the top of the pane"
+    );
+    close(&fixture, cx);
+}
+
+/// The pinned header is over the rows that scroll under it.
+///
+/// The copy at the top of the pane is drawn over the rows, so the pointer over
+/// it is over the copy: the wheel there scrolls the patch, and the row is the
+/// file's collapse control.
+#[gpui_kit::test]
+fn the_pinned_header_scrolls_the_patch_and_folds_its_file(cx: &mut TestAppContext) {
+    let fixture = changed_files(cx, &["a.rs", "b.rs"]);
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-a.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+
+    // The reader scrolls down the file, and the header is pinned over the rows
+    // that go under it.
+    scroll_diff(cx, &fixture, -400.);
+    let pinned = diff_row(cx, &fixture, "diff-pinned-file-a.rs")
+        .expect("the header of the file being read is pinned at the top");
+
+    // The wheel over the pinned header scrolls the patch: the copy is drawn
+    // over the rows, but it does not take the wheel.
+    scroll_diff_at(cx, &fixture, 400., pinned.center().y);
+    assert!(
+        diff_row(cx, &fixture, "diff-file-a.rs").is_some(),
+        "the wheel over the pinned header scrolls the patch"
+    );
+
+    // The pinned header is the file's collapse control, like the row in the
+    // list is.
+    scroll_diff(cx, &fixture, -400.);
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("diff-pinned-file-a.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let folded = fixture.view.read_with(cx, |app, _| {
+        !app.expanded_diffs
+            .contains(&(fixture.checkout.clone(), "a.rs".to_owned()))
+    });
+    assert!(folded, "the pinned header folds the file it names");
+    close(&fixture, cx);
+}
+
+/// Opening a file's diff does not move what the reader was reading.
+///
+/// The patch of the file that is opened lands in the list under the reader, and
+/// the list used to be reset by it: the diff went back to its first row, so
+/// the file that was being read was gone and the reader had to find it again.
+#[gpui_kit::test]
+fn opening_a_file_does_not_move_the_reader(cx: &mut TestAppContext) {
+    let fixture = changed_files(cx, &["a.rs", "b.rs", "c.rs"]);
+    cx.update_window(fixture.handle, |_, _, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.navigation.active_checkout = Some(fixture.checkout.clone());
+            app.open_changes(&fixture.checkout, None, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // The first and the last file are opened, and their patches are read. The
+    // last one is opened first: its rows land below the header the reader is
+    // about to open, and the reader's place is between the two.
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        window.click("diff-file-c.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        window.click("diff-file-a.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+
+    // The reader is on the next file's header, which is where they open it.
+    let header = scroll_diff_to(cx, &fixture, "diff-file-b.rs")
+        .expect("the next file's header is on screen");
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("diff-file-b.rs", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.handle, |_, window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+    let after = diff_row(cx, &fixture, "diff-file-b.rs")
+        .expect("the header the reader was on is still on screen");
+    assert_eq!(
+        after.origin.y, header.origin.y,
+        "the header the reader was on is still where it was: {after:?} against {header:?}"
+    );
+    assert!(
+        diff_row(cx, &fixture, "diff-file-a.rs").is_none(),
+        "the diff did not go back to the top of the list"
+    );
     close(&fixture, cx);
 }
 
