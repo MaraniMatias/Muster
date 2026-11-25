@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.3.5
 
 - **Two dependencies are updated for their security fixes.** The URL parser
   overflowed its stack on a `blob:` URL nested past a few thousand prefixes,

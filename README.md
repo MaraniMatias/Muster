@@ -8,12 +8,12 @@ You can send review notes to an existing OpenCode session, or export them as Mar
 
 ## Install
 
-The current release is **v1.3.4**:
+The current release is **v1.3.5**:
 
-- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.3.4/Muster_1.3.4_macOS_arm64.dmg)
-- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.3.4/Muster_1.3.4_macOS_x86_64.dmg)
-- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.3.4/muster_1.3.4_amd64.deb)
-- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.3.4/muster_1.3.4_arm64.deb)
+- [macOS, Apple Silicon](https://github.com/MaraniMatias/Muster/releases/download/v1.3.5/Muster_1.3.5_macOS_arm64.dmg)
+- [macOS, Intel](https://github.com/MaraniMatias/Muster/releases/download/v1.3.5/Muster_1.3.5_macOS_x86_64.dmg)
+- [Ubuntu, x86_64](https://github.com/MaraniMatias/Muster/releases/download/v1.3.5/muster_1.3.5_amd64.deb)
+- [Ubuntu, arm64](https://github.com/MaraniMatias/Muster/releases/download/v1.3.5/muster_1.3.5_arm64.deb)
 
 This is a stable release. Earlier candidates are on the [Releases page](https://github.com/MaraniMatias/Muster/releases).
 
