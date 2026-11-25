@@ -10,7 +10,7 @@ Cargo.toml        the workspace: the app + core, and the [patch.crates-io] table
 app/              muster            the app: GPUI Kit, VT grid, keyboard, sidebar, lifecycle
 app/src/          the app's source, and the tests that pin its rules
 app/assets/       the icon and the fonts the app draws with
-core/             muster-core   PTY + workspace shapes + Git discovery. No window, no toolkit.
+core/             muster-core   PTY + workspace shapes + Git discovery, and the shapes the app's own files hold. No toolkit.
 vendor/           the vendored crates the RustSec audit hash-pins
 scripts/          release gate and packaging for both platforms, the RustSec audit and the vendored-crate hash pins
 docs/             the migration plan, and what the port has to satisfy
@@ -57,7 +57,10 @@ docs/             the migration plan, and what the port has to satisfy
   sent again. Neither action touches queued, dispatching or unknown rounds.
   A restart creates a fresh shell in the selected checkout; it never revives
   processes that are gone.
-  Both files carry no version at all, so a stored shape is the whole contract: it is
+  The window's own size lives in `~/.muster/native-window.json`, written by
+  `core::window`: it is the window's frame and not the workspace's, so the
+  workspace file's shape does not change when a window is resized.
+  These files carry no version at all, so a stored shape is the whole contract: it is
   what it is, a change is made in place, and a file this build cannot read is
   refused by name rather than read through or migrated.
 - The preferences live in `~/.muster/settings.json`, written by `core::settings`.
@@ -315,6 +318,42 @@ The rules it depends on, each pinned by a test:
 - **A resized window keeps the widths at their limits too.**
   `a_resized_window_keeps_the_panels_widths_at_their_limits` in
   `app/src/app_tests.rs`.
+
+## The window's own size
+
+The window keeps its own size, and its own file keeps it: the size a window
+was left at is the size the next launch opens at.
+
+**It is the window's file and not the workspace's.** The window's frame is the
+window's, and the workdirs on the panel are the workspace's, so the size lives
+in `~/.muster/native-window.json` beside the workspace file. The workspace
+file's shape therefore does not change because a window was resized, and the
+workdirs a person has are not lost when it does.
+
+**The size kept is the windowed one.** A maximized window's own bounds are the
+screen's, so the size it had before it was maximized is what is kept: a window
+that is left maximized comes back maximized, and comes back to that size when it
+is un-maximized. The other platforms say the restore size themselves; macOS
+does not -- a zoomed window there reports the screen's bounds and not the size
+it was zoomed from -- so the size it had before is the one that is kept.
+
+**A window that opens maximized is opened at that size and then zoomed.** The
+toolkit asks the platform to zoom the window it has just opened, so the size to
+come back to is the size the file keeps.
+
+**It is written when the window is left.** The size is read while the window is
+there, and written to the file when the window is closed or the application
+quits.
+
+The rules it depends on, each pinned by a test:
+
+- **The file keeps the window's size.**
+  `the_window_state_round_trips` in `core/src/window.rs`.
+- **The window opens at the size the file keeps.**
+  `the_window_opens_at_the_size_it_was_left_at` in `app/src/app_tests.rs`.
+- **The window's size is kept while it is there, and reaches its file.**
+  `the_window_keeps_the_size_it_was_left_at` and
+  `the_window_keeps_its_size_in_its_own_file` in `app/src/app_tests.rs`.
 
 ## The unfinished work in the sidebar
 

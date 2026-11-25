@@ -30,6 +30,7 @@ use gpui_kit::{
 };
 use muster_core::navigation::{self, DiffTotals, GitReadBudget, PanelLayout};
 use muster_core::settings::FollowWorktree;
+use muster_core::window::WindowGeometry;
 use muster_core::workspace::{
     Checkout, Repo, RepoKind, Session, SessionStatus as SavedSessionStatus, SessionType,
 };
@@ -719,6 +720,18 @@ pub struct TerminalWindow {
     pub(crate) _maintenance: Option<Task<()>>,
     /// Keeps the visibility observer registered for this window's life.
     pub(crate) _visibility: Subscription,
+    /// Keeps the window's bounds observer registered for this window's life.
+    pub(crate) _window_bounds: Subscription,
+    /// The window's own size, and whether it was maximized, as it was left.
+    ///
+    /// The window's own and not the workspace's: it is kept in its own file,
+    /// so the workspace file's shape does not change because the window was
+    /// resized.
+    window_geometry: WindowGeometry,
+    /// Where the window's own size is kept.
+    ///
+    /// Absent when the app has nowhere to keep it.
+    window_state_path: Option<PathBuf>,
     /// The window's own size, as it was the last time the panels were drawn.
     ///
     /// The panels' group rescales its slots when the window is resized, so a
@@ -868,6 +881,9 @@ impl TerminalWindow {
             injected: false,
             _maintenance: None,
             _visibility: Subscription::new(|| {}),
+            _window_bounds: Subscription::new(|| {}),
+            window_geometry: WindowGeometry::default(),
+            window_state_path: None,
             viewport: size(px(0.), px(0.)),
         }
     }
@@ -889,8 +905,22 @@ impl TerminalWindow {
         self.visible = window.is_visible();
     }
 
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Watch the window's own size, and keep it while the window is there.
+    ///
+    /// The size the window is left at is the size the next launch opens at, so
+    /// it is read when the window's bounds change.
+    fn observe_window_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._window_bounds = cx.observe_window_bounds(window, |app, window, _| {
+            app.record_window_geometry(window);
+        });
+    }
+
+    pub fn new(window: &mut Window, geometry: WindowGeometry, cx: &mut Context<Self>) -> Self {
         let mut app = Self::empty(Arc::new(TerminalBackend::default()), true, cx);
+        // The size the window was left at is the size it opens at, and the
+        // size it comes back to when it is un-maximized.
+        app.window_geometry = geometry;
+        app.window_state_path = muster_core::window::state_path().ok();
         OWNERS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -901,6 +931,7 @@ impl TerminalWindow {
             false
         });
         app.observe_visibility(window, cx);
+        app.observe_window_geometry(window, cx);
         app.opening = true;
         let cwd = working_directory();
         let worker = cx
@@ -961,6 +992,7 @@ impl TerminalWindow {
             },
         );
         app.navigation.active_session = Some(id);
+        app.observe_window_geometry(window, cx);
         window.on_window_should_close(cx, move |_, _| {
             let status = shell.session.status();
             if status.foreground.running || status.poll_error.is_some() {
@@ -1187,6 +1219,29 @@ impl TerminalWindow {
         }
         if changed {
             self.persist();
+        }
+    }
+
+    /// Keep the window's own size, and so in the window's own file.
+    ///
+    /// The size kept is the windowed one: a maximized window's own bounds are
+    /// the screen's, so the size it had before it was maximized is what is
+    /// kept, and a window that is left maximized comes back maximized and comes
+    /// back to that size when it is un-maximized.
+    fn record_window_geometry(&mut self, window: &Window) {
+        self.window_geometry = window_geometry(window, self.window_geometry);
+    }
+
+    /// Keep the window's own size, so the next launch opens at it.
+    ///
+    /// The file is the window's own and not the workspace's: the workdirs on
+    /// the panel are the workspace's, and the window's frame is not.
+    fn save_window_geometry(&self) {
+        let Some(path) = self.window_state_path.as_ref() else {
+            return;
+        };
+        if let Err(error) = muster_core::window::save(path, &self.window_geometry) {
+            log::error!("window state save failed: {error}");
         }
     }
 
@@ -2017,6 +2072,9 @@ impl TerminalWindow {
                 || status.poll_error.is_some()
                 || matches!(status.shell, ShellState::Unknown)
         }) || !self.navigation.pending.is_empty();
+        // The window's own size is kept as it is left, so the next launch
+        // opens the window the way it was left.
+        self.save_window_geometry();
         if busy {
             const WINDOW_CLOSE_CHOICES: &[(&str, ButtonVariant)] = &[
                 ("Cancel", ButtonVariant::Default),
@@ -4234,16 +4292,53 @@ pub(crate) fn window_frame() -> Option<WindowDecorations> {
     }
 }
 
-pub fn window_bounds(cx: &App) -> WindowOptions {
+/// The size the window may not go below.
+///
+/// Narrower than this and the sidebar and a readable terminal cannot both keep
+/// a column.
+const MIN_WINDOW_WIDTH: f32 = 900.;
+const MIN_WINDOW_HEIGHT: f32 = 600.;
+
+/// The window's own size, as its own file keeps it.
+///
+/// A file that cannot be read leaves the window at its default size: a size is
+/// no work, and the file's own refusal is said in the log.
+pub fn restored_geometry() -> WindowGeometry {
+    let path = match muster_core::window::state_path() {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!("window state path is unavailable: {error}");
+            return WindowGeometry::default();
+        }
+    };
+    match muster_core::window::load(&path) {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            log::error!("window state could not be read: {error}");
+            WindowGeometry::default()
+        }
+    }
+}
+
+/// The options a window opens with, at the size it is opened at.
+///
+/// The size is the window's own and the one its own file keeps, and a window
+/// that was left maximized comes back maximized: the toolkit asks the platform
+/// to zoom the window it has just opened at that size, so un-maximizing it
+/// comes back to the size it was left at.
+pub fn window_bounds(geometry: WindowGeometry, cx: &App) -> WindowOptions {
+    let window_size = size(
+        px(geometry.width.max(MIN_WINDOW_WIDTH)),
+        px(geometry.height.max(MIN_WINDOW_HEIGHT)),
+    );
+    let bounds = Bounds::centered(None, window_size, cx);
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(1280.), px(800.)),
-            cx,
-        ))),
-        // What the window may not go below: narrower than this and the sidebar
-        // and a readable terminal cannot both keep a column.
-        window_min_size: Some(size(px(900.), px(600.))),
+        window_bounds: Some(if geometry.maximized {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        }),
+        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
         // The name the platform shows where there is no app-drawn bar to carry
         // it, over the transparent overlay the bar draws into.
         titlebar: Some(TitlebarOptions {
@@ -4259,6 +4354,40 @@ pub fn window_bounds(cx: &App) -> WindowOptions {
         // The bar draws and moves the window itself, so AppKit must not also
         // read a title bar there.
         ..TitleBar::window_options()
+    }
+}
+
+/// The window's own size, and whether it is maximized.
+///
+/// `current` is what is kept when the platform cannot say: a zoomed macOS
+/// window reports the screen's bounds and not the size it was zoomed from, so
+/// the size it had before is the one that is kept.
+fn window_geometry(window: &Window, current: WindowGeometry) -> WindowGeometry {
+    match window.window_bounds() {
+        WindowBounds::Maximized(bounds) | WindowBounds::Fullscreen(bounds) => WindowGeometry {
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+            maximized: true,
+        },
+        WindowBounds::Windowed(bounds) => {
+            let width = bounds.size.width.as_f32();
+            let height = bounds.size.height.as_f32();
+            // A window that was moved is not a window that was resized, and
+            // the platform is not asked about the screen for a move.
+            if (width != current.width || height != current.height) && window.is_maximized() {
+                // The window is zoomed: its bounds are the screen's, and the
+                // size it had before it was zoomed is the one kept.
+                return WindowGeometry {
+                    maximized: true,
+                    ..current
+                };
+            }
+            WindowGeometry {
+                width,
+                height,
+                maximized: false,
+            }
+        }
     }
 }
 #[cfg(test)]

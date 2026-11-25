@@ -6696,8 +6696,12 @@ async fn a_link_clicked_after_its_window_is_released_opens_nothing(cx: &mut Test
     // A window that has nothing in it, so the handler can be called with the
     // `Window` and `App` the text view would have handed it.
     let (handle, _) = cx.update(|cx| {
-        gpui_kit::open_window(crate::app::window_bounds(cx), cx, |_, cx| cx.new(|_| Empty))
-            .expect("a window to click in")
+        gpui_kit::open_window(
+            crate::app::window_bounds(WindowGeometry::default(), cx),
+            cx,
+            |_, cx| cx.new(|_| Empty),
+        )
+        .expect("a window to click in")
     });
     let click = ClickEvent::Mouse(MouseClickEvent {
         down: MouseDownEvent {

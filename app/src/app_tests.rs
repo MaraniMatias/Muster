@@ -189,6 +189,97 @@ fn the_window_manager_draws_the_frame() {
     );
 }
 
+/// The window opens at the size the workspace file keeps.
+///
+/// The size is the window's own, and a window that was left maximized comes
+/// back maximized: the toolkit zooms the window it opened at that size, so
+/// un-maximizing it comes back to the size it was left at.
+#[gpui_kit::test]
+fn the_window_opens_at_the_size_it_was_left_at(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let options = cx.update(|cx| {
+        window_bounds(
+            WindowGeometry {
+                width: 1000.,
+                height: 700.,
+                maximized: false,
+            },
+            cx,
+        )
+    });
+    match options.window_bounds.expect("the window opens at a size") {
+        WindowBounds::Windowed(bounds) => {
+            assert_eq!(bounds.size.width, px(1000.));
+            assert_eq!(bounds.size.height, px(700.));
+        }
+        other => panic!("a window that was left windowed opens windowed, not {other:?}"),
+    }
+
+    let options = cx.update(|cx| {
+        window_bounds(
+            WindowGeometry {
+                width: 1000.,
+                height: 700.,
+                maximized: true,
+            },
+            cx,
+        )
+    });
+    match options.window_bounds.expect("the window opens at a size") {
+        WindowBounds::Maximized(bounds) => {
+            assert_eq!(bounds.size.width, px(1000.));
+            assert_eq!(bounds.size.height, px(700.));
+        }
+        other => panic!("a window that was left maximized opens maximized, not {other:?}"),
+    }
+}
+
+/// The window's own size is kept, so the next launch opens at it.
+#[gpui_kit::test]
+fn the_window_keeps_the_size_it_was_left_at(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "sleep 30");
+    let (handle, app_entity) = open(cx, size(px(1000.), px(700.)), &backend, &session);
+    // The platform says the window's bounds changed: that is when the size is
+    // read, and a window that is resized is a window that was left at another
+    // size.
+    cx.update_window(handle, |_, window, cx| window.bounds_changed(cx))
+        .expect("the window reports its bounds");
+    let geometry = app_entity.read_with(cx, |app, _| app.window_geometry);
+    assert_eq!(geometry.width, 1000.);
+    assert_eq!(geometry.height, 700.);
+    assert!(!geometry.maximized);
+
+    session.close().wait().expect("the test session closes");
+}
+
+/// The window's own size reaches its own file.
+///
+/// The file is what the next launch reads, so a size that stops at the window
+/// is a size nobody finds again.
+#[gpui_kit::test]
+fn the_window_keeps_its_size_in_its_own_file(cx: &mut TestAppContext) {
+    let backend = Arc::new(TerminalBackend::default());
+    let session = session(&backend, "sleep 30");
+    let (handle, app_entity) = open(cx, size(px(1000.), px(700.)), &backend, &session);
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let state_path = directory.path().join("native-window.json");
+    app_entity.update(cx, |app, _| {
+        app.window_state_path = Some(state_path.clone());
+    });
+    cx.update_window(handle, |_, window, cx| window.bounds_changed(cx))
+        .expect("the window reports its bounds");
+    app_entity.update(cx, |app, _| app.save_window_geometry());
+
+    let saved =
+        muster_core::window::load(&state_path).expect("the window's own file holds its size");
+    assert_eq!(saved.width, 1000.);
+    assert_eq!(saved.height, 700.);
+    assert!(!saved.maximized);
+
+    session.close().wait().expect("the test session closes");
+}
+
 #[gpui_kit::test]
 fn the_terminal_renders_at_every_window_size(cx: &mut TestAppContext) {
     let backend = Arc::new(TerminalBackend::default());

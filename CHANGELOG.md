@@ -8,6 +8,14 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **The window keeps the size it was left at.** A window that was resized, or
+  maximized, came back at the default size and at its default state: nothing
+  read the window's own bounds, so nothing kept them. The window's own file
+  holds the size and whether it was maximized now, and the window opens at
+  them. The size kept is the windowed one, so a window that was left maximized
+  comes back maximized and comes back to the size it had before when it is
+  un-maximized.
+
 - **The panels keep the width they are drawn at.** A resizable group rescales
   its slots when the window is resized, and it rescales them without regard for
   the limits the panels declare: the size it holds can be one the panel may not

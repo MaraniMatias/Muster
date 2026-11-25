@@ -37,14 +37,17 @@ fn main() {
             // Before any window exists: the sidebar's family has to be registered
             // before the first frame asks for it, or GPUI answers with a fallback.
             app::load_fonts(cx);
+            // The window's own size, as its own file keeps it: the window opens
+            // at it, and it is the size the window comes back to.
+            let geometry = app::restored_geometry();
             gpui_kit::open_window(
-                app::window_bounds(cx),
+                app::window_bounds(geometry, cx),
                 cx,
                 |window: &mut Window, cx: &mut App| {
                     // Before the window exists: a quit that arrives while the shell
                     // is spawning has to find somebody already holding it.
                     app::install_quit_path(cx);
-                    cx.new(|cx| TerminalWindow::new(window, cx))
+                    cx.new(|cx| TerminalWindow::new(window, geometry, cx))
                 },
             )
             .expect("muster: failed to open window");

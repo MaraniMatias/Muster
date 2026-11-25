@@ -1750,73 +1750,77 @@ pub(super) fn open(cx: &mut TestAppContext) -> Fixture {
         cx.set_reduce_motion(true);
     });
     let (handle, view) = cx.update(|cx| {
-        gpui_kit::open_window(window_bounds(cx), cx, |window, cx| {
-            cx.new(|cx| {
-                let mut app = TerminalWindow::empty(backend.clone(), true, cx);
-                app.navigation.merge(
-                    navigation::OpenedDirectory {
-                        repo,
-                        checkout_id: checkout.clone(),
-                    },
-                    true,
-                );
-                for _ in 0..2 {
-                    let id = format!(
-                        "sidebar-test-{}-{}",
-                        std::process::id(),
-                        NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
-                    );
-                    let mut config = TerminalSessionConfig::new(
-                        id.clone(),
-                        directory.path().to_owned(),
-                        80,
-                        24,
-                        Some(PathBuf::from("/bin/sh")),
-                    );
-                    // Keep a shell parent and enable job control, like the application's
-                    // interactive login shell. An exec-optimized `sh -c cat` has
-                    // no separate foreground process group to observe.
-                    config.args = Some(vec!["-c".into(), "set -m; cat; :".into()]);
-                    config.status_interval = Duration::from_millis(20);
-                    let shell = app.owner.spawn(config).unwrap();
-                    // The child starts once the size it will keep is known: a
-                    // terminal that is never on screen is sized here. `start_at`
-                    // applies that size and starts the child in one step, so
-                    // the size is settled before any view measures its own: a
-                    // queued resize would land after the view's size and put
-                    // the grid back at the older one.
-                    shell
-                        .session
-                        .start_at(80, 24)
-                        .expect("the session takes its size");
-                    let terminal = cx.new(|cx| {
-                        TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
-                    });
-                    app.terminals.insert(
-                        id.clone(),
-                        LiveTerminal {
+        gpui_kit::open_window(
+            window_bounds(WindowGeometry::default(), cx),
+            cx,
+            |window, cx| {
+                cx.new(|cx| {
+                    let mut app = TerminalWindow::empty(backend.clone(), true, cx);
+                    app.navigation.merge(
+                        navigation::OpenedDirectory {
+                            repo,
                             checkout_id: checkout.clone(),
-                            view: terminal,
-                            shell,
                         },
+                        true,
                     );
-                    app.navigation.add_session(
-                        Session {
-                            id: id.clone(),
-                            checkout_id: checkout.clone(),
-                            name: "sh".into(),
-                            created_at: "test".into(),
-                            session_type: SessionType::Shell,
-                            status: SavedSessionStatus::Active,
-                        },
-                        Some(app.navigation.revision),
-                    );
-                    sessions.push(id);
-                }
-                app.focus_terminal(window, cx);
-                app
-            })
-        })
+                    for _ in 0..2 {
+                        let id = format!(
+                            "sidebar-test-{}-{}",
+                            std::process::id(),
+                            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+                        );
+                        let mut config = TerminalSessionConfig::new(
+                            id.clone(),
+                            directory.path().to_owned(),
+                            80,
+                            24,
+                            Some(PathBuf::from("/bin/sh")),
+                        );
+                        // Keep a shell parent and enable job control, like the application's
+                        // interactive login shell. An exec-optimized `sh -c cat` has
+                        // no separate foreground process group to observe.
+                        config.args = Some(vec!["-c".into(), "set -m; cat; :".into()]);
+                        config.status_interval = Duration::from_millis(20);
+                        let shell = app.owner.spawn(config).unwrap();
+                        // The child starts once the size it will keep is known: a
+                        // terminal that is never on screen is sized here. `start_at`
+                        // applies that size and starts the child in one step, so
+                        // the size is settled before any view measures its own: a
+                        // queued resize would land after the view's size and put
+                        // the grid back at the older one.
+                        shell
+                            .session
+                            .start_at(80, 24)
+                            .expect("the session takes its size");
+                        let terminal = cx.new(|cx| {
+                            TerminalView::new(shell.session.clone(), shell.metrics.clone(), cx)
+                        });
+                        app.terminals.insert(
+                            id.clone(),
+                            LiveTerminal {
+                                checkout_id: checkout.clone(),
+                                view: terminal,
+                                shell,
+                            },
+                        );
+                        app.navigation.add_session(
+                            Session {
+                                id: id.clone(),
+                                checkout_id: checkout.clone(),
+                                name: "sh".into(),
+                                created_at: "test".into(),
+                                session_type: SessionType::Shell,
+                                status: SavedSessionStatus::Active,
+                            },
+                            Some(app.navigation.revision),
+                        );
+                        sessions.push(id);
+                    }
+                    app.focus_terminal(window, cx);
+                    app
+                })
+            },
+        )
         .unwrap()
     });
     cx.update_window(handle, |_, window, cx| {
@@ -3533,14 +3537,19 @@ fn open_over_with(
         cx.set_reduce_motion(true);
     });
     let (handle, view) = cx.update(|cx| {
-        gpui_kit::open_window(window_bounds(cx), cx, |_window, cx| {
-            cx.new(|cx| {
-                let mut app = TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
-                app.navigation.merge(opened, true);
-                edit(&mut app.navigation);
-                app
-            })
-        })
+        gpui_kit::open_window(
+            window_bounds(WindowGeometry::default(), cx),
+            cx,
+            |_window, cx| {
+                cx.new(|cx| {
+                    let mut app =
+                        TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
+                    app.navigation.merge(opened, true);
+                    edit(&mut app.navigation);
+                    app
+                })
+            },
+        )
         .unwrap()
     });
     cx.update_window(handle, |_, window, cx| {
@@ -3574,13 +3583,18 @@ pub(super) fn open_second_window(
 ) -> (AnyWindowHandle, Entity<TerminalWindow>) {
     let opened = navigation::open_directory(&fixture.root).unwrap();
     let (handle, view) = cx.update(|cx| {
-        gpui_kit::open_window(window_bounds(cx), cx, |_window, cx| {
-            cx.new(|cx| {
-                let mut app = TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
-                app.navigation.merge(opened, true);
-                app
-            })
-        })
+        gpui_kit::open_window(
+            window_bounds(WindowGeometry::default(), cx),
+            cx,
+            |_window, cx| {
+                cx.new(|cx| {
+                    let mut app =
+                        TerminalWindow::empty(Arc::new(TerminalBackend::default()), true, cx);
+                    app.navigation.merge(opened, true);
+                    app
+                })
+            },
+        )
         .unwrap()
     });
     cx.update_window(handle, |_, window, cx| {

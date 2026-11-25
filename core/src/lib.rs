@@ -35,3 +35,10 @@ pub mod opencode;
 
 /// Pi process identity and the worktrees its live work protects.
 pub mod pi;
+
+/// The window's own size, as it is left and found again, in its own file
+/// beside the workspace file.
+///
+/// It is the application's state and not the workspace's: the window's frame is
+/// the window's, and the workdirs on the panel are the workspace's.
+pub mod window;

@@ -33,6 +33,7 @@ use gpui_kit::AppContext;
 use gpui_kit::{div, Context, IntoElement, Render, TestAppContext, Window};
 use muster_core::files::FileEntry;
 use muster_core::navigation::{ChangedFile, GitStatus};
+use muster_core::window::WindowGeometry;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -300,7 +301,11 @@ fn perf_files_tree_preparation(cx: &mut TestAppContext) {
                 gpui_kit::init(cx);
                 crate::app::load_fonts(cx);
                 crate::theme::install(cx);
-                gpui_kit::open_window(crate::app::window_bounds(cx), cx, |_, cx| cx.new(|_| Empty))
+                gpui_kit::open_window(
+                    crate::app::window_bounds(WindowGeometry::default(), cx),
+                    cx,
+                    |_, cx| cx.new(|_| Empty),
+                )
             })
             .unwrap();
         cx.update_window(handle, |_, window, _| {
