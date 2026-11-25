@@ -1004,6 +1004,79 @@ fn a_note_is_a_row_that_says_how_many(cx: &mut TestAppContext) {
     close(&fixture, cx);
 }
 
+/// Clicking a review in another worktree switches the pane to that worktree.
+///
+/// The terminal row already answered which checkout the pane was on. The review
+/// row has to answer the same question before opening its diff; otherwise the
+/// diff belongs to one checkout while the pane still renders the other one's
+/// terminal.
+#[gpui_kit::test]
+async fn clicking_a_review_item_switches_to_its_worktree(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    let (worktree, path) = add_worktree(&fixture, cx);
+    std::fs::write(path.join("notes.txt"), "review this\n").unwrap();
+    let note = muster_core::review::ReviewNote {
+        id: "review-note".into(),
+        checkout_id: worktree.clone(),
+        path: "notes.txt".into(),
+        side: muster_core::review::ReviewSide::New,
+        line_start: 1,
+        line_end: None,
+        content: "look at this".into(),
+        code: "review this".into(),
+        code_hash: muster_core::review::review_anchor_hash("review this"),
+        outdated: false,
+    };
+    fixture.view.update(cx, |app, cx| {
+        assert_eq!(
+            app.navigation.active_checkout.as_deref(),
+            Some(fixture.checkout.as_str())
+        );
+        app.review.notes.insert(worktree.clone(), vec![note]);
+        cx.notify();
+    });
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let item = "select-item-notes.txt (note)";
+        assert!(window.find(item).visible(), "the review row is on screen");
+        window.click(item, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.navigation.active_checkout.as_deref(),
+            Some(worktree.as_str()),
+            "the review's checkout becomes active"
+        );
+        assert_eq!(
+            app.open_diff,
+            Some((worktree.clone(), Some("notes.txt".into()))),
+            "the clicked file becomes the active diff"
+        );
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .diff_view
+            .as_ref()
+            .is_some_and(|view| view.ready.contains("notes.txt"))
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("review-card-review-note").visible());
+        assert_eq!(
+            window.find("select-item-notes.txt (note)").selected(),
+            Some(true)
+        );
+    })
+    .unwrap();
+    close(&fixture, cx);
+}
+
 /// A file on screen is a row of its own, and the terminal it replaced is not
 /// marked.
 ///

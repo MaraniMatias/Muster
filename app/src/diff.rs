@@ -481,7 +481,15 @@ impl TerminalWindow {
         // set: it is part of the panel that is about to be on screen.
         self.open_opencode_search(window, cx);
         self.request_document_transition(
-            Box::new(move |app, _, cx| app.open_changes(&checkout, path, cx)),
+            Box::new(move |app, _, cx| {
+                if app.navigation.active_checkout.as_deref() != Some(&checkout) {
+                    if !app.navigation.select_checkout(&checkout) {
+                        return;
+                    }
+                    app.persist();
+                }
+                app.open_changes(&checkout, path, cx);
+            }),
             window,
             cx,
         );
