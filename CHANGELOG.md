@@ -6,12 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## 1.3.7
-
-- **Compare changes against any local branch.** Search for a branch in the
-  Changes panel or diff header. The file list, diff and sidebar counts use
-  that branch's merge base; repositories without it use their own default
-  branch. Review exports and OpenCode messages name the branch used.
+## Unreleased
 
 - **Compare changes against any local branch.** Search for a branch in the
   Changes panel or diff header. The file list, diff and sidebar counts use
