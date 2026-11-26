@@ -44,7 +44,7 @@ use discovery::open_directory_within;
 use discovery::{canonical_or_original, parse_worktrees, path_text, Worktree};
 use git::*;
 use persistence::validate_path;
-use worktrees::default_ref_with_budget;
+use worktrees::default_ref_if_available;
 #[cfg(test)]
 use worktrees::*;
 
