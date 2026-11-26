@@ -1,3 +1,4 @@
+use super::changes::{base_commit, checkout_default_ref};
 use super::*;
 
 /// Net line changes from the default branch's merge base, as in Legacy's
@@ -32,23 +33,16 @@ pub fn diff_totals_for_checkout(
     let root = validated_checkout_root(repo, checkout, within)?;
     // The merge base is where the branch's own changes are measured from; the working
     // tree's are measured from the last commit, so the merge base is not asked for.
-    let base = match origin {
-        DiffOrigin::Branch => {
-            let primary_branch = repo
-                .checkouts
-                .iter()
-                .find(|checkout| checkout.is_primary)
-                .and_then(|checkout| checkout.branch.as_deref());
-            let (_, reference) = default_ref_with_budget(
-                root.as_path(),
-                repo.default_branch.as_deref().or(primary_branch),
-                within,
-            )?;
-            let base = git_success(root.as_path(), &["merge-base", &reference, "HEAD"], within)?;
-            output_text(&base)?.to_owned()
-        }
-        DiffOrigin::WorkingTree => "HEAD".to_owned(),
+    let default = match origin {
+        DiffOrigin::WorkingTree => None,
+        _ => checkout_default_ref(repo, root.as_path(), within)?,
     };
+    let (base, _) = base_commit(
+        root.as_path(),
+        &origin,
+        default.as_ref().map(|(_, reference)| reference.as_str()),
+        within,
+    )?;
     let output = git_success(
         root.as_path(),
         &[

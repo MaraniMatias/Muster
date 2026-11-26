@@ -8,6 +8,11 @@ here still gets its generated notes.
 
 ## Unreleased
 
+- **Compare changes against any local branch.** Search for a branch in the
+  Changes panel or diff header. The file list, diff and sidebar counts use
+  that branch's merge base; repositories without it use their own default
+  branch. Review exports and OpenCode messages name the branch used.
+
 - **The dependencies move to the newest releases they can reach.** Every crate
   the lockfile could take within its own constraint moves: 159 packages, from
   the URL and notification crates to the terminal stack and the tree-sitter

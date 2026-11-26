@@ -1408,12 +1408,11 @@ impl TerminalWindow {
             cx.notify();
             return None;
         };
-        let Some(repo) = self
+        let Some(_repo) = self
             .navigation
             .repos
             .iter()
             .find(|repo| repo.id == checkout.repo_id)
-            .cloned()
         else {
             self.review.destination_error =
                 Some("The repository for this review is no longer available.".into());
@@ -1438,15 +1437,18 @@ impl TerminalWindow {
                 return None;
             }
         };
+        let origin = self.effective_origin(&checkout_id);
+        let resolved_default = self.default_branch_name(&checkout_id);
         let markdown = review::build_review_markdown(
             &notes,
             &ReviewContext {
-                branch: match self.diff_origin {
-                    DiffOrigin::Branch => checkout.branch.as_deref(),
+                branch: match &origin {
+                    DiffOrigin::DefaultBranch | DiffOrigin::Branch(_) => checkout.branch.as_deref(),
                     DiffOrigin::WorkingTree => None,
                 },
-                default_branch: match self.diff_origin {
-                    DiffOrigin::Branch => repo.default_branch.as_deref(),
+                default_branch: match &origin {
+                    DiffOrigin::DefaultBranch => Some(resolved_default.as_str()),
+                    DiffOrigin::Branch(name) => Some(name.as_str()),
                     DiffOrigin::WorkingTree => None,
                 },
                 date: &date,
@@ -2232,13 +2234,15 @@ impl TerminalWindow {
             self.push_error("There are no review notes to export.", cx);
             return;
         }
+        let origin = self.effective_origin(&checkout_id);
         let branch = checkout.branch.clone();
-        let default_branch = repo.default_branch.clone();
+        let default_branch = self.default_branch_name(&checkout_id);
         // A review of the working tree is a review of the working tree, and a
         // file that names a branch range about one is a file that names another
         // change set.
-        let (branch, default_branch) = match self.diff_origin {
-            DiffOrigin::Branch => (branch, default_branch),
+        let (branch, default_branch) = match origin {
+            DiffOrigin::DefaultBranch => (branch, Some(default_branch)),
+            DiffOrigin::Branch(name) => (branch, Some(name)),
             DiffOrigin::WorkingTree => (None, None),
         };
         let storage = self.navigation.review_storage;

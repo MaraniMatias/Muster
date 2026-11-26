@@ -36,6 +36,13 @@ pub struct Repo {
     pub root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
+    /// The repository's local branches, as Git lists them.
+    ///
+    /// The branches a change set can be measured against. They are the repository's own
+    /// shape rather than a checkout's, so every checkout of a repository reads the same
+    /// list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<String>,
     pub checkouts: Vec<Checkout>,
     pub created_at: String,
     pub last_opened_at: String,
@@ -166,6 +173,7 @@ impl Repo {
             name,
             root: path,
             default_branch: None,
+            branches: Vec::new(),
             checkouts: vec![checkout],
             created_at: now.clone(),
             last_opened_at: now,

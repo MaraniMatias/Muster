@@ -1093,7 +1093,7 @@ impl TerminalWindow {
         // The origin the read is asked for is the one the window is asking
         // about now, so a read that is on its way for another one is answered
         // by another read.
-        let origin = self.diff_origin;
+        let origin = self.diff_origin.clone();
         let worker = cx.background_executor().spawn(async move {
             muster_core::navigation::status(
                 &repo,
@@ -1302,7 +1302,7 @@ impl TerminalWindow {
             path: path.to_owned(),
             repo,
             checkout,
-            origin: self.diff_origin,
+            origin: self.diff_origin.clone(),
         });
         if !wanted {
             self.git_diff_errors.insert(
@@ -1479,6 +1479,7 @@ impl TerminalWindow {
                             .id("inspector-origin-select")
                             .xsmall()
                             .bg(roles.surface_base)
+                            .search_placeholder("Search branches")
                             .accessibility_label("Changes origin"),
                     ),
             );
@@ -2189,7 +2190,7 @@ mod tests {
             path: format!("file-{index}"),
             repo: repo.clone(),
             checkout: checkout.clone(),
-            origin: muster_core::navigation::DiffOrigin::Branch,
+            origin: muster_core::navigation::DiffOrigin::DefaultBranch,
         };
         let mut queue = DiffQueue::default();
         let mut wanted = HashMap::new();

@@ -10,7 +10,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{
     Diff, DiffAnnotation, DiffEvent, DiffFile, DiffLinePosition, DiffSide, DiffState,
 };
-use gpui_kit::component::searchable_list::SearchableListItem;
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::Disableable;
 use gpui_kit::component::IndexPath;
@@ -28,7 +28,7 @@ use gpui_kit::{
 };
 use muster_core::navigation::DiffOrigin;
 use muster_core::review::{self, AnchorOutcome, ReviewSide};
-use muster_core::workspace::RepoKind;
+use muster_core::workspace::{Repo, RepoKind};
 
 pub(crate) const MAX_RETAINED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -158,37 +158,99 @@ impl TerminalWindow {
             .unwrap_or_default()
     }
 
+    /// The repository a checkout belongs to.
+    ///
+    /// The branches a repository holds are its own shape, so every checkout of a
+    /// repository reads the same list.
+    fn checkout_repo(&self, checkout: &str) -> Option<&Repo> {
+        self.navigation
+            .repos
+            .iter()
+            .find(|repo| repo.checkouts.iter().any(|entry| entry.id == checkout))
+    }
+
+    /// The name of the branch a checkout's changes are measured from by default.
+    ///
+    /// It is what the checkout's status knows, and the status is what this window
+    /// has not read yet when the picker is made.
+    pub(crate) fn default_branch_name(&self, checkout: &str) -> String {
+        self.git_status
+            .get(checkout)
+            .map(|status| status.default_branch.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.checkout_repo(checkout)
+                    .and_then(|repo| repo.default_branch.clone())
+            })
+            .unwrap_or_else(|| "base".to_owned())
+    }
+
     /// The origins the change set can be measured from, in the words the picker
     /// offers them.
     ///
     /// The first names the branch the changes are measured from, because "since
     /// main" says what the diff is against and "since base" does not. That name
     /// is what the checkout's status knows, and the status is what this window
-    /// has not read yet when the picker is made.
+    /// has not read yet when the picker is made. The repository's own branches
+    /// follow the two answers this window has always offered, and the default
+    /// branch is not among them: it is the first row.
     pub(crate) fn diff_origin_choices(&self, checkout: &str) -> Vec<DiffOriginChoice> {
-        let base = self
-            .git_status
-            .get(checkout)
-            .map(|status| status.default_branch.clone())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                self.navigation
-                    .repos
-                    .iter()
-                    .find(|repo| repo.checkouts.iter().any(|entry| entry.id == checkout))
-                    .and_then(|repo| repo.default_branch.clone())
-            })
-            .unwrap_or_else(|| "base".to_owned());
-        vec![
+        let repo = self.checkout_repo(checkout);
+        let base = self.default_branch_name(checkout);
+        let mut choices = vec![
             DiffOriginChoice {
-                origin: DiffOrigin::Branch,
+                origin: DiffOrigin::DefaultBranch,
                 label: format!("Since {base}").into(),
             },
             DiffOriginChoice {
                 origin: DiffOrigin::WorkingTree,
                 label: "Uncommitted".into(),
             },
-        ]
+        ];
+        let default = repo.and_then(|repo| repo.default_branch.as_deref());
+        for branch in repo
+            .map(|repo| repo.branches.as_slice())
+            .unwrap_or_default()
+        {
+            if branch == &base || Some(branch.as_str()) == default {
+                continue;
+            }
+            choices.push(DiffOriginChoice {
+                origin: DiffOrigin::Branch(branch.clone()),
+                label: format!("Since {branch}").into(),
+            });
+        }
+        choices
+    }
+
+    /// The origin a checkout's change set is measured from.
+    ///
+    /// The window's origin names a branch, and a branch belongs to one
+    /// repository: a repository that holds no branch by that name has no base to
+    /// offer, so its change set is measured from its own default branch. The
+    /// branch that is the default branch is that branch under another name. The
+    /// picker is drawn for one checkout, so it shows the origin that checkout is
+    /// measured against rather than a branch it does not hold.
+    pub(crate) fn effective_origin(&self, checkout: &str) -> DiffOrigin {
+        if let Some(status) = self.git_status.get(checkout) {
+            if status.requested_origin == self.diff_origin {
+                return status.origin.clone();
+            }
+        }
+        match &self.diff_origin {
+            DiffOrigin::Branch(name) => {
+                let held = self
+                    .checkout_repo(checkout)
+                    .is_some_and(|repo| repo.branches.iter().any(|branch| branch == name));
+                let default = self.default_branch_name(checkout);
+                if held && name != &default {
+                    self.diff_origin.clone()
+                } else {
+                    DiffOrigin::DefaultBranch
+                }
+            }
+            origin => origin.clone(),
+        }
     }
 
     /// The picker that chooses what the change set is measured from.
@@ -204,8 +266,9 @@ impl TerminalWindow {
         checkout: &str,
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
-    ) -> Entity<SelectState<Vec<DiffOriginChoice>>> {
+    ) -> Entity<SelectState<SearchableVec<DiffOriginChoice>>> {
         let choices = self.diff_origin_choices(checkout);
+        let origin = self.effective_origin(checkout);
         let existing = match slot {
             OriginPickerSlot::Diff => self.diff_origin_picker.clone(),
             OriginPickerSlot::Panel => self.panel_origin_picker.clone(),
@@ -213,14 +276,24 @@ impl TerminalWindow {
         let Some(picker) = existing else {
             let selected = choices
                 .iter()
-                .position(|choice| choice.origin == self.diff_origin)
+                .position(|choice| choice.origin == origin)
                 .map(|row| IndexPath::default().row(row));
-            let picker = cx.new(|cx| SelectState::new(choices.clone(), selected, &mut *window, cx));
+            // The menu is searchable, because a repository with many branches has
+            // more of them than a menu has room for.
+            let picker = cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(choices.clone()),
+                    selected,
+                    &mut *window,
+                    cx,
+                )
+                .searchable(true)
+            });
             let events = cx.subscribe_in(&picker, window, |app, _, event, _, cx| {
                 let SelectEvent::Confirm(Some(origin)) = event else {
                     return;
                 };
-                app.set_diff_origin(*origin, cx);
+                app.set_diff_origin(origin.clone(), cx);
             });
             match slot {
                 OriginPickerSlot::Diff => {
@@ -245,11 +318,13 @@ impl TerminalWindow {
                 OriginPickerSlot::Diff => self.diff_origin_offered = choices.clone(),
                 OriginPickerSlot::Panel => self.panel_origin_offered = choices.clone(),
             }
-            picker.update(cx, |state, cx| state.set_items(choices, &mut *window, cx));
-        }
-        if picker.read(cx).selected_value() != Some(&self.diff_origin) {
             picker.update(cx, |state, cx| {
-                state.set_selected_value(&self.diff_origin, window, cx);
+                state.set_items(SearchableVec::new(choices), &mut *window, cx);
+            });
+        }
+        if picker.read(cx).selected_value() != Some(&origin) {
+            picker.update(cx, |state, cx| {
+                state.set_selected_value(&origin, window, cx);
             });
         }
         picker
@@ -638,13 +713,15 @@ impl TerminalWindow {
                         &self.git_status_status(checkout, path),
                     ))
                 } else if diff.patch.is_empty() {
-                    Some(
-                        match self.diff_origin {
-                            DiffOrigin::Branch => "No net text changes against the default branch.",
-                            DiffOrigin::WorkingTree => "No uncommitted changes in this file.",
+                    Some(match self.effective_origin(checkout) {
+                        DiffOrigin::DefaultBranch => {
+                            "No net text changes against the default branch.".to_owned()
                         }
-                        .into(),
-                    )
+                        DiffOrigin::Branch(name) => format!("No net text changes against {name}."),
+                        DiffOrigin::WorkingTree => {
+                            "No uncommitted changes in this file.".to_owned()
+                        }
+                    })
                 } else {
                     None
                 };
@@ -1474,6 +1551,7 @@ impl TerminalWindow {
                                                 .id("diff-origin-select")
                                                 .xsmall()
                                                 .bg(roles.surface_base)
+                                                .search_placeholder("Search branches")
                                                 .accessibility_label("Changes origin"),
                                         ),
                                 )

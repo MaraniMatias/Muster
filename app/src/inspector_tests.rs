@@ -1483,6 +1483,24 @@ fn branch(root: &Path, name: &str) {
     );
 }
 
+/// A branch of the repository, with the checkout staying where it is.
+///
+/// The default branch is the one the primary checkout is on when the repository
+/// names no other, so a branch that is only there is not the one the change set
+/// is measured from.
+fn branch_only(root: &Path, name: &str) {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["branch", name])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[gpui_kit::test]
 fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAppContext) {
     let fixture = open_git(cx);
@@ -1543,14 +1561,14 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
     })
     .unwrap();
     fixture.view.read_with(cx, |app, cx| {
-        assert_eq!(app.diff_origin, DiffOrigin::Branch);
+        assert_eq!(app.diff_origin, DiffOrigin::DefaultBranch);
         assert_eq!(
             app.diff_origin_picker
                 .as_ref()
                 .unwrap()
                 .read(cx)
                 .selected_value(),
-            Some(&DiffOrigin::Branch)
+            Some(&DiffOrigin::DefaultBranch)
         );
         // The panel's own chooser follows the window's origin.
         assert_eq!(
@@ -1559,7 +1577,7 @@ fn the_changes_panel_can_choose_the_origin_before_opening_a_diff(cx: &mut TestAp
                 .unwrap()
                 .read(cx)
                 .selected_value(),
-            Some(&DiffOrigin::Branch)
+            Some(&DiffOrigin::DefaultBranch)
         );
     });
     close(&fixture, cx);
@@ -1610,7 +1628,7 @@ async fn the_diff_origin_chooser_asks_for_another_change_set(cx: &mut TestAppCon
     });
     read_status(&fixture, &fixture.checkout, cx).await;
     fixture.view.read_with(cx, |app, _| {
-        assert_eq!(app.diff_origin, DiffOrigin::Branch);
+        assert_eq!(app.diff_origin, DiffOrigin::DefaultBranch);
         let files = &app.git_status[&fixture.checkout].files;
         assert!(
             files.iter().any(|file| file.path == "committed.txt"),
@@ -1634,8 +1652,8 @@ async fn the_diff_origin_chooser_asks_for_another_change_set(cx: &mut TestAppCon
         .read_with(cx, |app, _| app.diff_origin_picker.clone().unwrap());
     fixture.view.read_with(cx, |_, cx| {
         assert_eq!(
-            picker.read(cx).selected_value().copied(),
-            Some(DiffOrigin::Branch)
+            picker.read(cx).selected_value().cloned(),
+            Some(DiffOrigin::DefaultBranch)
         );
     });
     picker.update(cx, |_, cx| {
@@ -1662,6 +1680,118 @@ async fn the_diff_origin_chooser_asks_for_another_change_set(cx: &mut TestAppCon
             files.iter().any(|file| file.path == "dirty.txt"),
             "{files:?}"
         );
+    });
+    close(&fixture, cx);
+}
+
+/// The chooser offers the answers this window has always offered first, and the
+/// repository's own branches after them.
+#[gpui_kit::test]
+async fn the_origin_chooser_offers_the_repositories_branches_after_the_current_rows(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_git(cx);
+    branch_only(&fixture.root, "feature");
+    branch_only(&fixture.root, "another");
+    std::fs::write(fixture.root.join("dirty.txt"), "dirty\n").unwrap();
+    // The repository's own shape is read again, the way the discovery reads it.
+    let opened = navigation::open_directory(&fixture.root).unwrap();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, None, cx);
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+    fixture.view.read_with(cx, |app, _| {
+        let labels = app
+            .diff_origin_choices(&fixture.checkout)
+            .iter()
+            .map(|choice| choice.label.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "Since main".to_owned(),
+                "Uncommitted".to_owned(),
+                "Since another".to_owned(),
+                "Since feature".to_owned()
+            ]
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// A branch absent from this checkout is measured from its default branch, and that
+/// effective origin is what the visible diff and review metadata use.
+#[gpui_kit::test]
+async fn a_missing_named_origin_resolves_to_the_checkout_default(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    std::fs::write(fixture.root.join("dirty.txt"), "dirty\n").unwrap();
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, None, cx);
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+    fixture.view.update(cx, |app, cx| {
+        app.set_diff_origin(DiffOrigin::Branch("elsewhere".to_owned()), cx);
+    });
+    cx.wait_for(fixture.handle, Duration::from_secs(20), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .git_status
+            .get(&fixture.checkout)
+            .is_some_and(|status| {
+                status.requested_origin == DiffOrigin::Branch("elsewhere".to_owned())
+            })
+    })
+    .await;
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(
+            app.effective_origin(&fixture.checkout),
+            DiffOrigin::DefaultBranch
+        );
+        assert_eq!(
+            app.git_status[&fixture.checkout].origin,
+            DiffOrigin::DefaultBranch
+        );
+        assert_eq!(
+            app.git_status[&fixture.checkout].requested_origin,
+            DiffOrigin::Branch("elsewhere".to_owned())
+        );
+    });
+    close(&fixture, cx);
+}
+
+/// The chooser's menu searches the branches it offers, so a repository with many
+/// of them is still readable.
+#[gpui_kit::test]
+async fn the_origin_chooser_searches_the_branches_it_offers(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    branch_only(&fixture.root, "feature");
+    branch_only(&fixture.root, "another");
+    std::fs::write(fixture.root.join("dirty.txt"), "dirty\n").unwrap();
+    let opened = navigation::open_directory(&fixture.root).unwrap();
+    fixture
+        .view
+        .update(cx, |app, _| app.navigation.merge(opened, false));
+    fixture.view.update(cx, |app, cx| {
+        app.open_changes(&fixture.checkout, None, cx);
+    });
+    read_status(&fixture, &fixture.checkout, cx).await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("diff-origin-select", cx);
+        window.render_frame(cx);
+        // The menu takes the query, and the row that answers it is the one the
+        // query is about.
+        window.input("feature", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    fixture.view.read_with(cx, |app, _| {
+        assert_eq!(app.diff_origin, DiffOrigin::Branch("feature".to_owned()));
     });
     close(&fixture, cx);
 }

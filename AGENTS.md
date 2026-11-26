@@ -614,6 +614,15 @@ merge base with it: every commit the checkout holds above that base, and what is
 on disk on top of them. **Uncommitted** — what `git status` reports — is the
 files on disk against the last commit.
 
+**Since any other branch** is the same answer measured from that branch's own
+merge base, and the chooser offers the repository's own branches after the two
+answers it has always offered. A repository with many branches has more of them
+than a menu has room for, so the menu takes a query and answers with the branch
+it names. The branches are the repository's own shape — `Repo::branches`, read
+by the discovery with `git for-each-ref` — so every checkout of a repository
+reads the same list, and the default branch is not among them: it is the first
+row.
+
 The chooser sits in the diff view's own header, beside the title, and not in the
 row under it: that row is empty until a note is saved, and a row that grows is a
 row that moves the diff under the note being written. The Changes panel carries
@@ -632,6 +641,12 @@ the figures on a workdir row and the diff itself are one answer, so they are
 read against the same base; read apart, they are three answers to three
 questions about two different change sets.
 
+A named branch belongs to one repository, so it is resolved in each checkout's
+own: a repository that holds no branch by that name has no base to offer, and
+its change set is measured from its own default branch. The chooser is drawn
+for one checkout, so it shows the origin that checkout is measured against, and
+never a branch it does not hold.
+
 Choosing another origin asks for the change set again rather than changing what
 is on screen: the answers that arrive replace the ones they were read against, and
 the ones on screen stay until then. A read that was asked for the other origin
@@ -641,7 +656,8 @@ A note written against one origin is written against the other's lines, so it
 goes stale when the origin changes — that is what the diff's own "outdated"
 answer is for. A review of the working tree says so: the exported Markdown names
 `working tree` rather than a branch range, because a file that named a range
-about it would be naming another change set.
+about it would be naming another change set. A review measured from another
+branch names that branch, so the file names the change set it is about.
 
 The rules it depends on, each pinned by a test:
 
@@ -665,10 +681,23 @@ The rules it depends on, each pinned by a test:
   `the_changes_panel_keeps_its_chooser_inside_its_own_width` in
   `app/src/inspector_tests.rs` pins it.
 - **How far the branch is above the default branch is a fact about the commits.**
-  It is counted from the merge base in either origin, because it is not a
-  statement about what the changes are measured from. A branch with no common
-  ancestor with the default branch has no merge base to count from, so the
-  count is unknown there rather than a number.
+  It is counted from the merge base with the default branch in every origin,
+  because it is not a statement about what the changes are measured from. A
+  branch with no common ancestor with the default branch has no merge base to
+  count from, so the count is unknown there rather than a number.
+- **A named branch is measured from its own merge base.** A repository that
+  holds no branch by that name has no base to offer, so its change set is
+  measured from its own default branch.
+  `a_named_branch_is_measured_from_its_own_merge_base` in
+  `core/src/navigation/tests.rs` pins it.
+- **The repository lists the branches a change set can be measured against.**
+  `a_repository_lists_its_local_branches` in
+  `core/src/navigation/tests.rs` pins it.
+- **The chooser offers the current answers first and the repository's branches
+  after them, and the menu takes a query.**
+  `the_origin_chooser_offers_the_repositories_branches_after_the_current_rows`
+  and `the_origin_chooser_searches_the_branches_it_offers` in
+  `app/src/inspector_tests.rs` pin them.
 
 ## The diff's own header, and the reader's place
 

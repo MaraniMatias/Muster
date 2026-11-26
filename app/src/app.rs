@@ -18,6 +18,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant},
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
+    searchable_list::SearchableVec,
     select::SelectState,
     Disableable, TitleBar,
 };
@@ -379,6 +380,9 @@ async fn count_sweep(
             // finds the sweep nearly over is told so rather than begun.
             let within =
                 GitReadBudget::new(sweep.remaining().unwrap_or_default().min(CHECKOUT_BUDGET));
+            // Every read is asked for the same origin, so each one carries its
+            // own copy of it.
+            let origin = origin.clone();
             reads.push(executor.spawn(async move {
                 let total = navigation::diff_totals_for_checkout(&item.1, &item.2, origin, within);
                 (item.0, item.2.path, total)
@@ -588,14 +592,15 @@ pub struct TerminalWindow {
     pub(crate) inspector_tab: InspectorTab,
     /// What the change set on screen is measured from.
     ///
-    /// The branch's own changes since it left the default branch, or the change
-    /// set `git status` reports about the files on disk. Every change list and
-    /// every diff in this window is read against it, so choosing another one is
-    /// a request to read them again rather than a change to what is already on
-    /// screen.
+    /// The branch's own changes since it left the default branch, its changes since it
+    /// left another branch, or the change set `git status` reports about the files on
+    /// disk. Every change list and every diff in this window is read against it, so
+    /// choosing another one is a request to read them again rather than a change to what
+    /// is already on screen.
     pub(crate) diff_origin: navigation::DiffOrigin,
     /// The picker that chooses what the change set is measured from.
-    pub(crate) diff_origin_picker: Option<Entity<SelectState<Vec<crate::diff::DiffOriginChoice>>>>,
+    pub(crate) diff_origin_picker:
+        Option<Entity<SelectState<SearchableVec<crate::diff::DiffOriginChoice>>>>,
     /// The subscription that reads the picker's answer.
     pub(crate) diff_origin_picker_events: Option<Subscription>,
     /// What the picker offers right now, so a name that arrived with the
@@ -606,7 +611,8 @@ pub struct TerminalWindow {
     /// It is a second control rather than a second view of the diff's: a
     /// `Select` draws its menu from the state it is given, so one state drawn
     /// in the diff and in the panel at once would draw the same menu twice.
-    pub(crate) panel_origin_picker: Option<Entity<SelectState<Vec<crate::diff::DiffOriginChoice>>>>,
+    pub(crate) panel_origin_picker:
+        Option<Entity<SelectState<SearchableVec<crate::diff::DiffOriginChoice>>>>,
     /// The subscription that reads the panel picker's answer.
     pub(crate) panel_origin_picker_events: Option<Subscription>,
     /// What the panel's picker offers right now.
@@ -824,7 +830,7 @@ impl TerminalWindow {
             file_request: HashMap::new(),
             document_request: 0,
             inspector_tab: InspectorTab::Files,
-            diff_origin: navigation::DiffOrigin::Branch,
+            diff_origin: navigation::DiffOrigin::DefaultBranch,
             diff_origin_picker: None,
             diff_origin_picker_events: None,
             diff_origin_offered: Vec::new(),
@@ -1852,12 +1858,13 @@ impl TerminalWindow {
         // The figures are counted against the origin the window is asking about,
         // so a sweep that answers for another one is a sweep about another change
         // set and is dropped rather than drawn.
-        let origin = self.diff_origin;
+        let origin = self.diff_origin.clone();
         self.diff_refresh_running = true;
         let executor = cx.background_executor().clone();
         let worker = executor.clone().spawn({
             let executor = executor.clone();
-            async move { count_sweep(work, origin, executor).await }
+            let counted = origin.clone();
+            async move { count_sweep(work, counted, executor).await }
         });
         cx.spawn(async move |view, cx| {
             let totals = worker.await;
@@ -4176,6 +4183,7 @@ fn restore_roots(nav: &mut Navigation, roots: &[String], errors: &mut Vec<String
                         .unwrap_or_else(|| root.clone()),
                     root: root.clone(),
                     default_branch: None,
+                    branches: Vec::new(),
                     created_at: "startup".into(),
                     last_opened_at: "startup".into(),
                     checkouts: vec![muster_core::workspace::Checkout {

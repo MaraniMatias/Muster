@@ -32,7 +32,7 @@ use crate::inspector::{prepare_tree, status_index, StatusIndex, TreeSource};
 use gpui_kit::AppContext;
 use gpui_kit::{div, Context, IntoElement, Render, TestAppContext, Window};
 use muster_core::files::FileEntry;
-use muster_core::navigation::{ChangedFile, GitStatus};
+use muster_core::navigation::{ChangedFile, DiffOrigin, GitStatus};
 use muster_core::window::WindowGeometry;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -261,6 +261,8 @@ fn tree_fixture(folders: usize, per_folder: usize) -> TreeFixture {
         branch: Some("main".to_owned()),
         head: Some("0f1e2d3".to_owned()),
         default_branch: "main".to_owned(),
+        requested_origin: DiffOrigin::DefaultBranch,
+        origin: DiffOrigin::DefaultBranch,
         ahead_count: Some(0),
         files,
     };
