@@ -171,6 +171,17 @@ written there against the node names that grammar declares. Its tree is
 hash-pinned by `scripts/patched-gherkin.mjs`, like every other vendored crate
 the audit is asked to trust.
 
+**A grammar is one version, and it is the one its query was written for.** The
+C# grammar is the app's own: the toolkit's copy of it is not linked, because
+two copies of one grammar crate are two copies of the same C symbols in one
+binary, and the link keeps one of them -- not the same one on every platform.
+A query answers the grammar it was written for and not the other one, so a
+file is read with no colours at all where the other copy won. The app
+registers the grammar and the query together in `theme::install`, as it does
+for Vue, Gitignore, INI, SVG and Gherkin.
+`theme::tests::the_locked_graph_holds_one_version_of_every_grammar` fails when
+the locked graph holds two versions of one grammar crate.
+
 The toolkit ships no SVG grammar either, and SVG is XML: the pinned upstream XML
 grammar reads it and `theme::install` registers it under SVG's own name, so the
 picker says SVG and the file is read as one. The query is the XML one, so the

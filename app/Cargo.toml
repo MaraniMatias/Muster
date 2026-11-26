@@ -40,7 +40,6 @@ gpui-kit = { version = "0.8.0", features = [
   "tree-sitter-c",
   "tree-sitter-cmake",
   "tree-sitter-cpp",
-  "tree-sitter-csharp",
   "tree-sitter-css",
   "tree-sitter-diff",
   "tree-sitter-ejs",
@@ -74,9 +73,14 @@ gpui-kit = { version = "0.8.0", features = [
 ] }
 # Already selected by the toolkit features above; expose their upstream
 # queries because GPUI Kit registers these grammars with empty queries.
-tree-sitter-c-sharp = "0.24"
 tree-sitter-cmake = "0.7.5"
 tree-sitter-swift = "0.7.4"
+# The C# grammar is the app's own, and the toolkit's copy of it is not linked
+# at all: two copies of one grammar crate are two copies of the same C
+# symbols, so the link decides which one answers, and a query only answers the
+# grammar it was written for. The grammar and the query come from this one
+# crate here, so they always agree.
+tree-sitter-c-sharp = "0.24"
 # The toolkit exposes no Vue grammar feature. Register the grammar and its
 # queries in the toolkit's existing highlighter through `theme::install`.
 tree-sitter-vue-updated = "0.1.0"

@@ -321,7 +321,6 @@ pub fn install(cx: &mut App) {
         cpp.highlights = format!("{}\n{}", c.highlights, cpp.highlights).into();
         registry.register("cpp", &cpp);
         for (name, query) in [
-            ("csharp", tree_sitter_c_sharp::HIGHLIGHTS_QUERY),
             ("cmake", tree_sitter_cmake::HIGHLIGHTS_QUERY),
             ("swift", tree_sitter_swift::HIGHLIGHTS_QUERY),
             // Two more the toolkit registers empty, and here the query is ours.
@@ -332,6 +331,22 @@ pub fn install(cx: &mut App) {
             config.highlights = query.to_owned().into();
             registry.register(name, &config);
         }
+        // The C# grammar is the app's own, and the toolkit's copy of it is not
+        // linked: two copies of one grammar crate are two copies of the same
+        // C symbols, so the link decides which one answers, and a query only
+        // answers the grammar it was written for. The grammar and the query
+        // come from the same crate here, so they always agree.
+        registry.register(
+            "csharp",
+            &LanguageConfig::new(
+                "csharp",
+                tree_sitter_c_sharp::LANGUAGE.into(),
+                Vec::new(),
+                tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
+        );
         // Legacy highlighted Vue and the toolkit ships a grammar for it with
         // no feature to turn one on, so it carries its grammar and its queries
         // in from the crate that owns them. It is the toolkit's own registry
@@ -1517,6 +1532,53 @@ mod tests {
         for color in ["rebeccapurple", "#12345", "#1234567", "5c7cfa", ""] {
             assert!(service_tint(color).is_none(), "{color} is not a colour");
         }
+    }
+
+    /// The grammar crates in a locked graph, and the versions each one holds.
+    fn grammar_versions(lock: &str) -> std::collections::BTreeMap<&str, Vec<&str>> {
+        let mut versions: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        let mut name = "";
+        for line in lock.lines() {
+            if let Some(rest) = line.strip_prefix("name = \"") {
+                name = rest.strip_suffix('"').unwrap_or(rest);
+            } else if let Some(rest) = line.strip_prefix("version = \"") {
+                let version = rest.strip_suffix('"').unwrap_or(rest);
+                if name.starts_with("tree-sitter") {
+                    versions.entry(name).or_default().push(version);
+                }
+                name = "";
+            }
+        }
+        versions
+    }
+
+    /// One version of every grammar crate in the locked graph.
+    ///
+    /// Two versions of one grammar crate are two copies of the same C symbols
+    /// in one binary: the link keeps one of them, and which one it keeps is
+    /// not the same on every platform. A query answers the grammar it was
+    /// written for and not the other one, so a file is read with no colours at
+    /// all on the platform where the other copy won.
+    #[test]
+    fn the_locked_graph_holds_one_version_of_every_grammar() {
+        let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.lock"))
+            .expect("the locked graph");
+        for (grammar, versions) in grammar_versions(&lock) {
+            assert_eq!(
+                versions.len(),
+                1,
+                "{grammar} is in the locked graph more than once: {versions:?}"
+            );
+        }
+        // The reader sees a second copy when there is one, or the rule above
+        // would pass a graph that is split.
+        let split = "[[package]]\nname = \"tree-sitter-c-sharp\"\nversion = \"0.23.5\"\n\
+                     [[package]]\nname = \"tree-sitter-c-sharp\"\nversion = \"0.24.0\"\n";
+        assert_eq!(
+            grammar_versions(split)["tree-sitter-c-sharp"].len(),
+            2,
+            "the reader does not see a second copy of a grammar"
+        );
     }
 
     /// This is the compatibility contract, stated once and read off Legacy's own
