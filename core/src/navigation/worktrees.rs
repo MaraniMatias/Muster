@@ -374,6 +374,16 @@ pub(super) fn default_ref_with_budget(
     persisted: Option<&str>,
     within: GitReadBudget,
 ) -> Result<(String, String), String> {
+    default_ref_if_available(root, persisted, within)?.ok_or_else(|| {
+        "Git could not determine a valid default branch; choose one before creating a worktree or viewing changes".into()
+    })
+}
+
+pub(super) fn default_ref_if_available(
+    root: &Path,
+    persisted: Option<&str>,
+    within: GitReadBudget,
+) -> Result<Option<(String, String)>, String> {
     let named = optional_ref(
         root,
         &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
@@ -414,11 +424,11 @@ pub(super) fn default_ref_with_budget(
             )?
             .is_some()
             {
-                return Ok((branch.to_owned(), reference));
+                return Ok(Some((branch.to_owned(), reference)));
             }
         }
     }
-    Err("Git could not determine a valid default branch; choose one before creating a worktree or viewing changes".into())
+    Ok(None)
 }
 
 /// Create on a worker, with no deadline on the Git mutation. Never deletes a

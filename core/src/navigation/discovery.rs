@@ -163,6 +163,7 @@ pub fn open_directory_with_budget(
         .filter(|name| !name.is_empty())
         .unwrap_or(&root)
         .to_owned();
+    let branches = local_branches(&checkout_root, within)?;
     within.remaining()?;
     Ok(OpenedDirectory {
         repo: Repo {
@@ -171,12 +172,34 @@ pub fn open_directory_with_budget(
             name,
             root,
             default_branch,
+            branches,
             checkouts,
             created_at: now.clone(),
             last_opened_at: now,
         },
         checkout_id: opened_checkout_id,
     })
+}
+
+/// The repository's local branches, as Git lists them.
+///
+/// The branches a change set can be measured against. The remote-tracking branches are not
+/// among them: a branch a person works on is one this repository holds.
+fn local_branches(root: &Path, within: GitReadBudget) -> Result<Vec<String>, String> {
+    let output = git_success(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        within,
+    )?;
+    let mut branches = output_text(&output)?
+        .lines()
+        .map(str::trim)
+        .filter_map(|name| name.strip_prefix("refs/heads/"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    branches.sort();
+    Ok(branches)
 }
 
 #[derive(Default)]

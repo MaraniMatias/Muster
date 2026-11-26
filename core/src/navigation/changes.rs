@@ -6,14 +6,20 @@ use super::*;
 
 /// What a change set is measured from.
 ///
-/// Two answers, and they are two different change sets rather than two views of one: the
-/// branch's own changes since it left the default branch, and the change set `git status`
-/// reports about the files on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Three answers, and they are three different change sets rather than three views of one:
+/// the checkout's own changes since it left the default branch, its changes since it left
+/// another branch, and the change set `git status` reports about the files on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffOrigin {
-    /// The merge base with the default branch: every commit this checkout holds above that
-    /// base, and what is on disk on top of them.
-    Branch,
+    /// The merge base with the repository's own default branch: every commit this checkout
+    /// holds above that base, and what is on disk on top of them.
+    DefaultBranch,
+    /// The merge base with the branch named here: every commit this checkout holds above
+    /// that base, and what is on disk on top of them.
+    ///
+    /// A repository that holds no branch by that name has no base to offer, so its change
+    /// set is measured from its own default branch instead.
+    Branch(String),
     /// `HEAD`: the files on disk against the last commit, which is what `git status`
     /// reports.
     WorkingTree,
@@ -31,7 +37,12 @@ pub struct GitStatus {
     pub branch: Option<String>,
     /// `None` only in a repository with no commit at all.
     pub head: Option<String>,
+    /// The resolved default branch, or empty when this repository has no default ref.
     pub default_branch: String,
+    /// The origin requested by the caller.
+    pub requested_origin: DiffOrigin,
+    /// The origin actually used. A missing named branch falls back to the default branch.
+    pub origin: DiffOrigin,
     /// How far the branch is above the default branch.
     ///
     /// `None` where there is no merge base to count from: a branch with no common
@@ -177,24 +188,22 @@ pub fn status(
     within: GitReadBudget,
 ) -> Result<GitStatus, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
-    // The default branch is what this checkout is compared with, and it is resolved the
-    // way it always was: the row names the same branch it named before.
-    let (default_branch, reference) = default_ref(repo, root.as_path(), within)?;
-    // The branch's changes are measured from the merge base with the default branch;
-    // the working tree's are measured from the last commit, so the merge base is not
-    // asked for there and a checkout with no common ancestor with the default branch
-    // still reads its own changes.
-    let (base, merge_base) = match origin {
-        DiffOrigin::Branch => {
-            let merge_base = merge_base(root.as_path(), &reference, within)?;
-            (merge_base.clone(), Some(merge_base))
-        }
-        DiffOrigin::WorkingTree => {
-            let merge_base = optional_merge_base(root.as_path(), &reference, within)?;
-            ("HEAD".to_owned(), merge_base)
-        }
-    };
-    let mut files = changed_files(root.as_path(), &base, origin, within)?;
+    let requested_origin = origin.clone();
+    let default = checkout_default_ref(repo, root.as_path(), within)?;
+    let default_branch = default
+        .as_ref()
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default();
+    // A named branch can be measured even when no default branch can be resolved; only
+    // its ahead count is then unknown. Reads still fail if neither requested nor default
+    // branch exists, and Git errors are never treated as an absent branch.
+    let (base, origin) = base_commit(
+        root.as_path(),
+        &origin,
+        default.as_ref().map(|(_, reference)| reference.as_str()),
+        within,
+    )?;
+    let mut files = changed_files(root.as_path(), &base, &origin, within)?;
     let counts = numstat_counts(root.as_path(), &base, within)?;
     let untracked = untracked_counts(&root, &files, within)?;
     for file in &mut files {
@@ -216,11 +225,17 @@ pub fn status(
     )?;
     let head = optional_ref(root.as_path(), &["rev-parse", "--short", "HEAD"], within)?;
     // How far the branch is above the default branch is a fact about the commits and not
-    // about what the changes are measured from, so it is counted from the merge base in
-    // either origin. A branch with no merge base with the default branch has no count to
-    // give, which is an unknown answer and not a zero.
-    let ahead_count = match &merge_base {
-        Some(merge_base) => Some(count_ahead(root.as_path(), merge_base, within)?),
+    // about what the changes are measured from, so it is counted from the merge base with
+    // the default branch in every origin. A branch with no merge base with the default
+    // branch has no count to give, which is an unknown answer and not a zero.
+    let ahead_count = match default.as_ref() {
+        Some((_, _)) if origin == DiffOrigin::DefaultBranch => {
+            Some(count_ahead(root.as_path(), &base, within)?)
+        }
+        Some((_, reference)) => match optional_merge_base(root.as_path(), reference, within)? {
+            Some(merge_base) => Some(count_ahead(root.as_path(), &merge_base, within)?),
+            None => None,
+        },
         None => None,
     };
     // The branch a row reads, without the `refs/` a ref carries: the ref is what Git is
@@ -229,6 +244,8 @@ pub fn status(
         branch,
         head,
         default_branch,
+        requested_origin,
+        origin,
         ahead_count,
         files,
     })
@@ -261,22 +278,27 @@ pub(super) fn file_diff_before_git(
 ) -> Result<FileDiff, String> {
     let root = validated_checkout_root(repo, checkout, within)?;
     let relative = validated_relative_path(path)?;
-    // The branch's file is measured from the merge base with the default branch; the
-    // working tree's from the last commit, so the merge base is not asked for there and
+    // The branch's file is measured from the merge base with the branch the origin names;
+    // the working tree's from the last commit, so the merge base is not asked for there and
     // a checkout with no common ancestor with the default branch still shows its own
     // changes.
-    let base = match origin {
-        DiffOrigin::Branch => {
-            let (_, reference) = default_ref(repo, root.as_path(), within)?;
-            merge_base(root.as_path(), &reference, within)?
-        }
-        DiffOrigin::WorkingTree => "HEAD".to_owned(),
+    let default = match origin {
+        DiffOrigin::WorkingTree => None,
+        _ => checkout_default_ref(repo, root.as_path(), within)?,
     };
-    let changed = changed_files(&root, &base, origin, within)?
+    let (base, _) = base_commit(
+        root.as_path(),
+        &origin,
+        default.as_ref().map(|(_, reference)| reference.as_str()),
+        within,
+    )?;
+    let changed = changed_files(&root, &base, &origin, within)?
         .into_iter()
         .find(|file| file.path == path)
-        .ok_or(match origin {
-            DiffOrigin::Branch => "Git does not report this file as changed in this checkout",
+        .ok_or(match &origin {
+            DiffOrigin::DefaultBranch | DiffOrigin::Branch(_) => {
+                "Git does not report this file as changed in this checkout"
+            }
             DiffOrigin::WorkingTree => {
                 "Git does not report this file as changed in the working tree"
             }
@@ -551,17 +573,84 @@ fn too_large(path: &str) -> FileDiff {
     }
 }
 
-fn default_ref(
+pub(super) fn checkout_default_ref(
     repo: &Repo,
     root: &Path,
     within: GitReadBudget,
-) -> Result<(String, String), String> {
+) -> Result<Option<(String, String)>, String> {
     let primary = repo
         .checkouts
         .iter()
         .find(|checkout| checkout.is_primary)
         .and_then(|checkout| checkout.branch.as_deref());
-    default_ref_with_budget(root, repo.default_branch.as_deref().or(primary), within)
+    super::default_ref_if_available(root, repo.default_branch.as_deref().or(primary), within)
+}
+
+/// The commit every change in this checkout is measured from.
+///
+/// The branch's own changes start at the merge base with the branch the origin names, and
+/// a checkout without one has no base to measure them from. The working tree's changes
+/// are measured from the last commit, so the merge base is not asked for there.
+pub(super) fn base_commit(
+    root: &Path,
+    origin: &DiffOrigin,
+    default_reference: Option<&str>,
+    within: GitReadBudget,
+) -> Result<(String, DiffOrigin), String> {
+    match origin {
+        DiffOrigin::WorkingTree => Ok(("HEAD".to_owned(), DiffOrigin::WorkingTree)),
+        DiffOrigin::DefaultBranch => {
+            let reference =
+                default_reference.ok_or("Git could not determine a valid default branch")?;
+            Ok((
+                merge_base(root, reference, within)?,
+                DiffOrigin::DefaultBranch,
+            ))
+        }
+        DiffOrigin::Branch(name) => {
+            let (reference, origin) = branch_reference(root, name, default_reference, within)?;
+            Ok((merge_base(root, &reference, within)?, origin))
+        }
+    }
+}
+
+/// The reference a named branch is measured from.
+///
+/// The local branch, when the repository holds one. A repository that holds no branch by
+/// that name has no base to offer, so its change set is measured from its own default
+/// branch instead.
+fn branch_reference(
+    root: &Path,
+    name: &str,
+    default_reference: Option<&str>,
+    within: GitReadBudget,
+) -> Result<(String, DiffOrigin), String> {
+    let reference = format!("refs/heads/{name}");
+    let valid = git_output(root, &["check-ref-format", &reference], within)?;
+    if !valid.status.success() {
+        if valid.status.code() != Some(1) || !valid.stderr.is_empty() {
+            return Err(git_error("could not validate branch", &valid));
+        }
+        return default_reference
+            .map(|reference| (reference.to_owned(), DiffOrigin::DefaultBranch))
+            .ok_or_else(|| format!("Git does not hold branch {name:?} and has no default branch"));
+    }
+    let exists = optional_ref(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ],
+        within,
+    )?;
+    match exists {
+        Some(_) => Ok((reference, DiffOrigin::Branch(name.to_owned()))),
+        None => default_reference
+            .map(|reference| (reference.to_owned(), DiffOrigin::DefaultBranch))
+            .ok_or_else(|| format!("Git does not hold branch {name:?} and has no default branch")),
+    }
 }
 
 /// The commit every change in this checkout is measured from.
@@ -616,7 +705,7 @@ fn count_ahead(root: &Path, merge_base: &str, within: GitReadBudget) -> Result<u
 fn changed_files(
     root: &Path,
     base: &str,
-    origin: DiffOrigin,
+    origin: &DiffOrigin,
     within: GitReadBudget,
 ) -> Result<Vec<ChangedFile>, String> {
     let status = git_success(
@@ -625,7 +714,7 @@ fn changed_files(
         within,
     )?;
     let mut files = parse_porcelain_v2(&status.stdout)?;
-    if origin == DiffOrigin::WorkingTree {
+    if matches!(origin, DiffOrigin::WorkingTree) {
         return Ok(files.into_values().collect());
     }
     let committed = git_success(
