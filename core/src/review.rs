@@ -196,7 +196,14 @@ pub fn review_note_snapshot(note: &ReviewNote) -> String {
 pub fn review_note_key(note: &ReviewNote) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(review_note_snapshot(note).as_bytes());
-    format!("{}:{digest:x}", note.id)
+    // The digest is a byte array rather than a `GenericArray`, and it does not
+    // carry a hex spelling of its own, so it is written out one byte at a time.
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        hex.push(char::from_digit((byte >> 4) as u32, 16).expect("a nibble is a digit"));
+        hex.push(char::from_digit((byte & 0x0f) as u32, 16).expect("a nibble is a digit"));
+    }
+    format!("{}:{hex}", note.id)
 }
 
 /// Refuses a note that could not be delivered as a comment about a line.

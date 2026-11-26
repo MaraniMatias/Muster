@@ -74,7 +74,7 @@ gpui-kit = { version = "0.7.3", features = [
 ] }
 # Already selected by the toolkit features above; expose their upstream
 # queries because GPUI Kit registers these grammars with empty queries.
-tree-sitter-c-sharp = "0.23.5"
+tree-sitter-c-sharp = "0.24"
 tree-sitter-cmake = "0.7.5"
 tree-sitter-swift = "0.7.4"
 # The toolkit exposes no Vue grammar feature. Register the grammar and its
@@ -104,7 +104,7 @@ unicode-width = "0.2"
 # and measure a document's own pictures before the toolkit decodes them: the
 # codecs below are the ones this window draws, and the toolkit compiles them in
 # already.
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = [
     "bmp",
