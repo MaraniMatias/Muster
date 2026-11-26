@@ -23,7 +23,7 @@ package to future releases. It never changes an existing release or version.
 
 ## Local checks
 
-Use Rust/rustup 1.97.1 and Node 22. On Ubuntu install:
+Use Rust/rustup 1.100.0 and Node 22. On Ubuntu install:
 
 ```sh
 sudo apt-get update

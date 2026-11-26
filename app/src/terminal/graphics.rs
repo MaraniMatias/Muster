@@ -474,7 +474,8 @@ fn decode(c: &Control, encoded: &[u8]) -> Result<RgbaImage> {
             }
             24 if data.len() == count / 4 * 3 => {
                 let mut rgba = Vec::with_capacity(count);
-                for rgb in data.chunks_exact(3) {
+                let (rgb, _) = data.as_chunks::<3>();
+                for rgb in rgb.iter() {
                     rgba.extend_from_slice(rgb);
                     rgba.push(255);
                 }
@@ -486,8 +487,11 @@ fn decode(c: &Control, encoded: &[u8]) -> Result<RgbaImage> {
     };
     // GPUI's raster contract is BGRA, not RGBA. No decoder or per-pixel
     // conversion is performed by the UI thread.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+    {
+        let (quads, _) = pixels.as_chunks_mut::<4>();
+        for quad in quads.iter_mut() {
+            quad.swap(0, 2);
+        }
     }
     Ok(pixels)
 }

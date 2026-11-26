@@ -20,7 +20,7 @@ Commands:
   publish    Publish the version this tree already carries (version argument)
   help       Show this help
 
-Requires Rust/rustup 1.97.1 and Node.js. Linux build prerequisites are listed
+Requires Rust/rustup 1.100.0 and Node.js. Linux build prerequisites are listed
 in .github/workflows/ci.yml. `release` creates dist/Muster.app and a macOS DMG; it does
 not publish, sign for distribution, notarize, or create a git tag.
 
@@ -51,13 +51,13 @@ cd "$root"
 
 require_toolchain() {
   local rustup_path
-  rustup_path="$(rustup which --toolchain 1.97.1 rustc)" || {
-    echo 'release: Rust toolchain 1.97.1 is required (install with rustup)' >&2
+  rustup_path="$(rustup which --toolchain 1.100.0 rustc)" || {
+    echo 'release: Rust toolchain 1.100.0 is required (install with rustup)' >&2
     exit 1
   }
   export PATH="$(dirname "$rustup_path"):$PATH"
-  [[ "$(rustc --version)" == rustc\ 1.97.1* ]] || { echo 'release: rustc must be 1.97.1' >&2; exit 1; }
-  [[ "$(cargo --version)" == cargo\ 1.97.1* ]] || { echo 'release: cargo must be 1.97.1' >&2; exit 1; }
+  [[ "$(rustc --version)" == rustc\ 1.100.0* ]] || { echo 'release: rustc must be 1.100.0' >&2; exit 1; }
+  [[ "$(cargo --version)" == cargo\ 1.100.0* ]] || { echo 'release: cargo must be 1.100.0' >&2; exit 1; }
 }
 
 # A file is rewritten through a temporary file and copied back over itself, so

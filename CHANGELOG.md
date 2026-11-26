@@ -15,6 +15,11 @@ here still gets its generated notes.
   base64, sha2 and the C# grammar -- and the toolkit moves from 0.7.3 to 0.8.0,
   which brings the editor, the diff and the table their own fixes.
 
+- **The toolchain moves to Rust 1.100.0.** It is the newest stable release,
+  and it is what the toolkit's newer releases need: the window backend uses a
+  std API that was stabilized in Rust 1.98. Building from source now needs
+  1.100.0; nothing about the app's own behavior changes.
+
 - **The toolkit's local patches are carried onto the new release.** The diff
   component is vendored for four things the upstream crate does not carry: the
   annotation's hit target, the full-source syntax of a patch, the header pinned

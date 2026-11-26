@@ -14,7 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TOOLCHAIN="1.97.1"
+TOOLCHAIN="1.100.0"
 PROFILE="release"
 
 if [[ "${1:-}" == "--debug" ]]; then

@@ -17,7 +17,7 @@
 //! or directly:
 //!
 //! ```sh
-//! rustup run 1.97.1 cargo test --locked -p muster perf:: \\
+//! rustup run 1.100.0 cargo test --locked -p muster perf:: \\
 //!   --release -- --ignored --nocapture --test-threads=1
 //! ```
 //!

@@ -89,7 +89,7 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: rustfmt, clippy
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -144,7 +144,7 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: rustfmt, clippy
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7

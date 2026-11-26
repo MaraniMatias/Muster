@@ -20,8 +20,8 @@ docs/             the migration plan, and what the port has to satisfy
 
 - The toolchain is pinned in `rust-toolchain.toml`. Use that `cargo`, not another
   one that happens to be earlier in `PATH`. Put the directory returned by
-  `dirname "$(rustup which --toolchain 1.97.1 rustc)"` first on `PATH`, then
-  confirm both `rustc --version` and `cargo --version` are 1.97.1.
+  `dirname "$(rustup which --toolchain 1.100.0 rustc)"` first on `PATH`, then
+  confirm both `rustc --version` and `cargo --version` are 1.100.0.
 - `cargo test --workspace` covers both crates. `cargo clippy --locked --workspace
 --all-targets -- -D warnings` and `cargo fmt --all --check` are both clean and
   are expected to stay that way.

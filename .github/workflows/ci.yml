@@ -21,15 +21,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: rustfmt, clippy
-      # That commit is the tip of the action's `1.97.1` branch, and its own
-      # `action.yml` carries `toolchain: 1.97.1`, so the pin installs the
+      # That commit is the tip of the action's `1.100.0` branch, and its own
+      # `action.yml` carries `toolchain: 1.100.0`, so the pin installs the
       # version this repository names rather than whatever the branch says
       # today. The build says so out loud rather than assuming it.
       - name: The toolchain in use is the one this repository pins
-        run: test "$(rustc --version | cut -d' ' -f2)" = "1.97.1"
+        run: test "$(rustc --version | cut -d' ' -f2)" = "1.100.0"
       # The Rust dependencies are the build's cost, and they only change when Cargo.lock does.
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -68,7 +68,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
