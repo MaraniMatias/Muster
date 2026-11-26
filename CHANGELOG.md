@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.3.6
 
 - **Opening a file does not move the reader.** The patch of a file is read
   when the file is opened, and it lands in the list under the reader: the rows
