@@ -6,6 +6,21 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **The dependencies move to the newest releases they can reach.** Every crate
+  the lockfile could take within its own constraint moves: 159 packages, from
+  the URL and notification crates to the terminal stack and the tree-sitter
+  grammars. Three direct dependencies move past their own major version --
+  base64, sha2 and the C# grammar -- and the toolkit moves from 0.7.3 to 0.8.0,
+  which brings the editor, the diff and the table their own fixes.
+
+- **The toolkit's local patches are carried onto the new release.** The diff
+  component is vendored for four things the upstream crate does not carry: the
+  annotation's hit target, the full-source syntax of a patch, the header pinned
+  at the top of the pane and the reader's place when a patch arrives. They are
+  ported onto 0.8.0 unchanged, and the tree's hash pin follows them.
+
 ## 1.3.6
 
 - **Opening a file does not move the reader.** The patch of a file is read
