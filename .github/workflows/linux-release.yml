@@ -245,5 +245,6 @@ jobs:
           gh api "repos/$REPO/git/refs" -X POST -f ref="refs/tags/$TAG" -f sha="$object"
           flags=()
           if [[ "$TAG" == *-* ]]; then flags+=(--prerelease --latest=false); fi
-          gh release create "$TAG" ./*.deb ./*.zip ./*.dmg SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "Native macOS arm64 and x86_64 and Ubuntu 24.04 amd64 and arm64 artifacts built and validated from $SHA." "${flags[@]}"
+          notes="$(printf 'Native macOS arm64 and x86_64 and Ubuntu 24.04 amd64 and arm64 artifacts for %s.\n\nThe exact commit these artifacts were built from is recorded in the SOURCE_SHA asset, and it is the commit this tag points at.' "$TAG")"
+          gh release create "$TAG" ./*.deb ./*.zip ./*.dmg SHA256SUMS SOURCE_SHA --repo "$REPO" --verify-tag --draft --title "Muster $TAG" --notes "$notes" "${flags[@]}"
           gh release edit "$TAG" --repo "$REPO" --draft=false "${flags[@]}"
