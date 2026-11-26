@@ -3041,7 +3041,13 @@ mod tests {
                 let colors: Vec<_> = styles.iter().filter_map(|(_, style)| style.color).collect();
                 assert!(
                     colors.iter().any(|color| Some(color) != colors.first()),
-                    "{path} is monochrome"
+                    // What it says tells the two failures apart: a file that
+                    // reached the highlighter with no text at all, and one
+                    // that was coloured in a single ink.
+                    "{path} is monochrome: {} bytes of text, {} styles, {} colours",
+                    text.len(),
+                    styles.len(),
+                    colors.len(),
                 );
             });
         }
