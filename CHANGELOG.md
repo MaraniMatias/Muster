@@ -6,6 +6,27 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
+## Unreleased
+
+- **Opening a file does not move the reader.** The patch of a file is read
+  when the file is opened, and it lands in the list under the reader: the rows
+  are spliced, and the row that was at the top of the viewport is put back, so
+  the diff does not go back to its first row and does not jump a row's height
+  either. The reader's place is a file's own name and the source line it
+  shows, and not the place of either in the list, so a patch that reorders its
+  files or supplies a different window of the same file keeps the reviewer's
+  selection where it is.
+
+- **The diff's header stays at the top of the pane.** A patch can be longer
+  than the pane, and the file's header row is what says which file the lines
+  under it belong to. It is now pinned over the rows that scroll under it, and
+  it is lifted by the room the next header takes: the next file's header is
+  never masked by it, and the pinned one never takes the next header's click.
+
+- **A diff opens in the worktree that owns it.** A diff reached from a
+  worktree's own row now selects that worktree before the patch is read, so it
+  opens where it belongs and not in whichever checkout was on screen.
+
 ## 1.3.5
 
 - **Two dependencies are updated for their security fixes.** The URL parser
