@@ -27,13 +27,13 @@ path = "src/main.rs"
 [dependencies]
 # Pin the component crate paired with this kit, so a lockfile update does not
 # select its older dependency on the incompatible gpui-pre version.
-gpui-component = "=0.7.3"
+gpui-component = "=0.8.0"
 # `component` is the widget layer this app draws its chrome with. The
 # `tree-sitter*` features enable the toolkit's grammars selected by
 # `document::syntax_language`, plus JSDoc for JavaScript injections. Gitignore
 # has its own pinned parser; Dotenv reuses the toolkit's Bash grammar. Unsupported
 # formats still open as plain text.
-gpui-kit = { version = "0.7.3", features = [
+gpui-kit = { version = "0.8.0", features = [
   "component",
   "tree-sitter",
   "tree-sitter-bash",
@@ -122,7 +122,7 @@ tempfile = "3"
 
 [dev-dependencies]
 # Same crate, test-support on: unit tests build the same type universe as the app.
-gpui-kit = { version = "0.7.3", features = ["component", "test-support"] }
+gpui-kit = { version = "0.8.0", features = ["component", "test-support"] }
 # Already compiled into the test binary through the toolkit, so this costs no
 # build: it reads the bundled icon face's own tables, which is how a test can
 # tell that a private use character has a glyph to be drawn with.

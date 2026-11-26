@@ -224,17 +224,17 @@ test("the diff component is accepted only at its pinned identity and source tree
   assert.equal(patchedGpuiComponentTreeSha256(), PATCHED_GPUI_COMPONENT_TREE_SHA256);
   assert.match(PATCHED_GPUI_COMPONENT_ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
   const pkg = {
-    id: "path+file:///fixture#gpui-component@0.7.3",
+    id: "path+file:///fixture#gpui-component@0.8.0",
     name: "gpui-component",
-    version: "0.7.3",
+    version: "0.8.0",
     source: null,
     manifest_path: join(PATCHED_GPUI_COMPONENT_DIR, "Cargo.toml"),
   };
   assert.deepEqual(parseCargoMetadata({ workspace_members: [APP_ID], packages: [pkg] }), [
-    { name: "gpui-component", version: "0.7.3", source: null },
+    { name: "gpui-component", version: "0.8.0", source: null },
   ]);
   for (const override of [
-    { version: "0.7.2" },
+    { version: "0.7.3" },
     { manifest_path: "/external/gpui-component/Cargo.toml" },
   ]) {
     assert.equal(auditedPatchedGpuiComponent({ ...pkg, ...override }), null);

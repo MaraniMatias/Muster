@@ -18,7 +18,7 @@ default-members = ["app", "core"]
 alacritty_terminal = { path = "vendor/alacritty_terminal-0.26.0" }
 # Keep annotations out of source selection and highlight complete diff sources
 # with injected languages. See the vendored PATCHES.md and its tree hash pin.
-gpui-component = { path = "vendor/gpui-component-0.7.3" }
+gpui-component = { path = "vendor/gpui-component-0.8.0" }
 
 # The VT parser and the GPUI text stack are hot enough that an unoptimized debug
 # build is not worth waiting for, and every third-party crate is worse.
