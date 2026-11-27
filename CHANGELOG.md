@@ -6,7 +6,7 @@ the part a reader should read and the generated list is the part they can skip. 
 under `Unreleased` and rename that heading to the version when you tag it; a version with no section
 here still gets its generated notes.
 
-## Unreleased
+## 1.4.1
 
 - **A worktree that holds a submodule can be removed.** Git keeps a linked
   worktree's submodule clones in that worktree's own Git directory and refuses
