@@ -17,6 +17,11 @@ pub struct WorktreeRemovalInfo {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub dirty_files: Vec<String>,
+    /// The submodule clones this worktree owns, in its own Git directory.
+    ///
+    /// Git refuses to remove a worktree that holds one of these unless the
+    /// removal is forced, even when the worktree itself is clean.
+    pub submodules: Vec<String>,
     pub default_branch: Option<String>,
     pub default_ref: Option<String>,
     pub unmerged_commits: u32,
@@ -30,6 +35,9 @@ pub struct WorktreeRemovalConfirmation {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub dirty_files: Vec<String>,
+    /// The submodule clones the preview showed, so that a worktree which
+    /// gained or lost one is asked about again rather than removed.
+    pub submodules: Vec<String>,
     pub default_ref: Option<String>,
     pub unmerged_commits: u32,
     pub confirm_dirty: bool,
@@ -220,6 +228,30 @@ pub(super) fn parse_worktree_dirty_files(bytes: &[u8]) -> Result<Vec<String>, St
     Ok(files)
 }
 
+/// The submodule clones this worktree owns, in the worktree's own Git directory.
+///
+/// Git keeps a linked worktree's submodule clones under that worktree's own
+/// administrative directory, and refuses to remove the worktree while they are
+/// there — even a worktree with nothing uncommitted. This asks Git where that
+/// directory is and reads what is under it, which is the same place Git looks.
+fn worktree_submodules(worktree: &Worktree, within: GitReadBudget) -> Result<Vec<String>, String> {
+    let git_dir = git_success(&worktree.path, &["rev-parse", "--absolute-git-dir"], within)?;
+    let git_dir = PathBuf::from(output_text(&git_dir)?.trim());
+    let entries = match fs::read_dir(git_dir.join("modules")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read the worktree's submodules: {error}")),
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Read a fresh Git preview for this exact, selected linked worktree.
 pub fn worktree_removal_info(
     repo: &Repo,
@@ -240,6 +272,7 @@ fn worktree_removal_info_with_budget(
         within,
     )?;
     let dirty_files = parse_worktree_dirty_files(&status.stdout)?;
+    let submodules = worktree_submodules(&worktree, within)?;
     let (default_branch, default_ref, unmerged_commits) =
         if let Some(branch) = worktree.branch.as_deref() {
             let (default_branch, default_ref) =
@@ -288,6 +321,7 @@ fn worktree_removal_info_with_budget(
         branch: worktree.branch,
         head: worktree.head,
         dirty_files,
+        submodules,
         default_branch,
         default_ref,
         unmerged_commits,
@@ -307,6 +341,7 @@ pub fn remove_worktree(
         || confirmation.branch != info.branch
         || confirmation.head != info.head
         || confirmation.dirty_files != info.dirty_files
+        || confirmation.submodules != info.submodules
         || confirmation.default_ref != info.default_ref
         || confirmation.unmerged_commits != info.unmerged_commits
     {
@@ -338,7 +373,11 @@ pub fn remove_worktree(
         .to_str()
         .ok_or("non-UTF-8 worktree paths are not supported")?;
     let mut args = vec!["worktree", "remove"];
-    if !info.dirty_files.is_empty() {
+    // Git refuses to remove a worktree that holds submodule clones unless the
+    // removal is forced, even when the worktree itself has nothing
+    // uncommitted. The person has already been shown what is in there, so this
+    // is the same force the uncommitted-files case uses.
+    if !info.dirty_files.is_empty() || !info.submodules.is_empty() {
         args.push("--force");
     }
     args.push(path);

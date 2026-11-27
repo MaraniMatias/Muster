@@ -4138,6 +4138,115 @@ async fn dirty_worktree_delete_needs_ack_and_preserves_branch_by_default(cx: &mu
     close(&fixture, cx);
 }
 
+/// A worktree that holds a submodule can be deleted.
+///
+/// Git keeps a linked worktree's submodule clone in that worktree's own Git
+/// directory and refuses to remove the worktree while it is there, even with
+/// nothing uncommitted in it. The dialog names what the worktree holds, and
+/// the deletion goes through.
+#[gpui_kit::test]
+async fn a_worktree_holding_a_submodule_is_deleted(cx: &mut TestAppContext) {
+    let fixture = open_git(cx);
+    // A repository of its own, so the submodule is a real clone Git keeps.
+    let source = fixture._directory.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    run_git(&source, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(
+        &source,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "first",
+        ],
+    );
+    run_git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.to_str().unwrap(),
+            "skills",
+        ],
+    );
+    run_git(
+        &fixture.root,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "-m",
+            "add submodule",
+        ],
+    );
+    let (id, path) = add_worktree(&fixture, cx);
+    // The clone belongs to this worktree, in this worktree's Git directory.
+    run_git(
+        &path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--quiet",
+        ],
+    );
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        fixture.view.update(cx, |app, cx| {
+            app.open_worktree_removal_dialog(&fixture.repo_id, &id, window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(10), |_, cx| {
+        fixture
+            .view
+            .read(cx)
+            .worktree_removal
+            .as_ref()
+            .is_some_and(|draft| {
+                draft
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.submodules == vec!["skills".to_owned()])
+            })
+    })
+    .await;
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("worktree-submodules").visible(),
+            "the dialog says the worktree holds a submodule"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(fixture.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("worktree-delete", cx);
+    })
+    .unwrap();
+    cx.wait_for(fixture.handle, Duration::from_secs(30), |_, cx| {
+        let app = fixture.view.read(cx);
+        app.worktree_removal.is_none() && app.navigation.checkout(&id).is_none()
+    })
+    .await;
+    assert!(!path.exists(), "the worktree that held a submodule is gone");
+    close(&fixture, cx);
+}
+
 fn removal_attempt(
     app: &mut TerminalWindow,
     repo_id: &str,
@@ -4267,6 +4376,7 @@ fn delete_completion_rechecks_activity_that_arrived_during_network_wait(cx: &mut
                 branch: info.branch,
                 head: info.head,
                 dirty_files: info.dirty_files,
+                submodules: info.submodules,
                 default_ref: info.default_ref,
                 unmerged_commits: info.unmerged_commits,
                 confirm_dirty: false,

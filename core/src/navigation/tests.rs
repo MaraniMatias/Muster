@@ -826,6 +826,7 @@ fn removal_confirmation(
         branch: info.branch.clone(),
         head: info.head.clone(),
         dirty_files: info.dirty_files.clone(),
+        submodules: info.submodules.clone(),
         default_ref: info.default_ref.clone(),
         unmerged_commits: info.unmerged_commits,
         confirm_dirty,
@@ -950,6 +951,94 @@ fn removal_deletes_a_branch_only_when_the_confirmation_asks_for_it() {
     .unwrap()
     .status
     .success());
+}
+
+/// A worktree that holds a submodule is removed, and the preview says so.
+///
+/// Git keeps a linked worktree's submodule clone in that worktree's own Git
+/// directory and refuses to remove the worktree while it is there, even with
+/// nothing uncommitted in it. The removal has to say so before it asks Git.
+#[test]
+fn a_worktree_holding_a_submodule_is_removed() {
+    let temp = tempdir().unwrap();
+    let repo = main_repo(temp.path());
+    let root = Path::new(&repo.root);
+    // A repository of its own, so the submodule is a real clone Git keeps.
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "first",
+        ],
+    );
+    git(
+        root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.to_str().unwrap(),
+            "skills",
+        ],
+    );
+    git(
+        root,
+        &[
+            "-c",
+            "user.email=muster@example.test",
+            "-c",
+            "user.name=Muster",
+            "commit",
+            "--quiet",
+            "-m",
+            "add submodule",
+        ],
+    );
+
+    let opened = create_worktree(&repo, "task", "feature/task", "").unwrap();
+    let checkout = opened
+        .repo
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == opened.checkout_id)
+        .unwrap()
+        .clone();
+    let path = Path::new(&checkout.path);
+    // The clone belongs to this worktree, in this worktree's Git directory.
+    git(
+        path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--quiet",
+        ],
+    );
+
+    let info = worktree_removal_info(&opened.repo, &checkout).unwrap();
+    assert_eq!(info.submodules, vec!["skills".to_owned()]);
+    assert!(info.dirty_files.is_empty());
+
+    let confirmation = removal_confirmation(&info, false, false);
+    let removed = remove_worktree(&opened.repo, &checkout, &confirmation).unwrap();
+    assert!(removed.warning.is_none());
+    assert!(!path.exists());
+    // The repository keeps its own clone of the submodule.
+    assert!(Path::new(&repo.root).join(".git/modules/skills").exists());
 }
 
 #[test]

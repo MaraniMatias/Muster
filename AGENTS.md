@@ -483,6 +483,32 @@ Three rules the rows depend on, each pinned by a test:
   `the_panel_order_is_the_order_the_workspace_file_keeps` in
   `app/src/navigation.rs`.
 
+## The worktree's own removal
+
+The dialog that deletes a worktree is a conversation with Git: it reads what
+the worktree holds, asks about what would be lost, and only then asks Git to
+remove it. What Git will not do on its own is part of that conversation.
+
+**A worktree that holds a submodule is still removable.** Git keeps a linked
+worktree's submodule clones in that worktree's own Git directory, and refuses
+to remove the worktree while they are there — `fatal: working trees containing
+submodules cannot be moved or removed` — even when the worktree has nothing
+uncommitted. The removal is therefore forced when the preview found
+submodules, the same force the uncommitted-files case uses, and the dialog
+says what the worktree holds before it asks.
+
+The submodule belongs to that worktree: its checkout lives inside the
+worktree and Git keeps a clone of it beside it, so both go when the worktree
+goes. The repository keeps its own clone, and a submodule with work in it is
+the parent's dirty file, so it is asked about like any other uncommitted file.
+
+The rules it depends on, each pinned by a test:
+
+- **A worktree holding a submodule is removed.**
+  `a_worktree_holding_a_submodule_is_removed` in `core/src/navigation/tests.rs`.
+- **The dialog says what the worktree holds, and the deletion goes through.**
+  `a_worktree_holding_a_submodule_is_deleted` in `app/src/sidebar_tests.rs`.
+
 ## The view the pane is on
 
 The centre pane shows a terminal, a file, or a change. A file is a **preview**

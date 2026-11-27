@@ -3385,6 +3385,7 @@ impl TerminalWindow {
             branch: info.branch.clone(),
             head: info.head.clone(),
             dirty_files: info.dirty_files.clone(),
+            submodules: info.submodules.clone(),
             default_ref: info.default_ref.clone(),
             unmerged_commits: info.unmerged_commits,
             confirm_dirty,

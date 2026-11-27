@@ -21,8 +21,8 @@ use gpui_kit::component::{
     Disableable, Sizable,
 };
 use gpui_kit::{
-    div, prelude::FluentBuilder, px, AnyElement, Context, Entity, IntoElement, ParentElement,
-    Styled, Subscription,
+    div, prelude::FluentBuilder, px, AnyElement, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Styled, Subscription, TestSupportExt,
 };
 use muster_core::navigation::WorktreeRemovalInfo;
 use muster_core::workspace::RepoKind;
@@ -86,6 +86,25 @@ pub(crate) fn escape_git_path(path: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The one line that says a worktree holds submodules, and what goes with them.
+///
+/// A submodule is another repository, checked out inside the worktree, and
+/// Git keeps a clone of it beside the worktree. Deleting the worktree takes
+/// the checkout with the directory and the clone with the registration, so
+/// the person is told what is in there before they are asked to delete it.
+pub(crate) fn submodule_removal_note(submodules: &[String]) -> Option<String> {
+    match submodules {
+        [] => None,
+        [one] => Some(format!(
+            "This worktree holds a submodule ({one}). Its checkout goes with it."
+        )),
+        many => Some(format!(
+            "This worktree holds submodules ({}). Their checkouts go with it.",
+            many.join(", ")
+        )),
+    }
 }
 
 /// Close a worktree dialog only when its non-cancellable Git mutation is idle.
@@ -449,6 +468,17 @@ impl TerminalWindow {
                                         });
                                     }),
                             );
+                    }
+                    if let Some(note) = submodule_removal_note(&info.submodules) {
+                        content = content.child(
+                            div()
+                                .id("worktree-submodules")
+                                .test_support()
+                                .mt_2()
+                                .text_size(px(12.))
+                                .text_color(roles.text_muted)
+                                .child(note),
+                        );
                     }
                     if info.unmerged_commits > 0 {
                         let warning = if info.branch.is_some() {
